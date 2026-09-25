@@ -21,6 +21,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+struct R300DrawPacket;     /* hw/display/r300/r300_draw.h */
+
 /*
  * Blit operation descriptor.
  * Used for 2D engine operations (fill, copy, host data upload).
@@ -311,6 +313,14 @@ typedef struct PPCMacGPURenderer {
      */
     int (*draw_r200)(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                      const R200DrawPacket *pkt);
+
+    /*
+     * Render one assembled R300 draw (see hw/display/r300/r300_draw.h);
+     * rt_gpu_addr and tex[].gpu_addr are already VRAM offsets.  Batched
+     * with draw_r200 work: flush_r200() finishes both.
+     */
+    int (*draw_r300)(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
+                     const struct R300DrawPacket *pkt);
 
     /*
      * Finish all batched draw_r200 work.  The device calls this before any

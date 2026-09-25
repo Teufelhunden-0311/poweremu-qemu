@@ -29,6 +29,9 @@ struct R200Vertex;
 #define PPC_MAC_GPU_PCI_VENDOR_ID      0x1002  /* ATI Technologies */
 #define PPC_MAC_GPU_PCI_DEVICE_ID      0x5960  /* RV280 [Radeon 9200 PRO] */
 #define PPC_MAC_GPU_PCI_REVISION       0x01
+
+/* ATI Radeon 9700 PRO Mac Edition (R300 "ND", FCode ATY,GoldenEye). */
+#define PPC_MAC_GPU_R300_DEVICE_ID     0x4E44
 #define PPC_MAC_GPU_PCI_CLASS          PCI_CLASS_DISPLAY_VGA  /* 0x0300 */
 
 /* ========================================================================
@@ -615,7 +618,10 @@ typedef struct PPCMacGPUDisplayMode {
     bool crtc_ext;       /* true when CRTC extended mode active (kext) */
 } PPCMacGPUDisplayMode;
 
+#include "../../../hw/display/r300/r300_draw.h"
+
 #define TYPE_PPC_MAC_GPU "ppc-mac-gpu"
+#define TYPE_ATI_RADEON_9700 "ati-radeon-9700"
 OBJECT_DECLARE_SIMPLE_TYPE(PPCMacGPUState, PPC_MAC_GPU)
 
 struct PPCMacGPUState {
@@ -657,6 +663,12 @@ struct PPCMacGPUState {
     char *biosrom;
 
     /* Device configuration */
+    bool r300;                  /* ati-radeon-9700: R300 instead of RV280 */
+    struct R300State *r3;       /* R300 3D register file (r300 only) */
+    struct R300Arrays r3_arrays;    /* last 3D_LOAD_VBPNTR */
+    FILE *r3_dump;              /* $R300_DUMP: state dumps at draws */
+    uint32_t r3_trace_lines;    /* register trace after the first draw */
+    uint32_t r300_aic_pt_base;  /* PCI GART table base (0x0AB0) */
     uint32_t vram_size_mb;      /* VRAM size in megabytes */
     uint64_t vram_size;         /* VRAM size in bytes (computed) */
 

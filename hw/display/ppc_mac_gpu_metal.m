@@ -31,6 +31,7 @@
 #import <QuartzCore/QuartzCore.h>
 
 #include "ppc_mac_gpu_renderer.h"
+#include "r300/r300_draw.h"
 #include "ppc_mac_gpu_3d_regs.h"
 #include "ppc_mac_gpu_surface.h"
 
@@ -6389,6 +6390,7 @@ static id<MTLCommandBuffer> g_r200_cb;
 static id<MTLCommandBuffer> g_r200_inflight;   /* newest committed, unwaited */
 static id<MTLRenderCommandEncoder> g_r200_enc;
 static R200TexKey g_r200_enc_key;
+static bool g_r300_enc_mine;        /* open encoder belongs to draw_r300 */
 static uint32_t g_r200_enc_depth_off = ~0u, g_r200_enc_depth_pitch; /* ~0: none */
 static bool g_r200_enc_depth_z16;
 static uint64_t g_r200_stat_draws, g_r200_stat_passes, g_r200_stat_flushes,
@@ -7141,7 +7143,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         bool want_ds = pkt->depth_enable || pkt->stencil_enable;
         bool enc_ds = g_r200_enc_depth_off != ~0u;
         if (g_r200_enc &&
-            (memcmp(&g_r200_enc_key, &rk, sizeof(rk)) ||
+            (g_r300_enc_mine || memcmp(&g_r200_enc_key, &rk, sizeof(rk)) ||
              (want_ds && (!enc_ds || g_r200_enc_depth_off != pkt->depth_offset ||
                           g_r200_enc_depth_pitch != pkt->depth_pitch)))) {
             [g_r200_enc endEncoding];
@@ -7191,6 +7193,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                 g_r200_enc_depth_off = ~0u;
             }
             g_r200_enc = [[g_r200_cb renderCommandEncoderWithDescriptor:rp] retain];
+            g_r300_enc_mine = false;
             /* The R200 does not clip on z for these draws: a depth clear drawn
              * exactly at z = 1.0 (Chess) would be clipped away by Metal. */
             [g_r200_enc setDepthClipMode:MTLDepthClipModeClamp];
@@ -7313,6 +7316,402 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     return 0;
 }
 
+
+/* ========================================================================
+ * R300 (ati-radeon-9700) draws
+ *
+ * The device hands over post-transform vertices and a complete MSL library
+ * generated from the fragment program (r300/r300_us.c), which also does
+ * alpha test, blending and packing into the colour buffer's byte order.
+ * Draws share the R200 path's batch, views and hazard tracking, so the
+ * device's flush_r200() covers them too.
+ * ======================================================================== */
+
+static NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *g_r300_pipes;
+static NSMutableDictionary<NSNumber *, id<MTLSamplerState>> *g_r300_samplers;
+static id<MTLTexture> g_r300_dummy;
+
+static void r300_metal_warn(uint32_t bit, const char *msg)
+{
+    static uint32_t warned;
+    if (!(warned & bit)) {
+        warned |= bit;
+        qemu_log("ppc-mac-gpu r300: %s\n", msg);
+    }
+}
+
+static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
+                                                const char *msl)
+{
+    NSString *key = [NSString stringWithUTF8String:msl];
+    id<MTLRenderPipelineState> p;
+    NSError *err = nil;
+
+    if (!g_r300_pipes) {
+        g_r300_pipes = [[NSMutableDictionary alloc] init];
+    }
+    p = g_r300_pipes[key];
+    if (p) {
+        return p;
+    }
+    id<MTLLibrary> lib = [dev newLibraryWithSource:key options:nil error:&err];
+    if (!lib) {
+        qemu_log("ppc-mac-gpu r300: shader compile failed: %s\n%s\n",
+                 err.localizedDescription.UTF8String, msl);
+        return nil;
+    }
+    MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+    pd.vertexFunction = [[lib newFunctionWithName:@"r300_vs"] autorelease];
+    pd.fragmentFunction = [[lib newFunctionWithName:@"r300_fs"] autorelease];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    p = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    [pd release];
+    [lib release];
+    if (!p) {
+        qemu_log("ppc-mac-gpu r300: pipeline failed: %s\n",
+                 err.localizedDescription.UTF8String);
+        return nil;
+    }
+    g_r300_pipes[key] = p;
+    [p release];
+    if (g_r300_pipes.count % 16 == 1) {
+        qemu_log("ppc-mac-gpu r300: %lu fragment pipelines\n",
+                 (unsigned long)g_r300_pipes.count);
+    }
+    return p;
+}
+
+static MTLSamplerAddressMode r300_wrap(uint32_t w)
+{
+    switch (w & 7) {
+    case 0:  return MTLSamplerAddressModeRepeat;
+    case 1:  return MTLSamplerAddressModeMirrorRepeat;
+    case 3:
+    case 5:  return MTLSamplerAddressModeMirrorClampToEdge;
+    case 6:
+    case 7:  return MTLSamplerAddressModeClampToBorderColor;
+    default: return MTLSamplerAddressModeClampToEdge;
+    }
+}
+
+static id<MTLSamplerState> r300_sampler(id<MTLDevice> dev, uint32_t f0)
+{
+    uint32_t key = f0 & 0x7FFF;
+    id<MTLSamplerState> s;
+
+    if (!g_r300_samplers) {
+        g_r300_samplers = [[NSMutableDictionary alloc] init];
+    }
+    s = g_r300_samplers[@(key)];
+    if (s) {
+        return s;
+    }
+    MTLSamplerDescriptor *d = [[MTLSamplerDescriptor alloc] init];
+    d.sAddressMode = r300_wrap(f0);
+    d.tAddressMode = r300_wrap(f0 >> 3);
+    d.rAddressMode = r300_wrap(f0 >> 6);
+    d.magFilter = ((f0 >> 9) & 3) == 1 ? MTLSamplerMinMagFilterNearest
+                                       : MTLSamplerMinMagFilterLinear;
+    d.minFilter = ((f0 >> 11) & 3) == 1 ? MTLSamplerMinMagFilterNearest
+                                        : MTLSamplerMinMagFilterLinear;
+    d.mipFilter = MTLSamplerMipFilterNotMipmapped;
+    s = [dev newSamplerStateWithDescriptor:d];
+    [d release];
+    g_r300_samplers[@(key)] = s;
+    [s release];
+    return s;
+}
+
+/*
+ * Write-after-read: a render target over memory the open batch samples
+ * through a different view.  Views aliasing one MTLBuffer are separate
+ * Metal resources, so nothing orders the write after those reads.  The
+ * compositor hits this while dragging a window: it reuses one scratch
+ * buffer at a new pitch every frame, draws into it and samples it back,
+ * and without the flush a frame's writes land under the previous frame's
+ * reads.  Rendering to the view already bound as this batch's target is
+ * ordered by the encoder and needs nothing.
+ */
+static bool r300_read_conflict(uint64_t lo, uint64_t hi, const R200TexKey *rt)
+{
+    if (g_r200_enc && !memcmp(&g_r200_enc_key, rt, sizeof(*rt)) &&
+        !g_r200_read_overflow) {
+        bool any = false;
+        for (int i = 0; i < g_r200_nread; i++) {
+            if (lo < g_r200_read[i].hi && g_r200_read[i].lo < hi) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) {
+            return false;
+        }
+    }
+    if (g_r200_read_overflow) {
+        return g_r200_cb != nil;
+    }
+    for (int i = 0; i < g_r200_nread; i++) {
+        if (lo < g_r200_read[i].hi && g_r200_read[i].lo < hi) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint32_t r300_tex_rows(const R300TexDesc *td)
+{
+    return td->kind >= R300_TEXK_DXT1 ? (td->height + 3) / 4 : td->height;
+}
+
+/* A 16bpp texel as the card sees it: the guest wrote big-endian halfwords. */
+static void r300_decode16(uint32_t fmt, uint16_t v, uint8_t out[4])
+{
+    uint32_t x, y, z, w;
+
+    switch (fmt) {
+    case 0x6:   /* Z5Y6X5 */
+        x = (v & 31) * 255 / 31; y = ((v >> 5) & 63) * 255 / 63;
+        z = (v >> 11) * 255 / 31; w = 255;
+        break;
+    case 0x7:   /* Z6Y5X5 */
+        x = (v & 31) * 255 / 31; y = ((v >> 5) & 31) * 255 / 31;
+        z = (v >> 10) * 255 / 63; w = 255;
+        break;
+    case 0xA:   /* W4Z4Y4X4 */
+        x = (v & 15) * 17; y = ((v >> 4) & 15) * 17;
+        z = ((v >> 8) & 15) * 17; w = (v >> 12) * 17;
+        break;
+    case 0xB:   /* W1Z5Y5X5 */
+        x = (v & 31) * 255 / 31; y = ((v >> 5) & 31) * 255 / 31;
+        z = ((v >> 10) & 31) * 255 / 31; w = (v >> 15) ? 255 : 0;
+        break;
+    default:    /* X16 */
+        x = v >> 8; y = z = 0; w = 255;
+        break;
+    }
+    out[0] = x; out[1] = y; out[2] = z; out[3] = w;
+}
+
+/* The Metal texture for one R300 texture unit (see R300_TEXK_*). */
+static id<MTLTexture> r300_texture(PPCMacGPUMetalState *st, id<MTLDevice> dev,
+                                   uint8_t *vram_ptr, uint64_t vram_size,
+                                   const R300TexDesc *td)
+{
+    uint64_t lo = td->gpu_addr;
+    uint64_t hi = lo + (uint64_t)td->pitch_bytes * r300_tex_rows(td);
+    MTLPixelFormat pf;
+
+    if (hi > vram_size) {
+        r300_metal_warn(2, "texture outside VRAM");
+        return nil;
+    }
+    switch (td->kind) {
+    case R300_TEXK_RGBA8: pf = MTLPixelFormatRGBA8Unorm; break;
+    case R300_TEXK_R8:    pf = MTLPixelFormatR8Unorm; break;
+    case R300_TEXK_RG8:   pf = MTLPixelFormatRG8Unorm; break;
+    default:              pf = MTLPixelFormatInvalid; break;
+    }
+    if (pf != MTLPixelFormatInvalid) {
+        /* Zero-copy view over VRAM. */
+        NSUInteger align = [dev minimumLinearTextureAlignmentForPixelFormat:pf];
+        if ((td->gpu_addr % align) || (td->pitch_bytes % align)) {
+            r300_metal_warn(8, "texture not aligned for a linear view");
+            return nil;
+        }
+        R200TexKey k = { td->gpu_addr, td->width, td->height, td->pitch_bytes,
+                         (uint32_t)pf };
+        return r200_view(st, k, pf, false);
+    }
+
+    /* Converted or copied: the CPU reads VRAM, so finish pending draws
+     * that write it first. */
+    if (r200_batch_conflict(lo, hi, NULL)) {
+        metal_flush_r200(st);
+    }
+    const uint8_t *src = vram_ptr + td->gpu_addr;
+    uint32_t w = td->width, h = td->height;
+
+    if (td->kind == R300_TEXK_CONVERT16) {
+        uint8_t *out = g_malloc((size_t)w * h * 4);
+        for (uint32_t y = 0; y < h; y++) {
+            const uint8_t *row = src + (uint64_t)y * td->pitch_bytes;
+            for (uint32_t x = 0; x < w; x++) {
+                uint16_t v = (uint16_t)(row[2 * x] << 8 | row[2 * x + 1]);
+                r300_decode16(td->format, v, out + ((size_t)y * w + x) * 4);
+            }
+        }
+        MTLTextureDescriptor *d = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+            width:w height:h mipmapped:NO];
+        d.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> t = [[dev newTextureWithDescriptor:d] autorelease];
+        [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
+               withBytes:out bytesPerRow:w * 4];
+        g_free(out);
+        return t;
+    }
+
+    /* DXT1/3/5: blocks as they lie (see the R200 path). */
+    MTLPixelFormat bc = td->kind == R300_TEXK_DXT1 ? MTLPixelFormatBC1_RGBA :
+                        td->kind == R300_TEXK_DXT3 ? MTLPixelFormatBC2_RGBA :
+                                                     MTLPixelFormatBC3_RGBA;
+    uint32_t bs = td->kind == R300_TEXK_DXT1 ? 8 : 16;
+    uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4;
+    MTLTextureDescriptor *d = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:bc width:bw * 4 height:bh * 4
+                                 mipmapped:NO];
+    d.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> t = [[dev newTextureWithDescriptor:d] autorelease];
+    uint8_t *blocks = g_malloc((size_t)bw * bh * bs);
+    for (uint32_t y = 0; y < bh; y++) {
+        memcpy(blocks + (size_t)y * bw * bs, src + (uint64_t)y * td->pitch_bytes,
+               (size_t)bw * bs);
+    }
+    [t replaceRegion:MTLRegionMake2D(0, 0, bw * 4, bh * 4) mipmapLevel:0
+           withBytes:blocks bytesPerRow:bw * bs];
+    g_free(blocks);
+    return t;
+}
+
+static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
+                           const R300DrawPacket *pkt)
+{
+    PPCMacGPUMetalState *st = opaque;
+    if (!st || !st->vramBuffer) {
+        return -1;
+    }
+    id<MTLDevice> dev = st->vramBuffer.device;
+    MTLPixelFormat pf = MTLPixelFormatRGBA8Unorm;
+    NSUInteger align = [dev minimumLinearTextureAlignmentForPixelFormat:pf];
+    uint32_t bpr = pkt->rt_pitch * 4;
+    uint32_t sx0 = pkt->scissor[0], sy0 = pkt->scissor[1];
+    uint32_t sx1 = MIN(pkt->scissor[2], pkt->rt_width);
+    uint32_t sy1 = MIN(pkt->scissor[3], pkt->rt_height);
+
+    if (sx0 >= sx1 || sy0 >= sy1 || !pkt->num_verts) {
+        return 0;
+    }
+    if ((pkt->rt_gpu_addr % align) || (bpr % align) ||
+        (uint64_t)pkt->rt_gpu_addr + (uint64_t)bpr * pkt->rt_height > vram_size) {
+        r300_metal_warn(1, "colour buffer unusable as a linear view");
+        return -1;
+    }
+    if (!g_r300_dummy) {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:pf width:1 height:1 mipmapped:NO];
+        g_r300_dummy = [dev newTextureWithDescriptor:td];
+    }
+
+    @autoreleasepool {
+        id<MTLRenderPipelineState> pipe = r300_pipeline(dev, pkt->msl);
+        if (!pipe) {
+            return -1;
+        }
+
+        id<MTLTexture> tex[R300_NUM_TEX_UNITS];
+        id<MTLSamplerState> smp[R300_NUM_TEX_UNITS];
+        R300FSUniforms u = pkt->uniforms;
+        for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
+            const R300TexDesc *td = &pkt->tex[t];
+            tex[t] = g_r300_dummy;
+            smp[t] = r300_sampler(dev, td->filter0);
+            if (!td->bound) {
+                u.tex_info[t][0] = 0;
+                continue;
+            }
+            id<MTLTexture> x = r300_texture(st, dev, vram_ptr, vram_size, td);
+            if (!x) {
+                u.tex_info[t][0] = 0;
+                continue;
+            }
+            tex[t] = x;
+        }
+
+        /* Batch hazards, as in the R200 path. */
+        R200TexKey rk = { pkt->rt_gpu_addr, pkt->rt_width, pkt->rt_height, bpr,
+                          (uint32_t)pf };
+        uint64_t rlo = pkt->rt_gpu_addr, rhi = rlo + (uint64_t)bpr * pkt->rt_height;
+        bool conflict = g_r200_nwritten == R200_MAX_WRITTEN ||
+                        r200_batch_conflict(rlo, rhi, &rk) ||
+                        r300_read_conflict(rlo, rhi, &rk);
+        for (int t = 0; t < R300_NUM_TEX_UNITS && !conflict; t++) {
+            if (u.tex_info[t][0]) {
+                conflict = r200_batch_conflict(pkt->tex[t].gpu_addr,
+                    pkt->tex[t].gpu_addr + (uint64_t)pkt->tex[t].pitch_bytes *
+                    r300_tex_rows(&pkt->tex[t]), NULL);
+            }
+        }
+        if (conflict) {
+            g_r200_stat_conflicts++;
+            metal_flush_r200(st);
+        }
+        if (!g_r200_cb) {
+            g_r200_cb = r200_new_cb(st);
+        }
+        if (g_r200_enc && (!g_r300_enc_mine ||
+                           memcmp(&g_r200_enc_key, &rk, sizeof(rk)))) {
+            [g_r200_enc endEncoding];
+            [g_r200_enc release];
+            g_r200_enc = nil;
+        }
+        if (!g_r200_enc) {
+            id<MTLTexture> rt = r200_view(st, rk, pf, true);
+            if (!rt) {
+                r300_metal_warn(4, "render target view failed");
+                return -1;
+            }
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture = rt;
+            rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            g_r200_enc = [[g_r200_cb renderCommandEncoderWithDescriptor:rp] retain];
+            [g_r200_enc setDepthClipMode:MTLDepthClipModeClamp];
+            [g_r200_enc setViewport:(MTLViewport){ 0, 0, pkt->rt_width,
+                                                  pkt->rt_height, 0, 1 }];
+            g_r200_enc_key = rk;
+            g_r200_enc_depth_off = ~0u;
+            g_r300_enc_mine = true;
+            g_r200_stat_passes++;
+            r200_note_written(rlo, rhi, &rk);
+        }
+        id<MTLRenderCommandEncoder> enc = g_r200_enc;
+        [enc setRenderPipelineState:pipe];
+        [enc setScissorRect:(MTLScissorRect){ sx0, sy0, sx1 - sx0, sy1 - sy0 }];
+
+        size_t vbytes = (size_t)pkt->num_verts * sizeof(R300Vertex);
+        id<MTLBuffer> vb = nil;
+        size_t voff = 0;
+        void *dst = r200_arena_alloc(st, vbytes, &vb, &voff);
+        if (dst) {
+            memcpy(dst, pkt->verts, vbytes);
+            [enc setVertexBuffer:vb offset:voff atIndex:0];
+        } else {
+            id<MTLBuffer> one = [dev newBufferWithBytes:pkt->verts length:vbytes
+                                                options:MTLResourceStorageModeShared];
+            [enc setVertexBuffer:one offset:0 atIndex:0];
+            [one release];
+        }
+        [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
+        for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
+            [enc setFragmentTexture:tex[t] atIndex:t];
+            [enc setFragmentSamplerState:smp[t] atIndex:t];
+        }
+        [enc drawPrimitives:pkt->prim_class == 2 ? MTLPrimitiveTypePoint :
+                            pkt->prim_class == 1 ? MTLPrimitiveTypeLine :
+                                                   MTLPrimitiveTypeTriangle
+                vertexStart:0 vertexCount:pkt->num_verts];
+        g_r200_stat_draws++;
+        for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
+            if (u.tex_info[t][0]) {
+                r200_note_read(pkt->tex[t].gpu_addr, pkt->tex[t].gpu_addr +
+                               (uint64_t)pkt->tex[t].pitch_bytes *
+                               r300_tex_rows(&pkt->tex[t]));
+            }
+        }
+    }
+    return 0;
+}
+
 static PPCMacGPURenderer metal_renderer = {
     .name              = "metal",
     .init              = metal_init,
@@ -7324,6 +7723,7 @@ static PPCMacGPURenderer metal_renderer = {
     .mode_change       = metal_mode_change,
     .srt_write_through = metal_srt_write_through,
     .draw_r200         = metal_draw_r200,
+    .draw_r300         = metal_draw_r300,
     .flush_r200        = metal_flush_r200,
     .submit_r200       = metal_submit_r200,
     .fill_notify_r200  = metal_fill_notify_r200,
