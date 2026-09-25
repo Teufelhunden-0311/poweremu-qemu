@@ -56,7 +56,34 @@ typedef struct R300TexDesc {
     uint32_t format;            /* TX_FORMAT1 & 0x1F */
     uint32_t kind;              /* R300_TEXK_* */
     uint32_t filter0;           /* TX_FILTER0 */
+    uint8_t *host_data;         /* texels copied out of the GART (owned), or NULL */
 } R300TexDesc;
+
+/* Depth/stencil buffer (ZB_*).  It stays in guest memory in the card's
+ * layout; the renderer tests and writes it in the fragment shader. */
+typedef struct R300DepthDesc {
+    bool attach;                /* ZB_CNTL enables the Z or stencil test */
+    uint32_t gpu_addr;          /* ZB_DEPTHOFFSET */
+    uint32_t pitch;             /* pixels */
+    uint32_t bpp;               /* 2 (Z16, Z13E3) or 4 (Z24S8) */
+    uint32_t format;            /* ZB_FORMAT.DEPTHFORMAT */
+} R300DepthDesc;
+
+/* SU_CULL_MODE */
+#define R300_CULL_FRONT         (1u << 0)
+#define R300_CULL_BACK          (1u << 1)
+#define R300_FACE_CW            (1u << 2)   /* else counter-clockwise front */
+
+/*
+ * The card's winding is the one seen on screen with row 0 at the top (as
+ * Mesa's r300 maps gallium's front_ccw straight to FRONT_FACE_CCW), which
+ * is also how Metal judges winding for the clip-space positions this
+ * module produces (their y is up).  So FACE_CCW is MTLWindingCounterClockwise.
+ */
+static inline bool r300_front_ccw(uint32_t cull)
+{
+    return !(cull & R300_FACE_CW);
+}
 
 typedef struct R300DrawPacket {
     /* Colour buffer 0 */
@@ -65,6 +92,8 @@ typedef struct R300DrawPacket {
     uint32_t rt_width, rt_height;
     uint32_t rt_format;         /* RB3D_COLORPITCH0 format field */
     uint32_t scissor[4];        /* x0, y0, x1, y1 (exclusive) */
+    R300DepthDesc depth;
+    uint32_t cull;              /* SU_CULL_MODE (0 for lines and points) */
 
     /* Fragment stage */
     char *msl;                  /* library source; owned by the packet */
@@ -92,6 +121,13 @@ typedef struct R300DrawPacket {
 typedef bool (*R300ReadFn)(void *opaque, uint32_t gpu_addr, void *dst,
                            uint32_t len);
 
+/* Index buffer from memory (INDX_BUFFER after a DRAW_INDX_2 with no
+ * inline indices), already fetched; NULL for other draws. */
+typedef struct R300Indices {
+    const uint32_t *dw;         /* raw dwords as fetched (VC_SWAP applied here) */
+    uint32_t ndw;
+} R300Indices;
+
 /* Decode a 3D_LOAD_VBPNTR (type-3 0x2F) body. */
 void r300_load_vbpntr(R300Arrays *arr, const uint32_t *d, uint32_t ndw);
 
@@ -105,6 +141,27 @@ bool r300_draw_build(const R300State *st, const R300Arrays *arr,
                      uint32_t opcode, const uint32_t *d, uint32_t ndw,
                      R300ReadFn read, void *opaque,
                      R300DrawPacket *pkt, const char **err);
+
+/*
+ * The same for DRAW_INDX_2 whose indices come from memory: vf is the
+ * packet's VAP_VF_CNTL and idx the dwords INDX_BUFFER pointed at, read
+ * as they lie (VC_SWAP is applied here, as the card's vertex cache does
+ * for all fetched data).
+ */
+bool r300_draw_build_indexed(const R300State *st, const R300Arrays *arr,
+                             uint32_t vf, const R300Indices *idx,
+                             R300ReadFn read, void *opaque,
+                             R300DrawPacket *pkt, const char **err);
+
+/* Index i (0-based) of a DRAW_INDX_2 index stream: 16-bit indices are
+ * packed two per dword, the first in the low half. */
+uint32_t r300_index_at(const uint32_t *dw, uint32_t ndw, bool i32, uint32_t i);
+
+/* Assemble a primitive list (VAP_VF_CNTL.PRIM_TYPE) of n vertices into
+ * triangle/line/point list indices; returns the index count (0 for an
+ * unsupported type).  list needs room for 3n + 6 entries. */
+uint32_t r300_assemble(unsigned prim, uint32_t n, uint32_t *list,
+                       uint32_t *cls);
 
 void r300_draw_free(R300DrawPacket *pkt);
 

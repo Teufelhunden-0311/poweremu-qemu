@@ -668,6 +668,11 @@ struct PPCMacGPUState {
     struct R300Arrays r3_arrays;    /* last 3D_LOAD_VBPNTR */
     FILE *r3_dump;              /* $R300_DUMP: state dumps at draws */
     uint32_t r3_trace_lines;    /* register trace after the first draw */
+    bool r3_zpass_active;       /* ZB_ZPASS_DATA written, count Z-pass samples */
+    uint32_t r3_indx_vf;        /* DRAW_INDX_2 waiting for INDX_BUFFER (0: none) */
+    uint32_t r3_indx_buf[3];    /* INDX_BUFFER waiting for its DRAW_INDX_2 */
+    bool r3_indx_buf_pending;
+    uint32_t r3_zb_offset, r3_zb_height;   /* depth buffer extent seen at draws */
     uint32_t r300_aic_pt_base;  /* PCI GART table base (0x0AB0) */
     uint32_t vram_size_mb;      /* VRAM size in megabytes */
     uint64_t vram_size;         /* VRAM size in bytes (computed) */

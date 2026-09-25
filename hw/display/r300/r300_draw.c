@@ -46,7 +46,13 @@
 #define RB3D_BLEND_COLOR            0x4E10
 #define RB3D_COLOROFFSET0           0x4E28
 #define RB3D_COLORPITCH0            0x4E38
+#define SU_CULL_MODE                0x42B8
 #define ZB_CNTL                     0x4F00
+#define ZB_ZSTENCILCNTL             0x4F04
+#define ZB_STENCILREFMASK           0x4F08
+#define ZB_FORMAT                   0x4F10
+#define ZB_DEPTHOFFSET              0x4F20
+#define ZB_DEPTHPITCH               0x4F24
 #define GA_POINT_S0                 0x4200  /* then T0, S1, T1 */
 #define GA_POINT_T0                 0x4204
 #define GA_POINT_S1                 0x4208
@@ -484,6 +490,37 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
     }
 }
 
+static void set_depth(const R300State *st, R300DrawPacket *pkt)
+{
+    uint32_t cntl = r300_reg(st, ZB_CNTL);
+    uint32_t fmt = r300_reg(st, ZB_FORMAT) & 0xF;
+    uint32_t pitch = r300_reg(st, ZB_DEPTHPITCH);
+    R300DepthDesc *z = &pkt->depth;
+    R300FSUniforms *u = &pkt->uniforms;
+
+    memset(z, 0, sizeof(*z));
+    /* STENCIL_ENABLE or Z_ENABLE; Z_WRITE_ENABLE alone does nothing. */
+    if (!(cntl & 3)) {
+        return;
+    }
+    z->attach = true;
+    z->gpu_addr = r300_reg(st, ZB_DEPTHOFFSET) & ~0x1Fu;
+    z->pitch = pitch & 0x3FFC;
+    z->format = fmt;
+    z->bpp = fmt == 2 ? 4 : 2;
+    if (fmt > 2) {
+        pkt->warn |= R300_WARN_DEPTH;       /* reserved format: as Z24S8 */
+        z->bpp = 4;
+    } else if (fmt == 1) {
+        pkt->warn |= R300_WARN_DEPTH;       /* 13E3 float: kept as 16-bit unorm */
+    }
+    u->zinfo[0] = cntl;
+    u->zinfo[1] = r300_reg(st, ZB_ZSTENCILCNTL);
+    u->zinfo[2] = r300_reg(st, ZB_STENCILREFMASK);
+    u->zinfo[3] = ((pitch >> 19) & R300_ZFMT_ENDIAN_MASK) |
+                  (z->bpp == 2 ? R300_ZFMT_Z16 : 0);
+}
+
 static void viewport_xform(const R300State *st, const R300DrawPacket *pkt,
                            const float c[4], float p[4])
 {
@@ -515,8 +552,8 @@ static void viewport_xform(const R300State *st, const R300DrawPacket *pkt,
 }
 
 /* Emit a primitive list as expanded triangles/lines/points. */
-static uint32_t assemble(unsigned prim, uint32_t n, uint32_t *list,
-                         uint32_t *cls)
+uint32_t r300_assemble(unsigned prim, uint32_t n, uint32_t *list,
+                       uint32_t *cls)
 {
     uint32_t m = 0;
 
@@ -573,15 +610,18 @@ static uint32_t assemble(unsigned prim, uint32_t n, uint32_t *list,
     return m;
 }
 
-bool r300_draw_build(const R300State *st, const R300Arrays *arr,
-                     uint32_t opcode, const uint32_t *d, uint32_t ndw,
-                     R300ReadFn read, void *opaque,
-                     R300DrawPacket *pkt, const char **err)
+/*
+ * Everything after vertex ordering.  order[] (n entries, malloc'd) is
+ * taken over; immd is the DRAW_IMMD_2 vertex data or NULL.
+ */
+static bool draw_core(const R300State *st, const R300Arrays *arr,
+                      uint32_t vf, uint32_t *order, uint32_t n,
+                      const uint32_t *immd, uint32_t immd_dw,
+                      R300ReadFn read, void *opaque,
+                      R300DrawPacket *pkt, const char **err)
 {
-    uint32_t vf, prim, n, nidx = 0;
-    const uint32_t *payload = d + 1;
-    uint32_t payload_dw = ndw ? ndw - 1 : 0;
-    uint32_t *order = NULL, *list = NULL;
+    uint32_t prim, nidx = 0;
+    uint32_t *list = NULL;
     Fetch f = { 0 };
     Layout lay;
     Route route;
@@ -594,19 +634,7 @@ bool r300_draw_build(const R300State *st, const R300Arrays *arr,
     R300PVSProgram prog;
     float consts[256][4];
 
-    memset(pkt, 0, sizeof(*pkt));
-    *err = NULL;
-    if (ndw < 1) {
-        *err = "empty draw packet";
-        return false;
-    }
-    vf = d[0];
     prim = vf & 0xF;
-    n = vf >> 16;
-    if (!n) {
-        *err = "no vertices";
-        return false;
-    }
 
     /* Colour buffer */
     pkt->rt_gpu_addr = r300_reg(st, RB3D_COLOROFFSET0) & ~0x1Fu;
@@ -615,6 +643,7 @@ bool r300_draw_build(const R300State *st, const R300Arrays *arr,
     if (pkt->rt_format != 6) {
         pkt->warn |= R300_WARN_RTFMT;
         *err = "colour buffer format not supported";
+        free(order);
         return false;
     }
     pkt->scissor[0] = ((tl & 0x1FFF) > SC_COORD_BIAS) ? (tl & 0x1FFF) - SC_COORD_BIAS : 0;
@@ -628,14 +657,16 @@ bool r300_draw_build(const R300State *st, const R300Arrays *arr,
     pkt->rt_height = pkt->scissor[3];
     if (!pkt->rt_width || !pkt->rt_height) {
         *err = "empty colour buffer";
+        free(order);
         return false;
-    }
-    if (r300_reg(st, ZB_CNTL) & 3) {
-        pkt->warn |= R300_WARN_DEPTH;
     }
 
     set_uniforms(st, pkt);
     set_textures(st, pkt);
+    set_depth(st, pkt);
+    /* The setup unit culls polygons only (triangles, fans, strips, quads,
+     * quad strips, polygons). */
+    pkt->cull = ((1u << prim) & 0xE0F0u) ? r300_reg(st, SU_CULL_MODE) & 7 : 0;
 
     /* Vertex order */
     f.st = st;
@@ -644,24 +675,8 @@ bool r300_draw_build(const R300State *st, const R300Arrays *arr,
     f.opaque = opaque;
     f.swap = r300_reg(st, VAP_CNTL_STATUS) & 3;
     f.vtx_size = r300_reg(st, VAP_VTX_SIZE) & 0x7F;
-    order = malloc(sizeof(uint32_t) * n);
-    if (opcode == 0x35) {                       /* DRAW_IMMD_2 */
-        f.immd = payload;
-        f.immd_dw = payload_dw;
-        for (uint32_t i = 0; i < n; i++) order[i] = i;
-    } else if (opcode == 0x36) {                /* DRAW_INDX_2, inline */
-        bool i32 = (vf >> 11) & 1;
-        for (uint32_t i = 0; i < n; i++) {
-            if (i32) {
-                order[i] = i < payload_dw ? payload[i] : 0;
-            } else {
-                uint32_t w = i / 2 < payload_dw ? payload[i / 2] : 0;
-                order[i] = (w >> (16 * (i & 1))) & 0xFFFF;
-            }
-        }
-    } else {                                    /* DRAW_VBUF_2 */
-        for (uint32_t i = 0; i < n; i++) order[i] = i;
-    }
+    f.immd = immd;
+    f.immd_dw = immd_dw;
 
     /* Vertex program */
     for (int i = 0; i < 256; i++) {
@@ -762,7 +777,7 @@ bool r300_draw_build(const R300State *st, const R300Arrays *arr,
     }
 
     list = malloc(sizeof(uint32_t) * (n * 3 + 6));
-    nidx = assemble(prim, n, list, &pkt->prim_class);
+    nidx = r300_assemble(prim, n, list, &pkt->prim_class);
     if (!nidx) {
         if (prim != 0) {
             pkt->warn |= R300_WARN_PRIM;
@@ -792,10 +807,89 @@ bool r300_draw_build(const R300State *st, const R300Arrays *arr,
     return true;
 }
 
+bool r300_draw_build(const R300State *st, const R300Arrays *arr,
+                     uint32_t opcode, const uint32_t *d, uint32_t ndw,
+                     R300ReadFn read, void *opaque,
+                     R300DrawPacket *pkt, const char **err)
+{
+    const uint32_t *payload = d + 1;
+    uint32_t payload_dw = ndw ? ndw - 1 : 0;
+    uint32_t vf, n, *order;
+
+    memset(pkt, 0, sizeof(*pkt));
+    *err = NULL;
+    if (ndw < 1) {
+        *err = "empty draw packet";
+        return false;
+    }
+    vf = d[0];
+    n = vf >> 16;
+    if (!n) {
+        *err = "no vertices";
+        return false;
+    }
+    order = malloc(sizeof(uint32_t) * n);
+    if (opcode == 0x36) {                       /* DRAW_INDX_2, inline */
+        bool i32 = (vf >> 11) & 1;
+        for (uint32_t i = 0; i < n; i++) {
+            order[i] = r300_index_at(payload, payload_dw, i32, i);
+        }
+    } else {                                    /* DRAW_VBUF_2, DRAW_IMMD_2 */
+        for (uint32_t i = 0; i < n; i++) {
+            order[i] = i;
+        }
+    }
+    return draw_core(st, arr, vf, order, n, opcode == 0x35 ? payload : NULL,
+                     opcode == 0x35 ? payload_dw : 0, read, opaque, pkt, err);
+}
+
+uint32_t r300_index_at(const uint32_t *dw, uint32_t ndw, bool i32, uint32_t i)
+{
+    if (i32) {
+        return i < ndw ? dw[i] : 0;
+    }
+    return i / 2 < ndw ? (dw[i / 2] >> (16 * (i & 1))) & 0xFFFF : 0;
+}
+
+bool r300_draw_build_indexed(const R300State *st, const R300Arrays *arr,
+                             uint32_t vf, const R300Indices *idx,
+                             R300ReadFn read, void *opaque,
+                             R300DrawPacket *pkt, const char **err)
+{
+    uint32_t n = vf >> 16, *order, *sw;
+    unsigned swap = r300_reg(st, VAP_CNTL_STATUS) & 3;
+    bool i32 = (vf >> 11) & 1;
+
+    memset(pkt, 0, sizeof(*pkt));
+    *err = NULL;
+    if (!n) {
+        *err = "no vertices";
+        return false;
+    }
+    if ((uint64_t)(i32 ? n : (n + 1) / 2) > idx->ndw) {
+        *err = "index buffer shorter than the draw";
+        return false;
+    }
+    sw = malloc(sizeof(uint32_t) * (idx->ndw ? idx->ndw : 1));
+    for (uint32_t k = 0; k < idx->ndw; k++) {
+        sw[k] = vc_swap(idx->dw[k], swap);
+    }
+    order = malloc(sizeof(uint32_t) * n);
+    for (uint32_t i = 0; i < n; i++) {
+        order[i] = r300_index_at(sw, idx->ndw, i32, i);
+    }
+    free(sw);
+    return draw_core(st, arr, vf, order, n, NULL, 0, read, opaque, pkt, err);
+}
+
 void r300_draw_free(R300DrawPacket *pkt)
 {
     free(pkt->msl);
     free(pkt->verts);
     pkt->msl = NULL;
     pkt->verts = NULL;
+    for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
+        free(pkt->tex[t].host_data);
+        pkt->tex[t].host_data = NULL;
+    }
 }

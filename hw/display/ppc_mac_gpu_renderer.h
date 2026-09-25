@@ -323,6 +323,13 @@ typedef struct PPCMacGPURenderer {
                      const struct R300DrawPacket *pkt);
 
     /*
+     * The R300 Z-pass (occlusion) counter that draws with
+     * uniforms.zpass_count set add to.  Finishes batched work first, then
+     * returns the count; with reset, sets it to value (ZB_ZPASS_DATA).
+     */
+    uint32_t (*zpass_r300)(void *opaque, bool reset, uint32_t value);
+
+    /*
      * Finish all batched draw_r200 work.  The device calls this before any
      * CPU-side access to VRAM that 3D rendering may have written.
      */

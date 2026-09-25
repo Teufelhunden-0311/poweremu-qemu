@@ -327,6 +327,8 @@ static const char us_prelude[] =
 "    uint4 out_sel;\n"
 "    uint rt_swap32; uint clip_rule; uint pad1, pad2;\n"
 "    int4 cliprect[4];\n"
+"    uint4 zinfo;\n"
+"    uint zpass_count, pad3, pad4, pad5;\n"
 "};\n"
 "\n"
 "vertex R300VOut r300_vs(uint vid [[vertex_id]],\n"
@@ -426,6 +428,71 @@ static const char us_prelude[] =
 "    return c;\n"
 "}\n"
 "\n"
+"/* Depth/stencil (ZB_*).  Attachment 1 is the guest buffer as uint words\n"
+"   as they lie in memory; DEPTHENDIAN says how the card swapped them.\n"
+"   Z24S8 words hold Z in bits 31:8 and stencil in 7:0. */\n"
+"static uint r300_zswap(uint v, uint e, bool z16)\n"
+"{\n"
+"    if (z16) return e == 1 || e == 2 ? ((v >> 8) & 0xffu) | ((v & 0xffu) << 8) : v;\n"
+"    switch (e) {\n"
+"    case 1: return ((v & 0x00ff00ffu) << 8) | ((v >> 8) & 0x00ff00ffu);\n"
+"    case 2: return (v >> 24) | ((v >> 8) & 0xff00u) | ((v << 8) & 0xff0000u) | (v << 24);\n"
+"    case 3: return (v << 16) | (v >> 16);\n"
+"    default: return v;\n"
+"    }\n"
+"}\n"
+"static bool r300_zcmp(uint f, uint a, uint b)\n"
+"{\n"
+"    switch (f & 7u) {\n"
+"    case 0: return false;  case 1: return a < b;   case 2: return a <= b;\n"
+"    case 3: return a == b; case 4: return a >= b;  case 5: return a > b;\n"
+"    case 6: return a != b; default: return true;\n"
+"    }\n"
+"}\n"
+"static uint r300_sop(uint op, uint s, uint ref)\n"
+"{\n"
+"    switch (op & 7u) {\n"
+"    case 1: return 0u;                  case 2: return ref;\n"
+"    case 3: return min(s + 1u, 255u);   case 4: return s > 0u ? s - 1u : 0u;\n"
+"    case 5: return ~s & 0xffu;          case 6: return (s + 1u) & 0xffu;\n"
+"    case 7: return (s - 1u) & 0xffu;    default: return s;\n"
+"    }\n"
+"}\n"
+"struct R300ZOut { float4 c [[color(0)]]; uint z [[color(1)]]; };\n"
+"/* ZB_CNTL: 0 stencil, 1 Z test, 2 Z write, 4 separate back-face stencil.\n"
+"   ZB_ZSTENCILCNTL: Z func 2:0; front stencil func/sfail/zpass/zfail at\n"
+"   3, 6, 9, 12; back at 15, 18, 21, 24.  STENCILREFMASK: ref, mask,\n"
+"   write mask.  Failing fragments leave the colour buffer as it was. */\n"
+"static R300ZOut r300_ztest(float4 col, float4 fb, uint zb, float fz, bool front,\n"
+"                           constant R300FSUniforms &u, device atomic_uint *zp)\n"
+"{\n"
+"    uint cntl = u.zinfo.x, zs = u.zinfo.y, rm = u.zinfo.z, fmt = u.zinfo.w;\n"
+"    bool z16 = (fmt & 4u) != 0u;\n"
+"    uint w = r300_zswap(z16 ? (zb & 0xffffu) : zb, fmt & 3u, z16);\n"
+"    uint zmax = z16 ? 0xffffu : 0xffffffu;\n"
+"    uint zold = z16 ? w : (w >> 8), sold = z16 ? 0u : (w & 0xffu);\n"
+"    /* rint + clamp: 1.0 * 16777215 + 0.5 rounds to 2^24 in float */\n"
+"    uint znew = min(uint(rint(saturate(fz) * float(zmax))), zmax);\n"
+"    bool sten = (cntl & 1u) != 0u, zen = (cntl & 2u) != 0u;\n"
+"    uint sf = zs >> ((!front && (cntl & 16u) != 0u) ? 15u : 3u);\n"
+"    uint ref = rm & 0xffu, mask = (rm >> 8) & 0xffu, wmask = (rm >> 16) & 0xffu;\n"
+"    R300ZOut o; o.c = col;\n"
+"    uint z = zold, sn = sold;\n"
+"    if (sten && !r300_zcmp(sf, ref & mask, sold & mask)) {\n"
+"        sn = r300_sop(sf >> 3, sold, ref); o.c = fb;\n"
+"    } else if (!zen || r300_zcmp(zs, znew, zold)) {\n"
+"        if (zen && (cntl & 4u) != 0u) z = znew;\n"
+"        if (sten) sn = r300_sop(sf >> 6, sold, ref);\n"
+"        if (u.zpass_count != 0u) atomic_fetch_add_explicit(zp, 1u, memory_order_relaxed);\n"
+"    } else {\n"
+"        if (sten) sn = r300_sop(sf >> 9, sold, ref);\n"
+"        o.c = fb;\n"
+"    }\n"
+"    sn = (sold & ~wmask) | (sn & wmask);\n"
+"    o.z = r300_zswap(z16 ? z : ((z << 8) | sn), fmt & 3u, z16);\n"
+"    return o;\n"
+"}\n"
+"\n"
 "static bool r300_alpha_pass(uint af, float a)\n"
 "{\n"
 "    if (!(af & (1u << 11))) return true;\n"
@@ -479,19 +546,26 @@ char *r300_us_to_msl(const R300State *st, const R300FSDesc *desc,
 
     r300_sb_init(&sb);
     r300_sb_printf(&sb, "%s", us_prelude);
-    r300_sb_printf(&sb,
-        "fragment float4 r300_fs(R300VOut in [[stage_in]],\n"
-        "                        constant R300FSUniforms &u [[buffer(0)]],\n");
+
+    /* Texture parameters of the shading function and the arguments that
+     * pass them on (entry points bind unit k at texture/sampler k). */
+    R300Sb tparm, targ, tent;
+    r300_sb_init(&tparm);
+    r300_sb_init(&targ);
+    r300_sb_init(&tent);
     for (unsigned k = 0; k < R300_NUM_TEX_UNITS; k++) {
         if (units & (1u << k)) {
-            r300_sb_printf(&sb,
+            r300_sb_printf(&tparm, ", texture2d<float> tex%u, sampler smp%u", k, k);
+            r300_sb_printf(&targ, ", tex%u, smp%u", k, k);
+            r300_sb_printf(&tent,
                 "                        texture2d<float> tex%u [[texture(%u)]],\n"
                 "                        sampler smp%u [[sampler(%u)]],\n",
                 k, k, k, k);
         }
     }
     r300_sb_printf(&sb,
-        "                        float4 fb [[color(0)]])\n"
+        "static float4 r300_shade(R300VOut in, constant R300FSUniforms &u,\n"
+        "                         float4 fb%s)\n"
         "{\n"
         "    /* SC_CLIP_RULE: a 16-entry truth table over which of the four\n"
         "       clip rectangles contain the pixel. */\n"
@@ -507,7 +581,8 @@ char *r300_us_to_msl(const R300State *st, const R300FSDesc *desc,
         "    float4 t[32];\n"
         "    for (int i = 0; i < 32; i++) t[i] = float4(0.0);\n"
         "    float4 vin[10] = { in.v0, in.v1, in.v2, in.v3, in.v4,\n"
-        "                       in.v5, in.v6, in.v7, in.v8, in.v9 };\n");
+        "                       in.v5, in.v6, in.v7, in.v8, in.v9 };\n",
+        tparm.buf ? tparm.buf : "");
     for (unsigned k = 0; k < R300_US_NUM_TEMPS; k++) {
         if (desc->route[k] >= 0) {
             r300_sb_printf(&sb, "    t[%u] = vin[%d];\n", k, desc->route[k]);
@@ -534,7 +609,34 @@ char *r300_us_to_msl(const R300State *st, const R300FSDesc *desc,
         "    res = float4((cm & 4) ? res.r : d.r, (cm & 2) ? res.g : d.g,\n"
         "                 (cm & 1) ? res.b : d.b, (cm & 8) ? res.a : d.a);\n"
         "    return r300_pack(res, u);\n"
-        "}\n");
+        "}\n"
+        "\n"
+        "fragment float4 r300_fs(R300VOut in [[stage_in]],\n"
+        "                        constant R300FSUniforms &u [[buffer(0)]],\n"
+        "                        device atomic_uint *zp [[buffer(1)]],\n"
+        "%s"
+        "                        float4 fb [[color(0)]])\n"
+        "{\n"
+        "    float4 c = r300_shade(in, u, fb%s);\n"
+        "    if (u.zpass_count != 0u) atomic_fetch_add_explicit(zp, 1u, memory_order_relaxed);\n"
+        "    return c;\n"
+        "}\n"
+        "\n"
+        "fragment R300ZOut r300_fs_z(R300VOut in [[stage_in]],\n"
+        "                            constant R300FSUniforms &u [[buffer(0)]],\n"
+        "                            device atomic_uint *zp [[buffer(1)]],\n"
+        "%s"
+        "                            float4 fb [[color(0)]], uint zb [[color(1)]],\n"
+        "                            bool front [[front_facing]])\n"
+        "{\n"
+        "    float4 c = r300_shade(in, u, fb%s);\n"
+        "    return r300_ztest(c, fb, zb, in.pos.z, front, u, zp);\n"
+        "}\n",
+        tent.buf ? tent.buf : "", targ.buf ? targ.buf : "",
+        tent.buf ? tent.buf : "", targ.buf ? targ.buf : "");
+    r300_sb_free(&tparm);
+    r300_sb_free(&targ);
+    r300_sb_free(&tent);
     r300_sb_free(&body);
     return r300_sb_steal(&sb);
 }

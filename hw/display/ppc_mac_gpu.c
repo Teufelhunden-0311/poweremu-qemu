@@ -2267,6 +2267,124 @@ static bool r300_read_raw(void *opaque, uint32_t gpu_addr, void *dst,
     return true;
 }
 
+static bool ppc_mac_gpu_gart_translate(PPCMacGPUState *s, uint32_t gpu_addr,
+                                        hwaddr *phys_addr);
+static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s, uint32_t gpu_addr,
+                                      hwaddr *phys_addr);
+
+/* A dword the card writes back to guest GPU memory (VRAM or AGP/GART),
+ * bytes as given (lowest address first). */
+static bool r300_write_raw(PPCMacGPUState *s, uint32_t gpu_addr,
+                           const uint8_t bytes[4])
+{
+    uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
+    hwaddr phys;
+
+    if (gpu_addr >= fb_base && (uint64_t)gpu_addr - fb_base + 4 <= s->vram_size) {
+        if (s->renderer && s->renderer->flush_r200) {
+            s->renderer->flush_r200(s->renderer_opaque);
+        }
+        memcpy((uint8_t *)memory_region_get_ram_ptr(&s->vram) +
+               (gpu_addr - fb_base), bytes, 4);
+        memory_region_set_dirty(&s->vram, gpu_addr - fb_base, 4);
+        return true;
+    }
+    if (ppc_mac_gpu_agp_translate(s, gpu_addr, &phys) ||
+        ppc_mac_gpu_gart_translate(s, gpu_addr, &phys)) {
+        cpu_physical_memory_write(phys, bytes, 4);
+        return true;
+    }
+    return false;
+}
+
+/* The card's endian swap modes (VC_SWAP, DEPTHENDIAN, ...). */
+static uint32_t r300_swap_mode(uint32_t v, unsigned mode)
+{
+    switch (mode & 3) {
+    case 1:  return ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+    case 2:  return bswap32(v);
+    case 3:  return (v << 16) | (v >> 16);
+    default: return v;
+    }
+}
+
+/*
+ * ZB_ZPASS_DATA / ZB_ZPASS_ADDR (occlusion queries).  Writing DATA sets
+ * the Z-pass counter; writing ADDR stores it at that GPU address, in the
+ * depth buffer's endian mode, for the pipes SU_REG_DEST selects.  The
+ * renderer counts every sample on one counter, which is reported as
+ * pipe 0's (the driver sums the pipes).
+ */
+static void r300_zpass_write(PPCMacGPUState *s, uint32_t addr, uint32_t val)
+{
+    PPCMacGPURenderer *r = s->renderer;
+
+    if (addr == 0x4F58) {
+        if (r && r->zpass_r300) {
+            r->zpass_r300(s->renderer_opaque, true, val);
+        }
+        s->r3_zpass_active = true;
+        return;
+    }
+    uint32_t dest = r300_reg(s->r3, 0x42C8);            /* SU_REG_DEST */
+    uint32_t n = (r && r->zpass_r300) ?
+                 r->zpass_r300(s->renderer_opaque, false, 0) : 0;
+    uint32_t w = r300_swap_mode((dest & 1) || !dest ? n : 0,
+                                (r300_reg(s->r3, 0x4F24) >> 19) & 3);
+    uint8_t b[4] = { w, w >> 8, w >> 16, w >> 24 };     /* card stores LE */
+
+    s->r3_zpass_active = false;
+    if (!r300_write_raw(s, val & ~3u, b)) {
+        qemu_log("ppc-mac-gpu r300: ZPASS_ADDR %08x not mapped\n", val);
+    }
+}
+
+/*
+ * 3D_CLEAR_ZMASK (0x32) marks every Z tile as holding ZB_DEPTHCLEARVALUE.
+ * Depth is kept uncompressed in memory here, so write the clear value
+ * over the buffer (the extent seen at earlier draws, else the scissor).
+ */
+static void r300_zmask_clear(PPCMacGPUState *s)
+{
+    uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
+    uint32_t off = r300_reg(s->r3, 0x4F20) & ~0x1Fu;
+    uint32_t pitch = r300_reg(s->r3, 0x4F24);
+    uint32_t bpp = (r300_reg(s->r3, 0x4F10) & 0xF) == 2 ? 4 : 2;
+    uint32_t rows = ((r300_reg(s->r3, 0x43E4) >> 13) & 0x1FFF);
+    uint32_t v = r300_swap_mode(r300_reg(s->r3, 0x4F28), (pitch >> 19) & 3);
+    uint64_t bpr = (uint64_t)(pitch & 0x3FFC) * bpp;
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+
+    rows = rows > 1440 ? rows - 1440 + 1 : 0;
+    if (s->r3_zb_offset == off && s->r3_zb_height > rows) {
+        rows = s->r3_zb_height;
+    }
+    if (off < fb_base || !bpr || !rows) {
+        return;
+    }
+    off -= fb_base;
+    if (off + bpr * rows > s->vram_size) {
+        rows = (s->vram_size - off) / bpr;
+    }
+    if (s->renderer && s->renderer->flush_r200) {
+        s->renderer->flush_r200(s->renderer_opaque);
+    }
+    for (uint64_t i = 0; i < bpr * rows; i += bpp) {
+        if (bpp == 4) {
+            stl_le_p(vram + off + i, v);
+        } else {
+            stw_le_p(vram + off + i, v);
+        }
+    }
+    memory_region_set_dirty(&s->vram, off, bpr * rows);
+    static int logged;
+    if (logged++ < 4) {
+        qemu_log("ppc-mac-gpu r300: 3D_CLEAR_ZMASK: depth at 0x%x, %u rows of "
+                 "%llu bytes <- %08x\n", off, rows, (unsigned long long)bpr,
+                 r300_reg(s->r3, 0x4F28));
+    }
+}
+
 static bool r300_to_vram(PPCMacGPUState *s, uint32_t *addr, uint64_t len)
 {
     uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
@@ -2292,12 +2410,65 @@ static void r300_warn_once(const char *what, const char *detail)
     }
 }
 
+/* $R300_DRAWLOG: one line per draw (and per other type-3 packet) with the
+ * state that decides depth, culling, tiling and texturing; capped. */
+static FILE *r300_drawlog(void)
+{
+    static FILE *f;
+    static int init;
+    static unsigned lines;
+
+    if (!init) {
+        const char *p = getenv("R300_DRAWLOG");
+        init = 1;
+        f = p ? fopen(p, "w") : NULL;
+    }
+    if (f && ++lines > 200000) {
+        fclose(f);
+        f = NULL;
+    }
+    return f;
+}
+
+static void r300_drawlog_draw(PPCMacGPUState *s, uint32_t opcode,
+                              const uint32_t *d, uint32_t body_dw)
+{
+    FILE *f = r300_drawlog();
+    const R300State *r = s->r3;
+
+    if (!f) {
+        return;
+    }
+    fprintf(f, "D%llu op%02x vf=%08x n=%u rt=%08x/%08x zb=%x zs=%08x rm=%08x "
+            "zf=%x zo=%08x zp=%08x bw=%x cull=%x pm=%x vte=%x vc=%x cb=%08x "
+            "ab=%08x cm=%x af=%x ten=%x",
+            (unsigned long long)r->draws, opcode, body_dw ? d[0] : 0, body_dw,
+            r300_reg(r, 0x4E28), r300_reg(r, 0x4E38), r300_reg(r, 0x4F00),
+            r300_reg(r, 0x4F04), r300_reg(r, 0x4F08), r300_reg(r, 0x4F10),
+            r300_reg(r, 0x4F20), r300_reg(r, 0x4F24), r300_reg(r, 0x4F1C),
+            r300_reg(r, 0x42B8), r300_reg(r, 0x4288), r300_reg(r, 0x20B0),
+            r300_reg(r, 0x2140), r300_reg(r, 0x4E04), r300_reg(r, 0x4E08),
+            r300_reg(r, 0x4E0C), r300_reg(r, 0x4BD4), r300_reg(r, 0x4104));
+    for (int t = 0; t < 16; t++) {
+        if (r300_reg(r, 0x4104) & (1u << t)) {
+            fprintf(f, " t%d=%08x/%08x/%08x/%08x/%08x", t,
+                    r300_reg(r, 0x4540 + 4 * t), r300_reg(r, 0x4480 + 4 * t),
+                    r300_reg(r, 0x44C0 + 4 * t), r300_reg(r, 0x4500 + 4 * t),
+                    r300_reg(r, 0x4400 + 4 * t));
+        }
+    }
+    fprintf(f, "\n");
+    fflush(f);
+}
+
 static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
-                        uint32_t body_dw)
+                        uint32_t body_dw, const R300Indices *idx)
 {
     R300DrawPacket pkt;
     const char *err;
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+
+    r300_drawlog_draw(s, opcode, d, body_dw);
 
     if (s->r3_dump) {
         /* Each distinct texture setup once, for format/layout work. */
@@ -2374,8 +2545,11 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             g_free(key);
         }
     }
-    bool build_ok = r300_draw_build(s->r3, &s->r3_arrays, opcode, d, body_dw,
-                                    r300_read_raw, s, &pkt, &err);
+    bool build_ok = idx ?
+        r300_draw_build_indexed(s->r3, &s->r3_arrays, d[0], idx, r300_read_raw,
+                                s, &pkt, &err) :
+        r300_draw_build(s->r3, &s->r3_arrays, opcode, d, body_dw,
+                        r300_read_raw, s, &pkt, &err);
     if (s->r3_dump && g_r300_arm_rt &&
         (r300_reg(s->r3, 0x4E28) & ~0x1Fu) == g_r300_arm_rt) {
         fprintf(s->r3_dump, "TRY op %02x vf %08x ok %d err %s tex0 en %u off %06x "
@@ -2415,7 +2589,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         return;
     }
     if (pkt.warn & R300_WARN_PVS)      r300_warn_once("vertex program uses unimplemented features", NULL);
-    if (pkt.warn & R300_WARN_DEPTH)    r300_warn_once("depth/stencil not implemented yet", NULL);
+    if (pkt.warn & R300_WARN_DEPTH)    r300_warn_once("depth format 13E3 or reserved: treated as integer Z", NULL);
     if (pkt.warn & R300_WARN_TEXFMT)   r300_warn_once("texture format not implemented yet", NULL);
     if (pkt.warn & R300_WARN_VTXFMT)   r300_warn_once("vertex format not implemented", NULL);
     if (pkt.warn & R300_WARN_VARYINGS) r300_warn_once("too many interpolants", NULL);
@@ -2428,15 +2602,49 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     }
     for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
         R300TexDesc *td = &pkt.tex[t];
-        if (td->bound &&
-            !r300_to_vram(s, &td->gpu_addr, (uint64_t)td->pitch_bytes *
-                          (td->kind >= R300_TEXK_DXT1 ? (td->height + 3) / 4
-                                                      : td->height))) {
-            r300_warn_once("texture outside VRAM (AGP textures not yet)", NULL);
+        uint64_t tlen = (uint64_t)td->pitch_bytes *
+                        (td->kind >= R300_TEXK_DXT1 ? (td->height + 3) / 4
+                                                    : td->height);
+        if (!td->bound) {
+            continue;
+        }
+        uint32_t ga = td->gpu_addr;
+        if (r300_to_vram(s, &td->gpu_addr, tlen)) {
+            continue;
+        }
+        /* AGP/GART texture: copy the texels out of guest memory (freed
+         * by r300_draw_free with free()). */
+        td->host_data = tlen && tlen <= 64 * 1024 * 1024 ? malloc(tlen) : NULL;
+        if (!td->host_data || !r300_read_raw(s, ga, td->host_data, tlen)) {
+            r300_warn_once("texture outside VRAM and the GART", NULL);
+            free(td->host_data);
+            td->host_data = NULL;
             td->bound = false;
             pkt.uniforms.tex_info[t][0] = 0;
+            continue;
+        }
+        static bool said;
+        if (!said) {
+            said = true;
+            qemu_log("ppc-mac-gpu r300: texture in AGP/GART memory at %08x "
+                     "(%ux%u), read through the GART\n", ga, td->width, td->height);
         }
     }
+    if (pkt.depth.attach) {
+        uint32_t zo = pkt.depth.gpu_addr;
+        if (!r300_to_vram(s, &pkt.depth.gpu_addr,
+                          (uint64_t)pkt.depth.pitch * pkt.depth.bpp * pkt.rt_height)) {
+            r300_warn_once("depth buffer outside VRAM", NULL);
+            pkt.depth.attach = false;
+        } else {
+            if (s->r3_zb_offset != zo) {
+                s->r3_zb_offset = zo;
+                s->r3_zb_height = 0;
+            }
+            s->r3_zb_height = MAX(s->r3_zb_height, pkt.rt_height);
+        }
+    }
+    pkt.uniforms.zpass_count = s->r3_zpass_active;
     if (s->renderer && s->renderer->draw_r300) {
         bool need_bql = !bql_locked();
 
@@ -2587,12 +2795,69 @@ static bool ppc_mac_gpu_r300_packet3(PPCMacGPUState *s, uint32_t opcode,
         fprintf(s->r3_dump ? s->r3_dump : stderr, "T3 %02x n=%u %08x %08x\n", opcode,
                 body_dw, body_dw ? d[0] : 0, body_dw > 1 ? d[1] : 0);
     }
+    if (!draw && r300_drawlog()) {
+        fprintf(r300_drawlog(), "P op%02x n=%u %08x %08x %08x %08x\n", opcode,
+                body_dw, body_dw ? d[0] : 0, body_dw > 1 ? d[1] : 0,
+                body_dw > 2 ? d[2] : 0, body_dw > 3 ? d[3] : 0);
+    }
     if (opcode == 0x2F) {
         /* 3D_LOAD_VBPNTR loads the VAP_VTX_NUM_ARRAYS / AOS registers
          * (0x20C0 on); Apple's driver often writes them directly. */
         for (uint32_t k = 0; k < body_dw && k < 1 + 3 * 8; k++) {
             r300_state_write(s->r3, 0x20C0 + 4 * k, d[k]);
         }
+        return true;
+    }
+    if (opcode == 0x32) {                   /* 3D_CLEAR_ZMASK */
+        r300_zmask_clear(s);
+        return true;
+    }
+    if (opcode == 0x37) {                   /* 3D_CLEAR_HIZ: no HiZ kept */
+        return true;
+    }
+    /*
+     * Indices from memory: DRAW_INDX_2 carries only VAP_VF_CNTL (PRIM_WALK
+     * = indices) and INDX_BUFFER says where they are (Mesa emits the draw
+     * first; take either order).
+     */
+    bool indx_mem = opcode == 0x36 && body_dw == 1 && ((d[0] >> 4) & 3) == 1 &&
+                    (d[0] >> 16) != 0;
+    if (opcode == 0x33 || (indx_mem && s->r3_indx_buf_pending)) {
+        uint32_t vf, ib[3];
+        if (opcode == 0x33) {
+            if (body_dw < 3) {
+                return true;
+            }
+            memcpy(ib, d, sizeof(ib));
+            if (!s->r3_indx_vf) {
+                memcpy(s->r3_indx_buf, ib, sizeof(ib));
+                s->r3_indx_buf_pending = true;
+                return true;
+            }
+            vf = s->r3_indx_vf;
+        } else {
+            memcpy(ib, s->r3_indx_buf, sizeof(ib));
+            vf = d[0];
+        }
+        s->r3_indx_vf = 0;
+        s->r3_indx_buf_pending = false;
+
+        /* ib: ONE_REG_WR | dst (VAP_PORT_IDX0 >> 2), GPU address, dwords */
+        uint32_t ndw = MIN(ib[2] & 0xFFFFFF, 4u * 1024 * 1024);
+        uint32_t *idx_dw = g_try_malloc(MAX(ndw, 1u) * 4);
+        if (!idx_dw || !r300_read_raw(s, ib[1] & ~3u, idx_dw, ndw * 4)) {
+            r300_warn_once("INDX_BUFFER outside VRAM and the GART", NULL);
+            g_free(idx_dw);
+            return true;
+        }
+        R300Indices idx = { idx_dw, ndw };
+        s->r3->draws++;
+        r300_render(s, 0x36, &vf, 1, &idx);
+        g_free(idx_dw);
+        return true;
+    }
+    if (indx_mem) {
+        s->r3_indx_vf = d[0];               /* wait for INDX_BUFFER */
         return true;
     }
     if (!draw) {
@@ -2647,7 +2912,7 @@ static bool ppc_mac_gpu_r300_packet3(PPCMacGPUState *s, uint32_t opcode,
         fprintf(s->r3_dump, "\n");
         r300_state_dump(s->r3, s->r3_dump);
     }
-    r300_render(s, opcode, d, body_dw);
+    r300_render(s, opcode, d, body_dw, NULL);
     return true;
 }
 
@@ -9457,6 +9722,9 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
 
     if (s->r3 && r300_state_owns(addr)) {
         r300_state_write(s->r3, addr, val);
+        if (addr == 0x4F58 || addr == 0x4F5C) {
+            r300_zpass_write(s, addr, val);
+        }
     }
     if (s->r300 && addr == 0x0AB0) {
         s->r300_aic_pt_base = val & ~0xFFFu;    /* PCI GART table base */

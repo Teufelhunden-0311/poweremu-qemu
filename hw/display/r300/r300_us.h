@@ -48,7 +48,14 @@ typedef struct R300FSUniforms {
     uint32_t out_sel[4];                      /* US_OUT_FMT_0 C0..C3 (0 A, 1 R, 2 G, 3 B) */
     uint32_t rt_swap32, clip_rule, pad[2];    /* stored bytes are C3,C2,C1,C0 */
     int32_t cliprect[4][4];                   /* SC_CLIPRECT x0, y0, x1, y1 (inclusive) */
+    /* Depth/stencil: ZB_CNTL, ZB_ZSTENCILCNTL, ZB_STENCILREFMASK, and
+     * R300_ZFMT_* (layout of the buffer bound as colour attachment 1). */
+    uint32_t zinfo[4];
+    uint32_t zpass_count, pad2[3];            /* count Z-pass samples (ZB_ZPASS_*) */
 } R300FSUniforms;
+
+#define R300_ZFMT_ENDIAN_MASK   3u            /* ZB_DEPTHPITCH.DEPTHENDIAN */
+#define R300_ZFMT_Z16           (1u << 2)     /* 16-bit Z, no stencil */
 
 /* What the translator needs besides the US registers themselves. */
 typedef struct R300FSDesc {
@@ -57,7 +64,9 @@ typedef struct R300FSDesc {
 
 /*
  * Build the MSL library for the current US program: functions
- * "r300_vs" and "r300_fs".  Returns a malloc'd string, or NULL with
+ * "r300_vs", "r300_fs" (colour only) and "r300_fs_z" (colour plus the
+ * depth/stencil buffer as a uint colour attachment 1; R32Uint for Z24S8,
+ * R16Uint for Z16).  Both take a Z-pass counter at fragment buffer 1.  Returns a malloc'd string, or NULL with
  * *err set for programs not yet translated.  Every register the source
  * depends on is folded into the text, so the string is its own cache key.
  */
