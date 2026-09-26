@@ -2239,6 +2239,9 @@ static void r200_scratch_write(PPCMacGPUState *s, int idx, uint32_t val)
  */
 static uint8_t *r200_agp_page(PPCMacGPUState *s, uint32_t gpu_addr);
 static uint32_t g_r300_arm_rt;      /* debug: drag-frame capture target */
+static void r300_surfwatch_update(PPCMacGPUState *s);
+static void r300_surface_changed(PPCMacGPUState *s);
+static void r300_zconv(PPCMacGPUState *s, bool to_card);
 
 /* Raw guest GPU memory (VRAM or AGP), bytes as they lie. */
 static bool r300_read_raw(void *opaque, uint32_t gpu_addr, void *dst,
@@ -2461,6 +2464,59 @@ static void r300_drawlog_draw(PPCMacGPUState *s, uint32_t opcode,
     fflush(f);
 }
 
+static void r300_aa_resolve(PPCMacGPUState *s, const R300DrawPacket *pkt)
+{
+    uint32_t dst = r300_reg(s->r3, 0x4E80) & ~0x1Fu;
+    uint32_t dpitch = (r300_reg(s->r3, 0x4E84) & 0x3FFE) * 4;
+    uint32_t spitch = pkt->rt_pitch * 4;
+    float x0 = pkt->rt_width, y0 = pkt->rt_height, x1 = 0, y1 = 0;
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+
+    for (uint32_t i = 0; i < pkt->num_verts; i++) {
+        const float *p = pkt->verts[i].pos;
+        float w = p[3] != 0.0f ? p[3] : 1.0f;
+        float x = (p[0] / w + 1.0f) * pkt->rt_width * 0.5f;
+        float y = (1.0f - p[1] / w) * pkt->rt_height * 0.5f;
+        x0 = MIN(x0, x); x1 = MAX(x1, x);
+        y0 = MIN(y0, y); y1 = MAX(y1, y);
+    }
+    int ix0 = MAX((int)floorf(x0 + 0.5f), (int)pkt->scissor[0]);
+    int iy0 = MAX((int)floorf(y0 + 0.5f), (int)pkt->scissor[1]);
+    int ix1 = MIN((int)floorf(x1 + 0.5f), (int)MIN(pkt->scissor[2], pkt->rt_width));
+    int iy1 = MIN((int)floorf(y1 + 0.5f), (int)MIN(pkt->scissor[3], pkt->rt_height));
+    uint32_t w = ix1 > ix0 ? ix1 - ix0 : 0, h = iy1 > iy0 ? iy1 - iy0 : 0;
+
+    if (!w || !h || !dpitch || (uint32_t)ix1 * 4 > dpitch) {
+        return;
+    }
+    if (!r300_to_vram(s, &dst, (uint64_t)dpitch * iy1)) {
+        r300_warn_once("AA resolve buffer outside VRAM", NULL);
+        return;
+    }
+    if (s->renderer && s->renderer->flush_r200) {
+        bool need_bql = !bql_locked();
+        if (need_bql) {
+            bql_lock();
+        }
+        s->renderer->flush_r200(s->renderer_opaque);
+        if (need_bql) {
+            bql_unlock();
+        }
+    }
+    for (int y = iy0; y < iy1; y++) {
+        memmove(vram + dst + (uint64_t)y * dpitch + ix0 * 4,
+                vram + pkt->rt_gpu_addr + (uint64_t)y * spitch + ix0 * 4,
+                (size_t)w * 4);
+    }
+    memory_region_set_dirty(&s->vram, dst + (uint64_t)iy0 * dpitch,
+                            (uint64_t)dpitch * h);
+    static int logged;
+    if (logged++ < 3) {
+        qemu_log("ppc-mac-gpu r300: AA resolve %06x/%u -> %06x/%u (%d,%d %ux%u)\n",
+                 pkt->rt_gpu_addr, spitch, dst, dpitch, ix0, iy0, w, h);
+    }
+}
+
 static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                         uint32_t body_dw, const R300Indices *idx)
 {
@@ -2630,6 +2686,10 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                      "(%ux%u), read through the GART\n", ga, td->width, td->height);
         }
     }
+    if (s->r3_zconv && (pkt.depth.attach || (r300_reg(s->r3, 0x4F00) & 7))) {
+        r300_zconv(s, false);           /* drawing again: back to linear */
+        s->r3_zconv = false;
+    }
     if (pkt.depth.attach) {
         uint32_t zo = pkt.depth.gpu_addr;
         if (!r300_to_vram(s, &pkt.depth.gpu_addr,
@@ -2642,9 +2702,28 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                 s->r3_zb_height = 0;
             }
             s->r3_zb_height = MAX(s->r3_zb_height, pkt.rt_height);
+            {
+                static const uint8_t n[4] = { 2, 3, 4, 6 };
+                uint32_t aa = r300_reg(s->r3, 0x4020);     /* GB_AA_CONFIG */
+                s->r3_zb_ns = (aa & 1) ? n[(aa >> 1) & 3] : 1;
+            }
         }
     }
     pkt.uniforms.zpass_count = s->r3_zpass_active;
+    /*
+     * RB3D_AARESOLVE_CTL.AARESOLVE_MODE: the colour buffer is in resolve
+     * mode, and the pixels a draw covers are filtered from it into the
+     * resolve buffer (RB3D_AARESOLVE_OFFSET/PITCH) instead of being
+     * rendered.  Apple's GL driver swaps a window's back buffer this way,
+     * with one point sprite over the drawable.  No multisampling here, so
+     * the resolve is a copy of the covered rectangle.
+     */
+    if (r300_reg(s->r3, 0x4E88) & 1) {
+        r300_aa_resolve(s, &pkt);
+        r300_draw_free(&pkt);
+        s->regs.stall_draws++;
+        return;
+    }
     if (s->renderer && s->renderer->draw_r300) {
         bool need_bql = !bql_locked();
 
@@ -4583,6 +4662,18 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
                         address_space_read(as, phys,
                                            MEMTXATTRS_UNSPECIFIED,
                                            &pixel, 4);
+                        /*
+                         * VRAM holds what the CPU sees through its
+                         * byte-swapping aperture (32-bit swap for 32bpp,
+                         * 16-bit for 16bpp).  The copy lands in the card's
+                         * view after the 0x15D4 swap; store the CPU view.
+                         * A swap equal to the aperture's is a plain copy.
+                         */
+                        if (s->r300 && bpp == 4 && s->r300_src_swap != 2) {
+                            pixel = bswap32(r300_swap_mode(pixel, s->r300_src_swap));
+                        } else if (s->r300 && bpp == 2 && s->r300_src_swap == 0) {
+                            pixel = r300_swap_mode(pixel, 1);
+                        }
                         xlate_ok++;
                     } else {
                         xlate_fail++;
@@ -7006,6 +7097,26 @@ static void ppc_mac_gpu_dispatch_3d_draw(PPCMacGPUState *s,
  * Process a stream of PM4 packets from a pre-read buffer.
  * Used by both IB execution and ring buffer processing.
  */
+/* $R300_RINGDUMP=path: every PM4 packet (header and body) and IB, capped. */
+static FILE *r300_ringdump(void)
+{
+    static FILE *f;
+    static int init;
+    static uint64_t bytes;
+
+    if (!init) {
+        const char *p = getenv("R300_RINGDUMP");
+        init = 1;
+        f = p ? fopen(p, "w") : NULL;
+    }
+    if (f && ftell(f) > (long)2000 * 1024 * 1024) {
+        fclose(f);
+        f = NULL;
+    }
+    (void)bytes;
+    return f;
+}
+
 static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                                      uint32_t *pm4_data,
                                      uint32_t size_dw)
@@ -7015,6 +7126,15 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
     while (i < size_dw) {
         uint32_t hdr = pm4_data[i];
         uint32_t type = (hdr >> 30) & 3;
+        FILE *rd = r300_ringdump();
+        if (rd) {
+            uint32_t n = type == 2 ? 0 : ((hdr >> 16) & 0x3FFF) + 1;
+            fprintf(rd, "%c%u %08x:", "0123"[type], g_in_pm4, hdr);
+            for (uint32_t k = 0; k < n && i + 1 + k < size_dw && k < 512; k++) {
+                fprintf(rd, " %08x", pm4_data[i + 1 + k]);
+            }
+            fputc('\n', rd);
+        }
         i++;
 
         if (type == 0) {
@@ -8317,8 +8437,12 @@ static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
                                     uint32_t ib_base,
                                     uint32_t ib_size_dw)
 {
+    if (r300_ringdump()) {
+        fprintf(r300_ringdump(), "IB base=%08x size=%u\n", ib_base, ib_size_dw);
+    }
     if (ib_size_dw == 0 || ib_size_dw > 0x100000) {
         s->regs.stall_ib_lost++;
+        qemu_log("ppc-mac-gpu: IB lost: base=%08x size=%u\n", ib_base, ib_size_dw);
         return;
     }
 
@@ -8332,6 +8456,8 @@ static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
         uint64_t ib_end = (uint64_t)ib_base + (uint64_t)ib_size_dw * 4;
         if (ib_end > s->vram_size) {
             gpu_debug_log("IB_EXEC: neither GART nor VRAM (base=0x%x)", ib_base);
+            qemu_log("ppc-mac-gpu: IB lost (not in GART or VRAM): base=%08x size=%u\n",
+                     ib_base, ib_size_dw);
             s->regs.stall_ib_lost++;
             return;
         }
@@ -8830,11 +8956,16 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
                                       PCI_BASE_ADDRESS_0, 4) & ~0xFU;
         break;
     case R200_CONFIG_APER_1_BASE:
+        if (s->r300) {
+            val = (pci_default_read_config(&s->pci, PCI_BASE_ADDRESS_0, 4) &
+                   ~0xFU) + (uint32_t)s->vram_size;
+            break;
+        }
         val = pci_default_read_config(&s->pci,
                                       PCI_BASE_ADDRESS_1, 4) & ~0x3U;
         break;
     case R200_CONFIG_APER_SIZE:
-        val = s->regs.config_memsize;
+        val = s->r300 ? (uint32_t)s->vram_size : s->regs.config_memsize;
         break;
     case R200_CONFIG_REG_1_BASE:
         val = pci_default_read_config(&s->pci,
@@ -9726,6 +9857,13 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
             r300_zpass_write(s, addr, val);
         }
     }
+    if (s->r300 && addr >= 0x0B00 && addr < 0x0B80) {
+        s->r300_surf[(addr - 0x0B00) / 4] = val;   /* SURFACEn bounds/info */
+        if (addr == 0x0B0C) {
+            r300_surface_changed(s);
+            r300_surfwatch_update(s);
+        }
+    }
     if (s->r300 && addr == 0x0AB0) {
         s->r300_aic_pt_base = val & ~0xFFFu;    /* PCI GART table base */
         r200_agp_tc_flush();
@@ -10520,13 +10658,26 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         /* R300 register catch-all: absorb writes to shadow storage.
          * Any R300-specific register the kext writes that isn't handled
          * by a specific case above gets stored in the shadow array. */
+        if (addr == 0x15D4) {
+            s->r300_src_swap = val & 3;         /* see below */
+        }
         if (addr < 0x5000 && is_r300_register((uint32_t)addr)) {
             s->r300_shadow[(uint32_t)addr / 4] = val;
             break;
         }
 
-        /* Registers 0x15D0, 0x15D4, 0x19E4 - kext writes, accept silently */
-        if (addr == 0x15D0 || addr == 0x15D4 || addr == 0x19E4) {
+        /*
+         * 0x15D4: endian swap the 2D engine applies to the source of a
+         * copy from system memory (write_2dblit_cmds_for_copy_buffer_using_DMA
+         * in ATIRadeon9700 passes 2 for Quartz's big-endian ARGB words and
+         * 0 for GL textures, which are byte arrays).
+         */
+        if (addr == 0x15D4) {
+            s->r300_src_swap = val & 3;
+            break;
+        }
+        /* Registers 0x15D0, 0x19E4 - kext writes, accept silently */
+        if (addr == 0x15D0 || addr == 0x19E4) {
             break;
         }
 
@@ -10663,6 +10814,265 @@ static void ppc_mac_gpu_vram_bswap_write(void *opaque, hwaddr addr,
     memory_region_set_dirty(&s->vram, addr, size);
 }
 
+/*
+ * R300 aperture 1.  A Radeon's frame-buffer BAR holds two apertures onto
+ * the same VRAM, each with its own CPU byte swap: SURFACE_CNTL.NONSURF_APn_SWP,
+ * or SURFACEn_INFO.SURF_APn_SWP inside a surface's bounds.  VRAM here holds
+ * what the CPU sees through aperture 0 with its 32-bit swap (mode 2), so an
+ * aperture 1 access is converted from that view.  Apple's GL driver reads
+ * the depth buffer back (glReadPixels, e.g. Chess's mouse picking) through
+ * aperture 1 with a surface that sets its swap.
+ */
+static unsigned r300_ap_swap(PPCMacGPUState *s, uint32_t off, int ap)
+{
+    for (int n = 0; n < 8; n++) {
+        uint32_t info = s->r300_surf[3 + 4 * n];
+        uint32_t lo = s->r300_surf[1 + 4 * n], hi = s->r300_surf[2 + 4 * n];
+        if ((lo || hi) && off >= lo && off <= hi) {
+            return (info >> (20 + 2 * ap)) & 3;
+        }
+    }
+    return (s->regs.surface_cntl >> (20 + 2 * ap)) & 3;
+}
+
+static void r300_permute(uint8_t b[4], unsigned mode)
+{
+    uint8_t t;
+    switch (mode & 3) {
+    case 1: t = b[0]; b[0] = b[1]; b[1] = t; t = b[2]; b[2] = b[3]; b[3] = t; break;
+    case 2: t = b[0]; b[0] = b[3]; b[3] = t; t = b[1]; b[1] = b[2]; b[2] = t; break;
+    case 3: t = b[0]; b[0] = b[2]; b[2] = t; t = b[1]; b[1] = b[3]; b[3] = t; break;
+    default: break;
+    }
+}
+
+static void r300_ap1_note(PPCMacGPUState *s, hwaddr off, bool wr, unsigned m)
+{
+    static int n;
+    if (n++ < 8) {
+        qemu_log("ppc-mac-gpu r300: aperture 1 %s at 0x%" HWADDR_PRIx " (swap %u)\n",
+                 wr ? "write" : "read", off, m);
+    }
+}
+
+static uint64_t r300_ap1_read(void *opaque, hwaddr addr, unsigned size)
+{
+    PPCMacGPUState *s = opaque;
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    hwaddr base = addr & ~3ull;
+    uint8_t b[4];
+    uint64_t v = 0;
+
+    if (base + 4 > s->vram_size) {
+        return 0;
+    }
+    r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
+    unsigned m = r300_ap_swap(s, base, 1);
+    memcpy(b, vram + base, 4);
+    r300_permute(b, 2);                 /* aperture 0 view -> card's bytes */
+    r300_permute(b, m);                 /* -> aperture 1 view */
+    for (unsigned i = 0; i < size && (addr & 3) + i < 4; i++) {
+        v = (v << 8) | b[(addr & 3) + i];
+    }
+    r300_ap1_note(s, addr, false, m);
+    return v;
+}
+
+static void r300_ap1_write(void *opaque, hwaddr addr, uint64_t val,
+                           unsigned size)
+{
+    PPCMacGPUState *s = opaque;
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    hwaddr base = addr & ~3ull;
+    uint8_t b[4];
+
+    if (base + 4 > s->vram_size) {
+        return;
+    }
+    r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
+    unsigned m = r300_ap_swap(s, base, 1);
+    memcpy(b, vram + base, 4);
+    r300_permute(b, 2);
+    r300_permute(b, m);
+    for (unsigned i = 0; i < size && (addr & 3) + i < 4; i++) {
+        b[(addr & 3) + i] = val >> (8 * (size - 1 - i));
+    }
+    r300_permute(b, m);
+    r300_permute(b, 2);
+    memcpy(vram + base, b, 4);
+    memory_region_set_dirty(&s->vram, base, 4);
+    r300_ap1_note(s, addr, true, m);
+}
+
+/* $R300_SURFWATCH: while SURFACE0 covers a range, trap aperture 0 over it
+ * and log what the CPU reads and writes (e.g. glReadPixels readbacks). */
+static uint64_t r300_watch_read(void *opaque, hwaddr addr, unsigned size)
+{
+    PPCMacGPUState *s = opaque;
+    uint8_t *p = (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
+                 s->r300_watch_base + addr;
+    uint64_t v = 0;
+
+    r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
+    for (unsigned i = 0; i < size; i++) {
+        v = (v << 8) | p[i];
+    }
+    if (s->r300_watch_logged++ < 64) {
+        qemu_log("r300 surfwatch: rd%u 0x%x = 0x%" PRIx64 "\n",
+                 size, (unsigned)(s->r300_watch_base + addr), v);
+    }
+    return v;
+}
+
+static void r300_watch_write(void *opaque, hwaddr addr, uint64_t val,
+                             unsigned size)
+{
+    PPCMacGPUState *s = opaque;
+    uint8_t *p = (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
+                 s->r300_watch_base + addr;
+
+    for (unsigned i = 0; i < size; i++) {
+        p[i] = val >> (8 * (size - 1 - i));
+    }
+    if (s->r300_watch_logged++ < 64) {
+        qemu_log("r300 surfwatch: wr%u 0x%x = 0x%" PRIx64 "\n", size,
+                 (unsigned)(s->r300_watch_base + addr), val);
+    }
+}
+
+static const MemoryRegionOps r300_watch_ops = {
+    .read = r300_watch_read,
+    .write = r300_watch_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 8 },
+    .impl = { .min_access_size = 1, .max_access_size = 8 },
+};
+
+/*
+ * Depth readback with multisampling.  The card keeps a multisampled depth
+ * buffer in its micro-tiled, sample-interleaved layout, and Apple's GL
+ * driver reads it that way (r300_msaa_offset) after mapping a surface over
+ * it with SURFACE0 - glReadPixels of depth, which Chess uses to pick the
+ * square under the mouse.  Depth is rendered here as one linear sample, so
+ * while such a surface is mapped the buffer is rewritten in the card's
+ * layout, and converted back (keeping any CPU writes) when it is unmapped.
+ */
+static void r300_zconv(PPCMacGPUState *s, bool to_card)
+{
+    uint8_t *vram = (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
+                    s->r3_zconv_off;
+    uint32_t pitch = s->r3_zconv_pitch, rows = s->r3_zconv_rows;
+    uint32_t ns = s->r3_zconv_ns;
+    uint64_t lin = (uint64_t)pitch * 4 * rows, card = lin * ns;
+    uint8_t *tmp;
+
+    if (!rows || s->r3_zconv_off + card > s->vram_size) {
+        return;
+    }
+    r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
+    tmp = g_malloc(card);
+    if (to_card) {
+        for (uint32_t y = 0; y < rows; y++) {
+            for (uint32_t x = 0; x < pitch; x++) {
+                for (uint32_t k = 0; k < ns; k++) {
+                    memcpy(tmp + r300_msaa_offset(x, y, ns, pitch, 4, k),
+                           vram + ((uint64_t)y * pitch + x) * 4, 4);
+                }
+            }
+        }
+        memcpy(vram, tmp, card);
+    } else {
+        memcpy(tmp, vram, card);
+        memset(vram + lin, 0, card - lin);
+        for (uint32_t y = 0; y < rows; y++) {
+            for (uint32_t x = 0; x < pitch; x++) {
+                memcpy(vram + ((uint64_t)y * pitch + x) * 4,
+                       tmp + r300_msaa_offset(x, y, ns, pitch, 4, 0), 4);
+            }
+        }
+    }
+    g_free(tmp);
+    memory_region_set_dirty(&s->vram, s->r3_zconv_off, card);
+    static int logged;
+    if (logged++ < 6) {
+        qemu_log("ppc-mac-gpu r300: depth at 0x%x (%ux%u, %u samples) %s the "
+                 "card's layout for a CPU readback\n", s->r3_zconv_off, pitch,
+                 rows, ns, to_card ? "to" : "back from");
+    }
+}
+
+static void r300_surface_changed(PPCMacGPUState *s)
+{
+    uint32_t lo = s->r300_surf[1], hi = s->r300_surf[2];
+    uint32_t pitch = r300_reg(s->r3, 0x4F24) & 0x3FFC;
+    uint32_t zo = r300_reg(s->r3, 0x4F20) & ~0x1Fu;
+    uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
+
+    if (s->r3_zconv) {
+        if (lo == s->r3_zconv_off) {
+            return;                             /* still mapped */
+        }
+        r300_zconv(s, false);
+        s->r3_zconv = false;
+    }
+    if (!s->r3 || hi <= lo || zo < fb_base || lo != zo - fb_base ||
+        s->r3_zb_offset != zo || (r300_reg(s->r3, 0x4F10) & 0xF) != 2 ||
+        !pitch || !s->r3_zb_height) {
+        return;
+    }
+    /* Samples: GB_AA_CONFIG at the depth draws, else what the size of the
+     * mapped surface implies. */
+    uint32_t ns = s->r3_zb_ns;
+    if (ns < 2) {
+        ns = ((hi - lo + 1) + pitch * 2 * s->r3_zb_height) /
+             (pitch * 4 * s->r3_zb_height);
+    }
+    if (ns != 2 && ns != 4) {
+        return;
+    }
+    s->r3_zconv_off = lo;
+    s->r3_zconv_pitch = pitch;
+    s->r3_zconv_ns = ns;
+    s->r3_zconv_rows = MIN(s->r3_zb_height, (hi - lo + 1) / (pitch * 4 * ns));
+    r300_zconv(s, true);
+    s->r3_zconv = true;
+}
+
+static void r300_surfwatch_update(PPCMacGPUState *s)
+{
+    static int enabled = -1;
+    uint32_t lo = s->r300_surf[1], hi = s->r300_surf[2];
+
+    if (enabled < 0) {
+        enabled = getenv("R300_SURFWATCH") != NULL;
+    }
+    if (!enabled || !s->r300) {
+        return;
+    }
+    if (s->r300_watch_on) {
+        memory_region_del_subregion(&s->vram_bar, &s->r300_watch);
+        object_unparent(OBJECT(&s->r300_watch));
+        s->r300_watch_on = false;
+    }
+    if (hi > lo && hi < s->vram_size) {
+        memory_region_init_io(&s->r300_watch, OBJECT(s), &r300_watch_ops, s,
+                              "ppc-mac-gpu-surfwatch", hi - lo + 1);
+        memory_region_add_subregion_overlap(&s->vram_bar, lo, &s->r300_watch, 10);
+        s->r300_watch_base = lo;
+        s->r300_watch_on = true;
+        qemu_log("r300 surfwatch: surface0 0x%x-0x%x info %08x\n", lo, hi,
+                 s->r300_surf[3]);
+    }
+}
+
+static const MemoryRegionOps r300_ap1_ops = {
+    .read = r300_ap1_read,
+    .write = r300_ap1_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+    .impl = { .min_access_size = 1, .max_access_size = 4 },
+};
+
 static const MemoryRegionOps ppc_mac_gpu_vram_bswap_ops = {
     .read = ppc_mac_gpu_vram_bswap_read,
     .write = ppc_mac_gpu_vram_bswap_write,
@@ -10784,6 +11194,7 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
 
     s->regs_size = sizeof(PPCMacGPURegs);   /* saved with the machine */
     s->r300 = object_dynamic_cast(obj, TYPE_ATI_RADEON_9700) != NULL;
+    s->r300_src_swap = 2;       /* plain copy until the driver says otherwise */
     if (s->r300) {
         const char *dump = getenv("R300_DUMP");
 
@@ -10837,8 +11248,20 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         memory_region_init_ram(&s->vram, obj, "ppc-mac-gpu-vram",
                                s->vram_size, &error_fatal);
     }
-    pci_register_bar(dev, PPC_MAC_GPU_VRAM_BAR,
-                     PCI_BASE_ADDRESS_MEM_PREFETCH, &s->vram);
+    if (s->r300) {
+        /* Two apertures onto VRAM, as on a real Radeon (see r300_ap1_ops). */
+        memory_region_init(&s->vram_bar, obj, "ppc-mac-gpu-vram-bar",
+                           2 * s->vram_size);
+        memory_region_add_subregion(&s->vram_bar, 0, &s->vram);
+        memory_region_init_io(&s->vram_ap1, obj, &r300_ap1_ops, s,
+                              "ppc-mac-gpu-vram-ap1", s->vram_size);
+        memory_region_add_subregion(&s->vram_bar, s->vram_size, &s->vram_ap1);
+        pci_register_bar(dev, PPC_MAC_GPU_VRAM_BAR,
+                         PCI_BASE_ADDRESS_MEM_PREFETCH, &s->vram_bar);
+    } else {
+        pci_register_bar(dev, PPC_MAC_GPU_VRAM_BAR,
+                         PCI_BASE_ADDRESS_MEM_PREFETCH, &s->vram);
+    }
 
     /* BAR2: MMIO register space */
     memory_region_init_io(&s->mmio, obj, &ppc_mac_gpu_mmio_ops, s,

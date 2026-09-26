@@ -843,6 +843,28 @@ bool r300_draw_build(const R300State *st, const R300Arrays *arr,
                      opcode == 0x35 ? payload_dw : 0, read, opaque, pkt, err);
 }
 
+uint32_t r300_msaa_offset(uint32_t x, uint32_t y, uint32_t ns,
+                          uint32_t pitch_px, uint32_t bpp, uint32_t sample)
+{
+    uint32_t sh = bpp == 2 ? 1 : 2;             /* log2(bytes per sample) */
+    uint32_t pitch = pitch_px * ns;             /* in samples, as the driver keeps it */
+    uint32_t base, idx;
+
+    if ((ns != 2 && ns != 4) || sample >= ns) {
+        return ~0u;
+    }
+    base = 32 * ((pitch / ns / 4) * ns * sh * 2 * (y >> 3) +
+                 ((((x >> 2) << 1) | ((y >> 2) & 1)) * ns * sh));
+    if (ns == 2) {
+        idx = (((y >> 1) & 1) << 4) | (((x >> 1) & 1) << 3) | (sample << 2);
+    } else {
+        idx = (((((x >> 2) & 1) ^ ((y >> 1) & 1))) << 5) |
+              (((x >> 1) & 1) << 4) | (sample << 2);
+    }
+    idx |= ((y & 1) << 1) | (x & 1);
+    return base + (idx << sh);
+}
+
 uint32_t r300_index_at(const uint32_t *dw, uint32_t ndw, bool i32, uint32_t i)
 {
     if (i32) {

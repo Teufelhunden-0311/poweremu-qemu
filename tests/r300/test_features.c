@@ -172,6 +172,23 @@ int main(void)
     idx.ndw = 1;
     CHECK(!r300_draw_build_indexed(&st, &arr, vf, &idx, rd, NULL, &p, &err), "short ib");
 
+    /* Multisample layout: every sample of a 64x16 buffer lands on a
+     * distinct slot inside the buffer, for 2 and 4 samples. */
+    for (unsigned ns = 2; ns <= 4; ns += 2) {
+        static uint8_t used[64 * 16 * 4 * 4];
+        memset(used, 0, sizeof(used));
+        bool ok = true;
+        for (unsigned y = 0; y < 16; y++)
+            for (unsigned x = 0; x < 64; x++)
+                for (unsigned k = 0; k < ns; k++) {
+                    uint32_t o = r300_msaa_offset(x, y, ns, 64, 4, k);
+                    if (o % 4 || o / 4 >= 64 * 16 * ns || used[o / 4]++) ok = false;
+                }
+        CHECK(ok, "msaa layout ns=%u not a permutation", ns);
+    }
+    /* The driver's own formula at a picked pixel (2 samples, 704 wide). */
+    CHECK(r300_msaa_offset(592, 496, 2, 704, 4, 0) == 0x2b3400, "msaa sample 0 %x",
+          r300_msaa_offset(592, 496, 2, 704, 4, 0));
     printf(fails ? "test_features: %d FAILED\n" : "test_features: PASS\n", fails);
     return fails != 0;
 }

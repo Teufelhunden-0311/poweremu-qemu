@@ -157,6 +157,16 @@ bool r300_draw_build_indexed(const R300State *st, const R300Arrays *arr,
  * packed two per dword, the first in the low half. */
 uint32_t r300_index_at(const uint32_t *dw, uint32_t ndw, bool i32, uint32_t i);
 
+/*
+ * Byte offset of sample `sample` of pixel (x, y) in a multisampled R300
+ * colour/depth buffer (ns = 2 or 4 samples) as Apple's ATIRadeon9700
+ * computes it for CPU access (ATIR300Surface get_offset_of_sample_0):
+ * 4x4-pixel micro tiles holding all samples, in 8-row bands, pitch_px
+ * pixels wide, bpp 2 or 4.  Returns ~0u for other sample counts.
+ */
+uint32_t r300_msaa_offset(uint32_t x, uint32_t y, uint32_t ns,
+                          uint32_t pitch_px, uint32_t bpp, uint32_t sample);
+
 /* Assemble a primitive list (VAP_VF_CNTL.PRIM_TYPE) of n vertices into
  * triangle/line/point list indices; returns the index count (0 for an
  * unsupported type).  list needs room for 3n + 6 entries. */
