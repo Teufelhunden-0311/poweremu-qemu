@@ -7330,6 +7330,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
 static NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *g_r300_pipes;
 static NSMutableDictionary<NSNumber *, id<MTLSamplerState>> *g_r300_samplers;
 static id<MTLTexture> g_r300_dummy;
+static id<MTLTexture> g_r300_dummy_u;   /* for units the shader decodes */
 
 static void r300_metal_warn(uint32_t bit, const char *msg)
 {
@@ -7347,10 +7348,12 @@ static void r300_metal_warn(uint32_t bit, const char *msg)
  */
 static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
                                                 const char *msl,
+                                                MTLPixelFormat cfmt,
                                                 MTLPixelFormat zfmt)
 {
     NSString *src = [NSString stringWithUTF8String:msl];
-    NSString *key = [src stringByAppendingFormat:@"\n// %lu\n", (unsigned long)zfmt];
+    NSString *key = [src stringByAppendingFormat:@"\n// %lu %lu\n",
+                     (unsigned long)cfmt, (unsigned long)zfmt];
     id<MTLRenderPipelineState> p;
     NSError *err = nil;
 
@@ -7371,7 +7374,7 @@ static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
     pd.vertexFunction = [[lib newFunctionWithName:@"r300_vs"] autorelease];
     pd.fragmentFunction = [[lib newFunctionWithName:
         zfmt == MTLPixelFormatInvalid ? @"r300_fs" : @"r300_fs_z"] autorelease];
-    pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    pd.colorAttachments[0].pixelFormat = cfmt;
     pd.colorAttachments[1].pixelFormat = zfmt;
     p = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
     [pd release];
@@ -7497,6 +7500,25 @@ static bool r300_read_conflict(uint64_t lo, uint64_t hi, const R200TexKey *rt)
     return false;
 }
 
+/* Metal format of a colour-buffer view (R300_RTV_*). */
+static MTLPixelFormat r300_rt_pf(uint32_t view)
+{
+    switch (view) {
+    case R300_RTV_R8U:     return MTLPixelFormatR8Uint;
+    case R300_RTV_R16U:    return MTLPixelFormatR16Uint;
+    case R300_RTV_R32U:    return MTLPixelFormatR32Uint;
+    case R300_RTV_RG32U:   return MTLPixelFormatRG32Uint;
+    case R300_RTV_RGBA32U: return MTLPixelFormatRGBA32Uint;
+    default:               return MTLPixelFormatRGBA8Unorm;
+    }
+}
+
+static MTLPixelFormat r300_raw_pf(uint32_t view_bpp)
+{
+    return view_bpp == 16 ? MTLPixelFormatRGBA32Uint :
+           view_bpp == 8 ? MTLPixelFormatRG32Uint : MTLPixelFormatR32Uint;
+}
+
 static uint32_t r300_tex_rows(const R300TexDesc *td)
 {
     return td->kind >= R300_TEXK_DXT1 ? (td->height + 3) / 4 : td->height;
@@ -7549,6 +7571,48 @@ static id<MTLTexture> r300_texture(PPCMacGPUMetalState *st, id<MTLDevice> dev,
     case R300_TEXK_R8:    pf = MTLPixelFormatR8Unorm; break;
     case R300_TEXK_RG8:   pf = MTLPixelFormatRG8Unorm; break;
     default:              pf = MTLPixelFormatInvalid; break;
+    }
+    if (td->kind == R300_TEXK_RAW) {
+        /* The shader decodes the texel dwords (r300_texu). */
+        MTLPixelFormat rpf = r300_raw_pf(td->view_bpp);
+        uint32_t vw = td->pitch_bytes / td->view_bpp;
+        NSUInteger align = [dev minimumLinearTextureAlignmentForPixelFormat:rpf];
+        if (!vw) {
+            return nil;
+        }
+        if (!td->host_data && !(td->gpu_addr % align) &&
+            !(td->pitch_bytes % td->view_bpp) && !(td->pitch_bytes % align)) {
+            R200TexKey k = { td->gpu_addr, vw, td->height, td->pitch_bytes,
+                             (uint32_t)rpf };
+            return r200_view(st, k, rpf, false);
+        }
+        /* Copy: GART texels (reversed per dword to VRAM's side of the
+         * aperture, see r300_tex_raw_bpp) or a view Metal cannot make. */
+        if (!td->host_data && r200_batch_conflict(lo, hi, NULL)) {
+            metal_flush_r200(st);
+        }
+        const uint8_t *src = td->host_data ? td->host_data : vram_ptr + td->gpu_addr;
+        vw = (td->pitch_bytes + td->view_bpp - 1) / td->view_bpp;
+        size_t rb = (size_t)vw * td->view_bpp;
+        uint8_t *buf = g_malloc0(rb * td->height);
+        for (uint32_t y = 0; y < td->height; y++) {
+            memcpy(buf + y * rb, src + (uint64_t)y * td->pitch_bytes, td->pitch_bytes);
+            if (td->host_data) {
+                uint32_t *d = (uint32_t *)(buf + y * rb);
+                for (size_t i = 0; i < rb / 4; i++) {
+                    d[i] = __builtin_bswap32(d[i]);
+                }
+            }
+        }
+        MTLTextureDescriptor *d = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:rpf width:vw height:td->height
+                                     mipmapped:NO];
+        d.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> t = [[dev newTextureWithDescriptor:d] autorelease];
+        [t replaceRegion:MTLRegionMake2D(0, 0, vw, td->height) mipmapLevel:0
+               withBytes:buf bytesPerRow:rb];
+        g_free(buf);
+        return t;
     }
     if (pf != MTLPixelFormatInvalid && td->host_data) {
         /* Copied out of the GART by the device: upload as it lies. */
@@ -7631,9 +7695,9 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         return -1;
     }
     id<MTLDevice> dev = st->vramBuffer.device;
-    MTLPixelFormat pf = MTLPixelFormatRGBA8Unorm;
+    MTLPixelFormat pf = r300_rt_pf(pkt->rt_view);
     NSUInteger align = [dev minimumLinearTextureAlignmentForPixelFormat:pf];
-    uint32_t bpr = pkt->rt_pitch * 4;
+    uint32_t bpr = pkt->rt_pitch * pkt->rt_bpp;
     uint32_t sx0 = pkt->scissor[0], sy0 = pkt->scissor[1];
     uint32_t sx1 = MIN(pkt->scissor[2], pkt->rt_width);
     uint32_t sy1 = MIN(pkt->scissor[3], pkt->rt_height);
@@ -7648,8 +7712,11 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     }
     if (!g_r300_dummy) {
         MTLTextureDescriptor *td = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:pf width:1 height:1 mipmapped:NO];
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                         width:1 height:1 mipmapped:NO];
         g_r300_dummy = [dev newTextureWithDescriptor:td];
+        td.pixelFormat = MTLPixelFormatR32Uint;
+        g_r300_dummy_u = [dev newTextureWithDescriptor:td];
     }
 
     if ((pkt->cull & (R300_CULL_FRONT | R300_CULL_BACK)) ==
@@ -7680,7 +7747,7 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         R300FSUniforms u = pkt->uniforms;
         for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
             const R300TexDesc *td = &pkt->tex[t];
-            tex[t] = g_r300_dummy;
+            tex[t] = td->kind == R300_TEXK_RAW ? g_r300_dummy_u : g_r300_dummy;
             smp[t] = r300_sampler(dev, td->filter0);
             if (!td->bound) {
                 u.tex_info[t][0] = 0;
@@ -7774,7 +7841,7 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             u.zinfo[0] = 0;
             u.zinfo[3] = g_r200_enc_depth_z16 ? R300_ZFMT_Z16 : 0;
         }
-        id<MTLRenderPipelineState> pipe = r300_pipeline(dev, pkt->msl, pass_zpf);
+        id<MTLRenderPipelineState> pipe = r300_pipeline(dev, pkt->msl, pf, pass_zpf);
         if (!pipe) {
             return -1;
         }

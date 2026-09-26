@@ -420,6 +420,7 @@ static void set_uniforms(const R300State *st, R300DrawPacket *pkt)
         u->out_sel[n] = (outfmt >> (8 + 2 * n)) & 3;
     }
     u->rt_swap32 = ((r300_reg(st, RB3D_COLORPITCH0) >> 19) & 3) == 2;
+    u->rt_endian = (r300_reg(st, RB3D_COLORPITCH0) >> 19) & 3;
     u->clip_rule = r300_reg(st, SC_CLIP_RULE) & 0xFFFF;
     for (int i = 0; i < 4; i++) {
         uint32_t tl = r300_reg(st, SC_CLIPRECT_TL_0 + 8 * i);
@@ -471,8 +472,14 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         case 0x10: t->kind = R300_TEXK_DXT3; bpp = 16; break;
         case 0x11: t->kind = R300_TEXK_DXT5; bpp = 16; break;
         default:
-            pkt->warn |= R300_WARN_TEXFMT;
-            continue;
+            bpp = r300_tex_raw_bpp(fmt);
+            if (!bpp) {
+                pkt->warn |= R300_WARN_TEXFMT;
+                continue;
+            }
+            t->kind = R300_TEXK_RAW;
+            t->view_bpp = bpp < 4 ? 4 : bpp;
+            break;
         }
         t->bound = true;
         t->gpu_addr = off & ~0x1Fu;
@@ -487,6 +494,8 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         t->filter0 = r300_reg(st, TX_FILTER0_0 + 4 * k);
         pkt->uniforms.tex_info[k][0] = 1;
         pkt->uniforms.tex_info[k][1] = decode;
+        pkt->uniforms.tex_info[k][2] = t->width;
+        pkt->uniforms.tex_info[k][3] = t->height;
     }
 }
 
@@ -640,7 +649,13 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     pkt->rt_gpu_addr = r300_reg(st, RB3D_COLOROFFSET0) & ~0x1Fu;
     pkt->rt_pitch = pitch_reg & 0x3FFE;
     pkt->rt_format = (pitch_reg >> 21) & 0xF;
-    if (pkt->rt_format != 6) {
+    pkt->rt_view = r300_cb_view(pkt->rt_format, r300_reg(st, US_OUT_FMT_0),
+                                &pkt->rt_bpp);
+    if ((pkt->rt_bpp == 1 && (pitch_reg >> 19) & 3) ||
+        (pkt->rt_bpp == 2 && ((pitch_reg >> 19) & 3) >= 2)) {
+        pkt->warn |= R300_WARN_RTFMT;   /* swap across pixels: not done */
+    }
+    if (pkt->rt_view == R300_RTV_NONE) {
         pkt->warn |= R300_WARN_RTFMT;
         *err = "colour buffer format not supported";
         free(order);

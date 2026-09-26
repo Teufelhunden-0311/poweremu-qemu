@@ -2464,11 +2464,57 @@ static void r300_drawlog_draw(PPCMacGPUState *s, uint32_t opcode,
     fflush(f);
 }
 
+/* Log each texture and colour-buffer format combination once: which
+ * formats a guest workload actually uses (and with which swaps). */
+static void r300_note_formats(PPCMacGPUState *s, const R300DrawPacket *pkt)
+{
+    static uint32_t seen[128];
+    static unsigned nseen;
+    uint32_t keys[1 + R300_NUM_TEX_UNITS];
+    unsigned nk = 0;
+
+    keys[nk++] = 0x80000000u | (pkt->rt_format << 24) |
+                 ((r300_reg(s->r3, 0x4E38) >> 19) & 3) << 20 |
+                 (r300_reg(s->r3, 0x46A4) & 0xF001F);
+    for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
+        const R300TexDesc *td = &pkt->tex[t];
+        uint32_t f1 = r300_reg(s->r3, 0x44C0 + 4 * t);
+        if (td->bound) {
+            keys[nk++] = ((f1 & 0x1F) << 24) | (f1 & 0x1E0) |
+                         (r300_reg(s->r3, 0x4540 + 4 * t) & 3) << 20 |
+                         ((f1 >> 21) & 1) << 19 | ((f1 >> 22) & 1) << 18 |
+                         (td->host_data ? 1u << 17 : 0) |
+                         ((r300_reg(s->r3, 0x4400 + 4 * t) >> 9) & 0xF);
+        }
+    }
+    for (unsigned i = 0; i < nk && nseen < ARRAY_SIZE(seen); i++) {
+        unsigned j;
+        for (j = 0; j < nseen && seen[j] != keys[i]; j++) {
+        }
+        if (j < nseen) {
+            continue;
+        }
+        seen[nseen++] = keys[i];
+        if (keys[i] & 0x80000000u) {
+            qemu_log("ppc-mac-gpu r300: colour buffer format %u endian %u "
+                     "US_OUT_FMT %05x (%ux%u at %08x)\n", pkt->rt_format,
+                     (keys[i] >> 20) & 3, keys[i] & 0xF001F, pkt->rt_pitch,
+                     pkt->rt_height, pkt->rt_gpu_addr);
+        } else {
+            qemu_log("ppc-mac-gpu r300: texture format 0x%02x swap %u "
+                     "sign %x gamma %u yuv %u %s filter %x\n", keys[i] >> 24,
+                     (keys[i] >> 20) & 3, (keys[i] >> 5) & 0xF,
+                     (keys[i] >> 19) & 1, (keys[i] >> 18) & 1,
+                     (keys[i] >> 17) & 1 ? "GART" : "VRAM", keys[i] & 0xF);
+        }
+    }
+}
+
 static void r300_aa_resolve(PPCMacGPUState *s, const R300DrawPacket *pkt)
 {
     uint32_t dst = r300_reg(s->r3, 0x4E80) & ~0x1Fu;
     uint32_t dpitch = (r300_reg(s->r3, 0x4E84) & 0x3FFE) * 4;
-    uint32_t spitch = pkt->rt_pitch * 4;
+    uint32_t spitch = pkt->rt_pitch * pkt->rt_bpp;
     float x0 = pkt->rt_width, y0 = pkt->rt_height, x1 = 0, y1 = 0;
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
 
@@ -2647,11 +2693,12 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     if (pkt.warn & R300_WARN_PVS)      r300_warn_once("vertex program uses unimplemented features", NULL);
     if (pkt.warn & R300_WARN_DEPTH)    r300_warn_once("depth format 13E3 or reserved: treated as integer Z", NULL);
     if (pkt.warn & R300_WARN_TEXFMT)   r300_warn_once("texture format not implemented yet", NULL);
+    if (pkt.warn & R300_WARN_RTFMT)    r300_warn_once("colour buffer endian swap across pixels ignored", NULL);
     if (pkt.warn & R300_WARN_VTXFMT)   r300_warn_once("vertex format not implemented", NULL);
     if (pkt.warn & R300_WARN_VARYINGS) r300_warn_once("too many interpolants", NULL);
 
     if (!r300_to_vram(s, &pkt.rt_gpu_addr,
-                      (uint64_t)pkt.rt_pitch * 4 * pkt.rt_height)) {
+                      (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height)) {
         r300_warn_once("colour buffer outside VRAM", NULL);
         r300_draw_free(&pkt);
         return;
@@ -2686,6 +2733,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                      "(%ux%u), read through the GART\n", ga, td->width, td->height);
         }
     }
+    r300_note_formats(s, &pkt);
     if (s->r3_zconv && (pkt.depth.attach || (r300_reg(s->r3, 0x4F00) & 7))) {
         r300_zconv(s, false);           /* drawing again: back to linear */
         s->r3_zconv = false;
@@ -2756,7 +2804,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                     pkt.rt_gpu_addr == 0 && pkt.tex[0].bound &&
                     pkt.tex[0].gpu_addr != 0 && pkt.tex[0].height > 350 &&
                     pkt.tex[0].width > 500 &&
-                    pkt.tex[0].pitch_bytes != pkt.rt_pitch * 4 && step == 0) {
+                    pkt.tex[0].pitch_bytes != pkt.rt_pitch * pkt.rt_bpp && step == 0) {
                     arm_rt = pkt.tex[0].gpu_addr;
                     g_r300_arm_rt = arm_rt;
                     armed_left = 60;
@@ -2766,11 +2814,11 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                     FILE *f;
                     s->renderer->flush_r200(s->renderer_opaque);
                     snprintf(path, sizeof(path), "%s.step%02u_p%u_h%u.bin",
-                             getenv("R300_DUMP"), step, pkt.rt_pitch * 4,
+                             getenv("R300_DUMP"), step, pkt.rt_pitch * pkt.rt_bpp,
                              pkt.rt_height);
                     if ((f = fopen(path, "wb"))) {
                         fwrite(vram + pkt.rt_gpu_addr, 1,
-                               (size_t)pkt.rt_pitch * 4 * pkt.rt_height, f);
+                               (size_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height, f);
                         fclose(f);
                     }
                     fprintf(s->r3_dump, "STEP %02u tex %06x %ux%u/%u kind %u "
@@ -2819,10 +2867,10 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                         fclose(f);
                     }
                     snprintf(path, sizeof(path), "%s.%02d.screen_p%u_h%u.bin",
-                             getenv("R300_DUMP"), reads / 150, pkt.rt_pitch * 4,
+                             getenv("R300_DUMP"), reads / 150, pkt.rt_pitch * pkt.rt_bpp,
                              pkt.rt_height);
                     if ((f = fopen(path, "wb"))) {
-                        fwrite(vram, 1, (size_t)pkt.rt_pitch * 4 * pkt.rt_height, f);
+                        fwrite(vram, 1, (size_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height, f);
                         fclose(f);
                     }
                     fprintf(s->r3_dump, "SNAP taken at draw %llu\n",
@@ -2831,7 +2879,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             }
             /* As the R200 path does: the display and the dirty-tracking
              * scanout only refresh what they are told changed. */
-            uint64_t len = (uint64_t)pkt.rt_pitch * 4 * pkt.rt_height;
+            uint64_t len = (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height;
             memory_region_set_dirty(&s->vram, pkt.rt_gpu_addr, len);
             r200_rate.draws++;
             r200_perf.draws++;
@@ -2841,8 +2889,8 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
              * at the card's 3D pitch (a multiple of 32 pixels): scan out
              * at that pitch, as the R200 path does for its present BLT. */
             if (pkt.rt_gpu_addr == s->disp.offset &&
-                pkt.rt_pitch * 4 != s->disp.stride) {
-                r200_set_present_pitch(s, pkt.rt_pitch * 4);
+                pkt.rt_pitch * pkt.rt_bpp != s->disp.stride) {
+                r200_set_present_pitch(s, pkt.rt_pitch * pkt.rt_bpp);
             }
         }
         if (need_bql) {

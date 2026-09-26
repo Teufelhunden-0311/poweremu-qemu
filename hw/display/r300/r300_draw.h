@@ -43,6 +43,8 @@ enum {
     R300_TEXK_R8,               /* X8 view */
     R300_TEXK_RG8,              /* Y8X8 view; shader swaps the bytes */
     R300_TEXK_CONVERT16,        /* 16bpp packed: decoded to RGBA8 on the CPU */
+    R300_TEXK_RAW,              /* uint view of the texel dwords, decoded by
+                                   the shader (r300_tex_raw_bpp) */
     R300_TEXK_DXT1,             /* compressed blocks, copied as they lie */
     R300_TEXK_DXT3,
     R300_TEXK_DXT5,
@@ -55,6 +57,7 @@ typedef struct R300TexDesc {
     uint32_t pitch_bytes;       /* bytes per row (per row of blocks for DXT) */
     uint32_t format;            /* TX_FORMAT1 & 0x1F */
     uint32_t kind;              /* R300_TEXK_* */
+    uint32_t view_bpp;          /* RAW: bytes per uint-view element (4, 8, 16) */
     uint32_t filter0;           /* TX_FILTER0 */
     uint8_t *host_data;         /* texels copied out of the GART (owned), or NULL */
 } R300TexDesc;
@@ -91,6 +94,8 @@ typedef struct R300DrawPacket {
     uint32_t rt_pitch;          /* pixels */
     uint32_t rt_width, rt_height;
     uint32_t rt_format;         /* RB3D_COLORPITCH0 format field */
+    uint32_t rt_bpp;            /* bytes per pixel */
+    uint32_t rt_view;           /* R300_RTV_* */
     uint32_t scissor[4];        /* x0, y0, x1, y1 (exclusive) */
     R300DepthDesc depth;
     uint32_t cull;              /* SU_CULL_MODE (0 for lines and points) */

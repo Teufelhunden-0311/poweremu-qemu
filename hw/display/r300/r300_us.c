@@ -30,6 +30,67 @@
 #define US_ALU_ALPHA_ADDR_0 0x47C0
 #define US_ALU_RGB_INST_0   0x48C0
 #define US_ALU_ALPHA_INST_0 0x49C0
+#define US_OUT_FMT_0        0x46A4
+#define TX_FILTER0_0        0x4400
+#define TX_FORMAT1_0        0x44C0
+#define TX_OFFSET_0         0x4540
+#define TX_ENABLE           0x4104
+#define RB3D_COLORPITCH0    0x4E38
+
+uint32_t r300_tex_raw_bpp(uint32_t txformat)
+{
+    switch (txformat & 0x1F) {
+    case 0x02: case 0x05:                           /* Y4X4, Z3Y3X2 */
+        return 1;
+    case 0x12: case 0x14: case 0x15:                /* CxV8U8, VYUY, YVYU */
+    case 0x16: case 0x18:                           /* 16 MPEG, 16F */
+        return 2;
+    case 0x04: case 0x08: case 0x09: case 0x0D:     /* Y16X16, 11/11/10, 2/10/10/10 */
+    case 0x13: case 0x17: case 0x19: case 0x1B:     /* AVYU, 16_16 MPEG, 16F x2, 32F */
+        return 4;
+    case 0x0E: case 0x1A: case 0x1C:                /* W16Z16Y16X16, 16F x4, 32F x2 */
+        return 8;
+    case 0x1D:                                      /* 32F x4 */
+        return 16;
+    default:
+        return 0;
+    }
+}
+
+uint32_t r300_cb_view(uint32_t cf, uint32_t of, uint32_t *bpp)
+{
+    of &= 0x1F;
+    switch (cf & 0xF) {
+    case 9:                                         /* I8 */
+        *bpp = 1;
+        return R300_RTV_R8U;
+    case 3: case 4: case 13: case 15:               /* 1555, 565, UV88, 4444 */
+        *bpp = 2;
+        return R300_RTV_R16U;
+    case 6:                                         /* ARGB8888 */
+        /* C4_10 (Tiger's desktop) still stores 8 bits a channel here:
+         * the buffer format decides the layout, and 10-bit storage is
+         * the R5xx ARGB2101010.  Other OUT_FMTs are Mesa's aliases
+         * (RG16, R32F, RG16F) of a 32-bit pixel. */
+        *bpp = 4;
+        return of <= 2 ? R300_RTV_RGBA8 : R300_RTV_R32U;
+    case 10:                                        /* ARGB16161616 */
+        *bpp = 8;
+        return R300_RTV_RG32U;
+    case 7:                                         /* ARGB32323232 */
+        *bpp = 16;
+        return R300_RTV_RGBA32U;
+    default:                                        /* reserved, YUV 4:2:2 */
+        *bpp = 4;
+        return R300_RTV_NONE;
+    }
+}
+
+/* TX_FORMAT1.TXFORMAT 16F..32F x4: the card cannot filter them. */
+static bool tex_is_float(uint32_t fmt)
+{
+    return fmt >= 0x18 && fmt <= 0x1D;
+}
 
 float r300_float24(uint32_t v)
 {
@@ -180,11 +241,53 @@ static void us_mask(char *buf, unsigned m)
 
 /* ---- instructions --------------------------------------------------- */
 
-static bool us_emit_tex(R300Sb *sb, uint32_t inst, uint32_t *units_used,
-                        const char **err)
+/* The r300_texu() call for a unit whose texels the shader decodes. */
+static void us_texu_args(char *buf, size_t len, const R300State *st,
+                         unsigned unit)
+{
+    uint32_t f1 = r300_reg(st, TX_FORMAT1_0 + 4 * unit);
+    uint32_t f0 = r300_reg(st, TX_FILTER0_0 + 4 * unit);
+    uint32_t fmt = f1 & 0x1F;
+    /* filt: bit 0 magnify linear, bit 1 minify linear, S wrap 6:4,
+     * T wrap 10:8 (TX_FILTER0 CLAMP_S/CLAMP_T) */
+    uint32_t filt = ((f0 & 7) << 4) | (((f0 >> 3) & 7) << 8);
+
+    if (!tex_is_float(fmt)) {
+        filt |= (((f0 >> 9) & 3) != 1 ? 1 : 0) | (((f0 >> 11) & 3) != 1 ? 2 : 0);
+    }
+    snprintf(buf, len, "0x%xu, %uu, %uu, 0x%xu, %s", fmt, r300_tex_raw_bpp(fmt),
+             r300_reg(st, TX_OFFSET_0 + 4 * unit) & 3, filt,
+             (f1 >> 22) & 1 ? "true" : "false");
+}
+
+static bool unit_is_raw(const R300State *st, unsigned unit)
+{
+    return (r300_reg(st, TX_ENABLE) >> unit) & 1 &&
+           r300_tex_raw_bpp(r300_reg(st, TX_FORMAT1_0 + 4 * unit));
+}
+
+static bool us_emit_tex(R300Sb *sb, const R300State *st, uint32_t inst,
+                        uint32_t *units_used, const char **err)
 {
     unsigned src = inst & 0x1F, dst = (inst >> 6) & 0x1F;
     unsigned unit = (inst >> 11) & 0xF, op = (inst >> 15) & 7;
+
+    if (unit_is_raw(st, unit) && op != 0 && op != 2) {
+        char a[96];
+        us_texu_args(a, sizeof(a), st, unit);
+        if (op == 3) {
+            r300_sb_printf(sb, "    t[%u] = r300_texu(tex%u, u, %u, t[%u].xy / t[%u].w, %s);\n",
+                           dst, unit, unit, src, src, a);
+        } else if (op == 1 || op == 4) {
+            r300_sb_printf(sb, "    t[%u] = r300_texu(tex%u, u, %u, t[%u].xy, %s);\n",
+                           dst, unit, unit, src, a);
+        } else {
+            *err = "unknown texture instruction";
+            return false;
+        }
+        *units_used |= 1u << unit;
+        return true;
+    }
 
     switch (op) {
     case 0:         /* NOP */
@@ -325,7 +428,7 @@ static const char us_prelude[] =
 "    uint4 tex_info[16];\n"
 "    uint cblend, ablend, chanmask, alpha_func;\n"
 "    uint4 out_sel;\n"
-"    uint rt_swap32; uint clip_rule; uint pad1, pad2;\n"
+"    uint rt_swap32; uint clip_rule; uint rt_endian, pad1;\n"
 "    int4 cliprect[4];\n"
 "    uint4 zinfo;\n"
 "    uint zpass_count, pad3, pad4, pad5;\n"
@@ -359,6 +462,138 @@ static const char us_prelude[] =
 "    float4 raw = tx.sample(sm, uv, metal::bias(bias));\n"
 "    uint k = u.tex_info[unit].y;\n"
 "    float4 hw = k == 1 ? raw.abgr : k == 2 ? raw.grba : raw;\n"
+"    uint4 s = u.tex_swz[unit];\n"
+"    return float4(r300_swz1(hw, s.x), r300_swz1(hw, s.y),\n"
+"                  r300_swz1(hw, s.z), r300_swz1(hw, s.w));\n"
+"}\n"
+"\n"
+"/* Texels the shader decodes itself (r300_tex_raw_bpp): a uint view of\n"
+"   guest memory, 4-byte elements for texels of up to 4 bytes.  The card's\n"
+"   dword is the TXO_ENDIAN swap of the big-endian dword in VRAM. */\n"
+"static uint r300_bswap32(uint v)\n"
+"{\n"
+"    return (v >> 24) | ((v >> 8) & 0xff00u) | ((v << 8) & 0xff0000u) | (v << 24);\n"
+"}\n"
+"static uint r300_cswap(uint v, uint e)\n"
+"{\n"
+"    switch (e & 3u) {\n"
+"    case 1: return ((v & 0x00ff00ffu) << 8) | ((v >> 8) & 0x00ff00ffu);\n"
+"    case 2: return r300_bswap32(v);\n"
+"    case 3: return (v << 16) | (v >> 16);\n"
+"    default: return v;\n"
+"    }\n"
+"}\n"
+"static float r300_h16(uint v) { return float(as_type<half>(ushort(v & 0xffffu))); }\n"
+"static float r300_u8(uint v, uint sh) { return float((v >> sh) & 0xffu) / 255.0; }\n"
+"static float r300_s8(uint v) { return max(float(int(v << 24) >> 24) / 127.0, -1.0); }\n"
+"static float r300_s16(uint v) { return max(float(int(v << 16) >> 16) / 32767.0, -1.0); }\n"
+"static float r300_un(uint v, uint sh, uint bits)\n"
+"{\n"
+"    uint m = (1u << bits) - 1u;\n"
+"    return float((v >> sh) & m) / float(m);\n"
+"}\n"
+"/* YUV_TO_RGB: BT.601 video range; the result is B, G, R in X, Y, Z (the\n"
+"   raw texel has Cr, Y, Cb there, as Mesa's swizzles for UYVY imply). */\n"
+"static float4 r300_yuv(float4 c)\n"
+"{\n"
+"    float y = 1.164 * (c.y - 16.0 / 255.0), cb = c.z - 128.0 / 255.0, cr = c.x - 128.0 / 255.0;\n"
+"    return float4(saturate(y + 2.018 * cb), saturate(y - 0.813 * cr - 0.391 * cb),\n"
+"                  saturate(y + 1.596 * cr), c.w);\n"
+"}\n"
+"static float4 r300_tdecode(uint fmt, uint4 w, uint odd, bool yuv)\n"
+"{\n"
+"    float4 c = float4(0.0, 0.0, 0.0, 1.0);\n"
+"    uint v = w.x;\n"
+"    switch (fmt) {\n"
+"    case 0x02: c.x = r300_un(v, 0, 4); c.y = r300_un(v, 4, 4); break;\n"
+"    case 0x04: c.x = r300_un(v, 0, 16); c.y = r300_un(v, 16, 16); break;\n"
+"    case 0x05: c.x = r300_un(v, 0, 2); c.y = r300_un(v, 2, 3); c.z = r300_un(v, 5, 3); break;\n"
+"    case 0x08: c.x = r300_un(v, 0, 10); c.y = r300_un(v, 10, 11); c.z = r300_un(v, 21, 11); break;\n"
+"    case 0x09: c.x = r300_un(v, 0, 11); c.y = r300_un(v, 11, 11); c.z = r300_un(v, 22, 10); break;\n"
+"    case 0x0D: c = float4(r300_un(v, 0, 10), r300_un(v, 10, 10), r300_un(v, 20, 10),\n"
+"                          r300_un(v, 30, 2)); break;\n"
+"    case 0x0E: c = float4(r300_un(w.x, 0, 16), r300_un(w.x, 16, 16),\n"
+"                          r300_un(w.y, 0, 16), r300_un(w.y, 16, 16)); break;\n"
+"    case 0x12: c.x = r300_s8(v); c.y = r300_s8(v >> 8);\n"
+"               c.z = sqrt(saturate(1.0 - c.x * c.x - c.y * c.y)); break;\n"
+"    case 0x13: c = float4(r300_u8(v, 16), r300_u8(v, 8), r300_u8(v, 0), r300_u8(v, 24)); break;\n"
+"    /* 4:2:2, the dword of a pixel pair: VYUY = Y0 U Y1 V, YVYU = U Y0 V Y1\n"
+"       from the low byte up (Mesa: YUYV and UYVY) */\n"
+"    case 0x14: c = float4(r300_u8(v, 24), r300_u8(v, odd ? 16 : 0), r300_u8(v, 8), 1.0); break;\n"
+"    case 0x15: c = float4(r300_u8(v, 16), r300_u8(v, odd ? 24 : 8), r300_u8(v, 0), 1.0); break;\n"
+"    case 0x16: c.x = r300_s16(v); break;\n"
+"    case 0x17: c.x = r300_s16(v); c.y = r300_s16(v >> 16); break;\n"
+"    case 0x18: c.x = r300_h16(v); break;\n"
+"    case 0x19: c.x = r300_h16(v); c.y = r300_h16(v >> 16); break;\n"
+"    case 0x1A: c = float4(r300_h16(w.x), r300_h16(w.x >> 16), r300_h16(w.y), r300_h16(w.y >> 16)); break;\n"
+"    case 0x1B: c.x = as_type<float>(v); break;\n"
+"    case 0x1C: c.x = as_type<float>(w.x); c.y = as_type<float>(w.y); break;\n"
+"    case 0x1D: c = as_type<float4>(w); break;\n"
+"    default: break;\n"
+"    }\n"
+"    return yuv && (fmt == 0x13 || fmt == 0x14 || fmt == 0x15) ? r300_yuv(c) : c;\n"
+"}\n"
+"/* TX_FILTER0 CLAMP_*: wrap, mirror, clamp to last, mirror once to last,\n"
+"   clamp to half-border (as last), mirror once to half-border (as\n"
+"   last), clamp to border, mirror once to border (border colour 0). */\n"
+"static int r300_wrap1(int p, int n, uint m, thread bool &border)\n"
+"{\n"
+"    switch (m & 7u) {\n"
+"    case 0: return ((p % n) + n) % n;\n"
+"    case 1: { int q = ((p % (2 * n)) + 2 * n) % (2 * n); return q < n ? q : 2 * n - 1 - q; }\n"
+"    case 3: case 5: case 7: {\n"
+"        int q = p < 0 ? -1 - p : p;\n"
+"        if (q >= n && (m & 7u) == 7u) border = true;\n"
+"        return min(q, n - 1);\n"
+"    }\n"
+"    case 6: if (p < 0 || p >= n) border = true; return clamp(p, 0, n - 1);\n"
+"    default: return clamp(p, 0, n - 1);\n"
+"    }\n"
+"}\n"
+"static float4 r300_texel(texture2d<uint> tx, uint fmt, uint bpp, uint e,\n"
+"                         uint filt, int2 p, int2 sz, bool yuv)\n"
+"{\n"
+"    bool border = false;\n"
+"    p.x = r300_wrap1(p.x, sz.x, filt >> 4, border);\n"
+"    p.y = r300_wrap1(p.y, sz.y, filt >> 8, border);\n"
+"    if (border) return float4(0.0);\n"
+"    uint4 w;\n"
+"    uint odd = 0u;\n"
+"    if (bpp <= 4u) {\n"
+"        uint x = uint(p.x);\n"
+"        if (fmt == 0x14u || fmt == 0x15u) { odd = x & 1u; x &= ~1u; }\n"
+"        uint off = x * bpp;\n"
+"        uint d = r300_cswap(r300_bswap32(tx.read(uint2(off >> 2, uint(p.y))).x), e);\n"
+"        w = uint4(d >> ((off & 3u) * 8u), 0u, 0u, 0u);\n"
+"    } else {\n"
+"        uint4 r = tx.read(uint2(p));\n"
+"        w = uint4(r300_cswap(r300_bswap32(r.x), e), r300_cswap(r300_bswap32(r.y), e),\n"
+"                  r300_cswap(r300_bswap32(r.z), e), r300_cswap(r300_bswap32(r.w), e));\n"
+"    }\n"
+"    return r300_tdecode(fmt, w, odd, yuv);\n"
+"}\n"
+"/* filt: bit 0 magnify linear, bit 1 minify linear, wrap S 6:4, T 10:8 */\n"
+"static float4 r300_texu(texture2d<uint> tx, constant R300FSUniforms &u, uint unit,\n"
+"                        float2 uv, uint fmt, uint bpp, uint e, uint filt, bool yuv)\n"
+"{\n"
+"    if (u.tex_info[unit].x == 0) return float4(0.0, 0.0, 0.0, 1.0);\n"
+"    int2 sz = int2(max(u.tex_info[unit].zw, uint2(1u)));\n"
+"    float2 st = uv * float2(sz);\n"
+"    float2 fw = fwidth(st);\n"
+"    bool lin = (filt & (max(fw.x, fw.y) > 1.0 ? 2u : 1u)) != 0u;\n"
+"    float4 hw;\n"
+"    if (!lin) {\n"
+"        hw = r300_texel(tx, fmt, bpp, e, filt, int2(floor(st)), sz, yuv);\n"
+"    } else {\n"
+"        float2 f = st - 0.5;\n"
+"        int2 p = int2(floor(f));\n"
+"        float2 a = f - floor(f);\n"
+"        float4 c00 = r300_texel(tx, fmt, bpp, e, filt, p, sz, yuv);\n"
+"        float4 c10 = r300_texel(tx, fmt, bpp, e, filt, p + int2(1, 0), sz, yuv);\n"
+"        float4 c01 = r300_texel(tx, fmt, bpp, e, filt, p + int2(0, 1), sz, yuv);\n"
+"        float4 c11 = r300_texel(tx, fmt, bpp, e, filt, p + int2(1, 1), sz, yuv);\n"
+"        hw = mix(mix(c00, c10, a.x), mix(c01, c11, a.x), a.y);\n"
+"    }\n"
 "    uint4 s = u.tex_swz[unit];\n"
 "    return float4(r300_swz1(hw, s.x), r300_swz1(hw, s.y),\n"
 "                  r300_swz1(hw, s.z), r300_swz1(hw, s.w));\n"
@@ -427,7 +662,43 @@ static const char us_prelude[] =
 "    }\n"
 "    return c;\n"
 "}\n"
+"/* Formats other than ARGB8888/C4_8 (r300_cb_view): the colour buffer is\n"
+"   a uint view of the pixel's dwords (or halfword, byte) as they lie; the\n"
+"   card wrote the COLOR_ENDIAN swap of its little-endian word(s), with\n"
+"   component C0 in the low bits (AMD R5xx guide, section 3.3 formats). */\n"
+"static float4 r300_to_hw(float4 c, constant R300FSUniforms &u)\n"
+"{\n"
+"    return float4(r300_chan(c, u.out_sel.x), r300_chan(c, u.out_sel.y),\n"
+"                  r300_chan(c, u.out_sel.z), r300_chan(c, u.out_sel.w));\n"
+"}\n"
+"static float4 r300_from_hw(float4 hw, constant R300FSUniforms &u)\n"
+"{\n"
+"    float4 c = float4(0.0);\n"
+"    for (uint n = 0; n < 4; n++) {\n"
+"        uint s = u.out_sel[n];\n"
+"        if (s == 0) c.a = hw[n]; else if (s == 1) c.r = hw[n];\n"
+"        else if (s == 2) c.g = hw[n]; else c.b = hw[n];\n"
+"    }\n"
+"    return c;\n"
+"}\n"
+"static float r300_upk(uint v, uint sh, uint bits, bool sgn)\n"
+"{\n"
+"    uint m = (1u << bits) - 1u, x = (v >> sh) & m;\n"
+"    if (!sgn) return float(x) / float(m);\n"
+"    int sx = int(x << (32u - bits)) >> (32u - bits);\n"
+"    return max(float(sx) / float(m >> 1), -1.0);\n"
+"}\n"
+"static uint r300_pk(float f, uint sh, uint bits, bool sgn)\n"
+"{\n"
+"    uint m = (1u << bits) - 1u;\n"
+"    if (!sgn) return uint(rint(saturate(f) * float(m))) << sh;\n"
+"    return (uint(int(rint(clamp(f, -1.0, 1.0) * float(m >> 1)))) & m) << sh;\n"
+"}\n"
+"static uint r300_ph16(float f) { return uint(as_type<ushort>(half(f))); }\n"
 "\n"
+"";
+
+static const char us_prelude_z[] =
 "/* Depth/stencil (ZB_*).  Attachment 1 is the guest buffer as uint words\n"
 "   as they lie in memory; DEPTHENDIAN says how the card swapped them.\n"
 "   Z24S8 words hold Z in bits 31:8 and stencil in 7:0. */\n"
@@ -458,12 +729,12 @@ static const char us_prelude[] =
 "    case 7: return (s - 1u) & 0xffu;    default: return s;\n"
 "    }\n"
 "}\n"
-"struct R300ZOut { float4 c [[color(0)]]; uint z [[color(1)]]; };\n"
+"struct R300ZOut { r300_cb_t c [[color(0)]]; uint z [[color(1)]]; };\n"
 "/* ZB_CNTL: 0 stencil, 1 Z test, 2 Z write, 4 separate back-face stencil.\n"
 "   ZB_ZSTENCILCNTL: Z func 2:0; front stencil func/sfail/zpass/zfail at\n"
 "   3, 6, 9, 12; back at 15, 18, 21, 24.  STENCILREFMASK: ref, mask,\n"
 "   write mask.  Failing fragments leave the colour buffer as it was. */\n"
-"static R300ZOut r300_ztest(float4 col, float4 fb, uint zb, float fz, bool front,\n"
+"static R300ZOut r300_ztest(r300_cb_t col, r300_cb_t fb, uint zb, float fz, bool front,\n"
 "                           constant R300FSUniforms &u, device atomic_uint *zp)\n"
 "{\n"
 "    uint cntl = u.zinfo.x, zs = u.zinfo.y, rm = u.zinfo.z, fmt = u.zinfo.w;\n"
@@ -510,6 +781,163 @@ static const char us_prelude[] =
 "}\n"
 "\n";
 
+/*
+ * The colour buffer's pixel type and its conversions to and from the
+ * blender's colour (r300_cb_view).  Everything is folded into the text.
+ */
+static void us_emit_cb(R300Sb *sb, const R300State *st)
+{
+    uint32_t pitch = r300_reg(st, RB3D_COLORPITCH0);
+    uint32_t cf = (pitch >> 21) & 0xF, e = (pitch >> 19) & 3;
+    uint32_t ofr = r300_reg(st, US_OUT_FMT_0), of = ofr & 0x1F;
+    uint32_t bpp, view = r300_cb_view(cf, of, &bpp);
+    bool sg[4];
+    const char *type;
+    /* The R300 blends and clamps only its 8-bit-per-channel formats. */
+    bool fp = of >= 16 && of <= 21;
+    bool blend = view == R300_RTV_RGBA8 || cf == 3 || cf == 4 || cf == 15 ||
+                 cf == 9 || (cf == 13 && of == 0);
+
+    for (int n = 0; n < 4; n++) {
+        sg[n] = (ofr >> (16 + n)) & 1;
+    }
+    if (view == R300_RTV_RGBA8 || view == R300_RTV_NONE) {
+        r300_sb_printf(sb,
+            "typedef float4 r300_cb_t;\n"
+            "#define R300_CB_CLAMP 1\n#define R300_CB_BLEND 1\n"
+            "static float4 r300_cb_unpack(float4 fb, constant R300FSUniforms &u) { return r300_unpack(fb, u); }\n"
+            "static float4 r300_cb_pack(float4 c, constant R300FSUniforms &u) { return r300_pack(c, u); }\n\n");
+        return;
+    }
+    type = view == R300_RTV_RG32U ? "uint2" : view == R300_RTV_RGBA32U ? "uint4" : "uint";
+    r300_sb_printf(sb, "// colour buffer: format %u, US_OUT_FMT %08x, endian %u, %u bytes\n"
+                   "typedef %s r300_cb_t;\n#define R300_CB_CLAMP %d\n#define R300_CB_BLEND %d\n",
+                   cf, ofr, e, bpp, type, !fp, blend);
+
+    /* The card's word(s): swaps are their own inverse. */
+    char swb[200];
+    if (bpp == 1) {
+        snprintf(swb, sizeof(swb), "uint w = fb;");
+    } else if (bpp == 2) {
+        snprintf(swb, sizeof(swb), "%s", e == 1 || e == 2 ?
+                 "uint w = ((fb >> 8) & 0xffu) | ((fb & 0xffu) << 8);" : "uint w = fb & 0xffffu;");
+    } else if (bpp == 4) {
+        snprintf(swb, sizeof(swb), "uint w = r300_cswap(fb, %uu);", e);
+    } else if (bpp == 8) {
+        snprintf(swb, sizeof(swb), "uint2 w = uint2(r300_cswap(fb.x, %uu), r300_cswap(fb.y, %uu));", e, e);
+    } else {
+        snprintf(swb, sizeof(swb), "uint4 w = uint4(r300_cswap(fb.x, %uu), r300_cswap(fb.y, %uu), "
+                 "r300_cswap(fb.z, %uu), r300_cswap(fb.w, %uu));", e, e, e, e);
+    }
+
+    const char *un = "", *pk = "";
+    char ub[640], pb[640];
+#define S(n) (sg[n] ? "true" : "false")
+    switch (cf) {
+    case 9:     /* I8 stores C2 (Mesa r300_translate_out_fmt) */
+        snprintf(ub, sizeof(ub), "h.z = r300_upk(w, 0, 8, %s);", S(2));
+        snprintf(pb, sizeof(pb), "uint w = r300_pk(h.z, 0, 8, %s);", S(2));
+        break;
+    case 4:     /* C_5_6_5 */
+        snprintf(ub, sizeof(ub), "h = float4(r300_upk(w, 0, 5, false), r300_upk(w, 5, 6, false), r300_upk(w, 11, 5, false), 1.0);");
+        snprintf(pb, sizeof(pb), "uint w = r300_pk(h.x, 0, 5, false) | r300_pk(h.y, 5, 6, false) | r300_pk(h.z, 11, 5, false);");
+        break;
+    case 3:     /* C_1_5_5_5 */
+        snprintf(ub, sizeof(ub), "h = float4(r300_upk(w, 0, 5, false), r300_upk(w, 5, 5, false), r300_upk(w, 10, 5, false), r300_upk(w, 15, 1, false));");
+        snprintf(pb, sizeof(pb), "uint w = r300_pk(h.x, 0, 5, false) | r300_pk(h.y, 5, 5, false) | r300_pk(h.z, 10, 5, false) | r300_pk(h.w, 15, 1, false);");
+        break;
+    case 15:    /* C4_4 */
+        snprintf(ub, sizeof(ub), "h = float4(r300_upk(w, 0, 4, false), r300_upk(w, 4, 4, false), r300_upk(w, 8, 4, false), r300_upk(w, 12, 4, false));");
+        snprintf(pb, sizeof(pb), "uint w = r300_pk(h.x, 0, 4, false) | r300_pk(h.y, 4, 4, false) | r300_pk(h.z, 8, 4, false) | r300_pk(h.w, 12, 4, false);");
+        break;
+    case 13:    /* UV88: C2 low byte, C0 high (Mesa); C_16 / C_16_FP: C0 */
+        if (of == 3) {
+            snprintf(ub, sizeof(ub), "h.x = r300_upk(w, 0, 16, %s);", S(0));
+            snprintf(pb, sizeof(pb), "uint w = r300_pk(h.x, 0, 16, %s);", S(0));
+        } else if (of == 16) {
+            snprintf(ub, sizeof(ub), "h.x = r300_h16(w);");
+            snprintf(pb, sizeof(pb), "uint w = r300_ph16(h.x);");
+        } else {
+            snprintf(ub, sizeof(ub), "h.z = r300_upk(w, 0, 8, %s); h.x = r300_upk(w, 8, 8, %s);", S(2), S(0));
+            snprintf(pb, sizeof(pb), "uint w = r300_pk(h.z, 0, 8, %s) | r300_pk(h.x, 8, 8, %s);", S(2), S(0));
+        }
+        break;
+    case 6:     /* 32-bit pixels other than C4_8 */
+        switch (of) {
+        case 3:
+            snprintf(ub, sizeof(ub), "h.x = r300_upk(w, 0, 16, %s);", S(0));
+            snprintf(pb, sizeof(pb), "uint w = r300_pk(h.x, 0, 16, %s);", S(0));
+            break;
+        case 16:
+            snprintf(ub, sizeof(ub), "h.x = r300_h16(w);");
+            snprintf(pb, sizeof(pb), "uint w = r300_ph16(h.x);");
+            break;
+        case 17:
+            snprintf(ub, sizeof(ub), "h.x = r300_h16(w); h.y = r300_h16(w >> 16);");
+            snprintf(pb, sizeof(pb), "uint w = r300_ph16(h.x) | (r300_ph16(h.y) << 16);");
+            break;
+        case 19:
+            snprintf(ub, sizeof(ub), "h.x = as_type<float>(w);");
+            snprintf(pb, sizeof(pb), "uint w = as_type<uint>(h.x);");
+            break;
+        default:    /* C2_16 */
+            snprintf(ub, sizeof(ub), "h.x = r300_upk(w, 0, 16, %s); h.y = r300_upk(w, 16, 16, %s);", S(0), S(1));
+            snprintf(pb, sizeof(pb), "uint w = r300_pk(h.x, 0, 16, %s) | r300_pk(h.y, 16, 16, %s);", S(0), S(1));
+            break;
+        }
+        break;
+    case 10:    /* 64-bit pixels */
+        if (of == 18) {
+            snprintf(ub, sizeof(ub), "h = float4(r300_h16(w.x), r300_h16(w.x >> 16), r300_h16(w.y), r300_h16(w.y >> 16));");
+            snprintf(pb, sizeof(pb), "uint2 w = uint2(r300_ph16(h.x) | (r300_ph16(h.y) << 16), r300_ph16(h.z) | (r300_ph16(h.w) << 16));");
+        } else if (of == 20) {
+            snprintf(ub, sizeof(ub), "h.x = as_type<float>(w.x); h.y = as_type<float>(w.y);");
+            snprintf(pb, sizeof(pb), "uint2 w = uint2(as_type<uint>(h.x), as_type<uint>(h.y));");
+        } else {    /* C4_16 */
+            snprintf(ub, sizeof(ub), "h = float4(r300_upk(w.x, 0, 16, %s), r300_upk(w.x, 16, 16, %s), r300_upk(w.y, 0, 16, %s), r300_upk(w.y, 16, 16, %s));",
+                     S(0), S(1), S(2), S(3));
+            snprintf(pb, sizeof(pb), "uint2 w = uint2(r300_pk(h.x, 0, 16, %s) | r300_pk(h.y, 16, 16, %s), r300_pk(h.z, 0, 16, %s) | r300_pk(h.w, 16, 16, %s));",
+                     S(0), S(1), S(2), S(3));
+        }
+        break;
+    default:    /* 7: 128-bit pixels, C4_32_FP (C2_32_FP fills two) */
+        if (of == 20) {
+            snprintf(ub, sizeof(ub), "h.x = as_type<float>(w.x); h.y = as_type<float>(w.y);");
+            snprintf(pb, sizeof(pb), "uint4 w = uint4(as_type<uint>(h.x), as_type<uint>(h.y), 0u, 0u);");
+        } else {
+            snprintf(ub, sizeof(ub), "h = as_type<float4>(w);");
+            snprintf(pb, sizeof(pb), "uint4 w = as_type<uint4>(h);");
+        }
+        break;
+    }
+#undef S
+    un = ub;
+    pk = pb;
+
+    /* Pack: the word(s), then the same swap back. */
+    char back[200];
+    if (bpp == 1) {
+        snprintf(back, sizeof(back), "return w & 0xffu;");
+    } else if (bpp == 2) {
+        snprintf(back, sizeof(back), "%s", e == 1 || e == 2 ?
+                 "return ((w >> 8) & 0xffu) | ((w & 0xffu) << 8);" : "return w & 0xffffu;");
+    } else if (bpp == 4) {
+        snprintf(back, sizeof(back), "return r300_cswap(w, %uu);", e);
+    } else if (bpp == 8) {
+        snprintf(back, sizeof(back), "return uint2(r300_cswap(w.x, %uu), r300_cswap(w.y, %uu));", e, e);
+    } else {
+        snprintf(back, sizeof(back), "return uint4(r300_cswap(w.x, %uu), r300_cswap(w.y, %uu), "
+                 "r300_cswap(w.z, %uu), r300_cswap(w.w, %uu));", e, e, e, e);
+    }
+    r300_sb_printf(sb,
+        "static float4 r300_cb_unpack(r300_cb_t fb, constant R300FSUniforms &u)\n"
+        "{\n    %s\n    float4 h = float4(0.0, 0.0, 0.0, 1.0);\n    %s\n"
+        "    return r300_from_hw(h, u);\n}\n"
+        "static r300_cb_t r300_cb_pack(float4 c, constant R300FSUniforms &u)\n"
+        "{\n    float4 h = r300_to_hw(c, u);\n    %s\n    %s\n}\n\n",
+        swb, un, pk, back);
+}
+
 char *r300_us_to_msl(const R300State *st, const R300FSDesc *desc,
                      const char **err)
 {
@@ -532,7 +960,7 @@ char *r300_us_to_msl(const R300State *st, const R300FSDesc *desc,
         r300_sb_printf(&body, "    // node %u: tex %u+%u alu %u+%u\n", i,
                        nd->tex_start, nd->tex_count, nd->alu_start, nd->alu_count);
         for (unsigned k = 0; k < nd->tex_count; k++) {
-            if (!us_emit_tex(&body, r300_reg(st, US_TEX_INST_0 +
+            if (!us_emit_tex(&body, st, r300_reg(st, US_TEX_INST_0 +
                                                  4 * (nd->tex_start + k)),
                              &units, err)) {
                 r300_sb_free(&body);
@@ -546,6 +974,8 @@ char *r300_us_to_msl(const R300State *st, const R300FSDesc *desc,
 
     r300_sb_init(&sb);
     r300_sb_printf(&sb, "%s", us_prelude);
+    us_emit_cb(&sb, st);
+    r300_sb_printf(&sb, "%s", us_prelude_z);
 
     /* Texture parameters of the shading function and the arguments that
      * pass them on (entry points bind unit k at texture/sampler k). */
@@ -555,17 +985,18 @@ char *r300_us_to_msl(const R300State *st, const R300FSDesc *desc,
     r300_sb_init(&tent);
     for (unsigned k = 0; k < R300_NUM_TEX_UNITS; k++) {
         if (units & (1u << k)) {
-            r300_sb_printf(&tparm, ", texture2d<float> tex%u, sampler smp%u", k, k);
+            const char *tt = unit_is_raw(st, k) ? "uint" : "float";
+            r300_sb_printf(&tparm, ", texture2d<%s> tex%u, sampler smp%u", tt, k, k);
             r300_sb_printf(&targ, ", tex%u, smp%u", k, k);
             r300_sb_printf(&tent,
-                "                        texture2d<float> tex%u [[texture(%u)]],\n"
+                "                        texture2d<%s> tex%u [[texture(%u)]],\n"
                 "                        sampler smp%u [[sampler(%u)]],\n",
-                k, k, k, k);
+                tt, k, k, k, k);
         }
     }
     r300_sb_printf(&sb,
-        "static float4 r300_shade(R300VOut in, constant R300FSUniforms &u,\n"
-        "                         float4 fb%s)\n"
+        "static r300_cb_t r300_shade(R300VOut in, constant R300FSUniforms &u,\n"
+        "                            r300_cb_t fb%s)\n"
         "{\n"
         "    /* SC_CLIP_RULE: a 16-entry truth table over which of the four\n"
         "       clip rectangles contain the pixel. */\n"
@@ -591,10 +1022,10 @@ char *r300_us_to_msl(const R300State *st, const R300FSDesc *desc,
     r300_sb_printf(&sb, "    float4 oc = float4(0.0, 0.0, 0.0, 1.0);\n%s", body.buf);
     r300_sb_printf(&sb,
         "    if (!r300_alpha_pass(u.alpha_func, saturate(oc.a))) discard_fragment();\n"
-        "    float4 d = r300_unpack(fb, u);\n"
+        "    float4 d = r300_cb_unpack(fb, u);\n"
         "    float4 s = oc;\n"
-        "    float4 res = saturate(s);\n"
-        "    if (u.cblend & 1) {\n"
+        "    float4 res = R300_CB_CLAMP ? saturate(s) : s;\n"
+        "    if (R300_CB_BLEND && (u.cblend & 1)) {\n"
         "        uint ab = (u.cblend & 2) ? u.ablend : u.cblend;\n"
         "        uint cs = (u.cblend >> 16) & 63, cd = (u.cblend >> 24) & 63;\n"
         "        uint as_ = (ab >> 16) & 63, ad = (ab >> 24) & 63;\n"
@@ -608,16 +1039,16 @@ char *r300_us_to_msl(const R300State *st, const R300FSDesc *desc,
         "    uint cm = u.chanmask;\n"
         "    res = float4((cm & 4) ? res.r : d.r, (cm & 2) ? res.g : d.g,\n"
         "                 (cm & 1) ? res.b : d.b, (cm & 8) ? res.a : d.a);\n"
-        "    return r300_pack(res, u);\n"
+        "    return r300_cb_pack(res, u);\n"
         "}\n"
         "\n"
-        "fragment float4 r300_fs(R300VOut in [[stage_in]],\n"
+        "fragment r300_cb_t r300_fs(R300VOut in [[stage_in]],\n"
         "                        constant R300FSUniforms &u [[buffer(0)]],\n"
         "                        device atomic_uint *zp [[buffer(1)]],\n"
         "%s"
-        "                        float4 fb [[color(0)]])\n"
+        "                        r300_cb_t fb [[color(0)]])\n"
         "{\n"
-        "    float4 c = r300_shade(in, u, fb%s);\n"
+        "    r300_cb_t c = r300_shade(in, u, fb%s);\n"
         "    if (u.zpass_count != 0u) atomic_fetch_add_explicit(zp, 1u, memory_order_relaxed);\n"
         "    return c;\n"
         "}\n"
@@ -626,10 +1057,10 @@ char *r300_us_to_msl(const R300State *st, const R300FSDesc *desc,
         "                            constant R300FSUniforms &u [[buffer(0)]],\n"
         "                            device atomic_uint *zp [[buffer(1)]],\n"
         "%s"
-        "                            float4 fb [[color(0)]], uint zb [[color(1)]],\n"
+        "                            r300_cb_t fb [[color(0)]], uint zb [[color(1)]],\n"
         "                            bool front [[front_facing]])\n"
         "{\n"
-        "    float4 c = r300_shade(in, u, fb%s);\n"
+        "    r300_cb_t c = r300_shade(in, u, fb%s);\n"
         "    return r300_ztest(c, fb, zb, in.pos.z, front, u, zp);\n"
         "}\n",
         tent.buf ? tent.buf : "", targ.buf ? targ.buf : "",

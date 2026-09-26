@@ -43,10 +43,12 @@ typedef struct R300FSUniforms {
     float consts[R300_US_NUM_CONSTS][4];
     float blend_color[4];
     uint32_t tex_swz[R300_NUM_TEX_UNITS][4];  /* R,G,B,A selects: 0-3 XYZW, 4 zero, 5 one */
-    uint32_t tex_info[R300_NUM_TEX_UNITS][4]; /* x: 1 bound, y: raw->XYZW (0 as is, 1 .abgr, 2 .grba) */
+    uint32_t tex_info[R300_NUM_TEX_UNITS][4]; /* x: 1 bound, y: raw->XYZW (0 as is, 1 .abgr, 2 .grba),
+                                                 z, w: width, height in texels */
     uint32_t cblend, ablend, chanmask, alpha_func;
     uint32_t out_sel[4];                      /* US_OUT_FMT_0 C0..C3 (0 A, 1 R, 2 G, 3 B) */
-    uint32_t rt_swap32, clip_rule, pad[2];    /* stored bytes are C3,C2,C1,C0 */
+    uint32_t rt_swap32, clip_rule;            /* stored bytes are C3,C2,C1,C0 */
+    uint32_t rt_endian, pad;                  /* RB3D_COLORPITCH0.COLOR_ENDIAN */
     int32_t cliprect[4][4];                   /* SC_CLIPRECT x0, y0, x1, y1 (inclusive) */
     /* Depth/stencil: ZB_CNTL, ZB_ZSTENCILCNTL, ZB_STENCILREFMASK, and
      * R300_ZFMT_* (layout of the buffer bound as colour attachment 1). */
@@ -72,6 +74,35 @@ typedef struct R300FSDesc {
  */
 char *r300_us_to_msl(const R300State *st, const R300FSDesc *desc,
                      const char **err);
+
+/*
+ * Texture formats (TX_FORMAT1.TXFORMAT) the shader decodes itself from the
+ * texel words, read through a uint view of guest memory: returns the texel
+ * size in bytes, or 0 for the formats sampled through a float texture
+ * (X8, X16, Y8X8, the 16-bit colour formats, W8Z8Y8X8, DXT) and for ones
+ * not implemented.  The uint view's element is 4 bytes for texels of up
+ * to 4 bytes, else the texel.
+ *
+ * The card's view of a texel dword follows the rule the 32-bit formats
+ * established: dword = TXO_ENDIAN swap of the big-endian dword in VRAM
+ * (VRAM holds the guest CPU's side of its byte-swapping aperture), and
+ * the texel at the lowest address is in the low bits.  GART copies are
+ * byte-reversed per dword on upload so the same rule holds.
+ */
+uint32_t r300_tex_raw_bpp(uint32_t txformat);
+
+/* Colour buffer layout, from RB3D_COLORPITCH0.COLORFORMAT and
+ * US_OUT_FMT_0.OUT_FMT. */
+enum {
+    R300_RTV_NONE = 0,          /* unsupported combination */
+    R300_RTV_RGBA8,             /* ARGB8888 with C4_8: float RGBA8 view */
+    R300_RTV_R8U,               /* 1-byte pixels, uint views ... */
+    R300_RTV_R16U,
+    R300_RTV_R32U,
+    R300_RTV_RG32U,
+    R300_RTV_RGBA32U,
+};
+uint32_t r300_cb_view(uint32_t colorformat, uint32_t outfmt, uint32_t *bpp);
 
 /* R300 US constants are 24-bit floats (1 sign, 7 exponent, 16 mantissa). */
 float r300_float24(uint32_t v);
