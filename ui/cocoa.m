@@ -611,8 +611,23 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
                                   (const UInt8 *)pixman_image_get_data(pixman_image),
                                   (CFIndex)stride * h);
     CGDataProviderRef provider = CGDataProviderCreateWithCFData(data);
+    /*
+     * Tag the frame with the display's own colour space: Core Animation
+     * then shows it as it is.  Tagged sRGB on a wide-gamut display, every
+     * refresh went through a full ColorSync conversion on the main thread
+     * (vImage AnyToAny, most of its time during video playback), which
+     * dropped frames.  QEMU_COCOA_SRGB=1 keeps the exact sRGB conversion.
+     */
+    static int exact = -1;
+    if (exact < 0) {
+        exact = getenv("QEMU_COCOA_SRGB") != NULL;
+    }
+    CGColorSpaceRef cs = colorspace;
+    if (!exact && [[self window] colorSpace]) {
+        cs = [[[self window] colorSpace] CGColorSpace];
+    }
     CGImageRef image = CGImageCreate(w, h, DIV_ROUND_UP(bitsPerPixel, 8) * 2,
-                                     bitsPerPixel, stride, colorspace,
+                                     bitsPerPixel, stride, cs,
                                      kCGBitmapByteOrder32Little |
                                      kCGImageAlphaNoneSkipFirst,
                                      provider, NULL, 0,
