@@ -50,17 +50,51 @@ enum {
     R300_TEXK_DXT5,
 };
 
+/* TX_FORMAT1.TEX_COORD_TYPE */
+enum { R300_TEXDIM_2D = 0, R300_TEXDIM_3D = 1, R300_TEXDIM_CUBE = 2 };
+
+#define R300_TEX_MAX_LEVELS     12      /* 2048 .. 1 */
+
 typedef struct R300TexDesc {
     bool bound;
     uint32_t gpu_addr;          /* TX_OFFSET, low bits cleared */
     uint32_t width, height;
-    uint32_t pitch_bytes;       /* bytes per row (per row of blocks for DXT) */
+    uint32_t pitch_bytes;       /* level 0: bytes per row (per row of blocks for DXT) */
     uint32_t format;            /* TX_FORMAT1 & 0x1F */
     uint32_t kind;              /* R300_TEXK_* */
     uint32_t view_bpp;          /* RAW: bytes per uint-view element (4, 8, 16) */
     uint32_t filter0;           /* TX_FILTER0 */
+    uint32_t filter1;           /* TX_FILTER1 */
     uint8_t *host_data;         /* texels copied out of the GART (owned), or NULL */
+
+    /*
+     * The whole image as the sampler addresses it (r300_tex_layout): mip
+     * levels one after another, each holding its cube faces or 3D slices
+     * back to back.  Rows are 32-byte aligned below level 0 (and at level
+     * 0 without TX_PITCH_EN), and heights round up to a power of two when
+     * the texture has mip levels or is 3D or a cube.
+     */
+    uint32_t dim;               /* R300_TEXDIM_* */
+    uint32_t depth;             /* 3D: slices at level 0, else 1 */
+    uint32_t levels;            /* TX_FORMAT0.NUM_LEVELS + 1 */
+    uint32_t lvl_off[R300_TEX_MAX_LEVELS];      /* bytes from gpu_addr */
+    uint32_t lvl_pitch[R300_TEX_MAX_LEVELS];    /* bytes per row (of blocks) */
+    uint32_t lvl_rows[R300_TEX_MAX_LEVELS];     /* rows (of blocks) per face/slice */
+    uint32_t size_bytes;        /* the whole chain */
 } R300TexDesc;
+
+/* Width, height and depth (slices; 6 faces for a cube) of mip level l. */
+void r300_tex_level_dims(const R300TexDesc *td, uint32_t l, uint32_t *w,
+                         uint32_t *h, uint32_t *d);
+
+/* Fill the layout fields of td from its size, format, dim and levels;
+ * bpp is bytes per texel (per 4x4 block for DXT, flagged by dxt). */
+void r300_tex_layout(R300TexDesc *td, uint32_t bpp, bool dxt, bool pitch_en);
+
+/* A TX_BORDER_COLOR dword as the unit's XYZW before the swizzle: packed
+ * like a texel of the unit's format (8888 for texels wider than 32 bits;
+ * DXT as B8G8R8A8). */
+void r300_border_color(uint32_t txformat, uint32_t v, float out[4]);
 
 /* Depth/stencil buffer (ZB_*).  It stays in guest memory in the card's
  * layout; the renderer tests and writes it in the fragment shader. */
@@ -88,6 +122,16 @@ static inline bool r300_front_ccw(uint32_t cull)
     return !(cull & R300_FACE_CW);
 }
 
+/* Colour buffers 1-3 of a multiple-render-target draw (buffer 0 is the
+ * packet's rt_* fields). */
+typedef struct R300ColorDesc {
+    uint32_t gpu_addr;          /* RB3D_COLOROFFSETn */
+    uint32_t pitch;             /* pixels */
+    uint32_t format;            /* RB3D_COLORPITCHn format field */
+    uint32_t bpp;
+    uint32_t view;              /* R300_RTV_* */
+} R300ColorDesc;
+
 typedef struct R300DrawPacket {
     /* Colour buffer 0 */
     uint32_t rt_gpu_addr;
@@ -97,6 +141,11 @@ typedef struct R300DrawPacket {
     uint32_t rt_bpp;            /* bytes per pixel */
     uint32_t rt_view;           /* R300_RTV_* */
     uint32_t scissor[4];        /* x0, y0, x1, y1 (exclusive) */
+    /* Colour buffers 1..num_cb-1 (render targets B-D the program writes,
+     * or RB3D_CCTL multiwrites); the depth buffer is bound after them, at
+     * colour attachment num_cb. */
+    uint32_t num_cb;
+    R300ColorDesc cb[R300_US_MAX_TARGETS];
     R300DepthDesc depth;
     uint32_t cull;              /* SU_CULL_MODE (0 for lines and points) */
 
@@ -105,10 +154,14 @@ typedef struct R300DrawPacket {
     R300FSUniforms uniforms;
     R300TexDesc tex[R300_NUM_TEX_UNITS];
 
-    /* Geometry, expanded (no indices) */
+    /* Geometry, expanded (no indices): num_verts vertices of a triangle
+     * or line list (prim_class), then num_line_verts more of a line list
+     * (polygon-mode edges drawn with filled polygons).  Points and wide
+     * lines arrive as triangles. */
     R300Vertex *verts;          /* owned by the packet */
     uint32_t num_verts;
-    uint32_t prim_class;        /* 0 triangles, 1 lines, 2 points */
+    uint32_t num_line_verts;
+    uint32_t prim_class;        /* 0 triangles, 1 lines (of num_verts) */
 
     uint32_t warn;              /* R300_WARN_* bits for things skipped */
 } R300DrawPacket;
@@ -120,6 +173,7 @@ typedef struct R300DrawPacket {
 #define R300_WARN_PRIM          (1u << 4)
 #define R300_WARN_RTFMT         (1u << 5)
 #define R300_WARN_VARYINGS      (1u << 6)
+#define R300_WARN_FLOW          (1u << 7)   /* PVS flow control ran away */
 
 /* Reads guest GPU memory (VRAM or GART) for vertex arrays and indices.
  * Returns false if the range is not mapped. */
@@ -177,6 +231,17 @@ uint32_t r300_msaa_offset(uint32_t x, uint32_t y, uint32_t ns,
  * unsupported type).  list needs room for 3n + 6 entries. */
 uint32_t r300_assemble(unsigned prim, uint32_t n, uint32_t *list,
                        uint32_t *cls);
+
+/* Per output primitive: the source primitive's FIRST, SECOND, THIRD and
+ * LAST vertex (flat-shading candidates) and its triangle edge flags. */
+typedef struct R300Prov {
+    uint32_t v[4];
+    uint32_t edges;
+} R300Prov;
+
+/* r300_assemble, also filling prov (room for 2n + 2 entries) or NULL. */
+uint32_t r300_assemble_prov(unsigned prim, uint32_t n, uint32_t *list,
+                            uint32_t *cls, R300Prov *prov);
 
 void r300_draw_free(R300DrawPacket *pkt);
 

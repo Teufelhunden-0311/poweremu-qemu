@@ -32,10 +32,13 @@
 #define US_ALU_ALPHA_INST_0 0x49C0
 #define US_OUT_FMT_0        0x46A4
 #define TX_FILTER0_0        0x4400
+#define TX_FORMAT0_0        0x4480
 #define TX_FORMAT1_0        0x44C0
 #define TX_OFFSET_0         0x4540
 #define TX_ENABLE           0x4104
+#define RB3D_CCTL           0x4E00
 #define RB3D_COLORPITCH0    0x4E38
+#define VAP_CLIP_CNTL       0x221C
 
 uint32_t r300_tex_raw_bpp(uint32_t txformat)
 {
@@ -241,7 +244,7 @@ static void us_mask(char *buf, unsigned m)
 
 /* ---- instructions --------------------------------------------------- */
 
-/* The r300_texu() call for a unit whose texels the shader decodes. */
+/* The r300_texu() arguments for a unit whose texels the shader decodes. */
 static void us_texu_args(char *buf, size_t len, const R300State *st,
                          unsigned unit)
 {
@@ -249,8 +252,8 @@ static void us_texu_args(char *buf, size_t len, const R300State *st,
     uint32_t f0 = r300_reg(st, TX_FILTER0_0 + 4 * unit);
     uint32_t fmt = f1 & 0x1F;
     /* filt: bit 0 magnify linear, bit 1 minify linear, S wrap 6:4,
-     * T wrap 10:8 (TX_FILTER0 CLAMP_S/CLAMP_T) */
-    uint32_t filt = ((f0 & 7) << 4) | (((f0 >> 3) & 7) << 8);
+     * T wrap 10:8, R wrap 14:12 (TX_FILTER0 CLAMP_S/T/R) */
+    uint32_t filt = ((f0 & 7) << 4) | (((f0 >> 3) & 7) << 8) | (((f0 >> 6) & 7) << 12);
 
     if (!tex_is_float(fmt)) {
         filt |= (((f0 >> 9) & 3) != 1 ? 1 : 0) | (((f0 >> 11) & 3) != 1 ? 2 : 0);
@@ -266,28 +269,44 @@ static bool unit_is_raw(const R300State *st, unsigned unit)
            r300_tex_raw_bpp(r300_reg(st, TX_FORMAT1_0 + 4 * unit));
 }
 
+/* TX_FORMAT1.TEX_COORD_TYPE of an enabled unit: 0 2D, 1 3D, 2 cube. */
+static unsigned unit_dim(const R300State *st, unsigned unit)
+{
+    unsigned d = (r300_reg(st, TX_FORMAT1_0 + 4 * unit) >> 25) & 3;
+    return (r300_reg(st, TX_ENABLE) >> unit) & 1 && d <= 2 ? d : 0;
+}
+
+/*
+ * Border handling of a unit sampled through a float texture: per axis
+ * 1 = clamp to border, 2 = mirror once to border (S bits 1:0, T 3:2,
+ * R 5:4), bit 6 linear filtering.  The Metal sampler clamps to
+ * transparent black and r300_tex adds TX_BORDER_COLOR for the missing
+ * coverage (Metal has no arbitrary border colours).
+ */
+static unsigned unit_border(const R300State *st, unsigned unit)
+{
+    uint32_t f0 = r300_reg(st, TX_FILTER0_0 + 4 * unit);
+    unsigned bm = 0, axes = unit_dim(st, unit) == 1 ? 3 : 2;
+
+    if (unit_dim(st, unit) == 2) {
+        return 0;                       /* cube maps never reach a border */
+    }
+    for (unsigned a = 0; a < axes; a++) {
+        unsigned m = (f0 >> (3 * a)) & 7;
+        bm |= (m == 6 ? 1u : m == 7 ? 2u : 0u) << (2 * a);
+    }
+    if (bm && (((f0 >> 9) & 3) != 1 || ((f0 >> 11) & 3) != 1)) {
+        bm |= 64;
+    }
+    return bm;
+}
+
 static bool us_emit_tex(R300Sb *sb, const R300State *st, uint32_t inst,
                         uint32_t *units_used, const char **err)
 {
     unsigned src = inst & 0x1F, dst = (inst >> 6) & 0x1F;
     unsigned unit = (inst >> 11) & 0xF, op = (inst >> 15) & 7;
-
-    if (unit_is_raw(st, unit) && op != 0 && op != 2) {
-        char a[96];
-        us_texu_args(a, sizeof(a), st, unit);
-        if (op == 3) {
-            r300_sb_printf(sb, "    t[%u] = r300_texu(tex%u, u, %u, t[%u].xy / t[%u].w, %s);\n",
-                           dst, unit, unit, src, src, a);
-        } else if (op == 1 || op == 4) {
-            r300_sb_printf(sb, "    t[%u] = r300_texu(tex%u, u, %u, t[%u].xy, %s);\n",
-                           dst, unit, unit, src, a);
-        } else {
-            *err = "unknown texture instruction";
-            return false;
-        }
-        *units_used |= 1u << unit;
-        return true;
-    }
+    const char *proj, *bias;
 
     switch (op) {
     case 0:         /* NOP */
@@ -296,20 +315,31 @@ static bool us_emit_tex(R300Sb *sb, const R300State *st, uint32_t inst,
         r300_sb_printf(sb, "    if (any(t[%u] < 0.0)) discard_fragment();\n", src);
         return true;
     case 1:         /* LD */
-        r300_sb_printf(sb, "    t[%u] = r300_tex(tex%u, smp%u, u, %u, t[%u].xy, 0.0);\n",
-                       dst, unit, unit, unit, src);
+        proj = "false"; bias = "0.0";
         break;
     case 3:         /* TXP */
-        r300_sb_printf(sb, "    t[%u] = r300_tex(tex%u, smp%u, u, %u, t[%u].xy / t[%u].w, 0.0);\n",
-                       dst, unit, unit, unit, src, src);
+        proj = "true"; bias = "0.0";
         break;
-    case 4:         /* TXB */
-        r300_sb_printf(sb, "    t[%u] = r300_tex(tex%u, smp%u, u, %u, t[%u].xy, t[%u].w);\n",
-                       dst, unit, unit, unit, src, src);
+    case 4:         /* TXB: bias in the source's w */
+        proj = "false"; bias = "0.0";
         break;
     default:
         *err = "unknown texture instruction";
         return false;
+    }
+    char bb[16];
+    if (op == 4) {
+        snprintf(bb, sizeof(bb), "t[%u].w", src);
+        bias = bb;
+    }
+    if (unit_is_raw(st, unit)) {
+        char a[128];
+        us_texu_args(a, sizeof(a), st, unit);
+        r300_sb_printf(sb, "    t[%u] = r300_texu(tex%u, u, %u, t[%u], %s, %s, %s);\n",
+                       dst, unit, unit, src, proj, bias, a);
+    } else {
+        r300_sb_printf(sb, "    t[%u] = r300_tex(tex%u, smp%u, u, %u, t[%u], %s, %s, %uu);\n",
+                       dst, unit, unit, unit, src, proj, bias, unit_border(st, unit));
     }
     *units_used |= 1u << unit;
     return true;
@@ -389,22 +419,79 @@ static void us_emit_alu(R300Sb *sb, const R300State *st, unsigned i)
         r300_sb_printf(sb, "        ar = saturate(ar);\n");
     }
 
-    /* Writes: temporaries, then the output FIFO (render target A only). */
+    /* Writes: temporaries, the output FIFO of render target TARGET, and
+     * (alpha OMASK_W) the fragment's depth. */
     us_mask(m, (ra >> 23) & 7);
     if (m[0]) {
         r300_sb_printf(sb, "        t[%u].%s = rr.%s;\n", (ra >> 18) & 0x1F, m, m);
     }
     us_mask(m, (ra >> 26) & 7);
-    if (m[0] && !((ra >> 29) & 3)) {
-        r300_sb_printf(sb, "        oc.%s = rr.%s;\n", m, m);
+    if (m[0]) {
+        r300_sb_printf(sb, "        oc[%u].%s = rr.%s;\n", (ra >> 29) & 3, m, m);
     }
     if ((aa >> 23) & 1) {
         r300_sb_printf(sb, "        t[%u].a = ar;\n", (aa >> 18) & 0x1F);
     }
-    if ((aa >> 24) & 1 && !((aa >> 25) & 3)) {
-        r300_sb_printf(sb, "        oc.a = ar;\n");
+    if ((aa >> 24) & 1) {
+        r300_sb_printf(sb, "        oc[%u].a = ar;\n", (aa >> 25) & 3);
+    }
+    if ((aa >> 27) & 1) {
+        r300_sb_printf(sb, "        ow = ar;\n");
     }
     r300_sb_printf(sb, "    }\n");
+}
+
+/* Render targets the active program writes (bit n: target n), and
+ * whether it writes depth (OMASK_W). */
+static uint32_t us_targets_written(const R300State *st, bool *writes_w)
+{
+    USNode nodes[4];
+    unsigned n = us_nodes(st, nodes);
+    uint32_t mask = 0;
+
+    *writes_w = false;
+    for (unsigned i = 0; i < n; i++) {
+        for (unsigned k = 0; k < nodes[i].alu_count; k++) {
+            unsigned a = nodes[i].alu_start + k;
+            uint32_t ra, aa;
+            if (a >= R300_US_MAX_ALU) {
+                break;
+            }
+            ra = r300_reg(st, US_ALU_RGB_ADDR_0 + 4 * a);
+            aa = r300_reg(st, US_ALU_ALPHA_ADDR_0 + 4 * a);
+            if ((ra >> 26) & 7) {
+                mask |= 1u << ((ra >> 29) & 3);
+            }
+            if ((aa >> 24) & 1) {
+                mask |= 1u << ((aa >> 25) & 3);
+            }
+            if ((aa >> 27) & 1) {
+                *writes_w = true;
+            }
+        }
+    }
+    return mask;
+}
+
+uint32_t r300_us_out_fmt(const R300State *st, unsigned k)
+{
+    uint32_t f = r300_reg(st, US_OUT_FMT_0 + 4 * k);
+    /* multiwrite targets without their own format use target A's */
+    return k && (f & 0x1F) == 15 ? r300_reg(st, US_OUT_FMT_0) : f;
+}
+
+uint32_t r300_us_num_targets(const R300State *st)
+{
+    bool w;
+    uint32_t written = us_targets_written(st, &w);
+    uint32_t n = 1, mw = ((r300_reg(st, RB3D_CCTL) >> 5) & 3) + 1;
+
+    for (unsigned k = 1; k < R300_US_MAX_TARGETS; k++) {
+        if ((written >> k) & 1 && (r300_reg(st, US_OUT_FMT_0 + 4 * k) & 0x1F) != 15) {
+            n = k + 1;
+        }
+    }
+    return n > mw ? n : mw;
 }
 
 /* ---- library -------------------------------------------------------- */
@@ -413,13 +500,13 @@ static const char us_prelude[] =
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"
 "\n"
-"struct R300Vertex { float4 pos; float4 v[10]; };\n"
+"struct R300Vertex { float4 pos; float4 v[10]; float4 aux; float ucp[8]; };\n"
 "struct R300VOut {\n"
 "    float4 pos [[position]];\n"
 "    float4 v0 [[user(v0)]]; float4 v1 [[user(v1)]]; float4 v2 [[user(v2)]];\n"
 "    float4 v3 [[user(v3)]]; float4 v4 [[user(v4)]]; float4 v5 [[user(v5)]];\n"
 "    float4 v6 [[user(v6)]]; float4 v7 [[user(v7)]]; float4 v8 [[user(v8)]];\n"
-"    float4 v9 [[user(v9)]];\n"
+"    float4 v9 [[user(v9)]]; float4 aux [[user(aux)]];\n"
 "};\n"
 "struct R300FSUniforms {\n"
 "    float4 consts[32];\n"
@@ -428,43 +515,109 @@ static const char us_prelude[] =
 "    uint4 tex_info[16];\n"
 "    uint cblend, ablend, chanmask, alpha_func;\n"
 "    uint4 out_sel;\n"
-"    uint rt_swap32; uint clip_rule; uint rt_endian, pad1;\n"
+"    uint rt_swap32; uint clip_rule; uint rt_endian, rop;\n"
 "    int4 cliprect[4];\n"
 "    uint4 zinfo;\n"
-"    uint zpass_count, pad3, pad4, pad5;\n"
+"    uint zpass_count, poly_en, pad4, pad5;\n"
+"    float4 tex_border[16];\n"
+"    float4 tex_lod[16];\n"
+"    uint4 tex_dim[16];\n"
+"    float4 fog_color;\n"
+"    uint fog_blend, depth_src, pad6, pad7;\n"
+"    float4 poly_offset;\n"
 "};\n"
-"\n"
-"vertex R300VOut r300_vs(uint vid [[vertex_id]],\n"
-"                        const device R300Vertex *vb [[buffer(0)]])\n"
-"{\n"
-"    R300Vertex x = vb[vid];\n"
-"    R300VOut o;\n"
-"    o.pos = x.pos;\n"
-"    o.v0 = x.v[0]; o.v1 = x.v[1]; o.v2 = x.v[2]; o.v3 = x.v[3];\n"
-"    o.v4 = x.v[4]; o.v5 = x.v[5]; o.v6 = x.v[6]; o.v7 = x.v[7];\n"
-"    o.v8 = x.v[8]; o.v9 = x.v[9];\n"
-"    return o;\n"
-"}\n"
 "\n"
 "static float r300_swz1(float4 v, uint s)\n"
 "{\n"
 "    return s < 4 ? v[s] : (s == 5 ? 1.0 : 0.0);\n"
 "}\n"
-"\n"
-"/* Sample a texture unit and apply its TX_FORMAT1 swizzle.  VRAM holds\n"
-"   what the guest CPU wrote (big-endian words), so a 32-bit texel reads\n"
-"   byte-reversed compared with the card's own little-endian view. */\n"
-"static float4 r300_tex(texture2d<float> tx, sampler sm,\n"
-"                       constant R300FSUniforms &u, uint unit,\n"
-"                       float2 uv, float bias)\n"
+"static float4 r300_tswz(float4 hw, constant R300FSUniforms &u, uint unit)\n"
 "{\n"
-"    if (u.tex_info[unit].x == 0) return float4(0.0, 0.0, 0.0, 1.0);\n"
-"    float4 raw = tx.sample(sm, uv, metal::bias(bias));\n"
-"    uint k = u.tex_info[unit].y;\n"
-"    float4 hw = k == 1 ? raw.abgr : k == 2 ? raw.grba : raw;\n"
 "    uint4 s = u.tex_swz[unit];\n"
 "    return float4(r300_swz1(hw, s.x), r300_swz1(hw, s.y),\n"
 "                  r300_swz1(hw, s.z), r300_swz1(hw, s.w));\n"
+"}\n"
+"\n"
+"/* TX_FORMAT1.SIGNED_* (8-bit components as two's complement) and GAMMA\n"
+"   (sRGB) for units sampled through a float texture. */\n"
+"static float4 r300_tfix(float4 hw, constant R300FSUniforms &u, uint unit)\n"
+"{\n"
+"    uint f = u.tex_dim[unit].w;\n"
+"    for (uint i = 0; i < 4; i++) {\n"
+"        if ((f >> i) & 1u) {\n"
+"            float b = rint(hw[i] * 255.0);\n"
+"            hw[i] = max((b > 127.0 ? b - 256.0 : b) / 127.0, -1.0);\n"
+"        }\n"
+"    }\n"
+"    if ((f & 16u) != 0u) {\n"
+"        float3 c = saturate(hw.xyz);\n"
+"        hw.xyz = select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045);\n"
+"    }\n"
+"    return hw;\n"
+"}\n"
+"/* VRAM holds what the guest CPU wrote (big-endian words), so a 32-bit\n"
+"   texel reads byte-reversed compared with the card's own view. */\n"
+"static float4 r300_tpost(float4 raw, constant R300FSUniforms &u, uint unit)\n"
+"{\n"
+"    uint k = u.tex_info[unit].y;\n"
+"    return r300_tfix(k == 1 ? raw.abgr : k == 2 ? raw.grba : raw, u, unit);\n"
+"}\n"
+"/* Share of a bilinear (or nearest) footprint inside [0, n) texels along\n"
+"   one axis; m 2 = mirror once first. */\n"
+"static float r300_bcov(float c, float n, uint m, bool lin)\n"
+"{\n"
+"    if (m == 0u) return 1.0;\n"
+"    if (m == 2u) c = abs(c);\n"
+"    if (!lin) { float i = floor(c * n); return i >= 0.0 && i < n ? 1.0 : 0.0; }\n"
+"    float p = c * n - 0.5, i0 = floor(p), f = p - i0;\n"
+"    return (i0 >= 0.0 && i0 < n ? 1.0 - f : 0.0) + (i0 + 1.0 >= 0.0 && i0 + 1.0 < n ? f : 0.0);\n"
+"}\n"
+"static float4 r300_border(float4 hw, float3 c, float3 n, uint bm,\n"
+"                          constant R300FSUniforms &u, uint unit)\n"
+"{\n"
+"    bool lin = (bm & 64u) != 0u;\n"
+"    float cov = r300_bcov(c.x, n.x, bm & 3u, lin) * r300_bcov(c.y, n.y, (bm >> 2) & 3u, lin) *\n"
+"                r300_bcov(c.z, n.z, (bm >> 4) & 3u, lin);\n"
+"    /* clamp to border sampled transparent black outside; mirror once\n"
+"       sampled the edge there */\n"
+"    return (bm & 42u) != 0u ? mix(u.tex_border[unit], hw, cov)\n"
+"                            : hw + u.tex_border[unit] * (1.0 - cov);\n"
+"}\n"
+"/* Units sampled through a float texture: c is the source temporary\n"
+"   (TXP divides by w), bias the TXB bias on top of TX_FILTER1.LOD_BIAS. */\n"
+"static float4 r300_tex(texture2d<float> tx, sampler sm, constant R300FSUniforms &u,\n"
+"                       uint unit, float4 c, bool proj, float bias, uint bm)\n"
+"{\n"
+"    if (u.tex_info[unit].x == 0) return float4(0.0, 0.0, 0.0, 1.0);\n"
+"    float2 uv = proj ? c.xy / c.w : c.xy;\n"
+"    float4 hw = r300_tpost(tx.sample(sm, uv, metal::bias(u.tex_lod[unit].x + bias)), u, unit);\n"
+"    if (bm != 0u) {\n"
+"        float l = floor(max(tx.calculate_clamped_lod(sm, uv), 0.0));\n"
+"        float2 n = max(floor(float2(u.tex_info[unit].zw) / exp2(l)), float2(1.0));\n"
+"        hw = r300_border(hw, float3(uv, 0.5), float3(n, 1.0), bm, u, unit);\n"
+"    }\n"
+"    return r300_tswz(hw, u, unit);\n"
+"}\n"
+"static float4 r300_tex(texture3d<float> tx, sampler sm, constant R300FSUniforms &u,\n"
+"                       uint unit, float4 c, bool proj, float bias, uint bm)\n"
+"{\n"
+"    if (u.tex_info[unit].x == 0) return float4(0.0, 0.0, 0.0, 1.0);\n"
+"    float3 uv = proj ? c.xyz / c.w : c.xyz;\n"
+"    float4 hw = r300_tpost(tx.sample(sm, uv, metal::bias(u.tex_lod[unit].x + bias)), u, unit);\n"
+"    if (bm != 0u) {\n"
+"        float l = floor(max(tx.calculate_clamped_lod(sm, uv), 0.0));\n"
+"        float3 n = max(floor(float3(float2(u.tex_info[unit].zw), float(u.tex_dim[unit].y)) / exp2(l)),\n"
+"                       float3(1.0));\n"
+"        hw = r300_border(hw, uv, n, bm, u, unit);\n"
+"    }\n"
+"    return r300_tswz(hw, u, unit);\n"
+"}\n"
+"static float4 r300_tex(texturecube<float> tx, sampler sm, constant R300FSUniforms &u,\n"
+"                       uint unit, float4 c, bool proj, float bias, uint bm)\n"
+"{\n"
+"    if (u.tex_info[unit].x == 0) return float4(0.0, 0.0, 0.0, 1.0);\n"
+"    float4 hw = r300_tpost(tx.sample(sm, c.xyz, metal::bias(u.tex_lod[unit].x + bias)), u, unit);\n"
+"    return r300_tswz(hw, u, unit);\n"
 "}\n"
 "\n"
 "/* Texels the shader decodes itself (r300_tex_raw_bpp): a uint view of\n"
@@ -535,7 +688,7 @@ static const char us_prelude[] =
 "}\n"
 "/* TX_FILTER0 CLAMP_*: wrap, mirror, clamp to last, mirror once to last,\n"
 "   clamp to half-border (as last), mirror once to half-border (as\n"
-"   last), clamp to border, mirror once to border (border colour 0). */\n"
+"   last), clamp to border, mirror once to border. */\n"
 "static int r300_wrap1(int p, int n, uint m, thread bool &border)\n"
 "{\n"
 "    switch (m & 7u) {\n"
@@ -550,53 +703,131 @@ static const char us_prelude[] =
 "    default: return clamp(p, 0, n - 1);\n"
 "    }\n"
 "}\n"
-"static float4 r300_texel(texture2d<uint> tx, uint fmt, uint bpp, uint e,\n"
-"                         uint filt, int2 p, int2 sz, bool yuv)\n"
+"/* Level l of a unit's chain as the card lays it out (r300_tex_layout):\n"
+"   byte offset, row pitch and face/slice size. */\n"
+"static uint r300_lvl(constant R300FSUniforms &u, uint unit, uint l, uint bpp,\n"
+"                     thread uint &pitch, thread uint &fbytes)\n"
+"{\n"
+"    uint4 dm = u.tex_dim[unit];\n"
+"    uint off = 0u;\n"
+"    for (uint i = 0u; i <= l; i++) {\n"
+"        uint w = max(u.tex_info[unit].z >> i, 1u), h = max(u.tex_info[unit].w >> i, 1u);\n"
+"        uint d = dm.x == 2u ? 6u : dm.x == 1u ? max(dm.y >> i, 1u) : 1u;\n"
+"        if ((dm.w & 32u) != 0u && h > 1u) h = 1u << (32u - clz(h - 1u));\n"
+"        uint p = i == 0u ? dm.z : (w * bpp + 31u) & ~31u;\n"
+"        if (i == l) { pitch = p; fbytes = p * h; break; }\n"
+"        off += p * h * d;\n"
+"    }\n"
+"    return off;\n"
+"}\n"
+"/* One texel: p = (x, y, slice or cube face), sz the level's size. */\n"
+"static float4 r300_texel(texture2d<uint> tx, constant R300FSUniforms &u, uint unit,\n"
+"                         uint fmt, uint bpp, uint e, uint filt, int3 p, int3 sz,\n"
+"                         uint base, uint pitch, uint fbytes, bool yuv, bool cube)\n"
 "{\n"
 "    bool border = false;\n"
-"    p.x = r300_wrap1(p.x, sz.x, filt >> 4, border);\n"
-"    p.y = r300_wrap1(p.y, sz.y, filt >> 8, border);\n"
-"    if (border) return float4(0.0);\n"
+"    p.x = r300_wrap1(p.x, sz.x, cube ? 2u : filt >> 4, border);\n"
+"    p.y = r300_wrap1(p.y, sz.y, cube ? 2u : filt >> 8, border);\n"
+"    if (!cube) p.z = r300_wrap1(p.z, sz.z, filt >> 12, border);\n"
+"    if (border) return u.tex_border[unit];\n"
+"    uint rowel = max(u.tex_info[unit].y, 1u);\n"
+"    uint row0 = base + uint(p.z) * fbytes + uint(p.y) * pitch;\n"
 "    uint4 w;\n"
 "    uint odd = 0u;\n"
 "    if (bpp <= 4u) {\n"
 "        uint x = uint(p.x);\n"
 "        if (fmt == 0x14u || fmt == 0x15u) { odd = x & 1u; x &= ~1u; }\n"
-"        uint off = x * bpp;\n"
-"        uint d = r300_cswap(r300_bswap32(tx.read(uint2(off >> 2, uint(p.y))).x), e);\n"
+"        uint off = row0 + x * bpp, el = off >> 2;\n"
+"        uint d = r300_cswap(r300_bswap32(tx.read(uint2(el % rowel, el / rowel)).x), e);\n"
 "        w = uint4(d >> ((off & 3u) * 8u), 0u, 0u, 0u);\n"
 "    } else {\n"
-"        uint4 r = tx.read(uint2(p));\n"
+"        uint el = (row0 + uint(p.x) * bpp) / bpp;\n"
+"        uint4 r = tx.read(uint2(el % rowel, el / rowel));\n"
 "        w = uint4(r300_cswap(r300_bswap32(r.x), e), r300_cswap(r300_bswap32(r.y), e),\n"
 "                  r300_cswap(r300_bswap32(r.z), e), r300_cswap(r300_bswap32(r.w), e));\n"
 "    }\n"
 "    return r300_tdecode(fmt, w, odd, yuv);\n"
 "}\n"
-"/* filt: bit 0 magnify linear, bit 1 minify linear, wrap S 6:4, T 10:8 */\n"
-"static float4 r300_texu(texture2d<uint> tx, constant R300FSUniforms &u, uint unit,\n"
-"                        float2 uv, uint fmt, uint bpp, uint e, uint filt, bool yuv)\n"
+"/* Nearest or (bi/tri)linear lookup in mip level l; q in [0, 1] units. */\n"
+"static float4 r300_texl(texture2d<uint> tx, constant R300FSUniforms &u, uint unit,\n"
+"                        uint fmt, uint bpp, uint e, uint filt, float3 q, int face,\n"
+"                        uint l, bool lin, bool yuv)\n"
 "{\n"
-"    if (u.tex_info[unit].x == 0) return float4(0.0, 0.0, 0.0, 1.0);\n"
-"    int2 sz = int2(max(u.tex_info[unit].zw, uint2(1u)));\n"
-"    float2 st = uv * float2(sz);\n"
-"    float2 fw = fwidth(st);\n"
-"    bool lin = (filt & (max(fw.x, fw.y) > 1.0 ? 2u : 1u)) != 0u;\n"
-"    float4 hw;\n"
+"    uint pitch = 0u, fbytes = 0u;\n"
+"    uint base = r300_lvl(u, unit, l, bpp, pitch, fbytes);\n"
+"    uint dim = u.tex_dim[unit].x;\n"
+"    bool cube = dim == 2u, vol = dim == 1u;\n"
+"    int3 sz = int3(max(int(u.tex_info[unit].z >> l), 1), max(int(u.tex_info[unit].w >> l), 1),\n"
+"                   vol ? max(int(u.tex_dim[unit].y >> l), 1) : 1);\n"
+"    float3 st = q * float3(sz);\n"
 "    if (!lin) {\n"
-"        hw = r300_texel(tx, fmt, bpp, e, filt, int2(floor(st)), sz, yuv);\n"
-"    } else {\n"
-"        float2 f = st - 0.5;\n"
-"        int2 p = int2(floor(f));\n"
-"        float2 a = f - floor(f);\n"
-"        float4 c00 = r300_texel(tx, fmt, bpp, e, filt, p, sz, yuv);\n"
-"        float4 c10 = r300_texel(tx, fmt, bpp, e, filt, p + int2(1, 0), sz, yuv);\n"
-"        float4 c01 = r300_texel(tx, fmt, bpp, e, filt, p + int2(0, 1), sz, yuv);\n"
-"        float4 c11 = r300_texel(tx, fmt, bpp, e, filt, p + int2(1, 1), sz, yuv);\n"
-"        hw = mix(mix(c00, c10, a.x), mix(c01, c11, a.x), a.y);\n"
+"        int3 p = int3(floor(st));\n"
+"        if (cube) p.z = face; else if (!vol) p.z = 0;\n"
+"        return r300_texel(tx, u, unit, fmt, bpp, e, filt, p, sz, base, pitch, fbytes, yuv, cube);\n"
 "    }\n"
-"    uint4 s = u.tex_swz[unit];\n"
-"    return float4(r300_swz1(hw, s.x), r300_swz1(hw, s.y),\n"
-"                  r300_swz1(hw, s.z), r300_swz1(hw, s.w));\n"
+"    float3 f = st - 0.5;\n"
+"    int3 p = int3(floor(f));\n"
+"    float3 a = f - floor(f);\n"
+"    if (cube) { p.z = face; a.z = 0.0; } else if (!vol) { p.z = 0; a.z = 0.0; }\n"
+"    float4 r = float4(0.0);\n"
+"    for (int k = 0; k < (vol ? 2 : 1); k++) {\n"
+"        int3 b = p + int3(0, 0, k);\n"
+"        float4 c00 = r300_texel(tx, u, unit, fmt, bpp, e, filt, b, sz, base, pitch, fbytes, yuv, cube);\n"
+"        float4 c10 = r300_texel(tx, u, unit, fmt, bpp, e, filt, b + int3(1, 0, 0), sz, base, pitch, fbytes, yuv, cube);\n"
+"        float4 c01 = r300_texel(tx, u, unit, fmt, bpp, e, filt, b + int3(0, 1, 0), sz, base, pitch, fbytes, yuv, cube);\n"
+"        float4 c11 = r300_texel(tx, u, unit, fmt, bpp, e, filt, b + int3(1, 1, 0), sz, base, pitch, fbytes, yuv, cube);\n"
+"        float4 m = mix(mix(c00, c10, a.x), mix(c01, c11, a.x), a.y);\n"
+"        r += vol ? m * (k == 0 ? 1.0 - a.z : a.z) : m;\n"
+"    }\n"
+"    return r;\n"
+"}\n"
+"/* Cube map face and (s, t) of direction r, as GL and the card pick them\n"
+"   (faces +X, -X, +Y, -Y, +Z, -Z). */\n"
+"static float2 r300_cubeface(float3 r, thread int &face)\n"
+"{\n"
+"    float3 a = abs(r);\n"
+"    float sc, tc, ma;\n"
+"    if (a.x >= a.y && a.x >= a.z) {\n"
+"        face = r.x >= 0.0 ? 0 : 1; ma = a.x; sc = r.x >= 0.0 ? -r.z : r.z; tc = -r.y;\n"
+"    } else if (a.y >= a.z) {\n"
+"        face = r.y >= 0.0 ? 2 : 3; ma = a.y; sc = r.x; tc = r.y >= 0.0 ? r.z : -r.z;\n"
+"    } else {\n"
+"        face = r.z >= 0.0 ? 4 : 5; ma = a.z; sc = r.z >= 0.0 ? r.x : -r.x; tc = -r.y;\n"
+"    }\n"
+"    ma = max(ma, 1e-20);\n"
+"    return float2(sc / ma, tc / ma) * 0.5 + 0.5;\n"
+"}\n"
+"/* filt: bit 0 magnify linear, bit 1 minify linear, wrap S 6:4, T 10:8,\n"
+"   R 14:12.  Mip level from the texel-space derivatives, TX_FILTER1\n"
+"   LOD_BIAS, MAX_MIP_LEVEL..NUM_LEVELS and the mip filter. */\n"
+"static float4 r300_texu(texture2d<uint> tx, constant R300FSUniforms &u, uint unit,\n"
+"                        float4 c, bool proj, float bias, uint fmt, uint bpp, uint e,\n"
+"                        uint filt, bool yuv)\n"
+"{\n"
+"    uint dim = u.tex_dim[unit].x;\n"
+"    float3 q = proj && dim != 2u ? c.xyz / c.w : c.xyz;\n"
+"    int face = 0;\n"
+"    if (dim == 2u) q = float3(r300_cubeface(c.xyz, face), 0.0);\n"
+"    float2 st = q.xy * float2(max(u.tex_info[unit].zw, uint2(1u)));\n"
+"    float rho = max(length(dfdx(st)), length(dfdy(st)));\n"
+"    if (u.tex_info[unit].x == 0) return float4(0.0, 0.0, 0.0, 1.0);\n"
+"    float4 lo = u.tex_lod[unit];\n"
+"    float lod = log2(max(rho, 1e-8)) + lo.x + bias;\n"
+"    bool lin = (filt & (lod > 0.0 ? 2u : 1u)) != 0u;\n"
+"    float4 hw;\n"
+"    if (lo.w == 0.0) {\n"
+"        hw = r300_texl(tx, u, unit, fmt, bpp, e, filt, q, face, uint(lo.y), lin, yuv);\n"
+"    } else {\n"
+"        float l = clamp(lod, lo.y, lo.z);\n"
+"        if (lo.w == 1.0) {\n"
+"            hw = r300_texl(tx, u, unit, fmt, bpp, e, filt, q, face, uint(rint(l)), lin, yuv);\n"
+"        } else {\n"
+"            uint l0 = uint(floor(l)), l1 = min(l0 + 1u, uint(lo.z));\n"
+"            hw = mix(r300_texl(tx, u, unit, fmt, bpp, e, filt, q, face, l0, lin, yuv),\n"
+"                     r300_texl(tx, u, unit, fmt, bpp, e, filt, q, face, l1, lin, yuv), fract(l));\n"
+"        }\n"
+"    }\n"
+"    return r300_tswz(hw, u, unit);\n"
 "}\n"
 "\n"
 "static float r300_bfactor(uint f, float4 src, float4 dst, float4 k,\n"
@@ -638,48 +869,81 @@ static const char us_prelude[] =
 "}\n"
 "\n"
 "/* Colour (r,g,b,a) <-> the raw RGBA8 view of the colour buffer.  The\n"
-"   card writes channel Cn = out_sel[n] of the colour (0 A, 1 R, 2 G, 3 B)\n"
-"   to byte n of a little-endian word; with rt_swap32 the word is stored\n"
-"   byte-reversed. */\n"
+"   card writes channel Cn = sel[n] of the colour (0 A, 1 R, 2 G, 3 B;\n"
+"   US_OUT_FMT C0..C3_SEL) to byte n of a little-endian word; with swap\n"
+"   (COLOR_ENDIAN 2) the word is stored byte-reversed. */\n"
 "static float r300_chan(float4 c, uint s)\n"
 "{\n"
 "    return s == 0 ? c.a : s == 1 ? c.r : s == 2 ? c.g : c.b;\n"
 "}\n"
-"static float4 r300_pack(float4 c, constant R300FSUniforms &u)\n"
+"static float4 r300_to_hw(float4 c, uint4 sel)\n"
 "{\n"
-"    float4 hw = float4(r300_chan(c, u.out_sel.x), r300_chan(c, u.out_sel.y),\n"
-"                       r300_chan(c, u.out_sel.z), r300_chan(c, u.out_sel.w));\n"
-"    return u.rt_swap32 != 0 ? hw.abgr : hw;\n"
+"    return float4(r300_chan(c, sel.x), r300_chan(c, sel.y),\n"
+"                  r300_chan(c, sel.z), r300_chan(c, sel.w));\n"
 "}\n"
-"static float4 r300_unpack(float4 raw, constant R300FSUniforms &u)\n"
+"static float4 r300_from_hw(float4 hw, uint4 sel)\n"
 "{\n"
-"    float4 hw = u.rt_swap32 != 0 ? raw.abgr : raw;\n"
 "    float4 c = float4(0.0);\n"
 "    for (uint n = 0; n < 4; n++) {\n"
-"        uint s = u.out_sel[n];\n"
+"        uint s = sel[n];\n"
 "        if (s == 0) c.a = hw[n]; else if (s == 1) c.r = hw[n];\n"
 "        else if (s == 2) c.g = hw[n]; else c.b = hw[n];\n"
 "    }\n"
 "    return c;\n"
 "}\n"
-"/* Formats other than ARGB8888/C4_8 (r300_cb_view): the colour buffer is\n"
-"   a uint view of the pixel's dwords (or halfword, byte) as they lie; the\n"
-"   card wrote the COLOR_ENDIAN swap of its little-endian word(s), with\n"
-"   component C0 in the low bits (AMD R5xx guide, section 3.3 formats). */\n"
-"static float4 r300_to_hw(float4 c, constant R300FSUniforms &u)\n"
+"static float4 r300_pack(float4 c, uint4 sel, uint swap)\n"
 "{\n"
-"    return float4(r300_chan(c, u.out_sel.x), r300_chan(c, u.out_sel.y),\n"
-"                  r300_chan(c, u.out_sel.z), r300_chan(c, u.out_sel.w));\n"
+"    float4 hw = r300_to_hw(c, sel);\n"
+"    return swap != 0 ? hw.abgr : hw;\n"
 "}\n"
-"static float4 r300_from_hw(float4 hw, constant R300FSUniforms &u)\n"
+"static float4 r300_unpack(float4 raw, uint4 sel, uint swap)\n"
 "{\n"
-"    float4 c = float4(0.0);\n"
-"    for (uint n = 0; n < 4; n++) {\n"
-"        uint s = u.out_sel[n];\n"
-"        if (s == 0) c.a = hw[n]; else if (s == 1) c.r = hw[n];\n"
-"        else if (s == 2) c.g = hw[n]; else c.b = hw[n];\n"
+"    return r300_from_hw(swap != 0 ? raw.abgr : raw, sel);\n"
+"}\n"
+"/* RB3D_ROPCNTL.ROP: a GDI ROP2 code as a truth table over (src, dst)\n"
+"   bits: bit 3 both set, 2 src only, 1 dst only, 0 neither. */\n"
+"static uint r300_rop1(uint s, uint d, uint c)\n"
+"{\n"
+"    return ((c & 8u) != 0u ? s & d : 0u) | ((c & 4u) != 0u ? s & ~d : 0u) |\n"
+"           ((c & 2u) != 0u ? ~s & d : 0u) | ((c & 1u) != 0u ? ~s & ~d : 0u);\n"
+"}\n"
+"static uint r300_rop(uint s, uint d, uint c) { return r300_rop1(s, d, c); }\n"
+"static uint2 r300_rop(uint2 s, uint2 d, uint c)\n"
+"{\n"
+"    return uint2(r300_rop1(s.x, d.x, c), r300_rop1(s.y, d.y, c));\n"
+"}\n"
+"static uint4 r300_rop(uint4 s, uint4 d, uint c)\n"
+"{\n"
+"    return uint4(r300_rop1(s.x, d.x, c), r300_rop1(s.y, d.y, c),\n"
+"                 r300_rop1(s.z, d.z, c), r300_rop1(s.w, d.w, c));\n"
+"}\n"
+"static float4 r300_rop(float4 s, float4 d, uint c)\n"
+"{\n"
+"    uint4 a = uint4(rint(saturate(s) * 255.0)), b = uint4(rint(saturate(d) * 255.0));\n"
+"    return float4(r300_rop(a, b, c) & 0xffu) / 255.0;\n"
+"}\n"
+"/* FG_FOG_BLEND.FN: linear, exp, exp2 of the interpolated fog value, or\n"
+"   FG_FOG_FACTOR; the result weights the colour against the fog colour. */\n"
+"static float r300_fogf(uint fb, float f, float k)\n"
+"{\n"
+"    switch ((fb >> 1) & 3u) {\n"
+"    case 0: return saturate(f);\n"
+"    case 1: return saturate(exp(-f));\n"
+"    case 2: return saturate(exp(-f * f));\n"
+"    default: return k;\n"
 "    }\n"
-"    return c;\n"
+"}\n"
+"/* RB3D_CBLEND.DISCARD_SRC_PIXELS: skip blending (keep the destination)\n"
+"   for source pixels whose alpha and/or colour is all 0 or all 1. */\n"
+"static bool r300_discard_src(uint cb, float4 s)\n"
+"{\n"
+"    uint m = (cb >> 3) & 7u;\n"
+"    bool a0 = s.a == 0.0, c0 = all(s.rgb == 0.0), a1 = s.a == 1.0, c1 = all(s.rgb == 1.0);\n"
+"    switch (m) {\n"
+"    case 1: return a0;        case 2: return c0;        case 3: return a0 && c0;\n"
+"    case 4: return a1;        case 5: return c1;        case 6: return a1 && c1;\n"
+"    default: return false;\n"
+"    }\n"
 "}\n"
 "static float r300_upk(uint v, uint sh, uint bits, bool sgn)\n"
 "{\n"
@@ -699,7 +963,8 @@ static const char us_prelude[] =
 "";
 
 static const char us_prelude_z[] =
-"/* Depth/stencil (ZB_*).  Attachment 1 is the guest buffer as uint words\n"
+"/* Depth/stencil (ZB_*).  The attachment after the colour buffers is the\n"
+"   guest buffer as uint words\n"
 "   as they lie in memory; DEPTHENDIAN says how the card swapped them.\n"
 "   Z24S8 words hold Z in bits 31:8 and stencil in 7:0. */\n"
 "static uint r300_zswap(uint v, uint e, bool z16)\n"
@@ -729,13 +994,13 @@ static const char us_prelude_z[] =
 "    case 7: return (s - 1u) & 0xffu;    default: return s;\n"
 "    }\n"
 "}\n"
-"struct R300ZOut { r300_cb_t c [[color(0)]]; uint z [[color(1)]]; };\n"
 "/* ZB_CNTL: 0 stencil, 1 Z test, 2 Z write, 4 separate back-face stencil.\n"
 "   ZB_ZSTENCILCNTL: Z func 2:0; front stencil func/sfail/zpass/zfail at\n"
 "   3, 6, 9, 12; back at 15, 18, 21, 24.  STENCILREFMASK: ref, mask,\n"
-"   write mask.  Failing fragments leave the colour buffer as it was. */\n"
-"static R300ZOut r300_ztest(r300_cb_t col, r300_cb_t fb, uint zb, float fz, bool front,\n"
-"                           constant R300FSUniforms &u, device atomic_uint *zp)\n"
+"   write mask.  Returns the new buffer word; pass says whether the\n"
+"   colour buffers take the fragment. */\n"
+"static uint r300_ztest(uint zb, float fz, bool front, constant R300FSUniforms &u,\n"
+"                       device atomic_uint *zp, thread bool &pass)\n"
 "{\n"
 "    uint cntl = u.zinfo.x, zs = u.zinfo.y, rm = u.zinfo.z, fmt = u.zinfo.w;\n"
 "    bool z16 = (fmt & 4u) != 0u;\n"
@@ -747,21 +1012,20 @@ static const char us_prelude_z[] =
 "    bool sten = (cntl & 1u) != 0u, zen = (cntl & 2u) != 0u;\n"
 "    uint sf = zs >> ((!front && (cntl & 16u) != 0u) ? 15u : 3u);\n"
 "    uint ref = rm & 0xffu, mask = (rm >> 8) & 0xffu, wmask = (rm >> 16) & 0xffu;\n"
-"    R300ZOut o; o.c = col;\n"
 "    uint z = zold, sn = sold;\n"
+"    pass = false;\n"
 "    if (sten && !r300_zcmp(sf, ref & mask, sold & mask)) {\n"
-"        sn = r300_sop(sf >> 3, sold, ref); o.c = fb;\n"
+"        sn = r300_sop(sf >> 3, sold, ref);\n"
 "    } else if (!zen || r300_zcmp(zs, znew, zold)) {\n"
 "        if (zen && (cntl & 4u) != 0u) z = znew;\n"
 "        if (sten) sn = r300_sop(sf >> 6, sold, ref);\n"
 "        if (u.zpass_count != 0u) atomic_fetch_add_explicit(zp, 1u, memory_order_relaxed);\n"
+"        pass = true;\n"
 "    } else {\n"
 "        if (sten) sn = r300_sop(sf >> 9, sold, ref);\n"
-"        o.c = fb;\n"
 "    }\n"
 "    sn = (sold & ~wmask) | (sn & wmask);\n"
-"    o.z = r300_zswap(z16 ? z : ((z << 8) | sn), fmt & 3u, z16);\n"
-"    return o;\n"
+"    return r300_zswap(z16 ? z : ((z << 8) | sn), fmt & 3u, z16);\n"
 "}\n"
 "\n"
 "static bool r300_alpha_pass(uint af, float a)\n"
@@ -782,37 +1046,48 @@ static const char us_prelude_z[] =
 "\n";
 
 /*
- * The colour buffer's pixel type and its conversions to and from the
- * blender's colour (r300_cb_view).  Everything is folded into the text.
+ * Colour buffer k's pixel type (r300_cbK_t) and its conversions to and
+ * from the blender's colour (r300_cb_view).  Target A reads its channel
+ * selects and swap from the uniforms; B-D have them folded into the text.
  */
-static void us_emit_cb(R300Sb *sb, const R300State *st)
+static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k)
 {
-    uint32_t pitch = r300_reg(st, RB3D_COLORPITCH0);
+    uint32_t pitch = r300_reg(st, RB3D_COLORPITCH0 + 4 * k);
     uint32_t cf = (pitch >> 21) & 0xF, e = (pitch >> 19) & 3;
-    uint32_t ofr = r300_reg(st, US_OUT_FMT_0), of = ofr & 0x1F;
+    uint32_t ofr = r300_us_out_fmt(st, k), of = ofr & 0x1F;
     uint32_t bpp, view = r300_cb_view(cf, of, &bpp);
     bool sg[4];
     const char *type;
+    char sel[64], swap[16];
     /* The R300 blends and clamps only its 8-bit-per-channel formats. */
     bool fp = of >= 16 && of <= 21;
     bool blend = view == R300_RTV_RGBA8 || cf == 3 || cf == 4 || cf == 15 ||
                  cf == 9 || (cf == 13 && of == 0);
 
+    if (k == 0) {
+        snprintf(sel, sizeof(sel), "u.out_sel");
+        snprintf(swap, sizeof(swap), "u.rt_swap32");
+    } else {
+        snprintf(sel, sizeof(sel), "uint4(%uu, %uu, %uu, %uu)", (ofr >> 8) & 3,
+                 (ofr >> 10) & 3, (ofr >> 12) & 3, (ofr >> 14) & 3);
+        snprintf(swap, sizeof(swap), "%uu", e == 2);
+    }
     for (int n = 0; n < 4; n++) {
         sg[n] = (ofr >> (16 + n)) & 1;
     }
     if (view == R300_RTV_RGBA8 || view == R300_RTV_NONE) {
         r300_sb_printf(sb,
-            "typedef float4 r300_cb_t;\n"
-            "#define R300_CB_CLAMP 1\n#define R300_CB_BLEND 1\n"
-            "static float4 r300_cb_unpack(float4 fb, constant R300FSUniforms &u) { return r300_unpack(fb, u); }\n"
-            "static float4 r300_cb_pack(float4 c, constant R300FSUniforms &u) { return r300_pack(c, u); }\n\n");
+            "typedef float4 r300_cb%u_t;\n"
+            "#define R300_CB%u_CLAMP 1\n#define R300_CB%u_BLEND 1\n"
+            "static float4 r300_cb%u_unpack(float4 fb, constant R300FSUniforms &u) { return r300_unpack(fb, %s, %s); }\n"
+            "static float4 r300_cb%u_pack(float4 c, constant R300FSUniforms &u) { return r300_pack(c, %s, %s); }\n\n",
+            k, k, k, k, sel, swap, k, sel, swap);
         return;
     }
     type = view == R300_RTV_RG32U ? "uint2" : view == R300_RTV_RGBA32U ? "uint4" : "uint";
-    r300_sb_printf(sb, "// colour buffer: format %u, US_OUT_FMT %08x, endian %u, %u bytes\n"
-                   "typedef %s r300_cb_t;\n#define R300_CB_CLAMP %d\n#define R300_CB_BLEND %d\n",
-                   cf, ofr, e, bpp, type, !fp, blend);
+    r300_sb_printf(sb, "// colour buffer %u: format %u, US_OUT_FMT %08x, endian %u, %u bytes\n"
+                   "typedef %s r300_cb%u_t;\n#define R300_CB%u_CLAMP %d\n#define R300_CB%u_BLEND %d\n",
+                   k, cf, ofr, e, bpp, type, k, k, !fp, k, blend);
 
     /* The card's word(s): swaps are their own inverse. */
     char swb[200];
@@ -830,7 +1105,6 @@ static void us_emit_cb(R300Sb *sb, const R300State *st)
                  "r300_cswap(fb.z, %uu), r300_cswap(fb.w, %uu));", e, e, e, e);
     }
 
-    const char *un = "", *pk = "";
     char ub[640], pb[640];
 #define S(n) (sg[n] ? "true" : "false")
     switch (cf) {
@@ -911,8 +1185,6 @@ static void us_emit_cb(R300Sb *sb, const R300State *st)
         break;
     }
 #undef S
-    un = ub;
-    pk = pb;
 
     /* Pack: the word(s), then the same swap back. */
     char back[200];
@@ -930,12 +1202,47 @@ static void us_emit_cb(R300Sb *sb, const R300State *st)
                  "r300_cswap(w.z, %uu), r300_cswap(w.w, %uu));", e, e, e, e);
     }
     r300_sb_printf(sb,
-        "static float4 r300_cb_unpack(r300_cb_t fb, constant R300FSUniforms &u)\n"
+        "static float4 r300_cb%u_unpack(r300_cb%u_t fb, constant R300FSUniforms &u)\n"
         "{\n    %s\n    float4 h = float4(0.0, 0.0, 0.0, 1.0);\n    %s\n"
-        "    return r300_from_hw(h, u);\n}\n"
-        "static r300_cb_t r300_cb_pack(float4 c, constant R300FSUniforms &u)\n"
-        "{\n    float4 h = r300_to_hw(c, u);\n    %s\n    %s\n}\n\n",
-        swb, un, pk, back);
+        "    return r300_from_hw(h, %s);\n}\n"
+        "static r300_cb%u_t r300_cb%u_pack(float4 c, constant R300FSUniforms &u)\n"
+        "{\n    float4 h = r300_to_hw(c, %s);\n    %s\n    %s\n}\n\n",
+        k, k, swb, ub, sel, k, k, sel, pb, back);
+}
+
+/* Blend, ROP and write mask for colour buffer k from shader output src. */
+static void us_emit_target(R300Sb *sb, unsigned k, int src)
+{
+    if (src < 0) {
+        r300_sb_printf(sb, "    o.c%u = fb%u;      // target %u: not written\n", k, k, k);
+        return;
+    }
+    r300_sb_printf(sb,
+        "    {   // target %u\n"
+        "        float4 s = oc[%d];\n"
+        "        float4 d = r300_cb%u_unpack(fb%u, u);\n"
+        "        float4 res = R300_CB%u_CLAMP ? saturate(s) : s;\n"
+        "        if (R300_CB%u_BLEND && (u.cblend & 1u) != 0u) {\n"
+        "            uint ab = (u.cblend & 2u) ? u.ablend : u.cblend;\n"
+        "            uint cs = (u.cblend >> 16) & 63u, cd = (u.cblend >> 24) & 63u;\n"
+        "            uint as_ = (ab >> 16) & 63u, ad = (ab >> 24) & 63u;\n"
+        "            for (uint c = 0; c < 3; c++)\n"
+        "                res[c] = r300_combine(u.cblend, s[c], r300_bfactor(cs, s, d, u.blend_color, c),\n"
+        "                                      d[c], r300_bfactor(cd, s, d, u.blend_color, c));\n"
+        "            res.a = r300_combine(ab, s.a, r300_bfactor(as_, s, d, u.blend_color, 3),\n"
+        "                                 d.a, r300_bfactor(ad, s, d, u.blend_color, 3));\n"
+        "            if (keep) res = d;\n"
+        "        }\n"
+        "        if ((u.rop & 4u) != 0u)\n"
+        "            res = r300_cb%u_unpack(r300_rop(r300_cb%u_pack(R300_CB%u_CLAMP ? saturate(s) : s, u),\n"
+        "                                            fb%u, (u.rop >> 8) & 15u), u);\n"
+        "        /* RB3D_COLOR_CHANNEL_MASK: B G R A in bits 0..3 */\n"
+        "        uint cm = u.chanmask;\n"
+        "        res = float4((cm & 4u) ? res.r : d.r, (cm & 2u) ? res.g : d.g,\n"
+        "                     (cm & 1u) ? res.b : d.b, (cm & 8u) ? res.a : d.a);\n"
+        "        o.c%u = r300_cb%u_pack(res, u);\n"
+        "    }\n",
+        k, src, k, k, k, k, k, k, k, k, k, k);
 }
 
 char *r300_us_to_msl(const R300State *st, const R300FSDesc *desc,
@@ -945,6 +1252,11 @@ char *r300_us_to_msl(const R300State *st, const R300FSDesc *desc,
     unsigned n = us_nodes(st, nodes);
     uint32_t units = 0;
     R300Sb body, sb;
+    bool writes_w;
+    uint32_t written = us_targets_written(st, &writes_w);
+    uint32_t nt = r300_us_num_targets(st);
+    uint32_t mw = ((r300_reg(st, RB3D_CCTL) >> 5) & 3) + 1;
+    uint32_t ucp = r300_reg(st, VAP_CLIP_CNTL) & 0x3F;
 
     *err = NULL;
     r300_sb_init(&body);
@@ -974,8 +1286,53 @@ char *r300_us_to_msl(const R300State *st, const R300FSDesc *desc,
 
     r300_sb_init(&sb);
     r300_sb_printf(&sb, "%s", us_prelude);
-    us_emit_cb(&sb, st);
+    for (unsigned k = 0; k < nt; k++) {
+        us_emit_cb(&sb, st, k);
+    }
     r300_sb_printf(&sb, "%s", us_prelude_z);
+
+    /* Vertex stage: post-transform vertices as they are, plus the user
+     * clip plane distances when VAP_CLIP_CNTL enables any. */
+    r300_sb_printf(&sb,
+        "struct R300VOutC {\n"
+        "    float4 pos [[position]];\n"
+        "    float4 v0 [[user(v0)]]; float4 v1 [[user(v1)]]; float4 v2 [[user(v2)]];\n"
+        "    float4 v3 [[user(v3)]]; float4 v4 [[user(v4)]]; float4 v5 [[user(v5)]];\n"
+        "    float4 v6 [[user(v6)]]; float4 v7 [[user(v7)]]; float4 v8 [[user(v8)]];\n"
+        "    float4 v9 [[user(v9)]]; float4 aux [[user(aux)]];\n"
+        "%s"
+        "};\n"
+        "vertex R300VOutC r300_vs(uint vid [[vertex_id]],\n"
+        "                         const device R300Vertex *vb [[buffer(0)]])\n"
+        "{\n"
+        "    R300Vertex x = vb[vid];\n"
+        "    R300VOutC o;\n"
+        "    o.pos = x.pos;\n"
+        "    o.v0 = x.v[0]; o.v1 = x.v[1]; o.v2 = x.v[2]; o.v3 = x.v[3];\n"
+        "    o.v4 = x.v[4]; o.v5 = x.v[5]; o.v6 = x.v[6]; o.v7 = x.v[7];\n"
+        "    o.v8 = x.v[8]; o.v9 = x.v[9]; o.aux = x.aux;\n"
+        "%s"
+        "    return o;\n"
+        "}\n\n",
+        ucp ? "    float clip [[clip_distance]] [6];\n" : "",
+        ucp ? "    for (int i = 0; i < 6; i++) o.clip[i] = x.ucp[i];\n" : "");
+
+    /* Fragment outputs: colour buffers 0..nt-1, then the depth buffer. */
+    R300Sb outs, fbp, fbarg, fbin, zsel;
+    r300_sb_init(&outs);
+    r300_sb_init(&fbp);
+    r300_sb_init(&fbarg);
+    r300_sb_init(&fbin);
+    r300_sb_init(&zsel);
+    for (unsigned k = 0; k < nt; k++) {
+        r300_sb_printf(&outs, "r300_cb%u_t c%u [[color(%u)]]; ", k, k, k);
+        r300_sb_printf(&fbp, ", r300_cb%u_t fb%u", k, k);
+        r300_sb_printf(&fbarg, ", fb%u", k);
+        r300_sb_printf(&fbin, "                        r300_cb%u_t fb%u [[color(%u)]],\n", k, k, k);
+        r300_sb_printf(&zsel, "    o.c%u = pass ? c.c%u : fb%u;\n", k, k, k);
+    }
+    r300_sb_printf(&sb, "struct R300FOut { %s};\nstruct R300FOutZ { %suint z [[color(%u)]]; };\n\n",
+                   outs.buf, outs.buf, nt);
 
     /* Texture parameters of the shading function and the arguments that
      * pass them on (entry points bind unit k at texture/sampler k). */
@@ -985,18 +1342,25 @@ char *r300_us_to_msl(const R300State *st, const R300FSDesc *desc,
     r300_sb_init(&tent);
     for (unsigned k = 0; k < R300_NUM_TEX_UNITS; k++) {
         if (units & (1u << k)) {
-            const char *tt = unit_is_raw(st, k) ? "uint" : "float";
-            r300_sb_printf(&tparm, ", texture2d<%s> tex%u, sampler smp%u", tt, k, k);
+            static const char *dims[3] = { "texture2d", "texture3d", "texturecube" };
+            const char *tt = unit_is_raw(st, k) ? "texture2d<uint>" : NULL;
+            char tf[32];
+            if (!tt) {
+                snprintf(tf, sizeof(tf), "%s<float>", dims[unit_dim(st, k)]);
+                tt = tf;
+            }
+            r300_sb_printf(&tparm, ", %s tex%u, sampler smp%u", tt, k, k);
             r300_sb_printf(&targ, ", tex%u, smp%u", k, k);
             r300_sb_printf(&tent,
-                "                        texture2d<%s> tex%u [[texture(%u)]],\n"
+                "                        %s tex%u [[texture(%u)]],\n"
                 "                        sampler smp%u [[sampler(%u)]],\n",
                 tt, k, k, k, k);
         }
     }
     r300_sb_printf(&sb,
-        "static r300_cb_t r300_shade(R300VOut in, constant R300FSUniforms &u,\n"
-        "                            r300_cb_t fb%s)\n"
+        "#define R300_WRITES_W %d\n"
+        "static R300FOut r300_shade(R300VOut in, constant R300FSUniforms &u%s,\n"
+        "                           thread float &ow%s)\n"
         "{\n"
         "    /* SC_CLIP_RULE: a 16-entry truth table over which of the four\n"
         "       clip rectangles contain the pixel. */\n"
@@ -1013,58 +1377,75 @@ char *r300_us_to_msl(const R300State *st, const R300FSDesc *desc,
         "    for (int i = 0; i < 32; i++) t[i] = float4(0.0);\n"
         "    float4 vin[10] = { in.v0, in.v1, in.v2, in.v3, in.v4,\n"
         "                       in.v5, in.v6, in.v7, in.v8, in.v9 };\n",
-        tparm.buf ? tparm.buf : "");
+        writes_w, fbp.buf ? fbp.buf : "", tparm.buf ? tparm.buf : "");
     for (unsigned k = 0; k < R300_US_NUM_TEMPS; k++) {
         if (desc->route[k] >= 0) {
             r300_sb_printf(&sb, "    t[%u] = vin[%d];\n", k, desc->route[k]);
         }
     }
-    r300_sb_printf(&sb, "    float4 oc = float4(0.0, 0.0, 0.0, 1.0);\n%s", body.buf);
     r300_sb_printf(&sb,
-        "    if (!r300_alpha_pass(u.alpha_func, saturate(oc.a))) discard_fragment();\n"
-        "    float4 d = r300_cb_unpack(fb, u);\n"
-        "    float4 s = oc;\n"
-        "    float4 res = R300_CB_CLAMP ? saturate(s) : s;\n"
-        "    if (R300_CB_BLEND && (u.cblend & 1)) {\n"
-        "        uint ab = (u.cblend & 2) ? u.ablend : u.cblend;\n"
-        "        uint cs = (u.cblend >> 16) & 63, cd = (u.cblend >> 24) & 63;\n"
-        "        uint as_ = (ab >> 16) & 63, ad = (ab >> 24) & 63;\n"
-        "        for (uint c = 0; c < 3; c++)\n"
-        "            res[c] = r300_combine(u.cblend, s[c], r300_bfactor(cs, s, d, u.blend_color, c),\n"
-        "                                  d[c], r300_bfactor(cd, s, d, u.blend_color, c));\n"
-        "        res.a = r300_combine(ab, s.a, r300_bfactor(as_, s, d, u.blend_color, 3),\n"
-        "                             d.a, r300_bfactor(ad, s, d, u.blend_color, 3));\n"
+        "    float4 oc[4] = { float4(0.0, 0.0, 0.0, 1.0), float4(0.0, 0.0, 0.0, 1.0),\n"
+        "                     float4(0.0, 0.0, 0.0, 1.0), float4(0.0, 0.0, 0.0, 1.0) };\n%s",
+        body.buf ? body.buf : "");
+    r300_sb_printf(&sb,
+        "    /* FG: fog, then the alpha test on render target A. */\n"
+        "    if ((u.fog_blend & 1u) != 0u) {\n"
+        "        float f = r300_fogf(u.fog_blend, in.aux.x, u.fog_color.w);\n"
+        "        for (int k = 0; k < 4; k++) oc[k].rgb = mix(u.fog_color.rgb, oc[k].rgb, f);\n"
         "    }\n"
-        "    /* RB3D_COLOR_CHANNEL_MASK: B G R A in bits 0..3 */\n"
-        "    uint cm = u.chanmask;\n"
-        "    res = float4((cm & 4) ? res.r : d.r, (cm & 2) ? res.g : d.g,\n"
-        "                 (cm & 1) ? res.b : d.b, (cm & 8) ? res.a : d.a);\n"
-        "    return r300_cb_pack(res, u);\n"
+        "    if (!r300_alpha_pass(u.alpha_func, saturate(oc[0].a))) discard_fragment();\n"
+        "    bool keep = r300_discard_src(u.cblend, saturate(oc[0]));\n"
+        "    R300FOut o;\n");
+    for (unsigned k = 0; k < nt; k++) {
+        int src = mw > 1 && k < mw ? 0 : ((written >> k) & 1) || k == 0 ? (int)k : -1;
+        us_emit_target(&sb, k, src);
+    }
+    r300_sb_printf(&sb,
+        "    return o;\n"
         "}\n"
         "\n"
-        "fragment r300_cb_t r300_fs(R300VOut in [[stage_in]],\n"
+        "fragment R300FOut r300_fs(R300VOut in [[stage_in]],\n"
         "                        constant R300FSUniforms &u [[buffer(0)]],\n"
         "                        device atomic_uint *zp [[buffer(1)]],\n"
-        "%s"
-        "                        r300_cb_t fb [[color(0)]])\n"
+        "%s%s"
+        "                        bool front_ [[front_facing]])\n"
         "{\n"
-        "    r300_cb_t c = r300_shade(in, u, fb%s);\n"
+        "    float ow = in.pos.z;\n"
+        "    R300FOut o = r300_shade(in, u%s, ow%s);\n"
         "    if (u.zpass_count != 0u) atomic_fetch_add_explicit(zp, 1u, memory_order_relaxed);\n"
-        "    return c;\n"
+        "    return o;\n"
         "}\n"
         "\n"
-        "fragment R300ZOut r300_fs_z(R300VOut in [[stage_in]],\n"
+        "fragment R300FOutZ r300_fs_z(R300VOut in [[stage_in]],\n"
         "                            constant R300FSUniforms &u [[buffer(0)]],\n"
         "                            device atomic_uint *zp [[buffer(1)]],\n"
-        "%s"
-        "                            r300_cb_t fb [[color(0)]], uint zb [[color(1)]],\n"
+        "%s%s"
+        "                            uint zb [[color(%u)]],\n"
         "                            bool front [[front_facing]])\n"
         "{\n"
-        "    r300_cb_t c = r300_shade(in, u, fb%s);\n"
-        "    return r300_ztest(c, fb, zb, in.pos.z, front, u, zp);\n"
+        "    /* SU_POLY_OFFSET_*: slope in depth per pixel */\n"
+        "    float slope = max(abs(dfdx(in.pos.z)), abs(dfdy(in.pos.z)));\n"
+        "    float ow = in.pos.z;\n"
+        "    R300FOut c = r300_shade(in, u%s, ow%s);\n"
+        "    /* FG_DEPTH_SRC: the program's OMASK_W output replaces the depth */\n"
+        "    float fz = (u.depth_src != 0u && R300_WRITES_W) ? ow : in.pos.z;\n"
+        "    if (front ? (u.poly_en & 1u) != 0u : (u.poly_en & 2u) != 0u)\n"
+        "        fz += front ? u.poly_offset.x * slope + u.poly_offset.y\n"
+        "                    : u.poly_offset.z * slope + u.poly_offset.w;\n"
+        "    bool pass;\n"
+        "    R300FOutZ o;\n"
+        "    o.z = r300_ztest(zb, fz, front, u, zp, pass);\n"
+        "%s"
+        "    return o;\n"
         "}\n",
-        tent.buf ? tent.buf : "", targ.buf ? targ.buf : "",
-        tent.buf ? tent.buf : "", targ.buf ? targ.buf : "");
+        tent.buf ? tent.buf : "", fbin.buf, fbarg.buf, targ.buf ? targ.buf : "",
+        tent.buf ? tent.buf : "", fbin.buf, nt, fbarg.buf, targ.buf ? targ.buf : "",
+        zsel.buf);
+    r300_sb_free(&outs);
+    r300_sb_free(&fbp);
+    r300_sb_free(&fbarg);
+    r300_sb_free(&fbin);
+    r300_sb_free(&zsel);
     r300_sb_free(&tparm);
     r300_sb_free(&targ);
     r300_sb_free(&tent);

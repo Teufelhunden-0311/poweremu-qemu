@@ -14,6 +14,11 @@
 
 /* Registers used here */
 #define SE_VPORT_XSCALE             0x1D98  /* then XOFFSET, YSCALE, ... ZOFFSET */
+#define GB_SELECT                   0x401C
+#define VAP_CLIP_CNTL               0x221C
+#define VAP_PVS_FLOW_CNTL_ADDRS_0   0x2230
+#define VAP_PVS_FLOW_CNTL_LOOP_INDEX_0 0x2290
+#define VAP_PVS_FLOW_CNTL_OPC       0x22DC
 #define VAP_CNTL_STATUS             0x2140
 #define VAP_OUTPUT_VTX_FMT_0        0x2090
 #define VAP_OUTPUT_VTX_FMT_1        0x2094
@@ -33,19 +38,28 @@
 #define SC_SCISSORS_TL              0x43E0
 #define SC_SCISSORS_BR              0x43E4
 #define TX_FILTER0_0                0x4400
+#define TX_FILTER1_0                0x4440
 #define TX_FORMAT0_0                0x4480
 #define TX_FORMAT1_0                0x44C0
 #define TX_FORMAT2_0                0x4500
 #define TX_OFFSET_0                 0x4540
+#define TX_BORDER_COLOR_0           0x45C0
 #define US_OUT_FMT_0                0x46A4
+#define FG_FOG_BLEND                0x4BC0
+#define FG_FOG_FACTOR               0x4BC4
+#define FG_FOG_COLOR_R              0x4BC8  /* then G, B */
 #define FG_ALPHA_FUNC               0x4BD4
+#define FG_DEPTH_SRC                0x4BD8
 #define PFS_PARAM_0_X               0x4C00
 #define RB3D_CBLEND                 0x4E04
 #define RB3D_ABLEND                 0x4E08
 #define RB3D_COLOR_CHANNEL_MASK     0x4E0C
 #define RB3D_BLEND_COLOR            0x4E10
+#define RB3D_ROPCNTL                0x4E18
 #define RB3D_COLOROFFSET0           0x4E28
 #define RB3D_COLORPITCH0            0x4E38
+#define SU_POLY_OFFSET_FRONT_SCALE  0x42A4  /* then FRONT_OFFSET, BACK_SCALE, BACK_OFFSET */
+#define SU_POLY_OFFSET_ENABLE       0x42B4
 #define SU_CULL_MODE                0x42B8
 #define ZB_CNTL                     0x4F00
 #define ZB_ZSTENCILCNTL             0x4F04
@@ -58,6 +72,18 @@
 #define GA_POINT_S1                 0x4208
 #define GA_POINT_T1                 0x420C
 #define GA_POINT_SIZE               0x421C
+#define GA_POINT_MINMAX             0x4230
+#define GA_LINE_CNTL                0x4234
+#define GA_LINE_STIPPLE_CONFIG      0x4238
+#define GA_LINE_STIPPLE_VALUE       0x4260
+#define GA_LINE_S0                  0x4264
+#define GA_LINE_S1                  0x4268
+#define GA_COLOR_CONTROL            0x4278
+#define GA_SOLID_RG                 0x427C
+#define GA_SOLID_BA                 0x4280
+#define GA_POLY_MODE                0x4288
+#define GA_FOG_SCALE                0x4294
+#define GA_FOG_OFFSET               0x4298
 
 #define SC_COORD_BIAS               1440    /* scissor/cliprect origin */
 
@@ -211,6 +237,22 @@ static void decode_element(unsigned type, bool sgn, bool norm,
             c[i] = x;
         }
         break;
+    case 8:                                 /* VECTOR_3_TTT: 10:10:10 */
+    case 9: {                               /* VECTOR_3_EET: 11:11:10 */
+        static const uint8_t sh[2][3] = { { 0, 10, 20 }, { 0, 11, 22 } };
+        static const uint8_t nb[2][3] = { { 10, 10, 10 }, { 11, 11, 10 } };
+        for (unsigned i = 0; i < 3; i++) {
+            unsigned n = nb[type - 8][i];
+            uint32_t b = (w[0] >> sh[type - 8][i]) & ((1u << n) - 1);
+            float x = sgn ? (float)((int32_t)(b << (32 - n)) >> (32 - n)) : (float)b;
+            if (norm) {
+                float m = (float)((1u << (sgn ? n - 1 : n)) - 1);
+                x = sgn ? fmaxf(x / m, -1.0f) : x / m;
+            }
+            c[i] = x;
+        }
+        break;
+    }
     case 11:                                /* FLT16_2 */
     case 12:                                /* FLT16_4 */
         for (unsigned i = 0; i < (type == 11 ? 2u : 4u); i++) {
@@ -219,6 +261,17 @@ static void decode_element(unsigned type, bool sgn, bool norm,
         break;
     default:
         break;
+    }
+}
+
+/* PSC element k's EXT swizzle and write mask into one input vector. */
+static void psc_store(unsigned x, const float c[4], float *dst)
+{
+    for (unsigned i = 0; i < 4; i++) {
+        if ((x >> (12 + i)) & 1) {
+            unsigned s = (x >> (3 * i)) & 7;
+            dst[i] = s < 4 ? c[s] : s == 5 ? 1.0f : 0.0f;
+        }
     }
 }
 
@@ -242,18 +295,19 @@ static bool fetch_vertex(Fetch *f, uint32_t vtx, float in[R300_PVS_NUM_INPUTS][4
             cursor = 0;                 /* each array starts afresh */
         }
         cursor += skip;
-        if (!n || type == 8 || type == 9 || type == 10) {
+        if (!n) {
             f->warn |= R300_WARN_VTXFMT;
         } else if (!fetch_dwords(f, k, vtx, cursor, n, w)) {
             return false;
+        } else if (type == 10) {
+            /* FLOAT_8: two FLOAT_4 vectors at DST_VEC_LOC and the next */
+            decode_element(3, false, false, w, c);
+            psc_store(x, c, in[dst]);
+            decode_element(3, false, false, w + 4, c);
+            psc_store(x, c, in[(dst + 1) % R300_PVS_NUM_INPUTS]);
         } else {
             decode_element(type, (e >> 14) & 1, (e >> 15) & 1, w, c);
-            for (unsigned i = 0; i < 4; i++) {
-                if ((x >> (12 + i)) & 1) {
-                    unsigned s = (x >> (3 * i)) & 7;
-                    in[dst][i] = s < 4 ? c[s] : s == 5 ? 1.0f : 0.0f;
-                }
-            }
+            psc_store(x, c, in[dst]);
         }
         cursor += n;
         if (e & (1u << 13)) {           /* LAST_VEC */
@@ -266,7 +320,7 @@ static bool fetch_vertex(Fetch *f, uint32_t vtx, float in[R300_PVS_NUM_INPUTS][4
 /* ---- output routing ------------------------------------------------- */
 
 typedef struct Layout {
-    int pos, color[4];
+    int pos, psize, color[4];
     int tex_slot[8];
     unsigned tex_n[8];
     /* texture interpolants as one scalar list: (slot, component) */
@@ -284,7 +338,7 @@ static void output_layout(const R300State *st, Layout *l)
     l->nscal = 0;
     l->pos = slot++;                    /* always present */
     if (f0 & (1u << 16)) {
-        slot++;                         /* point size */
+        l->psize = slot++;              /* point size (x) */
     }
     for (int c = 0; c < 4; c++) {
         if (f0 & (1u << (1 + c))) {
@@ -355,12 +409,28 @@ static float rs_col_fmt(unsigned fmt, const float *c, unsigned i)
     return s >= 0 ? c[s] : s == -2 ? 1.0f : 0.0f;
 }
 
-static void rs_values(const R300State *st, const Layout *l, const Route *r,
-                      float out[][4], const float *sprite,
-                      float v[R300_NUM_VARYINGS][4])
+/* The four rasterized colours of a vertex (RS colour pointer 0-3). */
+static void vtx_colors(const Layout *l, float out[][4], float cols[4][4])
 {
-    static const float zero[4];
+    for (int cp = 0; cp < 4; cp++) {
+        if (l->color[cp] >= 0) {
+            memcpy(cols[cp], out[l->color[cp]], sizeof(cols[cp]));
+        } else {
+            memset(cols[cp], 0, sizeof(cols[cp]));
+        }
+    }
+}
 
+/*
+ * Interpolant values of one vertex: texture coordinates from the output
+ * vertex, colours from cols (vtx_colors, or substituted for flat shading
+ * and back faces), and the rasterizer's generated (s, t) (point sprites,
+ * line stipple) past the vertex's own texture components.
+ */
+static void rs_values(const R300State *st, const Layout *l, const Route *r,
+                      float out[][4], const float (*cols)[4],
+                      const float *sprite, float v[R300_NUM_VARYINGS][4])
+{
     for (unsigned k = 0; k < r->nvary; k++) {
         uint32_t ip = r300_reg(st, RS_IP_0 + 4 * r->vary[k].ip);
 
@@ -384,9 +454,9 @@ static void rs_values(const R300State *st, const Layout *l, const Route *r,
                 v[k][i] = x;
             }
         } else {
+            static const float zero[4];
             unsigned cp = (ip >> 6) & 7;
-            int slot = cp < 4 ? l->color[cp] : -1;
-            const float *c = slot >= 0 ? out[slot] : zero;
+            const float *c = cp < 4 ? cols[cp] : zero;
             for (unsigned i = 0; i < 4; i++) {
                 v[k][i] = rs_col_fmt((ip >> 9) & 0xF, c, i);
             }
@@ -430,6 +500,140 @@ static void set_uniforms(const R300State *st, R300DrawPacket *pkt)
         u->cliprect[i][2] = (int32_t)(br & 0x1FFF) - SC_COORD_BIAS;
         u->cliprect[i][3] = (int32_t)((br >> 13) & 0x1FFF) - SC_COORD_BIAS;
     }
+    u->rop = r300_reg(st, RB3D_ROPCNTL);
+    /* Fog: colours and the constant factor are 10-bit fractions. */
+    for (int c = 0; c < 3; c++) {
+        u->fog_color[c] = (r300_reg(st, FG_FOG_COLOR_R + 4 * c) & 0x3FF) / 1023.0f;
+    }
+    u->fog_color[3] = (r300_reg(st, FG_FOG_FACTOR) & 0x3FF) / 1023.0f;
+    u->fog_blend = r300_reg(st, FG_FOG_BLEND) & 7;
+    u->depth_src = r300_reg(st, FG_DEPTH_SRC) & 1;
+    /*
+     * Polygon offset (SU_POLY_OFFSET_*): scale multiplies the depth slope
+     * per 1/12-pixel subpixel and offset is in units of 2^-24 of the depth
+     * range.  Mesa programs a 16-bit Z buffer's scale 16 times larger, so
+     * the slope there is in 2^-20 units; set_depth adjusts for Z16.
+     */
+    u->poly_en = r300_reg(st, SU_POLY_OFFSET_ENABLE) & 7;
+    for (int i = 0; i < 2; i++) {
+        u->poly_offset[2 * i] = bits_to_float(r300_reg(st, SU_POLY_OFFSET_FRONT_SCALE + 8 * i)) / 12.0f;
+        u->poly_offset[2 * i + 1] = bits_to_float(r300_reg(st, SU_POLY_OFFSET_FRONT_SCALE + 8 * i + 4)) /
+                                    16777216.0f;
+    }
+}
+
+static uint32_t pot_ceil(uint32_t v)
+{
+    uint32_t p = 1;
+    while (p < v) {
+        p <<= 1;
+    }
+    return p;
+}
+
+void r300_tex_level_dims(const R300TexDesc *td, uint32_t l, uint32_t *w,
+                         uint32_t *h, uint32_t *d)
+{
+    *w = td->width >> l ? td->width >> l : 1;
+    *h = td->height >> l ? td->height >> l : 1;
+    if (td->dim == R300_TEXDIM_CUBE) {
+        *d = 6;
+    } else if (td->dim == R300_TEXDIM_3D) {
+        *d = td->depth >> l ? td->depth >> l : 1;
+    } else {
+        *d = 1;
+    }
+}
+
+/* The hardware's addressing, as Mesa's r300_texture_desc.c lays out
+ * linear (untiled) textures: 32-byte rows, power-of-two heights for
+ * mipmapped, 3D and cube textures, levels one after another. */
+void r300_tex_layout(R300TexDesc *td, uint32_t bpp, bool dxt, bool pitch_en)
+{
+    bool pot_rows = td->levels > 1 || td->dim != R300_TEXDIM_2D;
+    uint32_t off = 0;
+
+    for (uint32_t l = 0; l < td->levels; l++) {
+        uint32_t w, h, d, pitch, rows;
+
+        r300_tex_level_dims(td, l, &w, &h, &d);
+        if (pot_rows) {
+            h = pot_ceil(h);
+        }
+        if (dxt) {
+            pitch = (((w + 3) / 4) * bpp + 31) & ~31u;
+            rows = (h + 3) / 4;
+        } else {
+            pitch = (w * bpp + 31) & ~31u;
+            rows = h;
+        }
+        if (l == 0 && pitch_en) {
+            pitch = td->pitch_bytes;
+        }
+        td->lvl_off[l] = off;
+        td->lvl_pitch[l] = pitch;
+        td->lvl_rows[l] = rows;
+        off += pitch * rows * d;
+    }
+    td->size_bytes = off;
+}
+
+static float un_bits(uint32_t v, unsigned sh, unsigned n)
+{
+    return (float)((v >> sh) & ((1u << n) - 1)) / (float)((1u << n) - 1);
+}
+
+static float sn_bits(uint32_t v, unsigned sh, unsigned n)
+{
+    int32_t x = (int32_t)(((v >> sh) & ((1u << n) - 1)) << (32 - n)) >> (32 - n);
+    return fmaxf((float)x / (float)((1u << (n - 1)) - 1), -1.0f);
+}
+
+void r300_border_color(uint32_t fmt, uint32_t v, float c[4])
+{
+    c[0] = c[1] = c[2] = c[3] = 0.0f;
+    switch (fmt & 0x1F) {
+    case 0x00: c[0] = un_bits(v, 0, 8); break;
+    case 0x01: c[0] = un_bits(v, 0, 16); break;
+    case 0x02: c[0] = un_bits(v, 0, 4); c[1] = un_bits(v, 4, 4); break;
+    case 0x03: c[0] = un_bits(v, 0, 8); c[1] = un_bits(v, 8, 8); break;
+    case 0x04: c[0] = un_bits(v, 0, 16); c[1] = un_bits(v, 16, 16); break;
+    case 0x05: c[0] = un_bits(v, 0, 2); c[1] = un_bits(v, 2, 3); c[2] = un_bits(v, 5, 3); break;
+    case 0x06: c[0] = un_bits(v, 0, 5); c[1] = un_bits(v, 5, 6); c[2] = un_bits(v, 11, 5); break;
+    case 0x07: c[0] = un_bits(v, 0, 5); c[1] = un_bits(v, 5, 5); c[2] = un_bits(v, 10, 6); break;
+    case 0x08: c[0] = un_bits(v, 0, 10); c[1] = un_bits(v, 10, 11); c[2] = un_bits(v, 21, 11); break;
+    case 0x09: c[0] = un_bits(v, 0, 11); c[1] = un_bits(v, 11, 11); c[2] = un_bits(v, 22, 10); break;
+    case 0x0A:
+        for (int i = 0; i < 4; i++) c[i] = un_bits(v, 4 * i, 4);
+        break;
+    case 0x0B:
+        for (int i = 0; i < 3; i++) c[i] = un_bits(v, 5 * i, 5);
+        c[3] = un_bits(v, 15, 1);
+        break;
+    case 0x0D:
+        for (int i = 0; i < 3; i++) c[i] = un_bits(v, 10 * i, 10);
+        c[3] = un_bits(v, 30, 2);
+        break;
+    case 0x0F: case 0x10: case 0x11:        /* DXT: B8G8R8A8 */
+        c[0] = un_bits(v, 16, 8); c[1] = un_bits(v, 8, 8);
+        c[2] = un_bits(v, 0, 8); c[3] = un_bits(v, 24, 8);
+        break;
+    case 0x12:                              /* signed formats: R8G8B8A8_SNORM */
+        for (int i = 0; i < 4; i++) c[i] = sn_bits(v, 8 * i, 8);
+        break;
+    case 0x16: case 0x17:                   /* R16G16_SNORM */
+        c[0] = sn_bits(v, 0, 16); c[1] = sn_bits(v, 16, 16);
+        break;
+    case 0x18: case 0x19:                   /* R16G16_FLOAT */
+        c[0] = half_to_float(v & 0xFFFF); c[1] = half_to_float(v >> 16);
+        break;
+    case 0x1B:
+        c[0] = bits_to_float(v);
+        break;
+    default:                                /* 8888 */
+        for (int i = 0; i < 4; i++) c[i] = un_bits(v, 8 * i, 8);
+        break;
+    }
 }
 
 static void set_textures(const R300State *st, R300DrawPacket *pkt)
@@ -438,6 +642,7 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
 
     for (unsigned k = 0; k < R300_NUM_TEX_UNITS; k++) {
         R300TexDesc *t = &pkt->tex[k];
+        R300FSUniforms *u = &pkt->uniforms;
         uint32_t f0 = r300_reg(st, TX_FORMAT0_0 + 4 * k);
         uint32_t f1 = r300_reg(st, TX_FORMAT1_0 + 4 * k);
         uint32_t f2 = r300_reg(st, TX_FORMAT2_0 + 4 * k);
@@ -446,14 +651,15 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
 
         memset(t, 0, sizeof(*t));
         /* swizzle: R 14:12, G 17:15, B 20:18, A 11:9 */
-        pkt->uniforms.tex_swz[k][0] = (f1 >> 12) & 7;
-        pkt->uniforms.tex_swz[k][1] = (f1 >> 15) & 7;
-        pkt->uniforms.tex_swz[k][2] = (f1 >> 18) & 7;
-        pkt->uniforms.tex_swz[k][3] = (f1 >> 9) & 7;
+        u->tex_swz[k][0] = (f1 >> 12) & 7;
+        u->tex_swz[k][1] = (f1 >> 15) & 7;
+        u->tex_swz[k][2] = (f1 >> 18) & 7;
+        u->tex_swz[k][3] = (f1 >> 9) & 7;
         if (!(enable & (1u << k))) {
             continue;
         }
         unsigned bpp, decode = 0;
+        bool dxt = false;
         switch (fmt) {
         case 0x0:                       /* X8 */
             t->kind = R300_TEXK_R8; bpp = 1;
@@ -468,9 +674,9 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
             /* VRAM holds the guest CPU's big-endian words (see r300_tex). */
             t->kind = R300_TEXK_RGBA8; bpp = 4; decode = (off & 3) == 0;
             break;
-        case 0xF:  t->kind = R300_TEXK_DXT1; bpp = 8;  break;   /* per block */
-        case 0x10: t->kind = R300_TEXK_DXT3; bpp = 16; break;
-        case 0x11: t->kind = R300_TEXK_DXT5; bpp = 16; break;
+        case 0xF:  t->kind = R300_TEXK_DXT1; bpp = 8;  dxt = true; break;   /* per block */
+        case 0x10: t->kind = R300_TEXK_DXT3; bpp = 16; dxt = true; break;
+        case 0x11: t->kind = R300_TEXK_DXT5; bpp = 16; dxt = true; break;
         default:
             bpp = r300_tex_raw_bpp(fmt);
             if (!bpp) {
@@ -485,17 +691,58 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         t->gpu_addr = off & ~0x1Fu;
         t->width = (f0 & 0x7FF) + 1;
         t->height = ((f0 >> 11) & 0x7FF) + 1;
-        {
-            uint32_t texels = (f0 >> 31) ? (f2 & 0x3FFF) + 1 : t->width;
-            t->pitch_bytes = t->kind >= R300_TEXK_DXT1 ? ((texels + 3) / 4) * bpp
-                                                       : texels * bpp;
+        t->dim = (f1 >> 25) & 3;
+        if (t->dim > R300_TEXDIM_CUBE) {
+            t->dim = R300_TEXDIM_2D;
         }
+        t->depth = t->dim == R300_TEXDIM_3D ? 1u << ((f0 >> 22) & 0xF) : 1;
+        {
+            /* NUM_LEVELS counts the levels below the base, up to 1x1x1 */
+            uint32_t big = t->width > t->height ? t->width : t->height, chain = 1;
+            if (t->depth > big) {
+                big = t->depth;
+            }
+            while (big >> chain) {
+                chain++;
+            }
+            t->levels = ((f0 >> 26) & 0xF) + 1;
+            if (t->levels > chain) {
+                t->levels = chain;
+            }
+            if (t->levels > R300_TEX_MAX_LEVELS) {
+                t->levels = R300_TEX_MAX_LEVELS;
+            }
+        }
+        if (f0 >> 31) {                 /* TX_PITCH_EN: level 0 pitch in texels */
+            uint32_t texels = (f2 & 0x3FFF) + 1;
+            t->pitch_bytes = dxt ? ((texels + 3) / 4) * bpp : texels * bpp;
+        }
+        r300_tex_layout(t, bpp, dxt, f0 >> 31);
+        t->pitch_bytes = t->lvl_pitch[0];
         t->format = fmt;
         t->filter0 = r300_reg(st, TX_FILTER0_0 + 4 * k);
-        pkt->uniforms.tex_info[k][0] = 1;
-        pkt->uniforms.tex_info[k][1] = decode;
-        pkt->uniforms.tex_info[k][2] = t->width;
-        pkt->uniforms.tex_info[k][3] = t->height;
+        t->filter1 = r300_reg(st, TX_FILTER1_0 + 4 * k);
+        u->tex_info[k][0] = 1;
+        /* RAW: the uint view's elements per row, as the renderer binds it */
+        u->tex_info[k][1] = t->kind == R300_TEXK_RAW ? t->pitch_bytes / t->view_bpp : decode;
+        u->tex_info[k][2] = t->width;
+        u->tex_info[k][3] = t->height;
+
+        r300_border_color(fmt, r300_reg(st, TX_BORDER_COLOR_0 + 4 * k), u->tex_border[k]);
+        {
+            int32_t bias = (int32_t)(((t->filter1 >> 3) & 0x3FF) << 22) >> 22;
+            uint32_t minl = (t->filter0 >> 17) & 0xF;
+            u->tex_lod[k][0] = bias / 32.0f;
+            u->tex_lod[k][1] = (float)(minl < t->levels ? minl : t->levels - 1);
+            u->tex_lod[k][2] = (float)(t->levels - 1);
+            u->tex_lod[k][3] = (float)((t->filter0 >> 13) & 3);
+        }
+        u->tex_dim[k][0] = t->dim;
+        u->tex_dim[k][1] = t->depth;
+        u->tex_dim[k][2] = t->pitch_bytes;
+        u->tex_dim[k][3] = ((f1 >> 8) & 1) | ((f1 >> 6) & 2) | ((f1 >> 4) & 4) |
+                           ((f1 >> 2) & 8) | ((f1 >> 21) & 1 ? R300_TEXF_GAMMA : 0) |
+                           (t->levels > 1 || t->dim != R300_TEXDIM_2D ? R300_TEXF_POT_ROWS : 0);
     }
 }
 
@@ -528,6 +775,10 @@ static void set_depth(const R300State *st, R300DrawPacket *pkt)
     u->zinfo[2] = r300_reg(st, ZB_STENCILREFMASK);
     u->zinfo[3] = ((pitch >> 19) & R300_ZFMT_ENDIAN_MASK) |
                   (z->bpp == 2 ? R300_ZFMT_Z16 : 0);
+    if (z->bpp == 2) {
+        u->poly_offset[0] /= 16.0f;
+        u->poly_offset[2] /= 16.0f;
+    }
 }
 
 static void viewport_xform(const R300State *st, const R300DrawPacket *pkt,
@@ -560,63 +811,359 @@ static void viewport_xform(const R300State *st, const R300DrawPacket *pkt,
     }
 }
 
-/* Emit a primitive list as expanded triangles/lines/points. */
-uint32_t r300_assemble(unsigned prim, uint32_t n, uint32_t *list,
-                       uint32_t *cls)
+/*
+ * Emit a primitive list as expanded triangles/lines/points.  With prov,
+ * also the flat-shading candidates of each output primitive (the
+ * FIRST, SECOND, THIRD and LAST vertex of the source primitive, per
+ * GA_COLOR_CONTROL.PROVOKING_VERTEX) and, for triangles, the edge flags
+ * polygon-mode lines honour (bit 0: edge 0-1, bit 1: 1-2, bit 2: 2-0;
+ * the diagonals the card adds inside quads and polygons are not edges).
+ */
+uint32_t r300_assemble_prov(unsigned prim, uint32_t n, uint32_t *list,
+                            uint32_t *cls, R300Prov *prov)
 {
-    uint32_t m = 0;
+    uint32_t m = 0, np = 0;
 
 #define PUT(a) (list[m++] = (a))
+#define PROV(f, s2, t, l, e) do { if (prov) { \
+        prov[np].v[0] = (f); prov[np].v[1] = (s2); prov[np].v[2] = (t); \
+        prov[np].v[3] = (l); prov[np].edges = (e); } np++; } while (0)
     switch (prim) {
     case 1:                                     /* points */
         *cls = 2;
-        for (uint32_t i = 0; i < n; i++) PUT(i);
+        for (uint32_t i = 0; i < n; i++) { PUT(i); PROV(i, i, i, i, 0); }
         break;
     case 2:                                     /* lines */
         *cls = 1;
-        for (uint32_t i = 0; i + 1 < n; i += 2) { PUT(i); PUT(i + 1); }
+        for (uint32_t i = 0; i + 1 < n; i += 2) {
+            PUT(i); PUT(i + 1); PROV(i, i + 1, i + 1, i + 1, 1);
+        }
         break;
     case 3:                                     /* line strip */
     case 12:                                    /* line loop */
         *cls = 1;
-        for (uint32_t i = 0; i + 1 < n; i++) { PUT(i); PUT(i + 1); }
-        if (prim == 12 && n > 2) { PUT(n - 1); PUT(0); }
+        for (uint32_t i = 0; i + 1 < n; i++) {
+            PUT(i); PUT(i + 1); PROV(i, i + 1, i + 1, i + 1, 1);
+        }
+        if (prim == 12 && n > 2) { PUT(n - 1); PUT(0); PROV(n - 1, 0, 0, 0, 1); }
         break;
     case 4:                                     /* triangles */
+    case 7:                                     /* triangles with wFlags */
         *cls = 0;
-        for (uint32_t i = 0; i + 2 < n; i += 3) { PUT(i); PUT(i + 1); PUT(i + 2); }
+        for (uint32_t i = 0; i + 2 < n; i += 3) {
+            PUT(i); PUT(i + 1); PUT(i + 2); PROV(i, i + 1, i + 2, i + 2, 7);
+        }
         break;
     case 5:                                     /* fan */
+        *cls = 0;
+        for (uint32_t i = 1; i + 1 < n; i++) {
+            PUT(0); PUT(i); PUT(i + 1); PROV(0, i, i + 1, i + 1, 7);
+        }
+        break;
     case 15:                                    /* polygon */
         *cls = 0;
-        for (uint32_t i = 1; i + 1 < n; i++) { PUT(0); PUT(i); PUT(i + 1); }
+        for (uint32_t i = 1; i + 1 < n; i++) {
+            PUT(0); PUT(i); PUT(i + 1);
+            PROV(0, 1, 2, n - 1, (i == 1 ? 1 : 0) | 2 | (i + 2 == n ? 4 : 0));
+        }
         break;
     case 6:                                     /* strip */
         *cls = 0;
         for (uint32_t i = 0; i + 2 < n; i++) {
             if (i & 1) { PUT(i + 1); PUT(i); PUT(i + 2); }
             else       { PUT(i); PUT(i + 1); PUT(i + 2); }
+            PROV(i, i + 1, i + 2, i + 2, 7);
         }
         break;
     case 13:                                    /* quads */
         *cls = 0;
         for (uint32_t i = 0; i + 3 < n; i += 4) {
-            PUT(i); PUT(i + 1); PUT(i + 2);
-            PUT(i); PUT(i + 2); PUT(i + 3);
+            PUT(i); PUT(i + 1); PUT(i + 2); PROV(i, i + 1, i + 2, i + 3, 3);
+            PUT(i); PUT(i + 2); PUT(i + 3); PROV(i, i + 1, i + 2, i + 3, 6);
         }
         break;
     case 14:                                    /* quad strip */
         *cls = 0;
         for (uint32_t i = 0; i + 3 < n; i += 2) {
-            PUT(i); PUT(i + 1); PUT(i + 3);
-            PUT(i); PUT(i + 3); PUT(i + 2);
+            PUT(i); PUT(i + 1); PUT(i + 3); PROV(i, i + 1, i + 2, i + 3, 3);
+            PUT(i); PUT(i + 3); PUT(i + 2); PROV(i, i + 1, i + 2, i + 3, 6);
         }
         break;
     default:
         return 0;
     }
+#undef PROV
 #undef PUT
     return m;
+}
+
+uint32_t r300_assemble(unsigned prim, uint32_t n, uint32_t *list,
+                       uint32_t *cls)
+{
+    return r300_assemble_prov(prim, n, list, cls, NULL);
+}
+
+/* ---- primitive emission --------------------------------------------- */
+
+typedef struct Build {
+    const R300State *st;
+    R300DrawPacket *pkt;
+    const Layout *lay;
+    const Route *route;
+    float (*outs)[R300_PVS_NUM_OUTPUTS][4];     /* per source vertex */
+    R300Vertex *xv;                             /* per source vertex */
+    uint32_t n;
+
+    uint32_t colctl;            /* GA_COLOR_CONTROL */
+    bool fancy_colors;          /* flat/solid shading or two-sided colours */
+    bool back_colors;           /* output colours 2/3 are back-face 0/1 */
+    float solid[4];             /* GA_SOLID_* */
+    uint32_t poly_mode;         /* GA_POLY_MODE, 0 when off */
+    uint32_t cull;              /* SU_CULL_MODE for CPU culling, else 0 */
+    float line_hw;              /* half line width, pixels */
+    uint32_t line_end;          /* GA_LINE_CNTL.END_TYPE */
+    float stip_scale;           /* GA_LINE_STIPPLE_CONFIG.STIPPLE_SCALE */
+    uint32_t stip_reset;
+    float stip_acc;             /* stipple accumulator, subpixels */
+    float point_hw, point_hh;   /* GA_POINT_SIZE, half, pixels */
+    float point_min, point_max; /* GA_POINT_MINMAX diameters, pixels */
+    bool point_psize;           /* per-vertex point size */
+
+    R300Vertex *tri, *line;
+    uint32_t ntri, nline, cap_tri, cap_line;
+} Build;
+
+static R300Vertex *push(R300Vertex **buf, uint32_t *n, uint32_t *cap, uint32_t k)
+{
+    if (*n + k > *cap) {
+        *cap = (*n + k) * 2 + 16;
+        *buf = realloc(*buf, sizeof(R300Vertex) * *cap);
+    }
+    *n += k;
+    return *buf + *n - k;
+}
+
+/* Colours of source vertex i as the rasterizer sees them on a face. */
+static void face_colors(Build *b, uint32_t i, bool back, float cols[4][4])
+{
+    vtx_colors(b->lay, b->outs[i], cols);
+    if (back && b->back_colors) {
+        /* Two-sided lighting: the setup engine picks colours 2 and 3 for
+         * back faces (AMD R5xx guide 7.5). */
+        for (int c = 0; c < 2; c++) {
+            if (b->lay->color[2 + c] >= 0) {
+                memcpy(cols[c], cols[2 + c], sizeof(cols[c]));
+            }
+        }
+    }
+}
+
+/*
+ * One output vertex from source vertex i: prov is its primitive's
+ * provoking-vertex candidates (NULL: none), back its facing, sprite the
+ * rasterizer's generated (s, t) or NULL.
+ */
+static void emit_vertex(Build *b, uint32_t i, const R300Prov *prov, bool back,
+                        const float *sprite, R300Vertex *o)
+{
+    *o = b->xv[i];
+    if (!b->fancy_colors && !sprite) {
+        return;
+    }
+    float cols[4][4];
+    face_colors(b, i, back, cols);
+    if (b->fancy_colors) {
+        float pc[4][4];
+        uint32_t pv = prov ? prov->v[(b->colctl >> 16) & 3] : i;
+        face_colors(b, pv < b->n ? pv : i, back, pc);
+        for (int c = 0; c < 4; c++) {
+            unsigned rgb = (b->colctl >> (4 * c)) & 3, a = (b->colctl >> (4 * c + 2)) & 3;
+            for (int k = 0; k < 4; k++) {
+                unsigned mode = k < 3 ? rgb : a;
+                if (mode == 0) {
+                    cols[c][k] = b->solid[k];
+                } else if (mode == 1) {
+                    cols[c][k] = pc[c][k];
+                }
+            }
+        }
+    }
+    rs_values(b->st, b->lay, b->route, b->outs[i], (const float (*)[4])cols,
+              sprite, o->v);
+}
+
+static void ndc_px(const Build *b, const float *p, float *x, float *y)
+{
+    float w = p[3] != 0.0f ? p[3] : 1.0f;
+    *x = (p[0] / w + 1.0f) * b->pkt->rt_width * 0.5f;
+    *y = (1.0f - p[1] / w) * b->pkt->rt_height * 0.5f;
+}
+
+/* Replace the x, y of clip-space p by pixel position (x, y), keeping w. */
+static void px_ndc(const Build *b, float x, float y, float *p)
+{
+    float w = p[3] != 0.0f ? p[3] : 1.0f;
+    p[0] = (2.0f * x / b->pkt->rt_width - 1.0f) * w;
+    p[1] = (1.0f - 2.0f * y / b->pkt->rt_height) * w;
+}
+
+/*
+ * A point: a screen-aligned square GA_POINT_SIZE wide (width in the high
+ * half, height in the low half, in sixths of a pixel), or the vertex's
+ * point size clamped to GA_POINT_MINMAX, with texture coordinates S0..S1
+ * left to right and T0..T1 bottom to top.  Apple's compositor presents
+ * the screen as one such point covering the whole frame buffer.
+ */
+static void emit_point(Build *b, uint32_t i, const R300Prov *prov, bool back)
+{
+    const R300State *st = b->st;
+    const float *p = b->xv[i].pos;
+    float hw = b->point_hw, hh = b->point_hh;
+    float s0 = bits_to_float(r300_reg(st, GA_POINT_S0));
+    float t0 = bits_to_float(r300_reg(st, GA_POINT_T0));
+    float s1 = bits_to_float(r300_reg(st, GA_POINT_S1));
+    float t1 = bits_to_float(r300_reg(st, GA_POINT_T1));
+    static const int corner[6] = { 0, 1, 2, 0, 2, 3 };
+    float cx, cy;
+
+    if (b->point_psize) {
+        float d = b->outs[i][b->lay->psize][0];
+        d = fminf(fmaxf(d, b->point_min), b->point_max);
+        hw = hh = d * 0.5f;
+    }
+    ndc_px(b, p, &cx, &cy);
+    /* corners: top-left, top-right, bottom-right, bottom-left */
+    float x[4] = { cx - hw, cx + hw, cx + hw, cx - hw };
+    float y[4] = { cy - hh, cy - hh, cy + hh, cy + hh };
+    float sc[4] = { s0, s1, s1, s0 };
+    float tc[4] = { t1, t1, t0, t0 };
+    R300Vertex *o = push(&b->tri, &b->ntri, &b->cap_tri, 6);
+
+    for (int k = 0; k < 6; k++) {
+        int c = corner[k];
+        float st2[2] = { sc[c], tc[c] };
+
+        emit_vertex(b, i, prov, back, st2, &o[k]);
+        /* screen-space square at the vertex's depth */
+        o[k].pos[2] = p[2] / (p[3] != 0.0f ? p[3] : 1.0f);
+        o[k].pos[3] = 1.0f;
+        px_ndc(b, x[c], y[c], o[k].pos);
+    }
+}
+
+/*
+ * A line from source vertex i0 to i1.  The rasterizer stuffs (s, t) for
+ * the texture components past the vertex's own: s runs GA_LINE_S0 to S1
+ * along the line, or with GA_LINE_STIPPLE_CONFIG.STIPPLE_SCALE set, is the
+ * stipple accumulator (subpixels, 12 a pixel) times the scale, which the
+ * driver's program looks up in its stipple pattern.  Lines wider than a
+ * pixel become quads: offset across the major axis (END_TYPE horizontal,
+ * vertical, square), or perpendicular to the line (computed).
+ */
+static void emit_line(Build *b, uint32_t i0, uint32_t i1, const R300Prov *prov,
+                      bool back)
+{
+    const float *p0 = b->xv[i0].pos, *p1 = b->xv[i1].pos;
+    float x0, y0, x1, y1;
+    float sp0[2] = { 0, 0 }, sp1[2] = { 0, 0 };
+
+    ndc_px(b, p0, &x0, &y0);
+    ndc_px(b, p1, &x1, &y1);
+    float dx = x1 - x0, dy = y1 - y0, len = sqrtf(dx * dx + dy * dy);
+    if (b->stip_scale != 0.0f) {
+        if (b->stip_reset == 1) {
+            b->stip_acc = 0.0f;
+        }
+        sp0[0] = b->stip_acc * b->stip_scale;
+        b->stip_acc += len * 12.0f;
+        sp1[0] = b->stip_acc * b->stip_scale;
+    } else {
+        sp0[0] = bits_to_float(r300_reg(b->st, GA_LINE_S0));
+        sp1[0] = bits_to_float(r300_reg(b->st, GA_LINE_S1));
+    }
+
+    if (b->line_hw <= 0.75f) {
+        R300Vertex *o = push(&b->line, &b->nline, &b->cap_line, 2);
+        emit_vertex(b, i0, prov, back, sp0, &o[0]);
+        emit_vertex(b, i1, prov, back, sp1, &o[1]);
+        return;
+    }
+    float ox, oy, hw = b->line_hw;
+    if (b->line_end == 3 && len > 0.0f) {
+        ox = -dy / len * hw;
+        oy = dx / len * hw;
+    } else if (fabsf(dx) >= fabsf(dy)) {
+        ox = 0.0f; oy = hw;             /* x-major: widen vertically */
+    } else {
+        ox = hw; oy = 0.0f;
+    }
+    R300Vertex q[4];
+    emit_vertex(b, i0, prov, back, sp0, &q[0]);
+    q[1] = q[0];
+    emit_vertex(b, i1, prov, back, sp1, &q[2]);
+    q[3] = q[2];
+    px_ndc(b, x0 - ox, y0 - oy, q[0].pos);
+    px_ndc(b, x0 + ox, y0 + oy, q[1].pos);
+    px_ndc(b, x1 + ox, y1 + oy, q[2].pos);
+    px_ndc(b, x1 - ox, y1 - oy, q[3].pos);
+    static const int tri[6] = { 0, 1, 2, 0, 2, 3 };
+    R300Vertex *o = push(&b->tri, &b->ntri, &b->cap_tri, 6);
+    for (int k = 0; k < 6; k++) {
+        o[k] = q[tri[k]];
+    }
+}
+
+/* Winding on screen, as Metal and SU_CULL_MODE judge it. */
+static bool tri_ccw(const Build *b, uint32_t a, uint32_t c, uint32_t d)
+{
+    const float *p[3] = { b->xv[a].pos, b->xv[c].pos, b->xv[d].pos };
+    float x[3], y[3];
+    for (int k = 0; k < 3; k++) {
+        float w = p[k][3] != 0.0f ? p[k][3] : 1.0f;
+        x[k] = p[k][0] / w;
+        y[k] = p[k][1] / w;
+    }
+    float area = (x[1] - x[0]) * (y[2] - y[0]) - (x[2] - x[0]) * (y[1] - y[0]);
+    /* a vertex behind the eye flips the projected winding */
+    if ((p[0][3] < 0) ^ (p[1][3] < 0) ^ (p[2][3] < 0)) {
+        area = -area;
+    }
+    return area > 0.0f;
+}
+
+static void emit_tri(Build *b, const uint32_t *ix, const R300Prov *prov)
+{
+    bool front = tri_ccw(b, ix[0], ix[1], ix[2]) == r300_front_ccw(r300_reg(b->st, SU_CULL_MODE));
+    bool back = !front;
+
+    if ((front && (b->cull & R300_CULL_FRONT)) || (back && (b->cull & R300_CULL_BACK))) {
+        return;
+    }
+    /* GA_POLY_MODE.FRONT_PTYPE / BACK_PTYPE: 0 points, 1 lines, 2 triangles */
+    unsigned ptype = !b->poly_mode ? 2 : front ? (b->poly_mode >> 4) & 7
+                                               : (b->poly_mode >> 7) & 7;
+    if (ptype == 0) {
+        for (int k = 0; k < 3; k++) {
+            emit_point(b, ix[k], prov, back);
+        }
+    } else if (ptype == 1) {
+        for (int k = 0; k < 3; k++) {
+            if (!prov || (prov->edges >> k) & 1) {
+                emit_line(b, ix[k], ix[(k + 1) % 3], prov, back);
+            }
+        }
+    } else {
+        R300Vertex *o = push(&b->tri, &b->ntri, &b->cap_tri, 3);
+        for (int k = 0; k < 3; k++) {
+            emit_vertex(b, ix[k], prov, back, NULL, &o[k]);
+        }
+    }
+}
+
+/* S3.12 fixed point (GA_SOLID_*). */
+static float s312(uint32_t v)
+{
+    return (int16_t)(v & 0xFFFF) / 4096.0f;
 }
 
 /*
@@ -631,6 +1178,7 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
 {
     uint32_t prim, nidx = 0;
     uint32_t *list = NULL;
+    R300Prov *prov = NULL;
     Fetch f = { 0 };
     Layout lay;
     Route route;
@@ -640,8 +1188,14 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     uint32_t cc = r300_reg(st, VAP_PVS_CONST_CNTL);
     bool bypass = (r300_reg(st, VAP_CNTL_STATUS) >> 8) & 1;
     uint32_t tl = r300_reg(st, SC_SCISSORS_TL), br = r300_reg(st, SC_SCISSORS_BR);
+    uint32_t clip = r300_reg(st, VAP_CLIP_CNTL);
+    uint32_t fogsel = r300_reg(st, GB_SELECT) & 7;
+    bool fog = r300_reg(st, FG_FOG_BLEND) & 1;
+    float fog_scale = bits_to_float(r300_reg(st, GA_FOG_SCALE));
+    float fog_off = bits_to_float(r300_reg(st, GA_FOG_OFFSET));
     R300PVSProgram prog;
     float consts[256][4];
+    Build b;
 
     prim = vf & 0xF;
 
@@ -661,6 +1215,21 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         free(order);
         return false;
     }
+    /* Render targets B-D (multiple render targets or multiwrites) */
+    pkt->num_cb = r300_us_num_targets(st);
+    for (uint32_t k = 1; k < pkt->num_cb; k++) {
+        R300ColorDesc *c = &pkt->cb[k];
+        uint32_t pr = r300_reg(st, RB3D_COLORPITCH0 + 4 * k);
+        c->gpu_addr = r300_reg(st, RB3D_COLOROFFSET0 + 4 * k) & ~0x1Fu;
+        c->pitch = pr & 0x3FFE;
+        c->format = (pr >> 21) & 0xF;
+        c->view = r300_cb_view(c->format, r300_us_out_fmt(st, k), &c->bpp);
+        if (c->view == R300_RTV_NONE || !c->pitch) {
+            pkt->warn |= R300_WARN_RTFMT;
+            pkt->num_cb = k;            /* bind the ones before it */
+            break;
+        }
+    }
     pkt->scissor[0] = ((tl & 0x1FFF) > SC_COORD_BIAS) ? (tl & 0x1FFF) - SC_COORD_BIAS : 0;
     pkt->scissor[1] = (((tl >> 13) & 0x1FFF) > SC_COORD_BIAS) ?
                       ((tl >> 13) & 0x1FFF) - SC_COORD_BIAS : 0;
@@ -679,9 +1248,6 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     set_uniforms(st, pkt);
     set_textures(st, pkt);
     set_depth(st, pkt);
-    /* The setup unit culls polygons only (triangles, fans, strips, quads,
-     * quad strips, polygons). */
-    pkt->cull = ((1u << prim) & 0xE0F0u) ? r300_reg(st, SU_CULL_MODE) & 7 : 0;
 
     /* Vertex order */
     f.st = st;
@@ -706,17 +1272,27 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     prog.last_inst = (cntl0 >> 20) & 0x3FF;
     prog.consts = (const float (*)[4])consts;
     prog.max_const = (cc >> 16) & 0xFF;
+    prog.fc_opc = r300_reg(st, VAP_PVS_FLOW_CNTL_OPC);
+    for (int i = 0; i < 16; i++) {
+        prog.fc_addrs[i] = r300_reg(st, VAP_PVS_FLOW_CNTL_ADDRS_0 + 4 * i);
+        prog.fc_loop[i] = r300_reg(st, VAP_PVS_FLOW_CNTL_LOOP_INDEX_0 + 4 * i);
+    }
 
     output_layout(st, &lay);
     rs_route(st, &route, &desc, &pkt->warn);
 
-    /* Transform every vertex in draw order (cheap next to the GPU work). */
-    R300Vertex *xv = calloc(n, sizeof(R300Vertex));
-    float (*outs)[R300_PVS_NUM_OUTPUTS][4] = calloc(n, sizeof(*outs));
-    for (uint32_t i = 0; i < n; i++) {
-        float in[R300_PVS_NUM_INPUTS][4], out[R300_PVS_NUM_OUTPUTS][4];
+    /* Rectangle lists: three corners a rectangle, the card completes the
+     * parallelogram (v0 + v2 - v1) and draws it as a quad. */
+    bool rects = prim == 8;
+    uint32_t nsrc = rects ? n / 3 * 4 : n;
 
-        memset(out, 0, sizeof(out));
+    /* Transform every vertex in draw order (cheap next to the GPU work). */
+    R300Vertex *xv = calloc(nsrc ? nsrc : 1, sizeof(R300Vertex));
+    float (*outs)[R300_PVS_NUM_OUTPUTS][4] = calloc(nsrc ? nsrc : 1, sizeof(*outs));
+    for (uint32_t i = 0, j = 0; i < n && j < nsrc; i++, j++) {
+        float in[R300_PVS_NUM_INPUTS][4];
+        float (*out)[4] = outs[j];
+
         if (!fetch_vertex(&f, order[i], in)) {
             *err = f.why ? f.why : "vertex data out of range";
             free(outs);
@@ -725,78 +1301,108 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
             return false;
         }
         if (bypass) {
-            memcpy(out, in, sizeof(out));
-        } else if (r300_pvs_run(&prog, (const float (*)[4])in, out)) {
-            pkt->warn |= R300_WARN_PVS;
+            memcpy(out, in, sizeof(outs[j]));
+        } else {
+            uint32_t u = r300_pvs_run(&prog, (const float (*)[4])in, out);
+            if (u & R300_PVS_UNSUP_FLOW) {
+                pkt->warn |= R300_WARN_FLOW;
+            }
+            if (u & ~R300_PVS_UNSUP_FLOW) {
+                pkt->warn |= R300_WARN_PVS;
+            }
         }
-        viewport_xform(st, pkt, out[lay.pos], xv[i].pos);
-        rs_values(st, &lay, &route, out, NULL, xv[i].v);
-        memcpy(outs[i], out, sizeof(out));
+        if (rects && i % 3 == 2) {
+            j++;
+            for (int o = 0; o < R300_PVS_NUM_OUTPUTS; o++) {
+                for (int c = 0; c < 4; c++) {
+                    outs[j][o][c] = outs[j - 3][o][c] + outs[j - 1][o][c] - outs[j - 2][o][c];
+                }
+            }
+        }
+    }
+    for (uint32_t j = 0; j < nsrc; j++) {
+        float (*out)[4] = outs[j];
+        float cols[4][4];
+
+        viewport_xform(st, pkt, out[lay.pos], xv[j].pos);
+        vtx_colors(&lay, out, cols);
+        rs_values(st, &lay, &route, out, (const float (*)[4])cols, NULL, xv[j].v);
+        if (fog) {
+            float src = fogsel < 4 ? (lay.color[fogsel] >= 0 ? out[lay.color[fogsel]][3] : 0.0f)
+                      : fogsel == 4 ? out[lay.pos][3]
+                      : xv[j].pos[2] / (xv[j].pos[3] != 0.0f ? xv[j].pos[3] : 1.0f);
+            xv[j].aux[0] = src * fog_scale + fog_off;
+        }
+        /* User clip planes (VAP_CLIP_CNTL.UCP_ENA_n): the distance of the
+         * clip-space position from plane n in PVS memory 1024 + n. */
+        for (int k = 0; k < 6; k++) {
+            const float *pl = (const float *)&st->pvs_mem[(R300_PVS_UCP_START + k) * 4];
+            const float *cp = out[lay.pos];
+            xv[j].ucp[k] = (clip >> k) & 1 ? cp[0] * pl[0] + cp[1] * pl[1] +
+                                             cp[2] * pl[2] + cp[3] * pl[3] : 1.0f;
+        }
+    }
+    if (rects) {
+        prim = 13;
+        n = nsrc;
     }
     pkt->warn |= f.warn;
 
-    if (prim == 1) {
-        /*
-         * Points are screen-aligned squares GA_POINT_SIZE wide (width in
-         * the high half, height in the low half, in sixths of a pixel)
-         * with texture coordinates S0..S1 left to right and T0..T1 bottom
-         * to top.  Apple's compositor presents the screen as one such
-         * point covering the whole frame buffer.
-         */
+    /* Primitive assembly */
+    memset(&b, 0, sizeof(b));
+    b.st = st;
+    b.pkt = pkt;
+    b.lay = &lay;
+    b.route = &route;
+    b.outs = outs;
+    b.xv = xv;
+    b.n = n;
+    b.colctl = r300_reg(st, GA_COLOR_CONTROL);
+    b.back_colors = (r300_reg(st, VAP_OUTPUT_VTX_FMT_0) & (3u << 3)) != 0;
+    for (int c = 0; c < 4 && !b.fancy_colors; c++) {
+        b.fancy_colors = ((b.colctl >> (4 * c)) & 3) != 2 ||
+                         ((b.colctl >> (4 * c + 2)) & 3) != 2;
+    }
+    b.fancy_colors |= b.back_colors;
+    b.solid[0] = s312(r300_reg(st, GA_SOLID_RG) >> 16);
+    b.solid[1] = s312(r300_reg(st, GA_SOLID_RG));
+    b.solid[2] = s312(r300_reg(st, GA_SOLID_BA) >> 16);
+    b.solid[3] = s312(r300_reg(st, GA_SOLID_BA));
+    b.poly_mode = (r300_reg(st, GA_POLY_MODE) & 3) == 1 ? r300_reg(st, GA_POLY_MODE) : 0;
+    {
+        uint32_t lc = r300_reg(st, GA_LINE_CNTL);
+        uint32_t sc = r300_reg(st, GA_LINE_STIPPLE_CONFIG);
         uint32_t ps = r300_reg(st, GA_POINT_SIZE);
-        float half_w = ((ps >> 16) & 0xFFFF) / 12.0f;
-        float half_h = (ps & 0xFFFF) / 12.0f;
-        float s0 = bits_to_float(r300_reg(st, GA_POINT_S0));
-        float t0 = bits_to_float(r300_reg(st, GA_POINT_T0));
-        float s1 = bits_to_float(r300_reg(st, GA_POINT_S1));
-        float t1 = bits_to_float(r300_reg(st, GA_POINT_T1));
-        float W = pkt->rt_width, H = pkt->rt_height;
-        static const int corner[6] = { 0, 1, 2, 0, 2, 3 };
-
-        pkt->verts = malloc(sizeof(R300Vertex) * n * 6);
-        pkt->num_verts = 0;
-        pkt->prim_class = 0;
-        for (uint32_t i = 0; i < n; i++) {
-            const float *p = xv[i].pos;
-            float w = p[3] != 0.0f ? p[3] : 1.0f;
-            float cx = (p[0] / w + 1.0f) * W * 0.5f;
-            float cy = (1.0f - p[1] / w) * H * 0.5f;
-            float z = p[2] / w;
-            /* corners: top-left, top-right, bottom-right, bottom-left */
-            float x[4] = { cx - half_w, cx + half_w, cx + half_w, cx - half_w };
-            float y[4] = { cy - half_h, cy - half_h, cy + half_h, cy + half_h };
-            float sc[4] = { s0, s1, s1, s0 };
-            float tc[4] = { t1, t1, t0, t0 };
-
-            for (int k = 0; k < 6; k++) {
-                int c = corner[k];
-                R300Vertex *o = &pkt->verts[pkt->num_verts++];
-                float st2[2] = { sc[c], tc[c] };
-
-                o->pos[0] = 2.0f * x[c] / W - 1.0f;
-                o->pos[1] = 1.0f - 2.0f * y[c] / H;
-                o->pos[2] = z;
-                o->pos[3] = 1.0f;
-                rs_values(st, &lay, &route, outs[i], st2, o->v);
-            }
-        }
-        free(outs);
-        free(xv);
-        free(order);
-        pkt->msl = r300_us_to_msl(st, &desc, err);
-        if (!pkt->msl) {
-            r300_draw_free(pkt);
-            return false;
-        }
-        return true;
+        uint32_t mm = r300_reg(st, GA_POINT_MINMAX);
+        b.line_hw = (lc & 0xFFFF) / 12.0f;
+        b.line_end = (lc >> 16) & 3;
+        b.stip_scale = bits_to_float(sc & ~3u);
+        b.stip_reset = sc & 3;
+        b.stip_acc = b.stip_reset ? 0.0f : (float)(r300_reg(st, GA_LINE_STIPPLE_VALUE) & 0xFFFFFF);
+        b.point_hw = ((ps >> 16) & 0xFFFF) / 12.0f;
+        b.point_hh = (ps & 0xFFFF) / 12.0f;
+        b.point_min = (mm & 0xFFFF) / 6.0f;
+        b.point_max = (mm >> 16) / 6.0f;
+        b.point_psize = lay.psize >= 0;
+    }
+    /* The setup unit culls polygons only (triangles, fans, strips, quads,
+     * quad strips, polygons).  Metal culls filled triangles; the CPU does
+     * it when polygon mode turns them into lines or points. */
+    pkt->cull = ((1u << prim) & 0xE0F0u) ? r300_reg(st, SU_CULL_MODE) & 7 : 0;
+    if (b.poly_mode && pkt->cull) {
+        b.cull = pkt->cull;
+        pkt->cull &= R300_FACE_CW;
     }
 
     list = malloc(sizeof(uint32_t) * (n * 3 + 6));
-    nidx = r300_assemble(prim, n, list, &pkt->prim_class);
+    prov = malloc(sizeof(R300Prov) * (n * 2 + 2));
+    uint32_t cls;
+    nidx = r300_assemble_prov(prim, n, list, &cls, prov);
     if (!nidx) {
         if (prim != 0) {
             pkt->warn |= R300_WARN_PRIM;
         }
+        free(prov);
         free(list);
         free(outs);
         free(xv);
@@ -804,11 +1410,39 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         *err = "primitive type not supported";
         return false;
     }
-    pkt->verts = malloc(sizeof(R300Vertex) * nidx);
-    for (uint32_t i = 0; i < nidx; i++) {
-        pkt->verts[i] = xv[list[i]];
+    if (cls == 0) {
+        for (uint32_t i = 0, t = 0; i + 2 < nidx; i += 3, t++) {
+            emit_tri(&b, &list[i], &prov[t]);
+        }
+    } else if (cls == 1) {
+        if (b.stip_reset == 2) {
+            b.stip_acc = 0.0f;
+        }
+        for (uint32_t i = 0, t = 0; i + 1 < nidx; i += 2, t++) {
+            emit_line(&b, list[i], list[i + 1], &prov[t], false);
+        }
+    } else {
+        for (uint32_t i = 0; i < nidx; i++) {
+            emit_point(&b, list[i], &prov[i], false);
+        }
     }
-    pkt->num_verts = nidx;
+    if (!b.ntri && b.nline) {
+        pkt->verts = b.line;
+        pkt->num_verts = b.nline;
+        pkt->prim_class = 1;
+        free(b.tri);
+    } else {
+        if (b.nline) {
+            b.tri = realloc(b.tri, sizeof(R300Vertex) * (b.ntri + b.nline));
+            memcpy(b.tri + b.ntri, b.line, sizeof(R300Vertex) * b.nline);
+        }
+        free(b.line);
+        pkt->verts = b.tri;
+        pkt->num_verts = b.ntri;
+        pkt->num_line_verts = b.nline;
+        pkt->prim_class = 0;
+    }
+    free(prov);
     free(list);
     free(outs);
     free(xv);

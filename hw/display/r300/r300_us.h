@@ -27,6 +27,7 @@
 #define R300_US_MAX_TEX         32
 #define R300_NUM_TEX_UNITS      16
 #define R300_NUM_VARYINGS       10
+#define R300_US_MAX_TARGETS     4       /* render targets A-D */
 
 /*
  * Post-transform vertex as the device hands it to Metal: pos is in Metal
@@ -36,6 +37,8 @@
 typedef struct R300Vertex {
     float pos[4];
     float v[R300_NUM_VARYINGS][4];
+    float aux[4];                   /* x: fog value (GB_SELECT.FOG_SELECT, GA_FOG_*) */
+    float ucp[8];                   /* user clip plane distances (VAP_CLIP_CNTL) */
 } R300Vertex;
 
 /* Must match struct R300FSUniforms in the generated MSL. */
@@ -48,13 +51,29 @@ typedef struct R300FSUniforms {
     uint32_t cblend, ablend, chanmask, alpha_func;
     uint32_t out_sel[4];                      /* US_OUT_FMT_0 C0..C3 (0 A, 1 R, 2 G, 3 B) */
     uint32_t rt_swap32, clip_rule;            /* stored bytes are C3,C2,C1,C0 */
-    uint32_t rt_endian, pad;                  /* RB3D_COLORPITCH0.COLOR_ENDIAN */
+    uint32_t rt_endian, rop;                  /* RB3D_COLORPITCH0.COLOR_ENDIAN, RB3D_ROPCNTL */
     int32_t cliprect[4][4];                   /* SC_CLIPRECT x0, y0, x1, y1 (inclusive) */
     /* Depth/stencil: ZB_CNTL, ZB_ZSTENCILCNTL, ZB_STENCILREFMASK, and
-     * R300_ZFMT_* (layout of the buffer bound as colour attachment 1). */
+     * R300_ZFMT_* (layout of the buffer bound after the colour buffers). */
     uint32_t zinfo[4];
-    uint32_t zpass_count, pad2[3];            /* count Z-pass samples (ZB_ZPASS_*) */
+    uint32_t zpass_count, poly_en, pad2[2];   /* count Z-pass samples (ZB_ZPASS_*);
+                                                 SU_POLY_OFFSET_ENABLE */
+    float tex_border[R300_NUM_TEX_UNITS][4];  /* TX_BORDER_COLOR, XYZW before the swizzle */
+    float tex_lod[R300_NUM_TEX_UNITS][4];     /* LOD bias, finest level (MAX_MIP_LEVEL),
+                                                 coarsest level, mip filter (0 none,
+                                                 1 nearest, 2 linear) */
+    uint32_t tex_dim[R300_NUM_TEX_UNITS][4];  /* R300_TEXDIM_*, level-0 depth, level-0
+                                                 pitch in bytes, R300_TEXF_* */
+    float fog_color[4];                       /* FG_FOG_COLOR_*, w: FG_FOG_FACTOR */
+    uint32_t fog_blend, depth_src, pad3[2];   /* FG_FOG_BLEND, FG_DEPTH_SRC */
+    float poly_offset[4];                     /* front scale, offset, back scale, offset,
+                                                 in units of the [0,1] depth range */
 } R300FSUniforms;
+
+/* tex_dim[k].w */
+#define R300_TEXF_SIGNED_X      (1u << 0)     /* .. W at bit 3 (TX_FORMAT1.SIGNED_*) */
+#define R300_TEXF_GAMMA         (1u << 4)
+#define R300_TEXF_POT_ROWS      (1u << 5)     /* heights round up to a power of two */
 
 #define R300_ZFMT_ENDIAN_MASK   3u            /* ZB_DEPTHPITCH.DEPTHENDIAN */
 #define R300_ZFMT_Z16           (1u << 2)     /* 16-bit Z, no stencil */
@@ -65,12 +84,25 @@ typedef struct R300FSDesc {
 } R300FSDesc;
 
 /*
- * Build the MSL library for the current US program: functions
- * "r300_vs", "r300_fs" (colour only) and "r300_fs_z" (colour plus the
- * depth/stencil buffer as a uint colour attachment 1; R32Uint for Z24S8,
- * R16Uint for Z16).  Both take a Z-pass counter at fragment buffer 1.  Returns a malloc'd string, or NULL with
- * *err set for programs not yet translated.  Every register the source
- * depends on is folded into the text, so the string is its own cache key.
+ * Colour buffers a draw binds: 1 + the highest render target (B-D) the
+ * program writes whose US_OUT_FMT is not UNUSED, or RB3D_CCTL's
+ * NUM_MULTIWRITES (target A replicated), whichever is larger.
+ */
+uint32_t r300_us_num_targets(const R300State *st);
+
+/* US_OUT_FMT of render target k (target A's for a multiwrite target left
+ * UNUSED). */
+uint32_t r300_us_out_fmt(const R300State *st, unsigned k);
+
+/*
+ * Build the MSL library for the current US program: functions "r300_vs",
+ * "r300_fs" (colour buffers only) and "r300_fs_z" (colour buffers plus
+ * the depth/stencil buffer as a uint colour attachment after them:
+ * R32Uint for Z24S8, R16Uint for Z16).  Colour buffer k is attachment k
+ * (r300_us_num_targets of them).  Both take a Z-pass counter at fragment
+ * buffer 1.  Returns a malloc'd string, or NULL with *err set for
+ * programs not yet translated.  Every register the source depends on is
+ * folded into the text, so the string is its own cache key.
  */
 char *r300_us_to_msl(const R300State *st, const R300FSDesc *desc,
                      const char **err);

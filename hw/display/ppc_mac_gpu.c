@@ -2388,6 +2388,69 @@ static void r300_zmask_clear(PPCMacGPUState *s)
     }
 }
 
+/*
+ * 3D_CLEAR_CMASK (type-3 0x38): a fast colour clear.  The card marks the
+ * colour buffer's CMASK tiles cleared and fills them with
+ * RB3D_COLOR_CLEAR_VALUE (ARGB) as it next reads them.  No CMASK is kept
+ * here, so the clear goes straight into colour buffer 0, over the scissor
+ * height, in the buffer's COLOR_ENDIAN order.  Apple's GL driver clears a
+ * window's back buffer this way each frame (Chess).
+ */
+static void r300_cmask_clear(PPCMacGPUState *s)
+{
+    uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
+    uint32_t off = r300_reg(s->r3, 0x4E28) & ~0x1Fu;
+    uint32_t pitch = r300_reg(s->r3, 0x4E38);
+    uint32_t cf = (pitch >> 21) & 0xF, endian = (pitch >> 19) & 3;
+    uint32_t rows = (r300_reg(s->r3, 0x43E4) >> 13) & 0x1FFF;
+    uint32_t v = r300_reg(s->r3, 0x4E14);
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint32_t bpp;
+    uint64_t bpr;
+
+    switch (cf) {
+    case 6:                     /* ARGB8888 */
+        bpp = 4;
+        break;
+    case 4:                     /* RGB565 */
+        bpp = 2;
+        v = ((v >> 8) & 0xF800) | ((v >> 5) & 0x07E0) | ((v >> 3) & 0x001F);
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "ppc-mac-gpu r300: 3D_CLEAR_CMASK on colour format %u\n", cf);
+        return;
+    }
+    bpr = (uint64_t)(pitch & 0x3FFE) * bpp;
+    rows = rows > 1440 ? rows - 1440 + 1 : 0;
+    if (off < fb_base || !bpr || !rows) {
+        return;
+    }
+    off -= fb_base;
+    if (off + bpr * rows > s->vram_size) {
+        rows = (s->vram_size - off) / bpr;
+    }
+    if (s->renderer && s->renderer->flush_r200) {
+        s->renderer->flush_r200(s->renderer_opaque);
+    }
+    if (bpp == 4) {
+        uint32_t w = r300_swap_mode(v, endian);
+        for (uint64_t i = 0; i < bpr * rows; i += 4) {
+            stl_le_p(vram + off + i, w);
+        }
+    } else {
+        uint16_t w = endian == 1 || endian == 2 ? bswap16(v) : v;
+        for (uint64_t i = 0; i < bpr * rows; i += 2) {
+            stw_le_p(vram + off + i, w);
+        }
+    }
+    memory_region_set_dirty(&s->vram, off, bpr * rows);
+    static int logged;
+    if (logged++ < 4) {
+        qemu_log("ppc-mac-gpu r300: 3D_CLEAR_CMASK: colour at 0x%x, %u rows of "
+                 "%llu bytes <- %08x\n", off, rows, (unsigned long long)bpr, v);
+    }
+}
+
 static bool r300_to_vram(PPCMacGPUState *s, uint32_t *addr, uint64_t len)
 {
     uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
@@ -2506,6 +2569,66 @@ static void r300_note_formats(PPCMacGPUState *s, const R300DrawPacket *pkt)
                      (keys[i] >> 20) & 3, (keys[i] >> 5) & 0xF,
                      (keys[i] >> 19) & 1, (keys[i] >> 18) & 1,
                      (keys[i] >> 17) & 1 ? "GART" : "VRAM", keys[i] & 0xF);
+        }
+    }
+}
+
+/* Log the first draw using each rendering feature (vm/gpu-trace.log), so
+ * guest workloads show which of them they exercise. */
+static void r300_note_features(PPCMacGPUState *s, const R300DrawPacket *pkt)
+{
+    const R300State *r = s->r3;
+    static uint32_t seen;
+    uint32_t f = 0;
+    static const char *const names[] = {
+        "mipmapped texture", "3D texture", "cube map", "border colour wrap",
+        "anisotropic filter", "LOD bias", "fog", "polygon mode", "polygon offset",
+        "wide lines", "line stipple", "flat/solid shading", "two-sided colours",
+        "user clip planes", "multiple render targets", "logic op",
+        "depth from the fragment program", "discard src pixels",
+        "vertex program flow control", "per-vertex point size", "signed texture",
+        "sRGB texture",
+    };
+
+    for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
+        const R300TexDesc *td = &pkt->tex[t];
+        uint32_t f0 = td->filter0, f1 = r300_reg(r, 0x44C0 + 4 * t);
+        if (!td->bound) {
+            continue;
+        }
+        f |= (td->levels > 1) << 0 | (td->dim == R300_TEXDIM_3D) << 1 |
+             (td->dim == R300_TEXDIM_CUBE) << 2;
+        for (int a = 0; a < 3; a++) {
+            unsigned m = (f0 >> (3 * a)) & 7;
+            f |= (m == 6 || m == 7) << 3;
+        }
+        f |= (((f0 >> 9) & 3) == 3 || ((f0 >> 11) & 3) == 3) << 4;
+        f |= (((td->filter1 >> 3) & 0x3FF) != 0) << 5;
+        f |= (((f1 >> 5) & 0xF) != 0) << 20 | ((f1 >> 21) & 1) << 21;
+    }
+    f |= (r300_reg(r, 0x4BC0) & 1) << 6;
+    f |= ((r300_reg(r, 0x4288) & 3) == 1) << 7;
+    f |= ((r300_reg(r, 0x42B4) & 3) != 0) << 8;
+    f |= ((r300_reg(r, 0x4234) & 0xFFFF) > 9) << 9;
+    f |= ((r300_reg(r, 0x4238) & ~3u) != 0) << 10;
+    for (int c = 0; c < 4; c++) {
+        uint32_t cc = r300_reg(r, 0x4278);
+        f |= (((cc >> (4 * c)) & 3) != 2 || ((cc >> (4 * c + 2)) & 3) != 2) << 11;
+    }
+    f |= ((r300_reg(r, 0x2090) & (3u << 3)) != 0) << 12;
+    f |= ((r300_reg(r, 0x221C) & 0x3F) != 0) << 13;
+    f |= (pkt->num_cb > 1) << 14;
+    f |= ((r300_reg(r, 0x4E18) >> 2) & 1) << 15;
+    f |= ((r300_reg(r, 0x4BD8) & 1) && pkt->msl && strstr(pkt->msl, "ow = ar")) << 16;
+    f |= ((r300_reg(r, 0x4E04) & 1) && ((r300_reg(r, 0x4E04) >> 3) & 7)) << 17;
+    f |= (r300_reg(r, 0x22DC) != 0) << 18;
+    f |= ((r300_reg(r, 0x2090) >> 16) & 1) << 19;
+    f &= ~seen;
+    for (unsigned i = 0; f; i++, f >>= 1) {
+        if (f & 1) {
+            seen |= 1u << i;
+            qemu_log("ppc-mac-gpu r300: first use of %s (draw %llu)\n", names[i],
+                     (unsigned long long)r->draws);
         }
     }
 }
@@ -2696,6 +2819,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     if (pkt.warn & R300_WARN_RTFMT)    r300_warn_once("colour buffer endian swap across pixels ignored", NULL);
     if (pkt.warn & R300_WARN_VTXFMT)   r300_warn_once("vertex format not implemented", NULL);
     if (pkt.warn & R300_WARN_VARYINGS) r300_warn_once("too many interpolants", NULL);
+    if (pkt.warn & R300_WARN_FLOW)     r300_warn_once("vertex program flow control ran away", NULL);
 
     if (!r300_to_vram(s, &pkt.rt_gpu_addr,
                       (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height)) {
@@ -2703,11 +2827,19 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         r300_draw_free(&pkt);
         return;
     }
+    /* Render targets B-D (multiple render targets / multiwrites) */
+    for (uint32_t k = 1; k < pkt.num_cb; k++) {
+        R300ColorDesc *c = &pkt.cb[k];
+        if (!r300_to_vram(s, &c->gpu_addr,
+                          (uint64_t)c->pitch * c->bpp * pkt.rt_height)) {
+            r300_warn_once("render target B-D outside VRAM", NULL);
+            pkt.num_cb = k;
+            break;
+        }
+    }
     for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
         R300TexDesc *td = &pkt.tex[t];
-        uint64_t tlen = (uint64_t)td->pitch_bytes *
-                        (td->kind >= R300_TEXK_DXT1 ? (td->height + 3) / 4
-                                                    : td->height);
+        uint64_t tlen = td->size_bytes;     /* the whole mip chain */
         if (!td->bound) {
             continue;
         }
@@ -2734,6 +2866,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         }
     }
     r300_note_formats(s, &pkt);
+    r300_note_features(s, &pkt);
     if (s->r3_zconv && (pkt.depth.attach || (r300_reg(s->r3, 0x4F00) & 7))) {
         r300_zconv(s, false);           /* drawing again: back to linear */
         s->r3_zconv = false;
@@ -2881,6 +3014,11 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
              * scanout only refresh what they are told changed. */
             uint64_t len = (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height;
             memory_region_set_dirty(&s->vram, pkt.rt_gpu_addr, len);
+            for (uint32_t k = 1; k < pkt.num_cb; k++) {
+                memory_region_set_dirty(&s->vram, pkt.cb[k].gpu_addr,
+                                        (uint64_t)pkt.cb[k].pitch * pkt.cb[k].bpp *
+                                        pkt.rt_height);
+            }
             r200_rate.draws++;
             r200_perf.draws++;
             r200_perf.drew = true;
@@ -2937,6 +3075,10 @@ static bool ppc_mac_gpu_r300_packet3(PPCMacGPUState *s, uint32_t opcode,
     }
     if (opcode == 0x32) {                   /* 3D_CLEAR_ZMASK */
         r300_zmask_clear(s);
+        return true;
+    }
+    if (opcode == 0x38) {                   /* 3D_CLEAR_CMASK */
+        r300_cmask_clear(s);
         return true;
     }
     if (opcode == 0x37) {                   /* 3D_CLEAR_HIZ: no HiZ kept */

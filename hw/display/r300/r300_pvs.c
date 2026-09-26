@@ -51,6 +51,7 @@ typedef struct PVSCtx {
     const float (*in)[4];
     float (*out)[4];
     PVSRegs r;
+    int al;                 /* fixed-point loop index of the innermost loop */
     uint32_t unsup;
 } PVSCtx;
 
@@ -71,17 +72,22 @@ static const float *pvs_mem(PVSCtx *c, unsigned type, int index)
     }
 }
 
-static int pvs_addr(PVSCtx *c, uint32_t s, unsigned offset)
+/* ADDR_MODE: 0 absolute, 1 relative to A0.ADDR_SEL, 2 relative to the
+ * loop index (R5xx guide, PVS source and destination operands). */
+static int pvs_rel(PVSCtx *c, unsigned mode, unsigned sel, unsigned offset)
 {
-    unsigned mode = ((s >> 4) & 1) | ((s >> 31) << 1);
-
     if (mode == 1) {
-        return (int)offset + c->r.a0[(s >> 29) & 3];
+        return (int)offset + c->r.a0[sel & 3];
     }
-    if (mode) {
-        c->unsup |= R300_PVS_UNSUP_FLOW;    /* loop index: needs flow control */
+    if (mode == 2) {
+        return (int)offset + c->al;
     }
     return offset;
+}
+
+static int pvs_addr(PVSCtx *c, uint32_t s, unsigned offset)
+{
+    return pvs_rel(c, ((s >> 4) & 1) | ((s >> 31) << 1), s >> 29, offset);
 }
 
 static float pvs_select(const float *v, unsigned sel)
@@ -255,14 +261,13 @@ static void pvs_sat(float r[4])
 static void pvs_write(PVSCtx *c, uint32_t d0, const float r[4])
 {
     unsigned type = (d0 >> 8) & 0xF;
-    unsigned index = (d0 >> 13) & 0x7F;
     unsigned mask = (d0 >> 20) & 0xF;
-    unsigned mode = ((d0 >> 12) & 1) | ((d0 >> 31) << 1);
+    /* ADDR_MODE_0 is bit 31, ADDR_MODE_1 bit 12 */
+    unsigned mode = ((d0 >> 31) & 1) | (((d0 >> 12) & 1) << 1);
+    int rel = pvs_rel(c, mode, d0 >> 29, (d0 >> 13) & 0x7F);
+    unsigned index = rel < 0 ? ~0u : (unsigned)rel;
     float *dst;
 
-    if (mode) {
-        c->unsup |= R300_PVS_UNSUP_RELDST;
-    }
     switch (type) {
     case DST_TEMP:
         dst = index < R300_PVS_NUM_TEMPS ? c->r.temp[index] : NULL;
@@ -295,6 +300,147 @@ static void pvs_write(PVSCtx *c, uint32_t d0, const float r[4])
     }
 }
 
+/*
+ * The instruction after pc, following the flow control instructions
+ * (AMD R5xx guide 7.5.5; VAP_PVS_FLOW_CNTL_*), once pc has run.  A
+ * loop's end and a subroutine's
+ * return are live only while that loop or call is.
+ *
+ *   ADDRS: 7:0 activation instruction (the last before the redirect),
+ *          15:8 JUMP/JSR target or LOOP count, 23:16 last instruction of
+ *          the loop or subroutine, 31:24 loop start or return address.
+ *   LOOP_INDEX: 7:0 initial loop index, 15:8 signed step.
+ */
+typedef struct PVSLoop {
+    int fc;                 /* its FLOW_CNTL instruction */
+    unsigned count;         /* iterations left */
+    int saved_al;           /* the enclosing loop's index */
+} PVSLoop;
+
+static unsigned pvs_flow(const R300PVSProgram *prog, PVSCtx *c, unsigned pc,
+                         PVSLoop *loop, unsigned *nloop, int *jsr, unsigned *njsr)
+{
+    if (*nloop) {
+        int k = loop[*nloop - 1].fc;
+        if (((prog->fc_addrs[k] >> 16) & 0xFF) == pc) {
+            c->al += (int8_t)(prog->fc_loop[k] >> 8);
+            if (--loop[*nloop - 1].count) {
+                return (prog->fc_addrs[k] >> 24) & 0xFF;
+            }
+            c->al = loop[--*nloop].saved_al;
+            return pc + 1;
+        }
+    }
+    if (*njsr) {
+        int k = jsr[*njsr - 1];
+        if (((prog->fc_addrs[k] >> 16) & 0xFF) == pc) {
+            --*njsr;
+            return (prog->fc_addrs[k] >> 24) & 0xFF;
+        }
+    }
+    for (int k = 0; k < 16; k++) {
+        unsigned op = (prog->fc_opc >> (2 * k)) & 3;
+        uint32_t a = prog->fc_addrs[k];
+
+        if (!op || (a & 0xFF) != pc) {
+            continue;
+        }
+        switch (op) {
+        case 1:                                 /* JUMP */
+            return (a >> 8) & 0xFF;
+        case 2:                                 /* LOOP */
+            if (!((a >> 8) & 0xFF) || *nloop == 16) {
+                return pc + 1;
+            }
+            loop[*nloop].fc = k;
+            loop[*nloop].count = (a >> 8) & 0xFF;
+            loop[*nloop].saved_al = c->al;
+            ++*nloop;
+            c->al = prog->fc_loop[k] & 0xFF;
+            return (a >> 24) & 0xFF;
+        default:                                /* JSR */
+            if (*njsr == 16) {
+                return pc + 1;
+            }
+            jsr[(*njsr)++] = k;
+            return (a >> 8) & 0xFF;
+        }
+    }
+    return pc + 1;
+}
+
+/* One instruction. */
+static void pvs_exec(PVSCtx *c, const uint32_t *d)
+{
+    uint32_t d0 = d[0];
+    unsigned op = d0 & 0x3F;
+    bool math = (d0 >> 6) & 1;
+    bool macro = (d0 >> 7) & 1;
+    bool dual = !math && !macro && ((d0 >> 28) & 1);
+    float a[4], b[4], cc[4], r[4];
+
+    if ((d0 >> 26) & 1) {
+        c->unsup |= R300_PVS_UNSUP_PRED;
+    }
+    pvs_src(c, d[1], a);
+    pvs_src(c, d[2], b);
+    if (!dual) {
+        pvs_src(c, d[3], cc);
+    }
+
+    if (math) {
+        pvs_math(c, op, a[3], b[3], cc[3], r);
+        if ((d0 >> 25) & 1) {
+            pvs_sat(r);
+        }
+        pvs_write(c, d0, r);
+        return;
+    }
+
+    if (macro) {
+        /* Two-clock MAD/M2X_ADD with three distinct temporaries. */
+        pvs_vector(c, (op & 1) ? VE_MULTIPLYX2_ADD : VE_MULTIPLY_ADD,
+                   a, b, cc, r);
+    } else {
+        pvs_vector(c, op, a, b, cc, r);
+    }
+    if ((d0 >> 24) & 1) {
+        pvs_sat(r);
+    }
+
+    if (dual) {
+        /* The third source dword describes a math op writing ATRM 0-3. */
+        uint32_t s = d[3];
+        unsigned mop = ((s >> 21) & 0xF) | (((s >> 2) & 1) << 4);
+        const float *v = pvs_mem(c, s & 3, pvs_addr(c, s, (s >> 5) & 0xFF));
+        float x = pvs_select(v, (s >> 13) & 7);
+        float y = pvs_select(v, (s >> 16) & 7);
+        float mr[4];
+
+        if (s & (1u << 3)) {
+            x = fabsf(x);
+            y = fabsf(y);
+        }
+        if (s & (1u << 25)) {
+            x = -x;
+        }
+        if (s & (1u << 26)) {
+            y = -y;
+        }
+        pvs_math(c, mop, x, y, y, mr);
+        if ((d0 >> 25) & 1) {
+            pvs_sat(mr);
+        }
+        pvs_write(c, d0, r);   /* vector result first... */
+        {
+            unsigned comp = (s >> 27) & 3;
+            c->r.alt[(s >> 19) & 3][comp] = mr[comp];  /* ...then math */
+        }
+        return;
+    }
+    pvs_write(c, d0, r);
+}
+
 uint32_t r300_pvs_run(const R300PVSProgram *prog,
                       const float in[R300_PVS_NUM_INPUTS][4],
                       float out[R300_PVS_NUM_OUTPUTS][4])
@@ -307,76 +453,22 @@ uint32_t r300_pvs_run(const R300PVSProgram *prog,
     c.out = out;
     c.unsup = 0;
 
-    for (unsigned pc = prog->first_inst;
-         pc <= prog->last_inst && pc < R300_PVS_MAX_INSTS; pc++) {
-        const uint32_t *d = &prog->code[pc * 4];
-        uint32_t d0 = d[0];
-        unsigned op = d0 & 0x3F;
-        bool math = (d0 >> 6) & 1;
-        bool macro = (d0 >> 7) & 1;
-        bool dual = !math && !macro && ((d0 >> 28) & 1);
-        float a[4], b[4], cc[4], r[4];
+    /* Flow control state: active loops (innermost last) and subroutine
+     * returns, as indices of their FLOW_CNTL instruction. */
+    PVSLoop loop[16];
+    int jsr[16];
+    unsigned nloop = 0, njsr = 0, steps = 0;
+    c.al = 0;
 
-        if ((d0 >> 26) & 1) {
-            c.unsup |= R300_PVS_UNSUP_PRED;
+    for (unsigned pc = prog->first_inst, next;
+         pc <= prog->last_inst && pc < R300_PVS_MAX_INSTS; pc = next) {
+        if (++steps > 65536) {
+            c.unsup |= R300_PVS_UNSUP_FLOW;     /* runaway loop */
+            break;
         }
-        pvs_src(&c, d[1], a);
-        pvs_src(&c, d[2], b);
-        if (!dual) {
-            pvs_src(&c, d[3], cc);
-        }
-
-        if (math) {
-            pvs_math(&c, op, a[3], b[3], cc[3], r);
-            if ((d0 >> 25) & 1) {
-                pvs_sat(r);
-            }
-            pvs_write(&c, d0, r);
-            continue;
-        }
-
-        if (macro) {
-            /* Two-clock MAD/M2X_ADD with three distinct temporaries. */
-            pvs_vector(&c, (op & 1) ? VE_MULTIPLYX2_ADD : VE_MULTIPLY_ADD,
-                       a, b, cc, r);
-        } else {
-            pvs_vector(&c, op, a, b, cc, r);
-        }
-        if ((d0 >> 24) & 1) {
-            pvs_sat(r);
-        }
-
-        if (dual) {
-            /* The third source dword describes a math op writing ATRM 0-3. */
-            uint32_t s = d[3];
-            unsigned mop = ((s >> 21) & 0xF) | (((s >> 2) & 1) << 4);
-            const float *v = pvs_mem(&c, s & 3, pvs_addr(&c, s, (s >> 5) & 0xFF));
-            float x = pvs_select(v, (s >> 13) & 7);
-            float y = pvs_select(v, (s >> 16) & 7);
-            float mr[4];
-
-            if (s & (1u << 3)) {
-                x = fabsf(x);
-                y = fabsf(y);
-            }
-            if (s & (1u << 25)) {
-                x = -x;
-            }
-            if (s & (1u << 26)) {
-                y = -y;
-            }
-            pvs_math(&c, mop, x, y, y, mr);
-            if ((d0 >> 25) & 1) {
-                pvs_sat(mr);
-            }
-            pvs_write(&c, d0, r);   /* vector result first... */
-            {
-                unsigned comp = (s >> 27) & 3;
-                c.r.alt[(s >> 19) & 3][comp] = mr[comp];  /* ...then math */
-            }
-            continue;
-        }
-        pvs_write(&c, d0, r);
+        pvs_exec(&c, &prog->code[pc * 4]);
+        next = prog->fc_opc ? pvs_flow(prog, &c, pc, loop, &nloop, jsr, &njsr)
+                            : pc + 1;
     }
     return c.unsup;
 }

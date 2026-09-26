@@ -7329,8 +7329,6 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
 
 static NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *g_r300_pipes;
 static NSMutableDictionary<NSNumber *, id<MTLSamplerState>> *g_r300_samplers;
-static id<MTLTexture> g_r300_dummy;
-static id<MTLTexture> g_r300_dummy_u;   /* for units the shader decodes */
 
 static void r300_metal_warn(uint32_t bit, const char *msg)
 {
@@ -7342,21 +7340,25 @@ static void r300_metal_warn(uint32_t bit, const char *msg)
 }
 
 /*
- * zfmt: MTLPixelFormatInvalid for a colour-only pass (r300_fs), else the
- * format of the depth/stencil buffer bound as colour attachment 1
- * (r300_fs_z).
+ * cfmt[0..ncb-1]: the colour buffers' formats; zfmt MTLPixelFormatInvalid
+ * for a colour-only pass (r300_fs), else the format of the depth/stencil
+ * buffer bound as colour attachment ncb (r300_fs_z).
  */
 static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
                                                 const char *msl,
-                                                MTLPixelFormat cfmt,
+                                                const MTLPixelFormat *cfmt,
+                                                uint32_t ncb,
                                                 MTLPixelFormat zfmt)
 {
     NSString *src = [NSString stringWithUTF8String:msl];
-    NSString *key = [src stringByAppendingFormat:@"\n// %lu %lu\n",
-                     (unsigned long)cfmt, (unsigned long)zfmt];
+    NSMutableString *key = [NSMutableString stringWithString:src];
     id<MTLRenderPipelineState> p;
     NSError *err = nil;
 
+    for (uint32_t k = 0; k < ncb; k++) {
+        [key appendFormat:@"\n// c%u %lu", k, (unsigned long)cfmt[k]];
+    }
+    [key appendFormat:@"\n// z %lu\n", (unsigned long)zfmt];
     if (!g_r300_pipes) {
         g_r300_pipes = [[NSMutableDictionary alloc] init];
     }
@@ -7374,8 +7376,10 @@ static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
     pd.vertexFunction = [[lib newFunctionWithName:@"r300_vs"] autorelease];
     pd.fragmentFunction = [[lib newFunctionWithName:
         zfmt == MTLPixelFormatInvalid ? @"r300_fs" : @"r300_fs_z"] autorelease];
-    pd.colorAttachments[0].pixelFormat = cfmt;
-    pd.colorAttachments[1].pixelFormat = zfmt;
+    for (uint32_t k = 0; k < ncb; k++) {
+        pd.colorAttachments[k].pixelFormat = cfmt[k];
+    }
+    pd.colorAttachments[ncb].pixelFormat = zfmt;
     p = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
     [pd release];
     [lib release];
@@ -7429,16 +7433,23 @@ static MTLSamplerAddressMode r300_wrap(uint32_t w)
     case 0:  return MTLSamplerAddressModeRepeat;
     case 1:  return MTLSamplerAddressModeMirrorRepeat;
     case 3:
-    case 5:  return MTLSamplerAddressModeMirrorClampToEdge;
-    case 6:
-    case 7:  return MTLSamplerAddressModeClampToBorderColor;
+    case 5:
+    case 7:  return MTLSamplerAddressModeMirrorClampToEdge;
+    case 6:  return MTLSamplerAddressModeClampToBorderColor;  /* r300_tex adds the colour */
     default: return MTLSamplerAddressModeClampToEdge;
     }
 }
 
-static id<MTLSamplerState> r300_sampler(id<MTLDevice> dev, uint32_t f0)
+/*
+ * TX_FILTER0: wrap S/T/R, MAG/MIN_FILTER (1 nearest, else linear; 3
+ * anisotropic), MIP_FILTER (0 none, 1 nearest, 2 linear), MAX_MIP_LEVEL
+ * (the finest level used), MAX_ANISO (1:1 .. 16:1); levels the texture's
+ * mip count.  The LOD bias is applied at the sample.
+ */
+static id<MTLSamplerState> r300_sampler(id<MTLDevice> dev, uint32_t f0,
+                                        uint32_t levels)
 {
-    uint32_t key = f0 & 0x7FFF;
+    uint32_t key = (f0 & 0xFFFFFF) | (MIN(levels, 15u) << 24);
     id<MTLSamplerState> s;
 
     if (!g_r300_samplers) {
@@ -7448,15 +7459,21 @@ static id<MTLSamplerState> r300_sampler(id<MTLDevice> dev, uint32_t f0)
     if (s) {
         return s;
     }
+    uint32_t mag = (f0 >> 9) & 3, min = (f0 >> 11) & 3, mip = (f0 >> 13) & 3;
     MTLSamplerDescriptor *d = [[MTLSamplerDescriptor alloc] init];
     d.sAddressMode = r300_wrap(f0);
     d.tAddressMode = r300_wrap(f0 >> 3);
     d.rAddressMode = r300_wrap(f0 >> 6);
-    d.magFilter = ((f0 >> 9) & 3) == 1 ? MTLSamplerMinMagFilterNearest
-                                       : MTLSamplerMinMagFilterLinear;
-    d.minFilter = ((f0 >> 11) & 3) == 1 ? MTLSamplerMinMagFilterNearest
-                                        : MTLSamplerMinMagFilterLinear;
-    d.mipFilter = MTLSamplerMipFilterNotMipmapped;
+    d.borderColor = MTLSamplerBorderColorTransparentBlack;
+    d.magFilter = mag == 1 ? MTLSamplerMinMagFilterNearest : MTLSamplerMinMagFilterLinear;
+    d.minFilter = min == 1 ? MTLSamplerMinMagFilterNearest : MTLSamplerMinMagFilterLinear;
+    d.mipFilter = levels <= 1 || mip == 0 ? MTLSamplerMipFilterNotMipmapped :
+                  mip == 1 ? MTLSamplerMipFilterNearest : MTLSamplerMipFilterLinear;
+    if ((mag == 3 || min == 3) && ((f0 >> 21) & 7)) {
+        d.maxAnisotropy = 1u << MIN((f0 >> 21) & 7, 4u);
+    }
+    d.lodMinClamp = MIN((f0 >> 17) & 0xF, levels ? levels - 1 : 0);
+    d.lodMaxClamp = levels ? levels - 1 : 0;
     s = [dev newSamplerStateWithDescriptor:d];
     [d release];
     g_r300_samplers[@(key)] = s;
@@ -7519,11 +7536,6 @@ static MTLPixelFormat r300_raw_pf(uint32_t view_bpp)
            view_bpp == 8 ? MTLPixelFormatRG32Uint : MTLPixelFormatR32Uint;
 }
 
-static uint32_t r300_tex_rows(const R300TexDesc *td)
-{
-    return td->kind >= R300_TEXK_DXT1 ? (td->height + 3) / 4 : td->height;
-}
-
 /* A 16bpp texel as the card sees it: the guest wrote big-endian halfwords. */
 static void r300_decode16(uint32_t fmt, uint16_t v, uint8_t out[4])
 {
@@ -7553,66 +7565,252 @@ static void r300_decode16(uint32_t fmt, uint16_t v, uint8_t out[4])
     out[0] = x; out[1] = y; out[2] = z; out[3] = w;
 }
 
+/* 64-bit content hash for the copied-texture cache (wyhash-style mix). */
+static uint64_t r300_hash(const uint8_t *p, size_t n)
+{
+    const uint64_t m = 0x9E3779B97F4A7C15ull;
+    uint64_t h = n * m, v;
+    size_t i = 0;
+
+    for (; i + 8 <= n; i += 8) {
+        memcpy(&v, p + i, 8);
+        h = (h ^ v) * m;
+        h ^= h >> 29;
+    }
+    for (; i < n; i++) {
+        h = (h ^ p[i]) * m;
+    }
+    return h ^ (h >> 32);
+}
+
+/*
+ * Textures the device rebuilds as real Metal textures (mip chains, 3D,
+ * cube maps: a linear view cannot have levels or faces).  Cached by the
+ * unit's layout and a hash of its bytes, so unchanged textures cost a
+ * hash, not an upload.
+ */
+#define R300_TCACHE 48
+typedef struct R300TexCacheKey {
+    uint32_t addr, format, kind, width, height, depth, dim, levels, pitch;
+    uint32_t host;
+    uint64_t hash;
+} R300TexCacheKey;
+static struct {
+    R300TexCacheKey key;
+    id<MTLTexture> tex;
+    uint64_t used;
+} g_r300_tcache[R300_TCACHE];
+static uint64_t g_r300_tcache_clock;
+
+/* One face/slice of one level as the Metal format wants it (tight rows). */
+static uint8_t *r300_level_bytes(const R300TexDesc *td, const uint8_t *src,
+                                 uint32_t l, uint32_t w, uint32_t h,
+                                 uint32_t *bpr)
+{
+    uint32_t pitch = td->lvl_pitch[l];
+    uint8_t *out;
+
+    switch (td->kind) {
+    case R300_TEXK_CONVERT16:
+        *bpr = w * 4;
+        out = g_malloc((size_t)w * h * 4);
+        for (uint32_t y = 0; y < h; y++) {
+            const uint8_t *row = src + (uint64_t)y * pitch;
+            for (uint32_t x = 0; x < w; x++) {
+                uint16_t v = (uint16_t)(row[2 * x] << 8 | row[2 * x + 1]);
+                r300_decode16(td->format, v, out + ((size_t)y * w + x) * 4);
+            }
+        }
+        return out;
+    case R300_TEXK_DXT1:
+    case R300_TEXK_DXT3:
+    case R300_TEXK_DXT5: {
+        uint32_t bs = td->kind == R300_TEXK_DXT1 ? 8 : 16;
+        uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4;
+        *bpr = bw * bs;
+        out = g_malloc((size_t)bw * bh * bs);
+        for (uint32_t y = 0; y < bh; y++) {
+            memcpy(out + (size_t)y * bw * bs, src + (uint64_t)y * pitch, (size_t)bw * bs);
+        }
+        return out;
+    }
+    default: {                          /* RGBA8, R8, RG8: bytes as they lie */
+        uint32_t bpp = td->kind == R300_TEXK_RGBA8 ? 4 : td->kind == R300_TEXK_RG8 ? 2 : 1;
+        *bpr = w * bpp;
+        out = g_malloc((size_t)w * h * bpp);
+        for (uint32_t y = 0; y < h; y++) {
+            memcpy(out + (size_t)y * w * bpp, src + (uint64_t)y * pitch, (size_t)w * bpp);
+        }
+        return out;
+    }
+    }
+}
+
+static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> dev,
+                                        uint8_t *vram_ptr, const R300TexDesc *td)
+{
+    const uint8_t *src = td->host_data ? td->host_data : vram_ptr + td->gpu_addr;
+    uint64_t lo = td->gpu_addr, hi = lo + td->size_bytes;
+    MTLPixelFormat pf;
+    bool dxt = td->kind >= R300_TEXK_DXT1;
+
+    switch (td->kind) {
+    case R300_TEXK_R8:    pf = MTLPixelFormatR8Unorm; break;
+    case R300_TEXK_RG8:   pf = MTLPixelFormatRG8Unorm; break;
+    case R300_TEXK_DXT1:  pf = MTLPixelFormatBC1_RGBA; break;
+    case R300_TEXK_DXT3:  pf = MTLPixelFormatBC2_RGBA; break;
+    case R300_TEXK_DXT5:  pf = MTLPixelFormatBC3_RGBA; break;
+    default:              pf = MTLPixelFormatRGBA8Unorm; break;
+    }
+    if (td->dim == R300_TEXDIM_CUBE && td->width != td->height) {
+        r300_metal_warn(64, "cube map with non-square faces");
+        return nil;
+    }
+    /* The CPU reads the texels: finish pending draws that write them. */
+    if (!td->host_data && r200_batch_conflict(lo, hi, NULL)) {
+        metal_flush_r200(st);
+    }
+
+    R300TexCacheKey key = { td->gpu_addr, td->format, td->kind, td->width, td->height,
+                            td->depth, td->dim, td->levels, td->pitch_bytes,
+                            td->host_data != NULL, r300_hash(src, td->size_bytes) };
+    int lru = 0;
+    for (int i = 0; i < R300_TCACHE; i++) {
+        if (g_r300_tcache[i].tex && !memcmp(&g_r300_tcache[i].key, &key, sizeof(key))) {
+            g_r300_tcache[i].used = ++g_r300_tcache_clock;
+            return g_r300_tcache[i].tex;
+        }
+        if (g_r300_tcache[i].used < g_r300_tcache[lru].used) {
+            lru = i;
+        }
+    }
+
+    MTLTextureDescriptor *d = [[MTLTextureDescriptor alloc] init];
+    d.textureType = td->dim == R300_TEXDIM_3D ? MTLTextureType3D :
+                    td->dim == R300_TEXDIM_CUBE ? MTLTextureTypeCube : MTLTextureType2D;
+    d.pixelFormat = pf;
+    /* BC textures: the base level a whole number of blocks */
+    d.width = dxt ? (td->width + 3) & ~3u : td->width;
+    d.height = dxt ? (td->height + 3) & ~3u : td->height;
+    d.depth = td->dim == R300_TEXDIM_3D ? td->depth : 1;
+    d.mipmapLevelCount = td->levels;
+    d.usage = MTLTextureUsageShaderRead;
+    d.storageMode = MTLStorageModeShared;
+    id<MTLTexture> t = [dev newTextureWithDescriptor:d];
+    [d release];
+    if (!t) {
+        return nil;
+    }
+    for (uint32_t l = 0; l < td->levels; l++) {
+        uint32_t w, h, n, bpr;
+        r300_tex_level_dims(td, l, &w, &h, &n);
+        /* Metal's level size (BC: from the rounded-up base) */
+        uint32_t mw = MAX((uint32_t)t.width >> l, 1u), mh = MAX((uint32_t)t.height >> l, 1u);
+        size_t face = (size_t)td->lvl_pitch[l] * td->lvl_rows[l];
+        for (uint32_t f = 0; f < n; f++) {
+            const uint8_t *fs = src + td->lvl_off[l] + f * face;
+            uint8_t *bytes = r300_level_bytes(td, fs, l, dxt ? mw : w, dxt ? mh : h, &bpr);
+            if (td->dim == R300_TEXDIM_3D) {
+                [t replaceRegion:MTLRegionMake3D(0, 0, f, dxt ? mw : w, dxt ? mh : h, 1)
+                     mipmapLevel:l slice:0 withBytes:bytes bytesPerRow:bpr bytesPerImage:0];
+            } else {
+                [t replaceRegion:MTLRegionMake2D(0, 0, dxt ? mw : w, dxt ? mh : h)
+                     mipmapLevel:l slice:f withBytes:bytes bytesPerRow:bpr bytesPerImage:0];
+            }
+            g_free(bytes);
+        }
+    }
+    [g_r300_tcache[lru].tex release];
+    g_r300_tcache[lru].key = key;
+    g_r300_tcache[lru].tex = t;
+    g_r300_tcache[lru].used = ++g_r300_tcache_clock;
+    return t;
+}
+
+/*
+ * Units the shader decodes (R300_TEXK_RAW): the whole chain as one uint
+ * view, *rowel elements a row, addressed by byte offset in the shader
+ * (r300_lvl, r300_texel).  Zero-copy over VRAM when the level-0 pitch
+ * suits a linear view; otherwise (GART texels, odd pitches) a copy with
+ * GART dwords byte-reversed to VRAM's side of the aperture (see
+ * r300_tex_raw_bpp).
+ */
+static id<MTLTexture> r300_texture_raw(PPCMacGPUMetalState *st, id<MTLDevice> dev,
+                                       uint8_t *vram_ptr, uint64_t vram_size,
+                                       const R300TexDesc *td, uint32_t *rowel)
+{
+    uint32_t eb = td->view_bpp;
+    MTLPixelFormat rpf = r300_raw_pf(eb);
+    NSUInteger align = [dev minimumLinearTextureAlignmentForPixelFormat:rpf];
+    uint32_t p0 = td->pitch_bytes;
+
+    if (!td->host_data && p0 && !(p0 % eb) && !(p0 % align) && !(td->gpu_addr % align)) {
+        uint32_t rows = (td->size_bytes + p0 - 1) / p0;
+        if (rows <= 16384 && (uint64_t)td->gpu_addr + (uint64_t)rows * p0 <= vram_size) {
+            R200TexKey k = { td->gpu_addr, p0 / eb, rows, p0, (uint32_t)rpf };
+            *rowel = p0 / eb;
+            return r200_view(st, k, rpf, false);
+        }
+    }
+    if (!td->host_data && r200_batch_conflict(td->gpu_addr, (uint64_t)td->gpu_addr +
+                                              td->size_bytes, NULL)) {
+        metal_flush_r200(st);
+    }
+    const uint8_t *src = td->host_data ? td->host_data : vram_ptr + td->gpu_addr;
+    uint32_t n = (td->size_bytes + eb - 1) / eb;        /* elements */
+    uint32_t w = 64;
+    while (w < 16384 && (uint64_t)w * w < n) {
+        w <<= 1;
+    }
+    uint32_t h = (n + w - 1) / w;
+    if (!h || h > 16384) {
+        r300_metal_warn(128, "shader-decoded texture too large");
+        return nil;
+    }
+    size_t bytes = (size_t)w * h * eb;
+    uint8_t *buf = g_malloc0(bytes);
+    memcpy(buf, src, td->size_bytes);
+    if (td->host_data) {
+        uint32_t *dw = (uint32_t *)buf;
+        for (size_t i = 0; i < bytes / 4; i++) {
+            dw[i] = __builtin_bswap32(dw[i]);
+        }
+    }
+    MTLTextureDescriptor *d = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:rpf width:w height:h mipmapped:NO];
+    d.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> t = [[dev newTextureWithDescriptor:d] autorelease];
+    [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
+           withBytes:buf bytesPerRow:(size_t)w * eb];
+    g_free(buf);
+    *rowel = w;
+    return t;
+}
+
 /* The Metal texture for one R300 texture unit (see R300_TEXK_*). */
 static id<MTLTexture> r300_texture(PPCMacGPUMetalState *st, id<MTLDevice> dev,
                                    uint8_t *vram_ptr, uint64_t vram_size,
-                                   const R300TexDesc *td)
+                                   const R300TexDesc *td, uint32_t *rowel)
 {
     uint64_t lo = td->gpu_addr;
-    uint64_t hi = lo + (uint64_t)td->pitch_bytes * r300_tex_rows(td);
+    uint64_t hi = lo + td->size_bytes;
     MTLPixelFormat pf;
 
     if (!td->host_data && hi > vram_size) {
         r300_metal_warn(2, "texture outside VRAM");
         return nil;
     }
+    if (td->kind == R300_TEXK_RAW) {
+        return r300_texture_raw(st, dev, vram_ptr, vram_size, td, rowel);
+    }
+    if (td->levels > 1 || td->dim != R300_TEXDIM_2D) {
+        return r300_texture_full(st, dev, vram_ptr, td);
+    }
     switch (td->kind) {
     case R300_TEXK_RGBA8: pf = MTLPixelFormatRGBA8Unorm; break;
     case R300_TEXK_R8:    pf = MTLPixelFormatR8Unorm; break;
     case R300_TEXK_RG8:   pf = MTLPixelFormatRG8Unorm; break;
     default:              pf = MTLPixelFormatInvalid; break;
-    }
-    if (td->kind == R300_TEXK_RAW) {
-        /* The shader decodes the texel dwords (r300_texu). */
-        MTLPixelFormat rpf = r300_raw_pf(td->view_bpp);
-        uint32_t vw = td->pitch_bytes / td->view_bpp;
-        NSUInteger align = [dev minimumLinearTextureAlignmentForPixelFormat:rpf];
-        if (!vw) {
-            return nil;
-        }
-        if (!td->host_data && !(td->gpu_addr % align) &&
-            !(td->pitch_bytes % td->view_bpp) && !(td->pitch_bytes % align)) {
-            R200TexKey k = { td->gpu_addr, vw, td->height, td->pitch_bytes,
-                             (uint32_t)rpf };
-            return r200_view(st, k, rpf, false);
-        }
-        /* Copy: GART texels (reversed per dword to VRAM's side of the
-         * aperture, see r300_tex_raw_bpp) or a view Metal cannot make. */
-        if (!td->host_data && r200_batch_conflict(lo, hi, NULL)) {
-            metal_flush_r200(st);
-        }
-        const uint8_t *src = td->host_data ? td->host_data : vram_ptr + td->gpu_addr;
-        vw = (td->pitch_bytes + td->view_bpp - 1) / td->view_bpp;
-        size_t rb = (size_t)vw * td->view_bpp;
-        uint8_t *buf = g_malloc0(rb * td->height);
-        for (uint32_t y = 0; y < td->height; y++) {
-            memcpy(buf + y * rb, src + (uint64_t)y * td->pitch_bytes, td->pitch_bytes);
-            if (td->host_data) {
-                uint32_t *d = (uint32_t *)(buf + y * rb);
-                for (size_t i = 0; i < rb / 4; i++) {
-                    d[i] = __builtin_bswap32(d[i]);
-                }
-            }
-        }
-        MTLTextureDescriptor *d = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:rpf width:vw height:td->height
-                                     mipmapped:NO];
-        d.usage = MTLTextureUsageShaderRead;
-        id<MTLTexture> t = [[dev newTextureWithDescriptor:d] autorelease];
-        [t replaceRegion:MTLRegionMake2D(0, 0, vw, td->height) mipmapLevel:0
-               withBytes:buf bytesPerRow:rb];
-        g_free(buf);
-        return t;
     }
     if (pf != MTLPixelFormatInvalid && td->host_data) {
         /* Copied out of the GART by the device: upload as it lies. */
@@ -7636,55 +7834,31 @@ static id<MTLTexture> r300_texture(PPCMacGPUMetalState *st, id<MTLDevice> dev,
                          (uint32_t)pf };
         return r200_view(st, k, pf, false);
     }
+    /* 16bpp formats and DXT: converted or copied by the CPU (cached). */
+    return r300_texture_full(st, dev, vram_ptr, td);
+}
 
-    /* Converted or copied: the CPU reads VRAM, so finish pending draws
-     * that write it first. */
-    if (!td->host_data && r200_batch_conflict(lo, hi, NULL)) {
-        metal_flush_r200(st);
-    }
-    const uint8_t *src = td->host_data ? td->host_data : vram_ptr + td->gpu_addr;
-    uint32_t w = td->width, h = td->height;
+/* Render targets B-D of the open R300 pass (target A is g_r200_enc_key). */
+static uint32_t g_r300_enc_ncb = 1;
+static R200TexKey g_r300_enc_cb[R300_US_MAX_TARGETS];
 
-    if (td->kind == R300_TEXK_CONVERT16) {
-        uint8_t *out = g_malloc((size_t)w * h * 4);
-        for (uint32_t y = 0; y < h; y++) {
-            const uint8_t *row = src + (uint64_t)y * td->pitch_bytes;
-            for (uint32_t x = 0; x < w; x++) {
-                uint16_t v = (uint16_t)(row[2 * x] << 8 | row[2 * x + 1]);
-                r300_decode16(td->format, v, out + ((size_t)y * w + x) * 4);
-            }
-        }
-        MTLTextureDescriptor *d = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-            width:w height:h mipmapped:NO];
-        d.usage = MTLTextureUsageShaderRead;
-        id<MTLTexture> t = [[dev newTextureWithDescriptor:d] autorelease];
-        [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
-               withBytes:out bytesPerRow:w * 4];
-        g_free(out);
-        return t;
-    }
+/* A 1x1 stand-in for an unbound unit, of the type the shader declares. */
+static id<MTLTexture> r300_dummy(id<MTLDevice> dev, bool raw, uint32_t dim)
+{
+    static id<MTLTexture> d[4];
+    int i = raw ? 3 : dim;
 
-    /* DXT1/3/5: blocks as they lie (see the R200 path). */
-    MTLPixelFormat bc = td->kind == R300_TEXK_DXT1 ? MTLPixelFormatBC1_RGBA :
-                        td->kind == R300_TEXK_DXT3 ? MTLPixelFormatBC2_RGBA :
-                                                     MTLPixelFormatBC3_RGBA;
-    uint32_t bs = td->kind == R300_TEXK_DXT1 ? 8 : 16;
-    uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4;
-    MTLTextureDescriptor *d = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:bc width:bw * 4 height:bh * 4
-                                 mipmapped:NO];
-    d.usage = MTLTextureUsageShaderRead;
-    id<MTLTexture> t = [[dev newTextureWithDescriptor:d] autorelease];
-    uint8_t *blocks = g_malloc((size_t)bw * bh * bs);
-    for (uint32_t y = 0; y < bh; y++) {
-        memcpy(blocks + (size_t)y * bw * bs, src + (uint64_t)y * td->pitch_bytes,
-               (size_t)bw * bs);
+    if (!d[i]) {
+        MTLTextureDescriptor *td = [[MTLTextureDescriptor alloc] init];
+        td.textureType = i == 1 ? MTLTextureType3D : i == 2 ? MTLTextureTypeCube
+                                                              : MTLTextureType2D;
+        td.pixelFormat = raw ? MTLPixelFormatR32Uint : MTLPixelFormatRGBA8Unorm;
+        td.width = td.height = td.depth = 1;
+        td.usage = MTLTextureUsageShaderRead;
+        d[i] = [dev newTextureWithDescriptor:td];
+        [td release];
     }
-    [t replaceRegion:MTLRegionMake2D(0, 0, bw * 4, bh * 4) mipmapLevel:0
-           withBytes:blocks bytesPerRow:bw * bs];
-    g_free(blocks);
-    return t;
+    return d[i];
 }
 
 static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
@@ -7695,37 +7869,44 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         return -1;
     }
     id<MTLDevice> dev = st->vramBuffer.device;
-    MTLPixelFormat pf = r300_rt_pf(pkt->rt_view);
-    NSUInteger align = [dev minimumLinearTextureAlignmentForPixelFormat:pf];
-    uint32_t bpr = pkt->rt_pitch * pkt->rt_bpp;
+    uint32_t ncb = MAX(pkt->num_cb, 1u);
+    MTLPixelFormat cpf[R300_US_MAX_TARGETS];
+    R200TexKey ck[R300_US_MAX_TARGETS];
     uint32_t sx0 = pkt->scissor[0], sy0 = pkt->scissor[1];
     uint32_t sx1 = MIN(pkt->scissor[2], pkt->rt_width);
     uint32_t sy1 = MIN(pkt->scissor[3], pkt->rt_height);
 
-    if (sx0 >= sx1 || sy0 >= sy1 || !pkt->num_verts) {
+    if (sx0 >= sx1 || sy0 >= sy1 || !(pkt->num_verts + pkt->num_line_verts)) {
         return 0;
     }
-    if ((pkt->rt_gpu_addr % align) || (bpr % align) ||
-        (uint64_t)pkt->rt_gpu_addr + (uint64_t)bpr * pkt->rt_height > vram_size) {
-        r300_metal_warn(1, "colour buffer unusable as a linear view");
-        return -1;
-    }
-    if (!g_r300_dummy) {
-        MTLTextureDescriptor *td = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                         width:1 height:1 mipmapped:NO];
-        g_r300_dummy = [dev newTextureWithDescriptor:td];
-        td.pixelFormat = MTLPixelFormatR32Uint;
-        g_r300_dummy_u = [dev newTextureWithDescriptor:td];
+    /* Colour buffers: A from the packet's rt_*, B-D from cb[]. */
+    for (uint32_t k = 0; k < ncb; k++) {
+        uint32_t view = k ? pkt->cb[k].view : pkt->rt_view;
+        uint32_t addr = k ? pkt->cb[k].gpu_addr : pkt->rt_gpu_addr;
+        uint32_t bpr = k ? pkt->cb[k].pitch * pkt->cb[k].bpp : pkt->rt_pitch * pkt->rt_bpp;
+        cpf[k] = r300_rt_pf(view);
+        NSUInteger align = [dev minimumLinearTextureAlignmentForPixelFormat:cpf[k]];
+        if ((addr % align) || (bpr % align) || !bpr ||
+            (uint64_t)addr + (uint64_t)bpr * pkt->rt_height > vram_size) {
+            if (k == 0) {
+                r300_metal_warn(1, "colour buffer unusable as a linear view");
+                return -1;
+            }
+            r300_metal_warn(256, "render target B-D unusable as a linear view");
+            ncb = k;
+            break;
+        }
+        ck[k] = (R200TexKey){ addr, pkt->rt_width, pkt->rt_height, bpr, (uint32_t)cpf[k] };
     }
 
     if ((pkt->cull & (R300_CULL_FRONT | R300_CULL_BACK)) ==
-        (R300_CULL_FRONT | R300_CULL_BACK)) {
+        (R300_CULL_FRONT | R300_CULL_BACK) && !pkt->num_line_verts) {
         return 0;                       /* every polygon culled */
     }
 
     @autoreleasepool {
-        /* Depth/stencil buffer in place, as colour attachment 1. */
+        /* Depth/stencil buffer in place, as the colour attachment after
+         * the colour buffers. */
         const R300DepthDesc *zd = &pkt->depth;
         MTLPixelFormat zpf = zd->bpp == 2 ? MTLPixelFormatR16Uint
                                           : MTLPixelFormatR32Uint;
@@ -7747,34 +7928,37 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         R300FSUniforms u = pkt->uniforms;
         for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
             const R300TexDesc *td = &pkt->tex[t];
-            tex[t] = td->kind == R300_TEXK_RAW ? g_r300_dummy_u : g_r300_dummy;
-            smp[t] = r300_sampler(dev, td->filter0);
+            bool raw = td->kind == R300_TEXK_RAW;
+            tex[t] = r300_dummy(dev, raw, raw ? 0 : td->dim);
+            smp[t] = r300_sampler(dev, td->filter0, td->levels);
             if (!td->bound) {
                 u.tex_info[t][0] = 0;
                 continue;
             }
-            id<MTLTexture> x = r300_texture(st, dev, vram_ptr, vram_size, td);
+            uint32_t rowel = u.tex_info[t][1];
+            id<MTLTexture> x = r300_texture(st, dev, vram_ptr, vram_size, td, &rowel);
             if (!x) {
                 u.tex_info[t][0] = 0;
                 continue;
+            }
+            if (raw) {
+                u.tex_info[t][1] = rowel;
             }
             tex[t] = x;
         }
 
         /* Batch hazards, as in the R200 path. */
-        R200TexKey rk = { pkt->rt_gpu_addr, pkt->rt_width, pkt->rt_height, bpr,
-                          (uint32_t)pf };
-        uint64_t rlo = pkt->rt_gpu_addr, rhi = rlo + (uint64_t)bpr * pkt->rt_height;
-        bool conflict = g_r200_nwritten >= R200_MAX_WRITTEN - 1 ||
-                        r200_batch_conflict(rlo, rhi, &rk) ||
-                        r300_read_conflict(rlo, rhi, &rk) ||
+        bool conflict = g_r200_nwritten >= R200_MAX_WRITTEN - 1 - (int)ncb ||
                         (want_ds && (r200_batch_conflict(dlo, dhi, &dk) ||
                                      r300_read_conflict(dlo, dhi, &dk)));
+        for (uint32_t k = 0; k < ncb && !conflict; k++) {
+            uint64_t lo = ck[k].offset, hi = lo + (uint64_t)ck[k].pitch * ck[k].height;
+            conflict = r200_batch_conflict(lo, hi, &ck[k]) || r300_read_conflict(lo, hi, &ck[k]);
+        }
         for (int t = 0; t < R300_NUM_TEX_UNITS && !conflict; t++) {
             if (u.tex_info[t][0] && !pkt->tex[t].host_data) {
                 conflict = r200_batch_conflict(pkt->tex[t].gpu_addr,
-                    pkt->tex[t].gpu_addr + (uint64_t)pkt->tex[t].pitch_bytes *
-                    r300_tex_rows(&pkt->tex[t]), NULL);
+                    (uint64_t)pkt->tex[t].gpu_addr + pkt->tex[t].size_bytes, NULL);
             }
         }
         if (conflict) {
@@ -7784,38 +7968,42 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         if (!g_r200_cb) {
             g_r200_cb = r200_new_cb(st);
         }
-        /* A pass is keyed by its colour buffer and, when it has one, its
+        /* A pass is keyed by its colour buffers and, when it has one, its
          * depth buffer.  Depth-less draws may run in a pass with depth
          * (test and write off); depth draws need their own buffer bound. */
         bool enc_ds = g_r200_enc_depth_off != ~0u;
-        if (g_r200_enc && (!g_r300_enc_mine ||
-                           memcmp(&g_r200_enc_key, &rk, sizeof(rk)) ||
-                           (want_ds && (!enc_ds || g_r200_enc_depth_off != dk.offset ||
-                                        g_r200_enc_depth_pitch != zd->pitch ||
-                                        g_r200_enc_depth_z16 != (zd->bpp == 2))))) {
+        bool same = g_r200_enc && g_r300_enc_mine && g_r300_enc_ncb == ncb &&
+                    !memcmp(&g_r200_enc_key, &ck[0], sizeof(ck[0])) &&
+                    (ncb == 1 || !memcmp(&g_r300_enc_cb[1], &ck[1], sizeof(ck[0]) * (ncb - 1))) &&
+                    !(want_ds && (!enc_ds || g_r200_enc_depth_off != dk.offset ||
+                                  g_r200_enc_depth_pitch != zd->pitch ||
+                                  g_r200_enc_depth_z16 != (zd->bpp == 2)));
+        if (g_r200_enc && !same) {
             [g_r200_enc endEncoding];
             [g_r200_enc release];
             g_r200_enc = nil;
         }
         if (!g_r200_enc) {
-            id<MTLTexture> rt = r200_view(st, rk, pf, true);
-            if (!rt) {
-                r300_metal_warn(4, "render target view failed");
-                return -1;
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            for (uint32_t k = 0; k < ncb; k++) {
+                id<MTLTexture> rt = r200_view(st, ck[k], cpf[k], true);
+                if (!rt) {
+                    r300_metal_warn(4, "render target view failed");
+                    return -1;
+                }
+                rp.colorAttachments[k].texture = rt;
+                rp.colorAttachments[k].loadAction = MTLLoadActionLoad;
+                rp.colorAttachments[k].storeAction = MTLStoreActionStore;
             }
             id<MTLTexture> ztex = want_ds ? r200_view(st, dk, zpf, true) : nil;
             if (want_ds && !ztex) {
                 r300_metal_warn(32, "depth buffer view failed");
                 want_ds = false;
             }
-            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
-            rp.colorAttachments[0].texture = rt;
-            rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
-            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
             if (ztex) {
-                rp.colorAttachments[1].texture = ztex;
-                rp.colorAttachments[1].loadAction = MTLLoadActionLoad;
-                rp.colorAttachments[1].storeAction = MTLStoreActionStore;
+                rp.colorAttachments[ncb].texture = ztex;
+                rp.colorAttachments[ncb].loadAction = MTLLoadActionLoad;
+                rp.colorAttachments[ncb].storeAction = MTLStoreActionStore;
                 g_r200_enc_depth_off = dk.offset;
                 g_r200_enc_depth_pitch = zd->pitch;
                 g_r200_enc_depth_z16 = zd->bpp == 2;
@@ -7827,10 +8015,15 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             [g_r200_enc setDepthClipMode:MTLDepthClipModeClamp];
             [g_r200_enc setViewport:(MTLViewport){ 0, 0, pkt->rt_width,
                                                   pkt->rt_height, 0, 1 }];
-            g_r200_enc_key = rk;
+            g_r200_enc_key = ck[0];
+            g_r300_enc_ncb = ncb;
+            memcpy(g_r300_enc_cb, ck, sizeof(ck[0]) * ncb);
             g_r300_enc_mine = true;
             g_r200_stat_passes++;
-            r200_note_written(rlo, rhi, &rk);
+            for (uint32_t k = 0; k < ncb; k++) {
+                r200_note_written(ck[k].offset,
+                                  ck[k].offset + (uint64_t)ck[k].pitch * ck[k].height, &ck[k]);
+            }
         }
         enc_ds = g_r200_enc_depth_off != ~0u;
         MTLPixelFormat pass_zpf = !enc_ds ? MTLPixelFormatInvalid :
@@ -7840,8 +8033,12 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             /* keep the pass's buffer as it is */
             u.zinfo[0] = 0;
             u.zinfo[3] = g_r200_enc_depth_z16 ? R300_ZFMT_Z16 : 0;
+            u.poly_en = 0;
         }
-        id<MTLRenderPipelineState> pipe = r300_pipeline(dev, pkt->msl, pf, pass_zpf);
+        if (ncb != MAX(pkt->num_cb, 1u)) {
+            return -1;                  /* the MSL declares targets we cannot bind */
+        }
+        id<MTLRenderPipelineState> pipe = r300_pipeline(dev, pkt->msl, cpf, ncb, pass_zpf);
         if (!pipe) {
             return -1;
         }
@@ -7856,7 +8053,8 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                          (pkt->cull & R300_CULL_BACK) ? MTLCullModeBack
                                                       : MTLCullModeNone];
 
-        size_t vbytes = (size_t)pkt->num_verts * sizeof(R300Vertex);
+        uint32_t nv = pkt->num_verts + pkt->num_line_verts;
+        size_t vbytes = (size_t)nv * sizeof(R300Vertex);
         id<MTLBuffer> vb = nil;
         size_t voff = 0;
         void *dst = r200_arena_alloc(st, vbytes, &vb, &voff);
@@ -7875,16 +8073,22 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             [enc setFragmentTexture:tex[t] atIndex:t];
             [enc setFragmentSamplerState:smp[t] atIndex:t];
         }
-        [enc drawPrimitives:pkt->prim_class == 2 ? MTLPrimitiveTypePoint :
-                            pkt->prim_class == 1 ? MTLPrimitiveTypeLine :
-                                                   MTLPrimitiveTypeTriangle
-                vertexStart:0 vertexCount:pkt->num_verts];
+        if (pkt->num_verts) {
+            [enc drawPrimitives:pkt->prim_class == 1 ? MTLPrimitiveTypeLine
+                                                     : MTLPrimitiveTypeTriangle
+                    vertexStart:0 vertexCount:pkt->num_verts];
+        }
+        if (pkt->num_line_verts) {
+            /* polygon-mode edges: lines, never culled */
+            [enc setCullMode:MTLCullModeNone];
+            [enc drawPrimitives:MTLPrimitiveTypeLine vertexStart:pkt->num_verts
+                    vertexCount:pkt->num_line_verts];
+        }
         g_r200_stat_draws++;
         for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
             if (u.tex_info[t][0] && !pkt->tex[t].host_data) {
-                r200_note_read(pkt->tex[t].gpu_addr, pkt->tex[t].gpu_addr +
-                               (uint64_t)pkt->tex[t].pitch_bytes *
-                               r300_tex_rows(&pkt->tex[t]));
+                r200_note_read(pkt->tex[t].gpu_addr,
+                               (uint64_t)pkt->tex[t].gpu_addr + pkt->tex[t].size_bytes);
             }
         }
     }

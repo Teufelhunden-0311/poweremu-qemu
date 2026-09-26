@@ -206,8 +206,10 @@ static Target render_tex(uint32_t fmt, uint32_t swap, bool yuv, const void *texe
             withBytes:texels bytesPerRow:pitch_bytes];
     R300FSUniforms u = base_uniforms();
     u.tex_info[0][0] = 1;
+    u.tex_info[0][1] = pitch_bytes / vb;    /* view elements per row */
     u.tex_info[0][2] = W;
     u.tex_info[0][3] = H;
+    u.tex_dim[0][2] = pitch_bytes;          /* level 0 pitch */
     R300Vertex v[6];
     quad(v, NULL, true);
     draw(&t, p, &u, v, tx);

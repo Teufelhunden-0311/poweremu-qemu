@@ -31,6 +31,12 @@ typedef struct R300PVSProgram {
     unsigned last_inst;     /* VAP_PVS_CODE_CNTL_0.PVS_LAST_INST */
     const float (*consts)[4];   /* constant memory, from CONST_BASE_OFFSET */
     int max_const;          /* reads beyond this return 0 */
+    /* Flow control (AMD R5xx guide 7.5.5): VAP_PVS_FLOW_CNTL_OPC (2 bits
+     * per instruction: 0 none, 1 JUMP, 2 LOOP, 3 JSR), _ADDRS and
+     * _LOOP_INDEX.  Zero fc_opc for straight-line programs. */
+    uint32_t fc_opc;
+    uint32_t fc_addrs[16];
+    uint32_t fc_loop[16];
 } R300PVSProgram;
 
 /*
@@ -39,7 +45,7 @@ typedef struct R300PVSProgram {
  * not write keep their previous contents.  Returns a bitmask of flags for
  * things the interpreter does not implement (0 when fully handled).
  */
-#define R300_PVS_UNSUP_FLOW     (1u << 0)   /* flow control (JUMP/LOOP/JSR) */
+#define R300_PVS_UNSUP_FLOW     (1u << 0)   /* flow control ran past its step limit */
 #define R300_PVS_UNSUP_PRED     (1u << 1)   /* R5xx predication */
 #define R300_PVS_UNSUP_OPCODE   (1u << 2)   /* unknown opcode */
 #define R300_PVS_UNSUP_RELDST   (1u << 3)   /* relative destination address */
