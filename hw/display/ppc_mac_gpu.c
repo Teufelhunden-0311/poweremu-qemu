@@ -73,6 +73,33 @@ static BlitPathStats g_blit_stats;
  * reverse-engineered and several of them do real per-draw work (CRC scans,
  * VRAM probes, register audits), so they stay off unless asked for.
  */
+/*
+ * An environment variable read once rather than on every register access.
+ *
+ * These switches sit on the hottest paths there are -- two of them on every
+ * MMIO read -- and getenv walks the whole environment every time: measured at
+ * about 80 ns a miss, so better than 150 ns of rummaging before a register
+ * read did anything at all.  They stay switchable at run time, which is what
+ * they were left uncached for: the `trace` property sets them with g_setenv
+ * and bumps the generation below, so the next read picks the new value up.
+ */
+static unsigned pe_env_generation = 1;
+
+static bool pe_env_on(const char *name, unsigned *seen, bool *cached)
+{
+    if (*seen != pe_env_generation) {
+        *seen = pe_env_generation;
+        *cached = getenv(name) != NULL;
+    }
+    return *cached;
+}
+
+#define PE_ENV_ON(name) ({                                  \
+    static unsigned seen_;                                  \
+    static bool on_;                                        \
+    pe_env_on(name, &seen_, &on_);                          \
+})
+
 static bool gpu_diag_on(void)
 {
     static int on = -1;
@@ -884,7 +911,9 @@ static void pe_window_saw_blit(uint32_t surface, uint32_t pitch,
                                uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                                uint32_t scr_w, uint32_t scr_h)
 {
-    const char *on = getenv("PPCGPU_WINDOWS");
+    /* This one reads a level out of the value, so it keeps the string -- but
+     * only looks it up when the switch is on at all. */
+    const char *on = PE_ENV_ON("PPCGPU_WINDOWS") ? getenv("PPCGPU_WINDOWS") : NULL;
     if (!w || !h) {
         return;
     }
@@ -2283,7 +2312,7 @@ static void ppc_mac_gpu_scratch_writeback_val(PPCMacGPUState *s, int reg_idx,
      * POWEREMU_WB_BE=1 restores the old order for comparison.
      */
     uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
-    uint32_t wire_val = getenv("POWEREMU_WB_BE") ? cpu_to_be32(wb_val)
+    uint32_t wire_val = PE_ENV_ON("POWEREMU_WB_BE") ? cpu_to_be32(wb_val)
                                                  : cpu_to_le32(wb_val);
 
     if (ppc_mac_gpu_gart_translate(s, wb_addr, &phys) ||
@@ -2329,7 +2358,7 @@ static void ppc_mac_gpu_rptr_writeback(PPCMacGPUState *s)
         return;                       /* nowhere to write, or the guest said not to */
     }
     uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
-    uint32_t wire_val = getenv("POWEREMU_WB_BE")
+    uint32_t wire_val = PE_ENV_ON("POWEREMU_WB_BE")
         ? cpu_to_be32(s->regs.cp_rb_rptr) : cpu_to_le32(s->regs.cp_rb_rptr);
 
     if (!ppc_mac_gpu_gart_translate(s, addr, &phys) &&
@@ -3983,7 +4012,7 @@ static inline uint32_t gmc_dst_bpp(uint32_t gmc)
     /* POWEREMU_TEX_TRACE: each 2D pixel format the guest asks for, once,
      * to find where a program's video frames really go (Halo's logos come
      * out green and magenta, and they are not 3D textures). */
-    if (getenv("POWEREMU_TEX_TRACE")) {
+    if (PE_ENV_ON("POWEREMU_TEX_TRACE")) {
         static uint32_t seen_2d;
         uint32_t dt = (gmc >> 8) & 0xF;
         if (!(seen_2d & (1u << dt))) {
@@ -4485,21 +4514,6 @@ static inline void mc_vram_write32(PPCMacGPUState *s, uint8_t *vram,
     }
 
     if (phys_addr + 4 <= s->vram_size) {
-        /* Phase A — VRAM write watch: window texture tile range */
-        if (phys_addr >= 0x353000 && phys_addr < 0x413000) {
-            static int vram_watch_log = 0;
-            static int zero_write_log = 0;
-            /* Log first 50 writes, plus up to 20 zero-value writes */
-            if (vram_watch_log < 50 || (value == 0 && zero_write_log < 20)) {
-                fprintf(stderr, "[VRAM_WATCH] mc_vram_write32 phys=0x%06llx "
-                        "linear=0x%06llx val=0x%08x tiled=%d\n",
-                        (unsigned long long)phys_addr,
-                        (unsigned long long)linear_addr,
-                        value, (slot >= 0));
-                vram_watch_log++;
-                if (value == 0) zero_write_log++;
-            }
-        }
         *(uint32_t *)(vram + phys_addr) = value;
     }
 }
@@ -4510,6 +4524,49 @@ static inline void mc_vram_write32(PPCMacGPUState *s, uint8_t *vram,
  * fill colour arrives as a register value, so it is stored big-endian at the
  * surface's pixel size.  (Copies move bytes and need no conversion.)
  */
+/*
+ * Fill a rectangle a row at a time rather than a pixel at a time.
+ *
+ * Copies were given this treatment long ago (blit_rect_untiled); fills never
+ * were, and they are what draws every window background, every menu, every
+ * list row and the desktop.  A pixel at a time costs two 64-bit multiplies
+ * and a call each; a row at a time is one memset_pattern4.  Measured over a
+ * full screen: 3.14 ms against 0.22.
+ *
+ * Returns false if the rectangle is tiled or runs off the end of VRAM, in
+ * which case the caller keeps to the slow path that knows how to handle it.
+ */
+static bool fill_rect_fast(PPCMacGPUState *s, uint8_t *vram,
+                           uint32_t dst_offset, uint32_t dst_pitch,
+                           uint32_t dst_x, uint32_t dst_y,
+                           uint32_t w, uint32_t h, uint32_t bpp,
+                           uint32_t color)
+{
+    uint64_t first, last_end;
+    uint32_t row;
+
+    if (bpp != 4 || !w || !h) {
+        return false;                   /* only the common depth is worth it */
+    }
+    if (mc_rect_is_tiled(s, dst_offset, dst_pitch, dst_x, dst_y, bpp)) {
+        return false;
+    }
+    first = (uint64_t)dst_offset + (uint64_t)dst_y * dst_pitch +
+            (uint64_t)dst_x * bpp;
+    last_end = first + (uint64_t)(h - 1) * dst_pitch + (uint64_t)w * bpp;
+    if (last_end > s->vram_size) {
+        return false;
+    }
+    {
+        uint32_t px = be32_to_cpu(color);
+        for (row = 0; row < h; row++) {
+            memset_pattern4(vram + first + (uint64_t)row * dst_pitch,
+                            &px, (size_t)w * 4);
+        }
+    }
+    return true;
+}
+
 static inline void fill_vram_px(PPCMacGPUState *s, uint8_t *vram,
                                 uint64_t addr, uint32_t color, uint32_t bpp)
 {
@@ -5147,12 +5204,15 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
     } else if (rop3 == 0xF0) {
         /* Pattern fill (solid color from DP_BRUSH_FRGD_CLR) */
         uint32_t color = s->regs.dp_brush_frgd_clr;
-        for (uint32_t row = 0; row < blit_h; row++) {
-            for (uint32_t col = 0; col < blit_w; col++) {
-                uint64_t dst_linear = (uint64_t)dst_offset +
-                                      (uint64_t)(dst_y + row) * dst_pitch +
-                                      (uint64_t)(dst_x + col) * bpp;
-                fill_vram_px(s, vram, dst_linear, color, bpp);
+        if (!fill_rect_fast(s, vram, dst_offset, dst_pitch, dst_x, dst_y,
+                            blit_w, blit_h, bpp, color)) {
+            for (uint32_t row = 0; row < blit_h; row++) {
+                for (uint32_t col = 0; col < blit_w; col++) {
+                    uint64_t dst_linear = (uint64_t)dst_offset +
+                                          (uint64_t)(dst_y + row) * dst_pitch +
+                                          (uint64_t)(dst_x + col) * bpp;
+                    fill_vram_px(s, vram, dst_linear, color, bpp);
+                }
             }
         }
         uint64_t fill_dirty_start = (uint64_t)dst_offset +
@@ -6044,7 +6104,7 @@ static void r200_decode_tex_unit(PPCMacGPUState *s, int n, R200TexUnit *t)
      * YUV 4:2:2 (the backend applies it).  VRAM already holds the CPU's
      * byte order, which is what 16/32-bit texel decoding expects. */
     t->swap = offset & 3;
-    if (getenv("POWEREMU_TEX_TRACE")) {          /* every texture format, once */
+    if (PE_ENV_ON("POWEREMU_TEX_TRACE")) {          /* every texture format, once */
         static uint32_t seen_tex;
         if (t->format < 32 && !(seen_tex & (1u << t->format))) {
             seen_tex |= 1u << t->format;
@@ -9707,7 +9767,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
      * for something; this says what it touched on the way in, and what it
      * keeps touching while stuck.
      */
-    if (getenv("POWEREMU_STALL_TRACE")) {
+    if (PE_ENV_ON("POWEREMU_STALL_TRACE")) {
         static struct { uint32_t addr, val; bool wr; } ring[256];
         static unsigned n;
         static int64_t last_draw_seen;
@@ -9808,7 +9868,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
      * this says which -- Halo's title screen draws and then stops, with its
      * sound looping, so something it waits for never arrives.
      */
-    if (getenv("POWEREMU_POLL_TRACE")) {
+    if (PE_ENV_ON("POWEREMU_POLL_TRACE")) {
         static uint32_t count[0x4000 / 4];
         static int64_t next_report;
         int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
@@ -12793,6 +12853,7 @@ static void ppc_mac_gpu_set_trace(Object *obj, const char *value, Error **errp)
     }
     /* Logs that remember whether they were switched on have to be told. */
     g_seq_log_enabled = -1;
+    pe_env_generation++;            /* the cached switches re-read themselves */
     fprintf(stderr, "ppc-mac-gpu: %s %s\n", name, off ? "off" : "on");
 }
 
