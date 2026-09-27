@@ -2645,7 +2645,7 @@ static void r300_note_features(PPCMacGPUState *s, const R300DrawPacket *pkt)
     f |= ((r300_reg(r, 0x221C) & 0x3F) != 0) << 13;
     f |= (pkt->num_cb > 1) << 14;
     f |= ((r300_reg(r, 0x4E18) >> 2) & 1) << 15;
-    f |= ((r300_reg(r, 0x4BD8) & 1) && pkt->msl && strstr(pkt->msl, "ow = ar")) << 16;
+    f |= ((r300_reg(r, 0x4BD8) & 1) && pkt->glsl && strstr(pkt->glsl, "ow = ar")) << 16;
     f |= ((r300_reg(r, 0x4E04) & 1) && ((r300_reg(r, 0x4E04) >> 3) & 7)) << 17;
     f |= (r300_reg(r, 0x22DC) != 0) << 18;
     f |= ((r300_reg(r, 0x2090) >> 16) & 1) << 19;

@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "../../hw/display/r300/r300_draw.h"
+#include "r300_mtl.h"
 
 #define W 64
 #define H 64
@@ -64,27 +65,26 @@ static void program(R300State *st, bool tex, bool mrt, bool w)
     }
 }
 
-static id<MTLLibrary> lib_for(R300State *st)
+static NSArray<id<MTLFunction>> *lib_for(R300State *st)
 {
     R300FSDesc d;
     const char *err;
-    NSError *e = nil;
     memset(d.route, -1, sizeof(d.route));
     d.route[0] = 0;
-    char *m = r300_us_to_msl(st, &d, &err);
-    if (!m) { printf("msl: %s\n", err); fails++; return nil; }
-    id<MTLLibrary> lib = [dev newLibraryWithSource:@(m) options:nil error:&e];
-    if (!lib) { printf("compile: %s\n%s\n", e.localizedDescription.UTF8String, m); fails++; }
+    char *m = r300_us_to_glsl(st, &d, 0, &err);
+    if (!m) { printf("glsl: %s\n", err); fails++; return nil; }
+    NSArray<id<MTLFunction>> *lib = r300_test_lib(dev, m);
+    if (!lib) fails++;
     free(m);
     return lib;
 }
 
-static id<MTLRenderPipelineState> pipe_for(id<MTLLibrary> lib, unsigned ncb, bool z)
+static id<MTLRenderPipelineState> pipe_for(NSArray<id<MTLFunction>> *lib, unsigned ncb, bool z)
 {
     NSError *e = nil;
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
-    pd.vertexFunction = [lib newFunctionWithName:@"r300_vs"];
-    pd.fragmentFunction = [lib newFunctionWithName:z ? @"r300_fs_z" : @"r300_fs"];
+    pd.vertexFunction = lib[R300_STAGE_VS];
+    pd.fragmentFunction = lib[z ? R300_STAGE_FS_Z : R300_STAGE_FS];
     for (unsigned k = 0; k < ncb; k++) {
         pd.colorAttachments[k].pixelFormat = MTLPixelFormatRGBA8Unorm;
     }
@@ -224,11 +224,11 @@ static float raw_sample(uint32_t fmt, uint32_t dim, const uint8_t *bytes, uint32
     r300_state_write(&st, 0x44C0, fmt | (dim << 25));
     r300_state_write(&st, 0x4E38, (7u << 21) | W);          /* ARGB32323232 */
     r300_state_write(&st, 0x46A4, 21);                      /* C4_32_FP */
-    id<MTLLibrary> lib = lib_for(&st);
+    NSArray<id<MTLFunction>> *lib = lib_for(&st);
     NSError *e = nil;
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
-    pd.vertexFunction = [lib newFunctionWithName:@"r300_vs"];
-    pd.fragmentFunction = [lib newFunctionWithName:@"r300_fs"];
+    pd.vertexFunction = lib[R300_STAGE_VS];
+    pd.fragmentFunction = lib[R300_STAGE_FS];
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA32Uint;
     id<MTLRenderPipelineState> p = [dev newRenderPipelineStateWithDescriptor:pd error:&e];
     if (!p) { printf("pipeline: %s\n", e.localizedDescription.UTF8String); fails++; return NAN; }
@@ -341,7 +341,7 @@ int main(void)
             r300_state_write(&st, 0x4104, 1);
             r300_state_write(&st, 0x44C0, 0x0C);
             r300_state_write(&st, 0x4400, 6 | (6u << 3) | (1u << 9) | (1u << 11));
-            id<MTLLibrary> lib = lib_for(&st);
+            NSArray<id<MTLFunction>> *lib = lib_for(&st);
             id<MTLRenderPipelineState> p = pipe_for(lib, 1, false);
             MTLTextureDescriptor *d = [MTLTextureDescriptor
                 texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4 height:4 mipmapped:NO];
@@ -373,7 +373,7 @@ int main(void)
         {
             static R300State st;
             program(&st, false, false, false);
-            id<MTLLibrary> lib = lib_for(&st);
+            NSArray<id<MTLFunction>> *lib = lib_for(&st);
             id<MTLRenderPipelineState> p = pipe_for(lib, 1, false);
             const float red[4] = { 1, 0, 0, 1 };
             R300Vertex v[6];
@@ -414,7 +414,7 @@ int main(void)
             static R300State st;
             program(&st, false, true, false);
             CHECK(r300_us_num_targets(&st) == 2, "targets %u", r300_us_num_targets(&st));
-            id<MTLLibrary> lib = lib_for(&st);
+            NSArray<id<MTLFunction>> *lib = lib_for(&st);
             id<MTLRenderPipelineState> p = pipe_for(lib, 2, false);
             const float c[4] = { 0, 0, 1, 1 };
             R300Vertex v[6];
@@ -440,7 +440,7 @@ int main(void)
 
             static R300State st;
             program(&st, false, false, true);
-            id<MTLLibrary> lib = lib_for(&st);
+            NSArray<id<MTLFunction>> *lib = lib_for(&st);
             id<MTLRenderPipelineState> p = pipe_for(lib, 1, true);
             const float c[4] = { 1, 1, 1, 1 };
             R300Vertex v[6];
@@ -489,7 +489,7 @@ int main(void)
             r300_state_write(&st, 0x4020, 6);               /* not enabled */
             CHECK(r300_aa_samples(&st) == 1, "AA off");
 
-            id<MTLLibrary> lib = lib_for(&st);
+            NSArray<id<MTLFunction>> *lib = lib_for(&st);
             id<MTLRenderPipelineState> p = pipe_for(lib, 1, false);
             id<MTLBuffer> mem = [dev newBufferWithLength:W * 4 * ns * H
                                                  options:MTLResourceStorageModeShared];

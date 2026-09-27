@@ -1,12 +1,13 @@
 /*
- * R300-family fragment shader unit (US) -> Metal Shading Language.
+ * R300-family fragment shader unit (US) -> GLSL.
  *
  * Encodings follow AMD's "R3xx 3D Registers" reference (US_* registers).
- * The generated library contains a pass-through vertex function for
- * post-transform vertices and a fragment function that runs the R300
- * program, then does the alpha test, blending and colour-buffer packing in
- * the shader (the guest's big-endian byte order rules out fixed-function
- * blending on the host).
+ * The generated source (Vulkan GLSL 4.50) holds a pass-through vertex
+ * shader for post-transform vertices and a fragment shader that runs the
+ * R300 program, then does the alpha test, blending and colour-buffer
+ * packing in the shader (the guest's big-endian byte order rules out
+ * fixed-function blending on the host).  r300_spirv.c compiles it to
+ * SPIR-V for Vulkan and on to MSL for Metal.
  *
  * Pure C, no QEMU dependencies.
  *
@@ -30,8 +31,8 @@
 #define R300_US_MAX_TARGETS     4       /* render targets A-D */
 
 /*
- * Post-transform vertex as the device hands it to Metal: pos is in Metal
- * clip space, v[k] are the values the rasterizer interpolates into
+ * Post-transform vertex as the device hands it to the renderer: pos is in
+ * clip space with y up (Metal's convention; Vulkan flips its viewport), v[k] are the values the rasterizer interpolates into
  * fragment temporaries (see R300FSDesc.route).
  */
 typedef struct R300Vertex {
@@ -41,7 +42,7 @@ typedef struct R300Vertex {
     float ucp[8];                   /* user clip plane distances (VAP_CLIP_CNTL) */
 } R300Vertex;
 
-/* Must match struct R300FSUniforms in the generated MSL. */
+/* Must match uniform block R300FSUniforms in the generated GLSL (std140). */
 typedef struct R300FSUniforms {
     float consts[R300_US_NUM_CONSTS][4];
     float blend_color[4];
@@ -68,6 +69,8 @@ typedef struct R300FSUniforms {
     uint32_t fog_blend, depth_src, pad3[2];   /* FG_FOG_BLEND, FG_DEPTH_SRC */
     float poly_offset[4];                     /* front scale, offset, back scale, offset,
                                                  in units of the [0,1] depth range */
+    uint32_t tex_addr[R300_NUM_TEX_UNITS][4]; /* x: VRAM byte address of a raw unit's
+                                                 texels (R300_GLSL_VRAM_SSBO only) */
 } R300FSUniforms;
 
 /* tex_dim[k].w */
@@ -95,17 +98,40 @@ uint32_t r300_us_num_targets(const R300State *st);
 uint32_t r300_us_out_fmt(const R300State *st, unsigned k);
 
 /*
- * Build the MSL library for the current US program: functions "r300_vs",
- * "r300_fs" (colour buffers only) and "r300_fs_z" (colour buffers plus
- * the depth/stencil buffer as a uint colour attachment after them:
- * R32Uint for Z24S8, R16Uint for Z16).  Colour buffer k is attachment k
- * (r300_us_num_targets of them).  Both take a Z-pass counter at fragment
- * buffer 1.  Returns a malloc'd string, or NULL with *err set for
- * programs not yet translated.  Every register the source depends on is
- * folded into the text, so the string is its own cache key.
+ * Resource bindings of the generated GLSL (descriptor set 0).  Metal gets
+ * them as: uniforms fragment buffer 0, Z-pass counter fragment buffer 1,
+ * vertices vertex buffer 0, sample shift vertex buffer 1, unit k texture
+ * and sampler k, input attachment k colour attachment k.
  */
-char *r300_us_to_msl(const R300State *st, const R300FSDesc *desc,
-                     const char **err);
+enum {
+    R300_BIND_UNIFORMS = 0,     /* UBO R300FSUniforms (fragment) */
+    R300_BIND_ZPASS = 1,        /* SSBO uint: ZB_ZPASS counter (fragment) */
+    R300_BIND_VERTS = 2,        /* SSBO R300Vertex[] (vertex) */
+    R300_BIND_MS = 3,           /* UBO vec4: multisample clip-space shift */
+    R300_BIND_VRAM = 4,         /* SSBO uint[]: VRAM (R300_GLSL_VRAM_SSBO) */
+    R300_BIND_FB0 = 8,          /* input attachments: colour buffers, then Z */
+    R300_BIND_TEX0 = 16,        /* combined image samplers, one per unit */
+    R300_BIND_COUNT = 32,
+};
+
+/* r300_us_to_glsl flags */
+#define R300_GLSL_VRAM_SSBO     (1u << 0)   /* raw units read VRAM from a storage
+                                               buffer, not a uint texture view */
+
+/*
+ * Build the GLSL source for the current US program.  It compiles as three
+ * shaders by the macro defined: R300_VS (vertex), R300_FS (colour buffers
+ * only) or R300_FS_Z (colour buffers plus the depth/stencil buffer as a
+ * uint colour attachment after them: R32Uint for Z24S8, R16Uint for Z16).
+ * Colour buffer k is output location k and input attachment k
+ * (r300_us_num_targets of them); the fragment shaders read the buffers'
+ * current contents through the input attachments (framebuffer fetch).
+ * Returns a malloc'd string, or NULL with *err set for programs not yet
+ * translated.  Every register the source depends on is folded into the
+ * text, so the string is its own cache key.
+ */
+char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
+                      uint32_t flags, const char **err);
 
 /*
  * Texture formats (TX_FORMAT1.TXFORMAT) the shader decodes itself from the

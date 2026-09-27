@@ -9,7 +9,7 @@
  *   outputs into fragment temporaries.
  *
  * The fragment program, blending and colour-buffer packing are compiled
- * from r300_us_to_msl(); the renderer only binds and draws.
+ * from r300_us_to_glsl(); the renderer only binds and draws.
  *
  * Pure C, no QEMU dependencies.
  *
@@ -161,7 +161,7 @@ typedef struct R300DrawPacket {
     float aa_pos[6][2];
 
     /* Fragment stage */
-    char *msl;                  /* library source; owned by the packet */
+    char *glsl;                 /* r300_us_to_glsl() source; owned by the packet */
     R300FSUniforms uniforms;
     R300TexDesc tex[R300_NUM_TEX_UNITS];
 
@@ -205,7 +205,7 @@ void r300_load_vbpntr(R300Arrays *arr, const uint32_t *d, uint32_t ndw);
  * Build a draw from a 3D_DRAW_VBUF_2 (0x34), 3D_DRAW_IMMD_2 (0x35) or
  * 3D_DRAW_INDX_2 (0x36) body.  Returns false (with *err) when the draw
  * cannot be assembled at all; smaller omissions are flagged in pkt->warn.
- * On success the caller owns pkt->msl and pkt->verts (r300_draw_free).
+ * On success the caller owns pkt->glsl and pkt->verts (r300_draw_free).
  */
 bool r300_draw_build(const R300State *st, const R300Arrays *arr,
                      uint32_t opcode, const uint32_t *d, uint32_t ndw,

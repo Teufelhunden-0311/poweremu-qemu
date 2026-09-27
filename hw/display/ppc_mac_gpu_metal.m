@@ -32,6 +32,7 @@
 
 #include "ppc_mac_gpu_renderer.h"
 #include "r300/r300_draw.h"
+#include "r300/r300_spirv.h"
 #include "ppc_mac_gpu_3d_regs.h"
 #include "ppc_mac_gpu_surface.h"
 
@@ -7397,8 +7398,9 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
 /* ========================================================================
  * R300 (ati-radeon-9700) draws
  *
- * The device hands over post-transform vertices and a complete MSL library
- * generated from the fragment program (r300/r300_us.c), which also does
+ * The device hands over post-transform vertices and the GLSL generated
+ * from the fragment program (r300/r300_us.c, compiled on to MSL by
+ * r300/r300_spirv.c), which also does
  * alpha test, blending and packing into the colour buffer's byte order.
  * Draws share the R200 path's batch, views and hazard tracking, so the
  * device's flush_r200() covers them too.
@@ -7417,17 +7419,62 @@ static void r300_metal_warn(uint32_t bit, const char *msg)
 }
 
 /*
+ * A stage of a r300_us_to_glsl() source as a Metal function: GLSL ->
+ * SPIR-V -> MSL (r300_spirv.c), compiled once per source and stage.
+ */
+static NSMutableDictionary<NSString *, id<MTLFunction>> *g_r300_fns;
+
+static id<MTLFunction> r300_function(id<MTLDevice> dev, NSString *glsl,
+                                     R300Stage stage)
+{
+    NSString *key = [glsl stringByAppendingFormat:@"\n// stage %d\n", stage];
+    id<MTLFunction> fn;
+    NSError *err = nil;
+    char *msg = NULL;
+
+    if (!g_r300_fns) {
+        g_r300_fns = [[NSMutableDictionary alloc] init];
+    }
+    fn = g_r300_fns[key];
+    if (fn) {
+        return fn;
+    }
+    char *msl = r300_glsl_to_msl(glsl.UTF8String, stage, &msg);
+    if (!msl) {
+        qemu_log("ppc-mac-gpu r300: %s: %s\n%s\n", r300_stage_entry(stage), msg,
+                 glsl.UTF8String);
+        free(msg);
+        return nil;
+    }
+    id<MTLLibrary> lib = [dev newLibraryWithSource:@(msl) options:nil error:&err];
+    if (!lib) {
+        qemu_log("ppc-mac-gpu r300: shader compile failed: %s\n%s\n",
+                 err.localizedDescription.UTF8String, msl);
+        free(msl);
+        return nil;
+    }
+    free(msl);
+    fn = [lib newFunctionWithName:@(r300_stage_entry(stage))];
+    [lib release];
+    if (fn) {
+        g_r300_fns[key] = fn;
+        [fn release];
+    }
+    return fn;
+}
+
+/*
  * cfmt[0..ncb-1]: the colour buffers' formats; zfmt MTLPixelFormatInvalid
  * for a colour-only pass (r300_fs), else the format of the depth/stencil
  * buffer bound as colour attachment ncb (r300_fs_z).
  */
 static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
-                                                const char *msl,
+                                                const char *glsl,
                                                 const MTLPixelFormat *cfmt,
                                                 uint32_t ncb,
                                                 MTLPixelFormat zfmt)
 {
-    NSString *src = [NSString stringWithUTF8String:msl];
+    NSString *src = [NSString stringWithUTF8String:glsl];
     NSMutableString *key = [NSMutableString stringWithString:src];
     id<MTLRenderPipelineState> p;
     NSError *err = nil;
@@ -7443,23 +7490,21 @@ static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
     if (p) {
         return p;
     }
-    id<MTLLibrary> lib = [dev newLibraryWithSource:src options:nil error:&err];
-    if (!lib) {
-        qemu_log("ppc-mac-gpu r300: shader compile failed: %s\n%s\n",
-                 err.localizedDescription.UTF8String, msl);
+    id<MTLFunction> vs = r300_function(dev, src, R300_STAGE_VS);
+    id<MTLFunction> fs = r300_function(dev, src, zfmt == MTLPixelFormatInvalid ?
+                                       R300_STAGE_FS : R300_STAGE_FS_Z);
+    if (!vs || !fs) {
         return nil;
     }
     MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
-    pd.vertexFunction = [[lib newFunctionWithName:@"r300_vs"] autorelease];
-    pd.fragmentFunction = [[lib newFunctionWithName:
-        zfmt == MTLPixelFormatInvalid ? @"r300_fs" : @"r300_fs_z"] autorelease];
+    pd.vertexFunction = vs;
+    pd.fragmentFunction = fs;
     for (uint32_t k = 0; k < ncb; k++) {
         pd.colorAttachments[k].pixelFormat = cfmt[k];
     }
     pd.colorAttachments[ncb].pixelFormat = zfmt;
     p = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
     [pd release];
-    [lib release];
     if (!p) {
         qemu_log("ppc-mac-gpu r300: pipeline failed: %s\n",
                  err.localizedDescription.UTF8String);
@@ -8136,7 +8181,7 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         if (ncb != MAX(pkt->num_cb, 1u)) {
             return -1;                  /* the MSL declares targets we cannot bind */
         }
-        id<MTLRenderPipelineState> pipe = r300_pipeline(dev, pkt->msl, cpf, ncb, pass_zpf);
+        id<MTLRenderPipelineState> pipe = r300_pipeline(dev, pkt->glsl, cpf, ncb, pass_zpf);
         if (!pipe) {
             return -1;
         }

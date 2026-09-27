@@ -288,7 +288,7 @@ static void rendering_completeness(void)
     CHECK(FEQ(p.verts[0].ucp[0], -1.0f) && FEQ(p.verts[1].ucp[0], -0.36f) &&
           p.verts[0].ucp[1] == 1.0f, "ucp %g %g %g", p.verts[0].ucp[0], p.verts[1].ucp[0],
           p.verts[0].ucp[1]);
-    CHECK(p.msl && strstr(p.msl, "clip_distance"), "vertex function lacks clip distances");
+    CHECK(p.glsl && strstr(p.glsl, "gl_ClipDistance[6]"), "vertex shader lacks clip distances");
     r300_draw_free(&p);
     r300_state_write(&st, 0x221C, 0);
 
@@ -313,7 +313,8 @@ static void rendering_completeness(void)
     r300_draw_build(&st, &none, 0x35, d, n, rd, NULL, &p, &err);
     CHECK(p.num_cb == 3 && p.cb[2].gpu_addr == 0x00300000 && p.cb[1].view == p.rt_view,
           "multiwrite cb %u %08x", p.num_cb, p.cb[2].gpu_addr);
-    CHECK(p.msl && strstr(p.msl, "c2 [[color(2)]]") && strstr(p.msl, "z [[color(3)]]"),
+    CHECK(p.glsl && strstr(p.glsl, "location = 2) out r300_cb2_o o_c2") &&
+          strstr(p.glsl, "location = 3) out uvec4 o_z"),
           "MRT outputs missing");
     r300_draw_free(&p);
     r300_state_write(&st, 0x4E00, 0);

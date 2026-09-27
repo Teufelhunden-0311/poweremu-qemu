@@ -20,9 +20,9 @@ int main(int argc, char **argv)
     d.route[1] = 1;     /* texcoord 0 -> t1 (RS_INST_0 TEX_ADDR 1) */
     char *dis = r300_us_disasm(&st);
     fprintf(stderr, "%s", dis);
-    char *msl = r300_us_to_msl(&st, &d, &err);
-    if (!msl) { fprintf(stderr, "error: %s\n", err); return 1; }
-    printf("%s", msl);
+    char *glsl = r300_us_to_glsl(&st, &d, argc > 2 ? strtoul(argv[2], NULL, 0) : 0, &err);
+    if (!glsl) { fprintf(stderr, "error: %s\n", err); return 1; }
+    printf("%s", glsl);
     fprintf(stderr, "PVS const0 float24(0x003F0000) = %g\n", r300_float24(0x003F0000));
     return 0;
 }

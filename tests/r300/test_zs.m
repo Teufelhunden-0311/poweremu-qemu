@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "../../hw/display/r300/r300_draw.h"
+#include "r300_mtl.h"
 
 #define W 64
 #define H 64
@@ -35,7 +36,7 @@ static char *make_msl(void)
     r300_state_write(&st, 0x49C0, 9 | (17u << 7) | (16u << 14));
     memset(d.route, -1, sizeof(d.route));
     d.route[0] = 0;
-    char *m = r300_us_to_msl(&st, &d, &err);
+    char *m = r300_us_to_glsl(&st, &d, 0, &err);
     if (!m) {
         printf("msl: %s\n", err);
     }
@@ -78,11 +79,11 @@ static Target make_target(bool z16, uint32_t zinit)
 static id<MTLRenderPipelineState> pipe_for(const char *msl, bool z16)
 {
     NSError *e = nil;
-    id<MTLLibrary> lib = [dev newLibraryWithSource:@(msl) options:nil error:&e];
-    if (!lib) { printf("compile: %s\n", e.localizedDescription.UTF8String); return nil; }
+    NSArray<id<MTLFunction>> *lib = r300_test_lib(dev, msl);
+    if (!lib) return nil;
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
-    pd.vertexFunction = [lib newFunctionWithName:@"r300_vs"];
-    pd.fragmentFunction = [lib newFunctionWithName:@"r300_fs_z"];
+    pd.vertexFunction = lib[R300_STAGE_VS];
+    pd.fragmentFunction = lib[R300_STAGE_FS_Z];
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
     pd.colorAttachments[1].pixelFormat = z16 ? MTLPixelFormatR16Uint : MTLPixelFormatR32Uint;
     id<MTLRenderPipelineState> p = [dev newRenderPipelineStateWithDescriptor:pd error:&e];
