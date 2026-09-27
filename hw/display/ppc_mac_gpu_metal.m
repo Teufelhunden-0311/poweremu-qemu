@@ -6609,7 +6609,47 @@ static bool r200_batch_conflict(uint64_t lo, uint64_t hi, const R200TexKey *same
 }
 static int64_t g_r200_stat_flush_us;
 
-/* Linear texture view over VRAM, cached; views stay alive while cached. */
+/* Bytes per pixel of the formats r200_view is used with; 0 = unknown. */
+static unsigned r200_pf_bytes(MTLPixelFormat pf)
+{
+    switch (pf) {
+    case MTLPixelFormatR8Unorm: case MTLPixelFormatR8Uint:
+    case MTLPixelFormatA8Unorm:
+        return 1;
+    case MTLPixelFormatRG8Unorm: case MTLPixelFormatRG8Uint:
+    case MTLPixelFormatR16Unorm: case MTLPixelFormatR16Uint:
+    case MTLPixelFormatR16Float: case MTLPixelFormatB5G6R5Unorm:
+    case MTLPixelFormatA1BGR5Unorm: case MTLPixelFormatABGR4Unorm:
+    case MTLPixelFormatBGR5A1Unorm:
+        return 2;
+    case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatBGRA8Unorm:
+    case MTLPixelFormatRGBA8Uint: case MTLPixelFormatR32Uint:
+    case MTLPixelFormatR32Float: case MTLPixelFormatRG16Unorm:
+    case MTLPixelFormatRG16Uint: case MTLPixelFormatRG16Float:
+    case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatBGR10A2Unorm:
+        return 4;
+    case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Float:
+    case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRGBA16Uint:
+    case MTLPixelFormatRGBA16Float:
+        return 8;
+    case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Float:
+        return 16;
+    default:
+        return 0;
+    }
+}
+
+/*
+ * Linear texture view over VRAM, cached; views stay alive while cached.
+ *
+ * The geometry comes from guest registers, and Metal aborts the whole
+ * process (not just fails the call) on a linear texture whose rows don't
+ * fit its bytesPerRow, a misaligned pitch/offset, or one running past the
+ * buffer.  So check first.  A sampled texture that doesn't fit is shrunk
+ * to what does (sampling past it clamps); a render target isn't, since
+ * callers size viewports and scissors from the guest's numbers: it gets
+ * no view, and the draw is skipped with a warning.
+ */
 static id<MTLTexture> r200_view(PPCMacGPUMetalState *st, R200TexKey k,
                                 MTLPixelFormat pf, bool render_target)
 {
@@ -6624,8 +6664,45 @@ static id<MTLTexture> r200_view(PPCMacGPUMetalState *st, R200TexKey k,
             lru = i;
         }
     }
+    uint64_t w = k.width, h = k.height, bpp = r200_pf_bytes(pf);
+    uint64_t align = [st->device minimumLinearTextureAlignmentForPixelFormat:pf];
+    uint64_t len = st->vramBuffer.length;
+    const char *why = NULL;
+
+    if (!w || !h || !k.pitch) {
+        why = "empty";
+    } else if (align && (k.pitch % align || k.offset % align)) {
+        why = "pitch/offset not aligned for Metal";
+    } else if (k.offset >= len) {
+        why = "offset outside VRAM";
+    } else if (bpp) {
+        if (w * bpp > k.pitch) {
+            w = k.pitch / bpp;             /* rows wider than the pitch */
+        }
+        if (k.offset + (h - 1) * k.pitch + w * bpp > len) {
+            h = (len - k.offset - w * bpp) / k.pitch + 1;   /* past the end */
+        }
+        if (!w || !h || k.offset + w * bpp > len) {
+            why = "does not fit";
+        } else if (render_target && (w != k.width || h != k.height)) {
+            why = "render target does not fit";
+        }
+    }
+    if (why || w != k.width || h != k.height) {
+        static int logged;
+        if (logged < 20) {
+            logged++;
+            qemu_log("ppc-mac-gpu-metal: VRAM view %ux%u pitch %u offset 0x%x "
+                     "fmt %lu: %s\n", k.width, k.height, k.pitch, k.offset,
+                     (unsigned long)pf,
+                     why ? why : "clamped to fit the pitch/VRAM");
+        }
+        if (why) {
+            return nil;
+        }
+    }
     MTLTextureDescriptor *d = [MTLTextureDescriptor
-        texture2DDescriptorWithPixelFormat:pf width:k.width height:k.height
+        texture2DDescriptorWithPixelFormat:pf width:w height:h
                                  mipmapped:NO];
     d.usage = MTLTextureUsageShaderRead |
               (render_target ? MTLTextureUsageRenderTarget : 0);
