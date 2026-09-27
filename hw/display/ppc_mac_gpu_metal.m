@@ -7875,15 +7875,35 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     uint32_t sx0 = pkt->scissor[0], sy0 = pkt->scissor[1];
     uint32_t sx1 = MIN(pkt->scissor[2], pkt->rt_width);
     uint32_t sy1 = MIN(pkt->scissor[3], pkt->rt_height);
+    /*
+     * Multisampling: sample k of row y is row y * ns + k of every buffer
+     * (R300DrawPacket.aa_samples), so one view ns rows' worth of bytes
+     * wide holds sample k in columns k * pitch onwards, and each sample
+     * is drawn into its columns in turn, with the geometry shifted by the
+     * sample's offset from the pixel centre.  The column offset is shared
+     * by all attachments, so they need the same pitch in pixels.
+     */
+    uint32_t ns = MIN(MAX(pkt->aa_samples, 1u), 6u);
 
     if (sx0 >= sx1 || sy0 >= sy1 || !(pkt->num_verts + pkt->num_line_verts)) {
         return 0;
+    }
+    if (ns > 1) {
+        bool same_pitch = !pkt->depth.attach || pkt->depth.pitch == pkt->rt_pitch;
+        for (uint32_t k = 1; k < ncb; k++) {
+            same_pitch &= pkt->cb[k].pitch == pkt->rt_pitch;
+        }
+        if (!same_pitch || (uint64_t)ns * pkt->rt_pitch > 16384) {
+            r300_metal_warn(512, "multisampled buffers of different pitches");
+            return -1;
+        }
     }
     /* Colour buffers: A from the packet's rt_*, B-D from cb[]. */
     for (uint32_t k = 0; k < ncb; k++) {
         uint32_t view = k ? pkt->cb[k].view : pkt->rt_view;
         uint32_t addr = k ? pkt->cb[k].gpu_addr : pkt->rt_gpu_addr;
-        uint32_t bpr = k ? pkt->cb[k].pitch * pkt->cb[k].bpp : pkt->rt_pitch * pkt->rt_bpp;
+        uint32_t bpr = ns * (k ? pkt->cb[k].pitch * pkt->cb[k].bpp
+                               : pkt->rt_pitch * pkt->rt_bpp);
         cpf[k] = r300_rt_pf(view);
         NSUInteger align = [dev minimumLinearTextureAlignmentForPixelFormat:cpf[k]];
         if ((addr % align) || (bpr % align) || !bpr ||
@@ -7896,7 +7916,8 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             ncb = k;
             break;
         }
-        ck[k] = (R200TexKey){ addr, pkt->rt_width, pkt->rt_height, bpr, (uint32_t)cpf[k] };
+        ck[k] = (R200TexKey){ addr, ns > 1 ? ns * pkt->rt_pitch : pkt->rt_width,
+                              pkt->rt_height, bpr, (uint32_t)cpf[k] };
     }
 
     if ((pkt->cull & (R300_CULL_FRONT | R300_CULL_BACK)) ==
@@ -7910,8 +7931,8 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         const R300DepthDesc *zd = &pkt->depth;
         MTLPixelFormat zpf = zd->bpp == 2 ? MTLPixelFormatR16Uint
                                           : MTLPixelFormatR32Uint;
-        R200TexKey dk = { zd->gpu_addr, pkt->rt_width, pkt->rt_height,
-                          zd->pitch * zd->bpp, (uint32_t)zpf };
+        R200TexKey dk = { zd->gpu_addr, ns > 1 ? ns * zd->pitch : pkt->rt_width,
+                          pkt->rt_height, ns * zd->pitch * zd->bpp, (uint32_t)zpf };
         bool want_ds = zd->attach;
         if (want_ds) {
             NSUInteger za = [dev minimumLinearTextureAlignmentForPixelFormat:zpf];
@@ -8044,14 +8065,13 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         }
         id<MTLRenderCommandEncoder> enc = g_r200_enc;
         [enc setRenderPipelineState:pipe];
-        [enc setScissorRect:(MTLScissorRect){ sx0, sy0, sx1 - sx0, sy1 - sy0 }];
         /* SU_CULL_MODE; the winding also decides [[front_facing]] for
          * two-sided stencil. */
         [enc setFrontFacingWinding:r300_front_ccw(pkt->cull) ?
                                    MTLWindingCounterClockwise : MTLWindingClockwise];
-        [enc setCullMode:(pkt->cull & R300_CULL_FRONT) ? MTLCullModeFront :
-                         (pkt->cull & R300_CULL_BACK) ? MTLCullModeBack
-                                                      : MTLCullModeNone];
+        MTLCullMode cull = (pkt->cull & R300_CULL_FRONT) ? MTLCullModeFront :
+                           (pkt->cull & R300_CULL_BACK) ? MTLCullModeBack
+                                                        : MTLCullModeNone;
 
         uint32_t nv = pkt->num_verts + pkt->num_line_verts;
         size_t vbytes = (size_t)nv * sizeof(R300Vertex);
@@ -8067,22 +8087,42 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             [enc setVertexBuffer:one offset:0 atIndex:0];
             [one release];
         }
-        [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
         [enc setFragmentBuffer:r300_zpass_buf(dev) offset:0 atIndex:1];
         for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
             [enc setFragmentTexture:tex[t] atIndex:t];
             [enc setFragmentSamplerState:smp[t] atIndex:t];
         }
-        if (pkt->num_verts) {
-            [enc drawPrimitives:pkt->prim_class == 1 ? MTLPrimitiveTypeLine
-                                                     : MTLPrimitiveTypeTriangle
-                    vertexStart:0 vertexCount:pkt->num_verts];
-        }
-        if (pkt->num_line_verts) {
-            /* polygon-mode edges: lines, never culled */
-            [enc setCullMode:MTLCullModeNone];
-            [enc drawPrimitives:MTLPrimitiveTypeLine vertexStart:pkt->num_verts
-                    vertexCount:pkt->num_line_verts];
+        for (uint32_t k = 0; k < ns; k++) {
+            /* Sample k: its columns, and the geometry moved so that the
+             * pixel centres land where the sample is. */
+            uint32_t cx = k * pkt->rt_pitch;
+            float ms[4] = { 0, 0, 0, 0 };
+            R300FSUniforms uk = u;
+            if (ns > 1) {
+                ms[0] = -2.0f * pkt->aa_pos[k][0] / pkt->rt_width;
+                ms[1] = 2.0f * pkt->aa_pos[k][1] / pkt->rt_height;
+                for (int i = 0; i < 4; i++) {
+                    uk.cliprect[i][0] += cx;
+                    uk.cliprect[i][2] += cx;
+                }
+                [enc setViewport:(MTLViewport){ cx, 0, pkt->rt_width,
+                                                pkt->rt_height, 0, 1 }];
+            }
+            [enc setScissorRect:(MTLScissorRect){ cx + sx0, sy0, sx1 - sx0, sy1 - sy0 }];
+            [enc setVertexBytes:ms length:sizeof(ms) atIndex:1];
+            [enc setFragmentBytes:&uk length:sizeof(uk) atIndex:0];
+            [enc setCullMode:cull];
+            if (pkt->num_verts) {
+                [enc drawPrimitives:pkt->prim_class == 1 ? MTLPrimitiveTypeLine
+                                                         : MTLPrimitiveTypeTriangle
+                        vertexStart:0 vertexCount:pkt->num_verts];
+            }
+            if (pkt->num_line_verts) {
+                /* polygon-mode edges: lines, never culled */
+                [enc setCullMode:MTLCullModeNone];
+                [enc drawPrimitives:MTLPrimitiveTypeLine vertexStart:pkt->num_verts
+                        vertexCount:pkt->num_line_verts];
+            }
         }
         g_r200_stat_draws++;
         for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {

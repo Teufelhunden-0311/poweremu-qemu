@@ -2,7 +2,8 @@
  * Rendering-completeness features of the generated MSL, run with Metal:
  * mip level selection, 3D and cube lookups for shader-decoded formats,
  * border colours, fog, logic ops, multiple render targets, depth from the
- * program (OMASK_W), polygon offset and RB3D discard-src-pixels.
+ * program (OMASK_W), polygon offset, RB3D discard-src-pixels and
+ * multisampling.
  */
 #import <Metal/Metal.h>
 #include <math.h>
@@ -176,6 +177,7 @@ static void run(Pass *ps, id<MTLRenderPipelineState> p, const R300FSUniforms *u,
     [e setRenderPipelineState:p];
     [e setFrontFacingWinding:MTLWindingCounterClockwise];
     [e setVertexBytes:v length:sizeof(R300Vertex) * nv atIndex:0];
+    [e setVertexBytes:(float[4]){ 0 } length:16 atIndex:1];
     [e setFragmentBytes:u length:sizeof(*u) atIndex:0];
     [e setFragmentBuffer:g_zp offset:0 atIndex:1];
     if (ps->tex) {
@@ -464,6 +466,82 @@ int main(void)
             [ps.z getBytes:&z bytesPerRow:4 fromRegion:MTLRegionMake2D(9, 9, 1, 1) mipmapLevel:0];
             uint32_t want = (uint32_t)lrintf(0.5f * 16777215) + 256;
             CHECK(abs((int)(z >> 8) - (int)want) <= 2, "poly offset %06x want %06x", z >> 8, want);
+        }
+        /* ---- 2x multisampling as the renderer draws it: sample k of row
+         * y is row 2y + k, i.e. columns kW.. of a view 2W wide; the
+         * geometry is shifted so each sample's position (GB_MSPOS, Mesa's
+         * 2x pattern: (3,9) and (9,3) twelfths) lands on pixel centres ---- */
+        {
+            static R300State st;
+            program(&st, false, false, false);
+            r300_state_write(&st, 0x4020, 1);               /* AA_ENABLE, 2 samples */
+            r300_state_write(&st, 0x4010, 0x33393993);
+            r300_state_write(&st, 0x4014, 0x03393939);
+            float pos[6][2];
+            uint32_t ns = r300_aa_samples(&st);
+            r300_aa_positions(&st, pos);
+            CHECK(ns == 2, "samples %u", ns);
+            CHECK(NEAR(pos[0][0], -0.25f, 1e-6) && NEAR(pos[0][1], 0.25f, 1e-6) &&
+                  NEAR(pos[1][0], 0.25f, 1e-6) && NEAR(pos[1][1], -0.25f, 1e-6),
+                  "positions %g,%g %g,%g", pos[0][0], pos[0][1], pos[1][0], pos[1][1]);
+            r300_state_write(&st, 0x4020, 5);               /* 4 samples */
+            CHECK(r300_aa_samples(&st) == 4, "4x");
+            r300_state_write(&st, 0x4020, 6);               /* not enabled */
+            CHECK(r300_aa_samples(&st) == 1, "AA off");
+
+            id<MTLLibrary> lib = lib_for(&st);
+            id<MTLRenderPipelineState> p = pipe_for(lib, 1, false);
+            id<MTLBuffer> mem = [dev newBufferWithLength:W * 4 * ns * H
+                                                 options:MTLResourceStorageModeShared];
+            memset(mem.contents, 0, mem.length);
+            MTLTextureDescriptor *d = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                width:W * ns height:H mipmapped:NO];
+            d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            d.storageMode = MTLStorageModeShared;
+            id<MTLTexture> view = [mem newTextureWithDescriptor:d offset:0
+                                                    bytesPerRow:W * 4 * ns];
+            const float c[4] = { 1, 1, 1, 1 };
+            R300Vertex v[6];
+            quad(v, 8.4f, c, 0);                            /* [0, 8.4) squared */
+            id<MTLCommandBuffer> cb = [q commandBuffer];
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture = view;
+            rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+            [e setRenderPipelineState:p];
+            [e setFrontFacingWinding:MTLWindingCounterClockwise];
+            [e setVertexBytes:v length:sizeof(v) atIndex:0];
+            [e setFragmentBuffer:g_zp offset:0 atIndex:1];
+            for (uint32_t k = 0; k < ns; k++) {
+                float ms[4] = { -2 * pos[k][0] / W, 2 * pos[k][1] / H, 0, 0 };
+                R300FSUniforms u = base_uniforms();
+                for (int i = 0; i < 4; i++) {
+                    u.cliprect[i][0] += k * W;
+                    u.cliprect[i][2] += k * W;
+                }
+                [e setViewport:(MTLViewport){ k * W, 0, W, H, 0, 1 }];
+                [e setScissorRect:(MTLScissorRect){ k * W, 0, W, H }];
+                [e setVertexBytes:ms length:sizeof(ms) atIndex:1];
+                [e setFragmentBytes:&u length:sizeof(u) atIndex:0];
+                [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+            }
+            [e endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            const uint8_t *m = mem.contents;
+#define SAMPLE(x, y, k) m[(((y) * ns + (k)) * W + (x)) * 4]
+            CHECK(SAMPLE(7, 7, 0) == 255 && SAMPLE(7, 7, 1) == 255, "inside");
+            CHECK(SAMPLE(9, 2, 0) == 0 && SAMPLE(9, 2, 1) == 0, "outside");
+            /* right edge x = 8.4: sample 0 at x 8.25 in, sample 1 at 8.75 out */
+            CHECK(SAMPLE(8, 2, 0) == 255 && SAMPLE(8, 2, 1) == 0,
+                  "right edge %u %u", SAMPLE(8, 2, 0), SAMPLE(8, 2, 1));
+            /* bottom edge y = 8.4: sample 0 at y 8.75 out, sample 1 at 8.25 in */
+            CHECK(SAMPLE(2, 8, 0) == 0 && SAMPLE(2, 8, 1) == 255,
+                  "bottom edge %u %u", SAMPLE(2, 8, 0), SAMPLE(2, 8, 1));
+            CHECK(SAMPLE(W - 1, 2, 1) == 0 && SAMPLE(0, 12, 0) == 0, "stays in its columns");
+#undef SAMPLE
         }
     }
     printf(fails ? "test_raster: %d failure(s)\n" : "test_raster: ok\n", fails);

@@ -1291,8 +1291,9 @@ char *r300_us_to_msl(const R300State *st, const R300FSDesc *desc,
     }
     r300_sb_printf(&sb, "%s", us_prelude_z);
 
-    /* Vertex stage: post-transform vertices as they are, plus the user
-     * clip plane distances when VAP_CLIP_CNTL enables any. */
+    /* Vertex stage: post-transform vertices as they are (shifted by the
+     * sample offset when multisampling), plus the user clip plane
+     * distances when VAP_CLIP_CNTL enables any. */
     r300_sb_printf(&sb,
         "struct R300VOutC {\n"
         "    float4 pos [[position]];\n"
@@ -1303,11 +1304,13 @@ char *r300_us_to_msl(const R300State *st, const R300FSDesc *desc,
         "%s"
         "};\n"
         "vertex R300VOutC r300_vs(uint vid [[vertex_id]],\n"
-        "                         const device R300Vertex *vb [[buffer(0)]])\n"
+        "                         const device R300Vertex *vb [[buffer(0)]],\n"
+        "                         constant float4 &ms [[buffer(1)]])\n"
         "{\n"
         "    R300Vertex x = vb[vid];\n"
         "    R300VOutC o;\n"
-        "    o.pos = x.pos;\n"
+        "    /* ms.xy: the multisample being drawn, as a clip-space shift */\n"
+        "    o.pos = float4(x.pos.xy + ms.xy * x.pos.w, x.pos.zw);\n"
         "    o.v0 = x.v[0]; o.v1 = x.v[1]; o.v2 = x.v[2]; o.v3 = x.v[3];\n"
         "    o.v4 = x.v[4]; o.v5 = x.v[5]; o.v6 = x.v[6]; o.v7 = x.v[7];\n"
         "    o.v8 = x.v[8]; o.v9 = x.v[9]; o.aux = x.aux;\n"

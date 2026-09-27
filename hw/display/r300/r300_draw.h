@@ -149,6 +149,17 @@ typedef struct R300DrawPacket {
     R300DepthDesc depth;
     uint32_t cull;              /* SU_CULL_MODE (0 for lines and points) */
 
+    /*
+     * Multisampling (GB_AA_CONFIG): with aa_samples > 1 every sample is
+     * rendered, as its own copy of the image.  Sample k of row y is row
+     * y * aa_samples + k of each colour and depth buffer, which fills the
+     * aa_samples-times footprint the driver allocates for them.  aa_pos
+     * is each sample's offset from the pixel centre in pixels (GB_MSPOS,
+     * twelfths of a pixel from the pixel's corner).
+     */
+    uint32_t aa_samples;
+    float aa_pos[6][2];
+
     /* Fragment stage */
     char *msl;                  /* library source; owned by the packet */
     R300FSUniforms uniforms;
@@ -215,6 +226,11 @@ bool r300_draw_build_indexed(const R300State *st, const R300Arrays *arr,
 /* Index i (0-based) of a DRAW_INDX_2 index stream: 16-bit indices are
  * packed two per dword, the first in the low half. */
 uint32_t r300_index_at(const uint32_t *dw, uint32_t ndw, bool i32, uint32_t i);
+
+/* GB_AA_CONFIG's sample count (1 without antialiasing), and GB_MSPOS's
+ * sample positions as offsets from the pixel centre, in pixels. */
+uint32_t r300_aa_samples(const R300State *st);
+void r300_aa_positions(const R300State *st, float pos[6][2]);
 
 /*
  * Byte offset of sample `sample` of pixel (x, y) in a multisampled R300

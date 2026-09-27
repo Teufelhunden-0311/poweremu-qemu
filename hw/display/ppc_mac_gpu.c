@@ -28,6 +28,7 @@
 #include <math.h>
 #include <sched.h>
 #include "qemu/log.h"
+#include "qemu/host-utils.h"
 #include "qemu/module.h"
 #include "qemu/units.h"
 #include "qemu/timer.h"
@@ -2343,9 +2344,30 @@ static void r300_zpass_write(PPCMacGPUState *s, uint32_t addr, uint32_t val)
 }
 
 /*
+ * Samples per pixel of the colour or depth buffer at VRAM offset off:
+ * GB_AA_CONFIG's, or when that is off now, what the buffer was last drawn
+ * with.  A multisampled buffer holds one row per sample for each row
+ * (R300DrawPacket.aa_samples), so a clear or resolve covers ns rows.
+ */
+static uint32_t r300_cb_samples(PPCMacGPUState *s, uint32_t off)
+{
+    uint32_t ns = r300_aa_samples(s->r3);
+
+    return ns == 1 && off == s->r3_cb_aa_off ? s->r3_cb_aa_ns : ns;
+}
+
+static uint32_t r300_zb_samples(PPCMacGPUState *s, uint32_t gpu_off)
+{
+    uint32_t ns = r300_aa_samples(s->r3);
+
+    return ns == 1 && gpu_off == s->r3_zb_offset ? MAX(s->r3_zb_ns, 1u) : ns;
+}
+
+/*
  * 3D_CLEAR_ZMASK (0x32) marks every Z tile as holding ZB_DEPTHCLEARVALUE.
  * Depth is kept uncompressed in memory here, so write the clear value
- * over the buffer (the extent seen at earlier draws, else the scissor).
+ * over the buffer (the extent seen at earlier draws, else the scissor),
+ * every sample of it.
  */
 static void r300_zmask_clear(PPCMacGPUState *s)
 {
@@ -2362,6 +2384,7 @@ static void r300_zmask_clear(PPCMacGPUState *s)
     if (s->r3_zb_offset == off && s->r3_zb_height > rows) {
         rows = s->r3_zb_height;
     }
+    rows *= r300_zb_samples(s, off);
     if (off < fb_base || !bpr || !rows) {
         return;
     }
@@ -2393,7 +2416,7 @@ static void r300_zmask_clear(PPCMacGPUState *s)
  * colour buffer's CMASK tiles cleared and fills them with
  * RB3D_COLOR_CLEAR_VALUE (ARGB) as it next reads them.  No CMASK is kept
  * here, so the clear goes straight into colour buffer 0, over the scissor
- * height, in the buffer's COLOR_ENDIAN order.  Apple's GL driver clears a
+ * height (all of its samples), in the buffer's COLOR_ENDIAN order.  Apple's GL driver clears a
  * window's back buffer this way each frame (Chess).
  */
 static void r300_cmask_clear(PPCMacGPUState *s)
@@ -2426,6 +2449,7 @@ static void r300_cmask_clear(PPCMacGPUState *s)
         return;
     }
     off -= fb_base;
+    rows *= r300_cb_samples(s, off);     /* every sample's rows */
     if (off + bpr * rows > s->vram_size) {
         rows = (s->vram_size - off) / bpr;
     }
@@ -2507,14 +2531,16 @@ static void r300_drawlog_draw(PPCMacGPUState *s, uint32_t opcode,
     }
     fprintf(f, "D%llu op%02x vf=%08x n=%u rt=%08x/%08x zb=%x zs=%08x rm=%08x "
             "zf=%x zo=%08x zp=%08x bw=%x cull=%x pm=%x vte=%x vc=%x cb=%08x "
-            "ab=%08x cm=%x af=%x ten=%x",
+            "ab=%08x cm=%x af=%x ten=%x aa=%x ms=%08x/%08x res=%x",
             (unsigned long long)r->draws, opcode, body_dw ? d[0] : 0, body_dw,
             r300_reg(r, 0x4E28), r300_reg(r, 0x4E38), r300_reg(r, 0x4F00),
             r300_reg(r, 0x4F04), r300_reg(r, 0x4F08), r300_reg(r, 0x4F10),
             r300_reg(r, 0x4F20), r300_reg(r, 0x4F24), r300_reg(r, 0x4F1C),
             r300_reg(r, 0x42B8), r300_reg(r, 0x4288), r300_reg(r, 0x20B0),
             r300_reg(r, 0x2140), r300_reg(r, 0x4E04), r300_reg(r, 0x4E08),
-            r300_reg(r, 0x4E0C), r300_reg(r, 0x4BD4), r300_reg(r, 0x4104));
+            r300_reg(r, 0x4E0C), r300_reg(r, 0x4BD4), r300_reg(r, 0x4104),
+            r300_reg(r, 0x4020), r300_reg(r, 0x4010), r300_reg(r, 0x4014),
+            r300_reg(r, 0x4E88));
     for (int t = 0; t < 16; t++) {
         if (r300_reg(r, 0x4104) & (1u << t)) {
             fprintf(f, " t%d=%08x/%08x/%08x/%08x/%08x", t,
@@ -2633,11 +2659,23 @@ static void r300_note_features(PPCMacGPUState *s, const R300DrawPacket *pkt)
     }
 }
 
+/*
+ * RB3D_AARESOLVE_CTL.AARESOLVE_MODE: the colour buffer is in resolve mode,
+ * and the pixels a draw covers are filtered from it into the resolve
+ * buffer (RB3D_AARESOLVE_OFFSET/PITCH) instead of being rendered.  Apple's
+ * GL driver swaps a window's back buffer this way, with one point sprite
+ * over the drawable.  The filter is the mean of the pixel's samples, with
+ * AARESOLVE_GAMMA 2.2 averaging linear light and AARESOLVE_ALPHA taking
+ * sample 0's alpha or the mean.  Without multisampling it is a copy.
+ */
 static void r300_aa_resolve(PPCMacGPUState *s, const R300DrawPacket *pkt)
 {
+    uint32_t ctl = r300_reg(s->r3, 0x4E88);
     uint32_t dst = r300_reg(s->r3, 0x4E80) & ~0x1Fu;
     uint32_t dpitch = (r300_reg(s->r3, 0x4E84) & 0x3FFE) * 4;
     uint32_t spitch = pkt->rt_pitch * pkt->rt_bpp;
+    uint32_t ns = r300_cb_samples(s, pkt->rt_gpu_addr);
+    uint64_t srow = (uint64_t)spitch * ns;          /* a row of every sample */
     float x0 = pkt->rt_width, y0 = pkt->rt_height, x1 = 0, y1 = 0;
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
 
@@ -2662,6 +2700,10 @@ static void r300_aa_resolve(PPCMacGPUState *s, const R300DrawPacket *pkt)
         r300_warn_once("AA resolve buffer outside VRAM", NULL);
         return;
     }
+    if ((uint64_t)pkt->rt_gpu_addr + srow * iy1 > s->vram_size) {
+        r300_warn_once("multisampled colour buffer outside VRAM", NULL);
+        return;
+    }
     if (s->renderer && s->renderer->flush_r200) {
         bool need_bql = !bql_locked();
         if (need_bql) {
@@ -2672,17 +2714,68 @@ static void r300_aa_resolve(PPCMacGPUState *s, const R300DrawPacket *pkt)
             bql_unlock();
         }
     }
-    for (int y = iy0; y < iy1; y++) {
-        memmove(vram + dst + (uint64_t)y * dpitch + ix0 * 4,
-                vram + pkt->rt_gpu_addr + (uint64_t)y * spitch + ix0 * 4,
-                (size_t)w * 4);
+    /* 8 bits a channel averages; other formats keep sample 0. */
+    bool avg = ns > 1 && pkt->rt_bpp == 4 &&
+               pkt->rt_format == 6;                    /* ARGB8888 */
+    if (ns > 1 && !avg) {
+        r300_warn_once("AA resolve of a colour format other than 8888: "
+                       "sample 0 kept", NULL);
+    }
+    if (!avg) {
+        for (int y = iy0; y < iy1; y++) {
+            memmove(vram + dst + (uint64_t)y * dpitch + ix0 * 4,
+                    vram + pkt->rt_gpu_addr + (uint64_t)y * srow + ix0 * 4,
+                    (size_t)w * 4);
+        }
+    } else {
+        static float degamma[256];
+        static uint8_t regamma[4096];
+        bool gamma = ctl & 2, alpha_avg = ctl & 4;
+        /* The byte alpha lands in: the ARGB dword in COLOR_ENDIAN order,
+         * stored little-endian (as 3D_CLEAR_CMASK writes it). */
+        uint32_t amask = r300_swap_mode(0xFF000000u,
+                                        (r300_reg(s->r3, 0x4E38) >> 19) & 3);
+        int ab = ctz32(amask) / 8;
+
+        if (gamma && degamma[255] == 0.0f) {
+            for (int i = 0; i < 256; i++) {
+                degamma[i] = powf(i / 255.0f, 2.2f);
+            }
+            for (int i = 0; i < 4096; i++) {
+                regamma[i] = (uint8_t)lrintf(255.0f * powf(i / 4095.0f, 1.0f / 2.2f));
+            }
+        }
+        for (int y = iy0; y < iy1; y++) {
+            const uint8_t *sp = vram + pkt->rt_gpu_addr + (uint64_t)y * srow + ix0 * 4;
+            uint8_t *dp = vram + dst + (uint64_t)y * dpitch + ix0 * 4;
+            for (uint32_t x = 0; x < w; x++, sp += 4, dp += 4) {
+                for (int c = 0; c < 4; c++) {
+                    if (c == ab && !alpha_avg) {
+                        dp[c] = sp[c];
+                    } else if (gamma && c != ab) {
+                        float sum = 0;
+                        for (uint32_t k = 0; k < ns; k++) {
+                            sum += degamma[sp[k * spitch + c]];
+                        }
+                        dp[c] = regamma[(int)lrintf(sum / ns * 4095.0f)];
+                    } else {
+                        uint32_t sum = ns / 2;
+                        for (uint32_t k = 0; k < ns; k++) {
+                            sum += sp[k * spitch + c];
+                        }
+                        dp[c] = sum / ns;
+                    }
+                }
+            }
+        }
     }
     memory_region_set_dirty(&s->vram, dst + (uint64_t)iy0 * dpitch,
                             (uint64_t)dpitch * h);
     static int logged;
     if (logged++ < 3) {
-        qemu_log("ppc-mac-gpu r300: AA resolve %06x/%u -> %06x/%u (%d,%d %ux%u)\n",
-                 pkt->rt_gpu_addr, spitch, dst, dpitch, ix0, iy0, w, h);
+        qemu_log("ppc-mac-gpu r300: AA resolve %06x/%u -> %06x/%u (%d,%d %ux%u), "
+                 "%u samples%s\n", pkt->rt_gpu_addr, spitch, dst, dpitch, ix0,
+                 iy0, w, h, ns, avg && (ctl & 2) ? ", gamma 2.2" : "");
     }
 }
 
@@ -2821,8 +2914,9 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     if (pkt.warn & R300_WARN_VARYINGS) r300_warn_once("too many interpolants", NULL);
     if (pkt.warn & R300_WARN_FLOW)     r300_warn_once("vertex program flow control ran away", NULL);
 
+    uint32_t ns = pkt.aa_samples;
     if (!r300_to_vram(s, &pkt.rt_gpu_addr,
-                      (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height)) {
+                      (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height * ns)) {
         r300_warn_once("colour buffer outside VRAM", NULL);
         r300_draw_free(&pkt);
         return;
@@ -2831,7 +2925,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     for (uint32_t k = 1; k < pkt.num_cb; k++) {
         R300ColorDesc *c = &pkt.cb[k];
         if (!r300_to_vram(s, &c->gpu_addr,
-                          (uint64_t)c->pitch * c->bpp * pkt.rt_height)) {
+                          (uint64_t)c->pitch * c->bpp * pkt.rt_height * ns)) {
             r300_warn_once("render target B-D outside VRAM", NULL);
             pkt.num_cb = k;
             break;
@@ -2874,7 +2968,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     if (pkt.depth.attach) {
         uint32_t zo = pkt.depth.gpu_addr;
         if (!r300_to_vram(s, &pkt.depth.gpu_addr,
-                          (uint64_t)pkt.depth.pitch * pkt.depth.bpp * pkt.rt_height)) {
+                          (uint64_t)pkt.depth.pitch * pkt.depth.bpp * pkt.rt_height * ns)) {
             r300_warn_once("depth buffer outside VRAM", NULL);
             pkt.depth.attach = false;
         } else {
@@ -2883,27 +2977,29 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                 s->r3_zb_height = 0;
             }
             s->r3_zb_height = MAX(s->r3_zb_height, pkt.rt_height);
-            {
-                static const uint8_t n[4] = { 2, 3, 4, 6 };
-                uint32_t aa = r300_reg(s->r3, 0x4020);     /* GB_AA_CONFIG */
-                s->r3_zb_ns = (aa & 1) ? n[(aa >> 1) & 3] : 1;
-            }
+            s->r3_zb_ns = ns;
         }
     }
     pkt.uniforms.zpass_count = s->r3_zpass_active;
-    /*
-     * RB3D_AARESOLVE_CTL.AARESOLVE_MODE: the colour buffer is in resolve
-     * mode, and the pixels a draw covers are filtered from it into the
-     * resolve buffer (RB3D_AARESOLVE_OFFSET/PITCH) instead of being
-     * rendered.  Apple's GL driver swaps a window's back buffer this way,
-     * with one point sprite over the drawable.  No multisampling here, so
-     * the resolve is a copy of the covered rectangle.
-     */
-    if (r300_reg(s->r3, 0x4E88) & 1) {
+    if (r300_reg(s->r3, 0x4E88) & 1) {         /* RB3D_AARESOLVE_CTL */
         r300_aa_resolve(s, &pkt);
         r300_draw_free(&pkt);
         s->regs.stall_draws++;
         return;
+    }
+    if (ns > 1) {
+        static bool said;
+        if (!said) {
+            said = true;
+            qemu_log("ppc-mac-gpu r300: first multisampled draw: %u samples "
+                     "(GB_MSPOS %08x %08x) into %06x\n", ns,
+                     r300_reg(s->r3, 0x4010), r300_reg(s->r3, 0x4014),
+                     pkt.rt_gpu_addr);
+        }
+        s->r3_cb_aa_off = pkt.rt_gpu_addr;
+        s->r3_cb_aa_ns = ns;
+    } else if (s->r3_cb_aa_off == pkt.rt_gpu_addr) {
+        s->r3_cb_aa_ns = 1;
     }
     if (s->renderer && s->renderer->draw_r300) {
         bool need_bql = !bql_locked();
@@ -11143,9 +11239,11 @@ static const MemoryRegionOps r300_watch_ops = {
  * buffer in its micro-tiled, sample-interleaved layout, and Apple's GL
  * driver reads it that way (r300_msaa_offset) after mapping a surface over
  * it with SURFACE0 - glReadPixels of depth, which Chess uses to pick the
- * square under the mouse.  Depth is rendered here as one linear sample, so
- * while such a surface is mapped the buffer is rewritten in the card's
- * layout, and converted back (keeping any CPU writes) when it is unmapped.
+ * square under the mouse.  Depth is rendered here one row per sample
+ * (R300DrawPacket.aa_samples), so while such a surface is mapped the buffer
+ * is rewritten in the card's layout, and converted back (keeping any CPU
+ * writes) when it is unmapped.  Depth drawn without multisampling is one
+ * linear sample, which every sample of the card's layout gets a copy of.
  */
 static void r300_zconv(PPCMacGPUState *s, bool to_card)
 {
@@ -11161,7 +11259,24 @@ static void r300_zconv(PPCMacGPUState *s, bool to_card)
     }
     r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
     tmp = g_malloc(card);
-    if (to_card) {
+    if (s->r3_zconv_rows_ns) {
+        for (uint32_t y = 0; y < rows; y++) {
+            for (uint32_t k = 0; k < ns; k++) {
+                uint8_t *row = (to_card ? vram : tmp) +
+                               ((uint64_t)y * ns + k) * pitch * 4;
+                for (uint32_t x = 0; x < pitch; x++) {
+                    uint8_t *c = (to_card ? tmp : vram) +
+                                 r300_msaa_offset(x, y, ns, pitch, 4, k);
+                    if (to_card) {
+                        memcpy(c, row + x * 4, 4);
+                    } else {
+                        memcpy(row + x * 4, c, 4);
+                    }
+                }
+            }
+        }
+        memcpy(vram, tmp, card);
+    } else if (to_card) {
         for (uint32_t y = 0; y < rows; y++) {
             for (uint32_t x = 0; x < pitch; x++) {
                 for (uint32_t k = 0; k < ns; k++) {
@@ -11213,6 +11328,7 @@ static void r300_surface_changed(PPCMacGPUState *s)
     /* Samples: GB_AA_CONFIG at the depth draws, else what the size of the
      * mapped surface implies. */
     uint32_t ns = s->r3_zb_ns;
+    s->r3_zconv_rows_ns = ns >= 2;
     if (ns < 2) {
         ns = ((hi - lo + 1) + pitch * 2 * s->r3_zb_height) /
              (pitch * 4 * s->r3_zb_height);

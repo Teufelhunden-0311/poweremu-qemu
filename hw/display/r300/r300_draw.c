@@ -14,7 +14,10 @@
 
 /* Registers used here */
 #define SE_VPORT_XSCALE             0x1D98  /* then XOFFSET, YSCALE, ... ZOFFSET */
+#define GB_MSPOS0                   0x4010
+#define GB_MSPOS1                   0x4014
 #define GB_SELECT                   0x401C
+#define GB_AA_CONFIG                0x4020
 #define VAP_CLIP_CNTL               0x221C
 #define VAP_PVS_FLOW_CNTL_ADDRS_0   0x2230
 #define VAP_PVS_FLOW_CNTL_LOOP_INDEX_0 0x2290
@@ -1245,6 +1248,9 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         return false;
     }
 
+    pkt->aa_samples = r300_aa_samples(st);
+    r300_aa_positions(st, pkt->aa_pos);
+
     set_uniforms(st, pkt);
     set_textures(st, pkt);
     set_depth(st, pkt);
@@ -1490,6 +1496,25 @@ bool r300_draw_build(const R300State *st, const R300Arrays *arr,
     }
     return draw_core(st, arr, vf, order, n, opcode == 0x35 ? payload : NULL,
                      opcode == 0x35 ? payload_dw : 0, read, opaque, pkt, err);
+}
+
+uint32_t r300_aa_samples(const R300State *st)
+{
+    static const uint8_t n[4] = { 2, 3, 4, 6 };
+    uint32_t aa = r300_reg(st, GB_AA_CONFIG);
+
+    return (aa & 1) ? n[(aa >> 1) & 3] : 1;
+}
+
+void r300_aa_positions(const R300State *st, float pos[6][2])
+{
+    uint64_t v = r300_reg(st, GB_MSPOS0) & 0xFFFFFF;
+
+    v |= (uint64_t)(r300_reg(st, GB_MSPOS1) & 0xFFFFFF) << 24;
+    for (int k = 0; k < 6; k++, v >>= 8) {
+        pos[k][0] = ((float)(v & 0xF) - 6.0f) / 12.0f;
+        pos[k][1] = ((float)((v >> 4) & 0xF) - 6.0f) / 12.0f;
+    }
 }
 
 uint32_t r300_msaa_offset(uint32_t x, uint32_t y, uint32_t ns,

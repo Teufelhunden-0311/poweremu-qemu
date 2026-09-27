@@ -141,6 +141,7 @@ static void draw(Target *t, id<MTLRenderPipelineState> p, const R300FSUniforms *
     [e setCullMode:(cull & R300_CULL_FRONT) ? MTLCullModeFront :
                    (cull & R300_CULL_BACK) ? MTLCullModeBack : MTLCullModeNone];
     [e setVertexBytes:v length:sizeof(R300Vertex) * n atIndex:0];
+    [e setVertexBytes:(float[4]){ 0 } length:16 atIndex:1];
     [e setFragmentBytes:u length:sizeof(*u) atIndex:0];
     [e setFragmentBuffer:g_zp offset:0 atIndex:1];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:n];

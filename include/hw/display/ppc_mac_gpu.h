@@ -681,7 +681,10 @@ struct PPCMacGPUState {
     bool r3_indx_buf_pending;
     uint32_t r3_zb_offset, r3_zb_height;   /* depth buffer extent seen at draws */
     uint32_t r3_zb_ns;          /* GB_AA_CONFIG samples at the last depth draw */
+    uint32_t r3_cb_aa_off, r3_cb_aa_ns; /* last multisampled colour buffer, samples */
     bool r3_zconv;              /* depth buffer currently in the card's MSAA layout */
+    bool r3_zconv_rows_ns;      /* ... converted from one row per sample (else
+                                   from one sample, which all samples copy) */
     uint32_t r3_zconv_off, r3_zconv_pitch, r3_zconv_rows, r3_zconv_ns;
     uint32_t r300_aic_pt_base;  /* PCI GART table base (0x0AB0) */
     uint32_t vram_size_mb;      /* VRAM size in megabytes */
