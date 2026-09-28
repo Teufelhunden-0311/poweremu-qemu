@@ -191,6 +191,9 @@ static void screamer_pace_cb(void *opaque)
         }
         due -= n;
         moved += n;
+        if (!s->voice) {
+            s->rpos = s->wpos;              /* no host output: play to nowhere */
+        }
     }
     if (moved) {
         s->pace_idle = 0;
@@ -348,12 +351,12 @@ static void screamer_update_settings(ScreamerState *s)
     struct audsettings as = { s->rate, 2, AUDIO_FORMAT_S16,
         1 };
 
-    s->voice = AUD_open_out(&s->card, s->voice, s_spk, s, screamerspk_callback, &as);
-    if (!s->voice) {
-        AUD_log(s_spk, "Could not open voice\n");
-        return;
-    }
-
+    /*
+     * The ring first: the guest's DMA fills it whether or not the host has
+     * a voice for it.  Without one, samples stayed 0 and the first sound
+     * Mac OS X played divided by zero in pmac_screamer_tx_transfer (seen
+     * on Intel Macs where CoreAudio would not open).
+     */
     s->shift = 2;
     if (!s->mixbuf) {
         /* SCREAMER_RING=<frames> overrides the default (for tuning) */
@@ -362,6 +365,11 @@ static void screamer_update_settings(ScreamerState *s)
         s->mixbuf = g_malloc0(s->samples << s->shift);
     }
 
+    s->voice = AUD_open_out(&s->card, s->voice, s_spk, s, screamerspk_callback, &as);
+    if (!s->voice) {
+        AUD_log(s_spk, "Could not open voice\n");
+        return;
+    }
     AUD_set_active_out(s->voice, true);
 }
 
