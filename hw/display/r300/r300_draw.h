@@ -261,4 +261,17 @@ uint32_t r300_assemble_prov(unsigned prim, uint32_t n, uint32_t *list,
 
 void r300_draw_free(R300DrawPacket *pkt);
 
+/*
+ * One face/slice of mip level l of a texture a renderer uploads (kinds
+ * other than R300_TEXK_RAW), repacked with tight rows: 16bpp formats
+ * decoded to RGBA8, DXT blocks and 8/16/32-bit texels copied as they lie.
+ * src is the face's first byte; w, h the level's size (for DXT, rounded
+ * up to whole blocks).  Returns malloc'd bytes and their row pitch.
+ */
+uint8_t *r300_tex_level_bytes(const R300TexDesc *td, const uint8_t *src,
+                              uint32_t l, uint32_t w, uint32_t h, uint32_t *bpr);
+
+/* 64-bit content hash, for caches of textures copied out of guest memory. */
+uint64_t r300_hash_bytes(const uint8_t *p, size_t n);
+
 #endif

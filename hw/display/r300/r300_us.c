@@ -754,14 +754,21 @@ static const char us_raw_tex[] =
 
 static const char us_raw_ssbo[] =
 "layout(std430, set = 0, binding = 4) readonly buffer R300VRAM { uint vram[]; };\n"
+"layout(std430, set = 0, binding = 5) readonly buffer R300Aux { uint rawaux[]; };\n"
 "#define R300_RAWTEX uint\n"
+"/* tex_addr.x: byte address of the texels in VRAM, or (tex_addr.y set)\n"
+"   in the draw's buffer of texels copied out of the GART */\n"
+"uint r300_rawword(uint unit, uint w)\n"
+"{\n"
+"    return u.tex_addr[unit].y != 0u ? rawaux[w] : vram[w];\n"
+"}\n"
 "/* el counts elements of bpp bytes (4 for texels of up to 4 bytes) */\n"
 "uvec4 r300_rawld(uint tx, uint unit, uint el, uint bpp)\n"
 "{\n"
 "    uint b = (u.tex_addr[unit].x >> 2) + el * (bpp >> 2);\n"
-"    uvec4 r = uvec4(vram[b], 0u, 0u, 0u);\n"
-"    if (bpp >= 8u) r.y = vram[b + 1u];\n"
-"    if (bpp >= 16u) { r.z = vram[b + 2u]; r.w = vram[b + 3u]; }\n"
+"    uvec4 r = uvec4(r300_rawword(unit, b), 0u, 0u, 0u);\n"
+"    if (bpp >= 8u) r.y = r300_rawword(unit, b + 1u);\n"
+"    if (bpp >= 16u) { r.z = r300_rawword(unit, b + 2u); r.w = r300_rawword(unit, b + 3u); }\n"
 "    return r;\n"
 "}\n";
 

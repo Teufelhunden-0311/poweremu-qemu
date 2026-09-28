@@ -1454,7 +1454,7 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     free(xv);
     free(order);
 
-    pkt->glsl = r300_us_to_glsl(st, &desc, 0, err);
+    pkt->glsl = r300_us_to_glsl(st, &desc, st->glsl_flags, err);
     if (!pkt->glsl) {
         r300_draw_free(pkt);
         return false;
@@ -1587,5 +1587,96 @@ void r300_draw_free(R300DrawPacket *pkt)
     for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
         free(pkt->tex[t].host_data);
         pkt->tex[t].host_data = NULL;
+    }
+}
+
+/* ---- texel repacking for renderers ------------------------------------ */
+
+/* A 16bpp texel as the card sees it: the guest wrote big-endian halfwords. */
+static void r300_decode16(uint32_t fmt, uint16_t v, uint8_t out[4])
+{
+    uint32_t x, y, z, w;
+
+    switch (fmt) {
+    case 0x6:   /* Z5Y6X5 */
+        x = (v & 31) * 255 / 31; y = ((v >> 5) & 63) * 255 / 63;
+        z = (v >> 11) * 255 / 31; w = 255;
+        break;
+    case 0x7:   /* Z6Y5X5 */
+        x = (v & 31) * 255 / 31; y = ((v >> 5) & 31) * 255 / 31;
+        z = (v >> 10) * 255 / 63; w = 255;
+        break;
+    case 0xA:   /* W4Z4Y4X4 */
+        x = (v & 15) * 17; y = ((v >> 4) & 15) * 17;
+        z = ((v >> 8) & 15) * 17; w = (v >> 12) * 17;
+        break;
+    case 0xB:   /* W1Z5Y5X5 */
+        x = (v & 31) * 255 / 31; y = ((v >> 5) & 31) * 255 / 31;
+        z = ((v >> 10) & 31) * 255 / 31; w = (v >> 15) ? 255 : 0;
+        break;
+    default:    /* X16 */
+        x = v >> 8; y = z = 0; w = 255;
+        break;
+    }
+    out[0] = x; out[1] = y; out[2] = z; out[3] = w;
+}
+
+uint64_t r300_hash_bytes(const uint8_t *p, size_t n)
+{
+    const uint64_t m = 0x9E3779B97F4A7C15ull;
+    uint64_t h = n * m, v;
+    size_t i = 0;
+
+    for (; i + 8 <= n; i += 8) {
+        memcpy(&v, p + i, 8);
+        h = (h ^ v) * m;
+        h ^= h >> 29;
+    }
+    for (; i < n; i++) {
+        h = (h ^ p[i]) * m;
+    }
+    return h ^ (h >> 32);
+}
+
+uint8_t *r300_tex_level_bytes(const R300TexDesc *td, const uint8_t *src,
+                                 uint32_t l, uint32_t w, uint32_t h,
+                                 uint32_t *bpr)
+{
+    uint32_t pitch = td->lvl_pitch[l];
+    uint8_t *out;
+
+    switch (td->kind) {
+    case R300_TEXK_CONVERT16:
+        *bpr = w * 4;
+        out = malloc((size_t)w * h * 4);
+        for (uint32_t y = 0; y < h; y++) {
+            const uint8_t *row = src + (uint64_t)y * pitch;
+            for (uint32_t x = 0; x < w; x++) {
+                uint16_t v = (uint16_t)(row[2 * x] << 8 | row[2 * x + 1]);
+                r300_decode16(td->format, v, out + ((size_t)y * w + x) * 4);
+            }
+        }
+        return out;
+    case R300_TEXK_DXT1:
+    case R300_TEXK_DXT3:
+    case R300_TEXK_DXT5: {
+        uint32_t bs = td->kind == R300_TEXK_DXT1 ? 8 : 16;
+        uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4;
+        *bpr = bw * bs;
+        out = malloc((size_t)bw * bh * bs);
+        for (uint32_t y = 0; y < bh; y++) {
+            memcpy(out + (size_t)y * bw * bs, src + (uint64_t)y * pitch, (size_t)bw * bs);
+        }
+        return out;
+    }
+    default: {                          /* RGBA8, R8, RG8: bytes as they lie */
+        uint32_t bpp = td->kind == R300_TEXK_RGBA8 ? 4 : td->kind == R300_TEXK_RG8 ? 2 : 1;
+        *bpr = w * bpp;
+        out = malloc((size_t)w * h * bpp);
+        for (uint32_t y = 0; y < h; y++) {
+            memcpy(out + (size_t)y * w * bpp, src + (uint64_t)y * pitch, (size_t)w * bpp);
+        }
+        return out;
+    }
     }
 }

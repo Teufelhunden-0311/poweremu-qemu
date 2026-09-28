@@ -73,20 +73,20 @@ uint32_t *r300_glsl_to_spirv(const char *glsl, R300Stage stage,
     return words;
 }
 
+/* The pre-"_2" API: SPIRV-Cross in Linux distributions still lacks _2. */
 static void msl_bind(spvc_compiler c, SpvExecutionModel model, unsigned binding,
                      unsigned buffer, unsigned texture, unsigned sampler)
 {
-    spvc_msl_resource_binding_2 b;
+    spvc_msl_resource_binding b;
 
-    spvc_msl_resource_binding_init_2(&b);
+    spvc_msl_resource_binding_init(&b);
     b.stage = model;
     b.desc_set = 0;
     b.binding = binding;
-    b.count = 1;
     b.msl_buffer = buffer;
     b.msl_texture = texture;
     b.msl_sampler = sampler;
-    spvc_compiler_msl_add_resource_binding_2(c, &b);
+    spvc_compiler_msl_add_resource_binding(c, &b);
 }
 
 char *r300_spirv_to_msl(const uint32_t *spv, size_t nwords, R300Stage stage,
@@ -117,7 +117,7 @@ char *r300_spirv_to_msl(const uint32_t *spv, size_t nwords, R300Stage stage,
     spvc_compiler_options_set_uint(o, SPVC_COMPILER_OPTION_MSL_VERSION,
                                    SPVC_MAKE_MSL_VERSION(2, 4, 0));
     /* input attachment k -> [[color(k)]] */
-    spvc_compiler_options_set_bool(o, SPVC_COMPILER_OPTION_MSL_FRAMEBUFFER_FETCH_SUBPASS,
+    spvc_compiler_options_set_bool(o, SPVC_COMPILER_OPTION_MSL_IOS_FRAMEBUFFER_FETCH_SUBPASS,
                                    SPVC_TRUE);
     if (spvc_compiler_install_compiler_options(c, o) != SPVC_SUCCESS) {
         goto fail;
@@ -129,6 +129,7 @@ char *r300_spirv_to_msl(const uint32_t *spv, size_t nwords, R300Stage stage,
         msl_bind(c, model, R300_BIND_UNIFORMS, 0, 0, 0);
         msl_bind(c, model, R300_BIND_ZPASS, 1, 0, 0);
         msl_bind(c, model, R300_BIND_VRAM, 2, 0, 0);
+        msl_bind(c, model, R300_BIND_AUX, 3, 0, 0);
         for (unsigned k = 0; k < R300_NUM_TEX_UNITS; k++) {
             msl_bind(c, model, R300_BIND_TEX0 + k, 0, k, k);
         }

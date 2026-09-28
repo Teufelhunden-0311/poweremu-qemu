@@ -36,7 +36,7 @@
 #include "ppc_mac_gpu_3d_regs.h"
 #include "ppc_mac_gpu_surface.h"
 
-FrameTracker *g_frame_tracker = NULL;
+/* g_frame_tracker is defined in ppc_mac_gpu.c (built on every host) */
 
 /* ========================================================================
  * Zero-copy unified VRAM — MTLBuffer shared with guest CPU
@@ -7658,53 +7658,6 @@ static MTLPixelFormat r300_raw_pf(uint32_t view_bpp)
            view_bpp == 8 ? MTLPixelFormatRG32Uint : MTLPixelFormatR32Uint;
 }
 
-/* A 16bpp texel as the card sees it: the guest wrote big-endian halfwords. */
-static void r300_decode16(uint32_t fmt, uint16_t v, uint8_t out[4])
-{
-    uint32_t x, y, z, w;
-
-    switch (fmt) {
-    case 0x6:   /* Z5Y6X5 */
-        x = (v & 31) * 255 / 31; y = ((v >> 5) & 63) * 255 / 63;
-        z = (v >> 11) * 255 / 31; w = 255;
-        break;
-    case 0x7:   /* Z6Y5X5 */
-        x = (v & 31) * 255 / 31; y = ((v >> 5) & 31) * 255 / 31;
-        z = (v >> 10) * 255 / 63; w = 255;
-        break;
-    case 0xA:   /* W4Z4Y4X4 */
-        x = (v & 15) * 17; y = ((v >> 4) & 15) * 17;
-        z = ((v >> 8) & 15) * 17; w = (v >> 12) * 17;
-        break;
-    case 0xB:   /* W1Z5Y5X5 */
-        x = (v & 31) * 255 / 31; y = ((v >> 5) & 31) * 255 / 31;
-        z = ((v >> 10) & 31) * 255 / 31; w = (v >> 15) ? 255 : 0;
-        break;
-    default:    /* X16 */
-        x = v >> 8; y = z = 0; w = 255;
-        break;
-    }
-    out[0] = x; out[1] = y; out[2] = z; out[3] = w;
-}
-
-/* 64-bit content hash for the copied-texture cache (wyhash-style mix). */
-static uint64_t r300_hash(const uint8_t *p, size_t n)
-{
-    const uint64_t m = 0x9E3779B97F4A7C15ull;
-    uint64_t h = n * m, v;
-    size_t i = 0;
-
-    for (; i + 8 <= n; i += 8) {
-        memcpy(&v, p + i, 8);
-        h = (h ^ v) * m;
-        h ^= h >> 29;
-    }
-    for (; i < n; i++) {
-        h = (h ^ p[i]) * m;
-    }
-    return h ^ (h >> 32);
-}
-
 /*
  * Textures the device rebuilds as real Metal textures (mip chains, 3D,
  * cube maps: a linear view cannot have levels or faces).  Cached by the
@@ -7723,50 +7676,6 @@ static struct {
     uint64_t used;
 } g_r300_tcache[R300_TCACHE];
 static uint64_t g_r300_tcache_clock;
-
-/* One face/slice of one level as the Metal format wants it (tight rows). */
-static uint8_t *r300_level_bytes(const R300TexDesc *td, const uint8_t *src,
-                                 uint32_t l, uint32_t w, uint32_t h,
-                                 uint32_t *bpr)
-{
-    uint32_t pitch = td->lvl_pitch[l];
-    uint8_t *out;
-
-    switch (td->kind) {
-    case R300_TEXK_CONVERT16:
-        *bpr = w * 4;
-        out = g_malloc((size_t)w * h * 4);
-        for (uint32_t y = 0; y < h; y++) {
-            const uint8_t *row = src + (uint64_t)y * pitch;
-            for (uint32_t x = 0; x < w; x++) {
-                uint16_t v = (uint16_t)(row[2 * x] << 8 | row[2 * x + 1]);
-                r300_decode16(td->format, v, out + ((size_t)y * w + x) * 4);
-            }
-        }
-        return out;
-    case R300_TEXK_DXT1:
-    case R300_TEXK_DXT3:
-    case R300_TEXK_DXT5: {
-        uint32_t bs = td->kind == R300_TEXK_DXT1 ? 8 : 16;
-        uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4;
-        *bpr = bw * bs;
-        out = g_malloc((size_t)bw * bh * bs);
-        for (uint32_t y = 0; y < bh; y++) {
-            memcpy(out + (size_t)y * bw * bs, src + (uint64_t)y * pitch, (size_t)bw * bs);
-        }
-        return out;
-    }
-    default: {                          /* RGBA8, R8, RG8: bytes as they lie */
-        uint32_t bpp = td->kind == R300_TEXK_RGBA8 ? 4 : td->kind == R300_TEXK_RG8 ? 2 : 1;
-        *bpr = w * bpp;
-        out = g_malloc((size_t)w * h * bpp);
-        for (uint32_t y = 0; y < h; y++) {
-            memcpy(out + (size_t)y * w * bpp, src + (uint64_t)y * pitch, (size_t)w * bpp);
-        }
-        return out;
-    }
-    }
-}
 
 static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> dev,
                                         uint8_t *vram_ptr, const R300TexDesc *td)
@@ -7795,7 +7704,7 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
 
     R300TexCacheKey key = { td->gpu_addr, td->format, td->kind, td->width, td->height,
                             td->depth, td->dim, td->levels, td->pitch_bytes,
-                            td->host_data != NULL, r300_hash(src, td->size_bytes) };
+                            td->host_data != NULL, r300_hash_bytes(src, td->size_bytes) };
     int lru = 0;
     for (int i = 0; i < R300_TCACHE; i++) {
         if (g_r300_tcache[i].tex && !memcmp(&g_r300_tcache[i].key, &key, sizeof(key))) {
@@ -7831,7 +7740,7 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
         size_t face = (size_t)td->lvl_pitch[l] * td->lvl_rows[l];
         for (uint32_t f = 0; f < n; f++) {
             const uint8_t *fs = src + td->lvl_off[l] + f * face;
-            uint8_t *bytes = r300_level_bytes(td, fs, l, dxt ? mw : w, dxt ? mh : h, &bpr);
+            uint8_t *bytes = r300_tex_level_bytes(td, fs, l, dxt ? mw : w, dxt ? mh : h, &bpr);
             if (td->dim == R300_TEXDIM_3D) {
                 [t replaceRegion:MTLRegionMake3D(0, 0, f, dxt ? mw : w, dxt ? mh : h, 1)
                      mipmapLevel:l slice:0 withBytes:bytes bytesPerRow:bpr bytesPerImage:0];
@@ -7839,7 +7748,7 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
                 [t replaceRegion:MTLRegionMake2D(0, 0, dxt ? mw : w, dxt ? mh : h)
                      mipmapLevel:l slice:f withBytes:bytes bytesPerRow:bpr bytesPerImage:0];
             }
-            g_free(bytes);
+            free(bytes);
         }
     }
     [g_r300_tcache[lru].tex release];

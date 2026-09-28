@@ -69,8 +69,9 @@ typedef struct R300FSUniforms {
     uint32_t fog_blend, depth_src, pad3[2];   /* FG_FOG_BLEND, FG_DEPTH_SRC */
     float poly_offset[4];                     /* front scale, offset, back scale, offset,
                                                  in units of the [0,1] depth range */
-    uint32_t tex_addr[R300_NUM_TEX_UNITS][4]; /* x: VRAM byte address of a raw unit's
-                                                 texels (R300_GLSL_VRAM_SSBO only) */
+    uint32_t tex_addr[R300_NUM_TEX_UNITS][4]; /* x: byte address of a raw unit's texels,
+                                                 y: 0 in VRAM, 1 in the aux buffer
+                                                 (R300_GLSL_VRAM_SSBO only) */
 } R300FSUniforms;
 
 /* tex_dim[k].w */
@@ -109,6 +110,7 @@ enum {
     R300_BIND_VERTS = 2,        /* SSBO R300Vertex[] (vertex) */
     R300_BIND_MS = 3,           /* UBO vec4: multisample clip-space shift */
     R300_BIND_VRAM = 4,         /* SSBO uint[]: VRAM (R300_GLSL_VRAM_SSBO) */
+    R300_BIND_AUX = 5,          /* SSBO uint[]: GART texels (R300_GLSL_VRAM_SSBO) */
     R300_BIND_FB0 = 8,          /* input attachments: colour buffers, then Z */
     R300_BIND_TEX0 = 16,        /* combined image samplers, one per unit */
     R300_BIND_COUNT = 32,

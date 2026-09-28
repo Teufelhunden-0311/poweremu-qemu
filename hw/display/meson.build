@@ -94,6 +94,18 @@ system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [files(
   'ppc_mac_gpu_vp.c',
 ), pixman] + r300_shader_deps)
 
+# Vulkan backend for the R300 (renderer=vulkan): MoltenVK through the
+# Vulkan loader on macOS, the loader alone elsewhere.  Optional: without
+# it the device refuses renderer=vulkan.
+if config_all_devices.has_key('CONFIG_PPC_MAC_GPU')
+  ppc_vulkan = dependency('vulkan', required: false, method: 'pkg-config')
+  if ppc_vulkan.found()
+    system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [
+      files('ppc_mac_gpu_vulkan.c'), ppc_vulkan,
+      declare_dependency(compile_args: ['-DCONFIG_PPC_MAC_GPU_VULKAN'])])
+  endif
+endif
+
 system_ss.add(when: 'CONFIG_POWEREMU_GPU', if_true: [files('poweremu-gpu.c'), pixman])
 
 if host_os == 'darwin'

@@ -108,6 +108,9 @@ static void fb_write_watch(const char *path, const char *src_kind,
         dst_x, dst_y, w, h, from_srt, nonzero_sample);
 }
 
+/* Set by the Metal backend when it tracks frames; NULL otherwise. */
+FrameTracker *g_frame_tracker;
+
 static void frame_tracker_record_2d_event(PassEventType type,
                                           uint32_t surface_offset,
                                           uint32_t pitch_bytes,
@@ -2863,6 +2866,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             g_free(key);
         }
     }
+    s->r3->glsl_flags = s->renderer ? s->renderer->r300_glsl_flags : 0;
     bool build_ok = idx ?
         r300_draw_build_indexed(s->r3, &s->r3_arrays, d[0], idx, r300_read_raw,
                                 s, &pkt, &err) :
@@ -3107,13 +3111,17 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                 }
             }
             /* As the R200 path does: the display and the dirty-tracking
-             * scanout only refresh what they are told changed. */
+             * scanout only refresh what they are told changed.  Not for
+             * renderers that read the dirty log as CPU writes (Vulkan):
+             * to them this would say the CPU overwrote what they drew. */
             uint64_t len = (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height;
-            memory_region_set_dirty(&s->vram, pkt.rt_gpu_addr, len);
-            for (uint32_t k = 1; k < pkt.num_cb; k++) {
-                memory_region_set_dirty(&s->vram, pkt.cb[k].gpu_addr,
-                                        (uint64_t)pkt.cb[k].pitch * pkt.cb[k].bpp *
-                                        pkt.rt_height);
+            if (!s->renderer->set_dirty_source) {
+                memory_region_set_dirty(&s->vram, pkt.rt_gpu_addr, len);
+                for (uint32_t k = 1; k < pkt.num_cb; k++) {
+                    memory_region_set_dirty(&s->vram, pkt.cb[k].gpu_addr,
+                                            (uint64_t)pkt.cb[k].pitch * pkt.cb[k].bpp *
+                                            pkt.rt_height);
+                }
             }
             r200_rate.draws++;
             r200_perf.draws++;
@@ -11493,6 +11501,36 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
     timer_del(&s->vblank_timer);
 }
 
+/*
+ * PPCMacGPUDirtyFn for renderers that keep copies of VRAM: the pages
+ * written since the last call, from the VGA dirty log this device keeps
+ * on (the CPU through the BARs, and the device's own writes, which it
+ * marks with memory_region_set_dirty).
+ */
+static void ppc_mac_gpu_vram_dirty(void *arg, unsigned long *bitmap,
+                                   uint64_t npages)
+{
+    PPCMacGPUState *s = arg;
+    const uint64_t pg = PPC_MAC_GPU_DIRTY_PAGE, chunk = 256 * pg;
+    DirtyBitmapSnapshot *snap =
+        memory_region_snapshot_and_clear_dirty(&s->vram, 0, s->vram_size,
+                                               DIRTY_MEMORY_VGA);
+
+    for (uint64_t off = 0; off < s->vram_size; off += chunk) {
+        uint64_t len = MIN(chunk, s->vram_size - off);
+        if (!memory_region_snapshot_get_dirty(&s->vram, snap, off, len)) {
+            continue;
+        }
+        for (uint64_t p = off; p < off + len; p += pg) {
+            if (p / pg < npages &&
+                memory_region_snapshot_get_dirty(&s->vram, snap, p, pg)) {
+                set_bit(p / pg, bitmap);
+            }
+        }
+    }
+    g_free(snap);
+}
+
 static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
 {
     PPCMacGPUState *s = PPC_MAC_GPU(dev);
@@ -11527,16 +11565,69 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
     s->con = graphic_console_init(DEVICE(dev), 0,
                                   &ppc_mac_gpu_gfx_ops, s);
 
+    /*
+     * The renderer ("renderer" property).  Unset means Metal on macOS,
+     * falling back to software; naming one makes it required.
+     */
+    const char *rname = s->renderer_name && *s->renderer_name &&
+                        strcmp(s->renderer_name, "auto") ? s->renderer_name : NULL;
+    bool want_vulkan = rname && !strcmp(rname, "vulkan");
+    if (rname && strcmp(rname, "metal") && !want_vulkan) {
+        error_setg(errp, "%s: unknown renderer '%s' (metal or vulkan)",
+                   object_get_typename(obj), rname);
+        return;
+    }
+#ifndef CONFIG_DARWIN
+    if (rname && !strcmp(rname, "metal")) {
+        error_setg(errp, "%s: renderer=metal is only available on macOS",
+                   object_get_typename(obj));
+        return;
+    }
+#endif
+    if (want_vulkan && !s->r300) {
+        error_setg(errp, "%s: renderer=vulkan needs the R300 card (ati-radeon-9700)",
+                   object_get_typename(obj));
+        return;
+    }
+#ifndef CONFIG_PPC_MAC_GPU_VULKAN
+    if (want_vulkan) {
+        error_setg(errp, "%s: renderer=vulkan: this QEMU was built without "
+                   "Vulkan (install the Vulkan loader/MoltenVK and rebuild)",
+                   object_get_typename(obj));
+        return;
+    }
+#endif
+
     /* BAR0: VRAM aperture (prefetchable)
      *
      * On macOS hosts, allocate VRAM as a Metal shared buffer (zero-copy).
      * This lets both the guest CPU (WindowServer memcpy) and the Metal GPU
      * (QE compositor draws) access the same physical memory — exactly like
-     * real VRAM on an R200.  Falls back to normal QEMU RAM on other hosts.
+     * real VRAM on an R200.  With Vulkan, VRAM is host-visible Vulkan
+     * memory the GPU copies to and from.  Falls back to normal QEMU RAM
+     * on other hosts.
      */
+#ifdef CONFIG_PPC_MAC_GPU_VULKAN
+    if (want_vulkan) {
+        s->metal_vram_ptr = ppc_mac_gpu_vulkan_alloc_vram(
+            s->vram_size, &s->metal_vram_opaque);
+        if (!s->metal_vram_ptr) {
+            error_setg(errp, "%s: renderer=vulkan unavailable: %s",
+                       object_get_typename(obj), ppc_mac_gpu_vulkan_error());
+            return;
+        }
+    }
+#endif
 #ifdef CONFIG_DARWIN
-    s->metal_vram_ptr = ppc_mac_gpu_metal_alloc_vram(
-        s->vram_size, &s->metal_vram_opaque);
+    if (!want_vulkan) {
+        s->metal_vram_ptr = ppc_mac_gpu_metal_alloc_vram(
+            s->vram_size, &s->metal_vram_opaque);
+        if (!s->metal_vram_ptr && rname) {
+            error_setg(errp, "%s: renderer=metal unavailable (no Metal device)",
+                       object_get_typename(obj));
+            return;
+        }
+    }
 #endif
     if (s->metal_vram_ptr) {
         /* Zero-copy path: QEMU uses the MTLBuffer's memory directly */
@@ -11817,13 +11908,28 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
      * fall back to software renderer if Metal is unavailable. */
     {
         uint8_t *vram_ptr = memory_region_get_ram_ptr(&s->vram);
+#ifdef CONFIG_PPC_MAC_GPU_VULKAN
+        if (want_vulkan) {
+            s->renderer = ppc_mac_gpu_renderer_vulkan();
+            s->renderer_opaque = s->renderer->init(vram_ptr, s->vram_size);
+            if (!s->renderer_opaque) {
+                error_setg(errp, "%s: renderer=vulkan unavailable: %s",
+                           object_get_typename(obj), ppc_mac_gpu_vulkan_error());
+                return;
+            }
+            qemu_log("ppc-mac-gpu: using Vulkan renderer for 3D\n");
+        }
+#endif
 #ifdef CONFIG_DARWIN
         /* Try Metal renderer first for hardware-accelerated 3D */
-        s->renderer = ppc_mac_gpu_renderer_metal();
-        if (s->renderer) {
+        if (!want_vulkan && (s->renderer = ppc_mac_gpu_renderer_metal())) {
             s->renderer_opaque = s->renderer->init(vram_ptr, s->vram_size);
             if (s->renderer_opaque) {
                 qemu_log("ppc-mac-gpu: using Metal renderer for 3D\n");
+            } else if (rname) {
+                error_setg(errp, "%s: renderer=metal: Metal init failed",
+                           object_get_typename(obj));
+                return;
             } else {
                 qemu_log("ppc-mac-gpu: Metal init failed, falling back to SW\n");
                 s->renderer = NULL;
@@ -11836,6 +11942,10 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
             s->renderer_opaque = s->renderer->init(vram_ptr, s->vram_size);
             qemu_log("ppc-mac-gpu: using software renderer (3D textured quad)\n");
         }
+    }
+
+    if (s->renderer && s->renderer->set_dirty_source) {
+        s->renderer->set_dirty_source(s->renderer_opaque, ppc_mac_gpu_vram_dirty, s);
     }
 
     /* Set PCI config space fields */
@@ -11939,6 +12049,7 @@ static const Property ppc_mac_gpu_properties[] = {
     DEFINE_PROP_UINT32("vgamem_mb", PPCMacGPUState, vram_size_mb, 128),
     DEFINE_PROP_BOOL("host-aspect-modes", PPCMacGPUState, host_aspect_modes, false),
     DEFINE_PROP_STRING("biosrom", PPCMacGPUState, biosrom),
+    DEFINE_PROP_STRING("renderer", PPCMacGPUState, renderer_name),
 };
 
 /* Read-only "perf": the running totals behind PowerEmu's overlay. */

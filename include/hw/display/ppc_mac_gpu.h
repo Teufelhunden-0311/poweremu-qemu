@@ -668,6 +668,9 @@ struct PPCMacGPUState {
     /* Full BIOS ROM path (separate from romfile which has the NDRV) */
     char *biosrom;
 
+    /* "renderer" property: metal, vulkan, or unset (the host's default) */
+    char *renderer_name;
+
     /* Device configuration */
     bool r300;                  /* ati-radeon-9700: R300 instead of RV280 */
     struct R300State *r3;       /* R300 3D register file (r300 only) */
@@ -823,9 +826,10 @@ struct PPCMacGPUState {
     bool hwc_announce;
 
     /*
-     * Zero-copy VRAM: when VRAM is backed by a shared Metal buffer,
-     * metal_vram_ptr is the host mapping and metal_vram_opaque is the
-     * handle to release it with.  Both NULL on the fallback path.
+     * VRAM from the renderer: a shared Metal buffer (zero-copy) or
+     * host-visible Vulkan memory.  metal_vram_ptr is the host mapping and
+     * metal_vram_opaque the backend's handle.  Both NULL on the fallback
+     * path (QEMU-managed RAM).
      */
     void *metal_vram_ptr;
     void *metal_vram_opaque;
