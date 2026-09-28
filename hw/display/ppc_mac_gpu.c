@@ -12028,7 +12028,8 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         s->metal_vram_ptr = ppc_mac_gpu_metal_alloc_vram(
             s->vram_size, &s->metal_vram_opaque);
         if (!s->metal_vram_ptr && rname) {
-            error_setg(errp, "%s: renderer=metal unavailable (no Metal device)",
+            error_setg(errp, "%s: renderer=metal unavailable: it needs an "
+                       "Apple GPU (on an Intel Mac, use renderer=vulkan)",
                        object_get_typename(obj));
             return;
         }

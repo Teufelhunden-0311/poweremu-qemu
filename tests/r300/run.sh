@@ -8,7 +8,7 @@ R=../../hw/display/r300
 SRC="$R/r300_state.c $R/r300_pvs.c $R/r300_us.c $R/r300_draw.c"
 
 # The shader toolchain: shaderc (GLSL -> SPIR-V) and SPIRV-Cross (-> MSL).
-BREW=$(brew --prefix 2>/dev/null || echo /opt/homebrew)
+BREW=$(brew --prefix 2>/dev/null || echo /opt/local)   # Homebrew, else MacPorts
 export PKG_CONFIG_PATH="$BREW/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 SPV="$R/r300_spirv.c $(pkg-config --cflags --libs shaderc spirv-cross-c)"
 SPV="$SPV -lspirv-cross-msl -lspirv-cross-hlsl -lspirv-cross-cpp -lspirv-cross-reflect"

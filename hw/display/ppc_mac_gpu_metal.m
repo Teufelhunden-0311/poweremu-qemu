@@ -71,6 +71,19 @@ void *ppc_mac_gpu_metal_alloc_vram(uint64_t vram_size, void **opaque_out)
             qemu_log("ppc-mac-gpu-metal: no Metal device for VRAM alloc\n");
             return NULL;
         }
+        /*
+         * The shaders read the colour and depth they blend into with
+         * framebuffer fetch ([[color(n)]] inputs), and render into linear
+         * texture views of this shared buffer.  Only Apple GPUs do either;
+         * the Intel and AMD GPUs of Intel Macs need the Vulkan backend
+         * (MoltenVK), which works without them.
+         */
+        if (![dev supportsFamily:MTLGPUFamilyApple1]) {
+            qemu_log("ppc-mac-gpu-metal: %s is not an Apple GPU; the Metal "
+                     "renderer needs one (use renderer=vulkan)\n",
+                     [[dev name] UTF8String]);
+            return NULL;
+        }
 
         /* Shared storage: CPU and GPU access the same physical memory.
          * This is the key to zero-copy — guest CPU writes are instantly
