@@ -659,6 +659,7 @@ struct PPCMacGPUState {
     uint32_t r300_watch_base, r300_watch_logged;
     MemoryRegion io;            /* BAR1: I/O register alias */
     MemoryRegion mmio;          /* BAR2: MMIO register space */
+    MemoryRegion cp_wptr_mr;    /* CP_RB_WPTR, lock-free (CP thread) */
     MemoryRegion rom_mr;        /* ROM BAR: traced expansion ROM */
 
     /* ROM data */

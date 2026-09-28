@@ -33,6 +33,8 @@
 #include "qemu/units.h"
 #include "qemu/timer.h"
 #include "qemu/datadir.h"
+#include "qemu/rcu.h"
+#include "qemu/main-loop.h"
 #include "hw/pci/pci_device.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
@@ -323,6 +325,27 @@ static struct {
     bool started;
     bool stop;
 } r200_async;
+
+/* The command processor thread (see "The command processor on its own
+ * thread" below). */
+#define CP_SLICE_US 200
+
+static struct {
+    PPCMacGPUState *s;
+    QemuThread thread;
+    QemuEvent kick;
+    bool started;
+    bool stop;
+    unsigned epoch;             /* bumped whenever the ring changes hands */
+    bool aborted;               /* the replay was taken over mid-segment */
+    uint32_t seg_rptr;          /* where the segment being replayed began */
+    uint32_t ring_mask;
+    unsigned pkts;
+    int64_t yield_at;
+    /* Statistics (BQL): catch-ups the guest forced, by register. */
+    uint32_t syncs, kicks;
+    uint16_t sync_reg[0x10000 / 4];
+} cp;
 
 static bool r200_async_enabled(void)
 {
@@ -1486,6 +1509,42 @@ static void ppc_mac_gpu_bswap_line32(uint32_t *dst, const uint32_t *src,
     }
 }
 
+/*
+ * CP thread statistics: how often the guest submitted, and how often it
+ * made the ring catch up before touching the card (and through which
+ * register) -- each of those is parallelism given back.
+ */
+static void ppc_mac_gpu_cp_rate_log(double sec)
+{
+    static const char *names[4];
+    unsigned top[3] = { 0 }, n = 0;
+
+    if (!cp.started || (!cp.kicks && !cp.syncs)) {
+        return;
+    }
+    for (unsigned r = 0; r < ARRAY_SIZE(cp.sync_reg); r++) {
+        for (unsigned k = 0; k < 3; k++) {
+            if (cp.sync_reg[r] > cp.sync_reg[top[k]]) {
+                memmove(&top[k + 1], &top[k], (2 - k) * sizeof(top[0]));
+                top[k] = r;
+                break;
+            }
+        }
+    }
+    for (unsigned k = 0; k < 3; k++) {
+        names[k] = cp.sync_reg[top[k]] ? ppc_mac_gpu_reg_name(top[k] * 4) : NULL;
+        n += names[k] != NULL;
+    }
+    qemu_log("ppc-mac-gpu ring: %.0f submits/s, %.0f catch-ups/s%s%s%s%s%s%s%s\n",
+             cp.kicks / sec, cp.syncs / sec, n ? " (" : "",
+             names[0] ? names[0] : "", names[1] ? ", " : "",
+             names[1] ? names[1] : "", names[2] ? ", " : "",
+             names[2] ? names[2] : "", n ? ")" : "");
+    qatomic_set(&cp.kicks, 0);
+    cp.syncs = 0;
+    memset(cp.sync_reg, 0, sizeof(cp.sync_reg));
+}
+
 static void ppc_mac_gpu_display_update(void *opaque)
 {
     PPCMacGPUState *s = opaque;
@@ -1521,6 +1580,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
                          r200_rate.ops2d / sec, r200_rate.flushes / sec,
                          r200_rate.flush_us / (sec * 1e4));
             }
+            ppc_mac_gpu_cp_rate_log((now - r200_rate.since) / 1e6);
             memset(&r200_rate, 0, sizeof(r200_rate));
             r200_rate.since = now;
         }
@@ -7491,6 +7551,9 @@ static FILE *r300_ringdump(void)
     return f;
 }
 
+static bool ppc_mac_gpu_cp_yield(PPCMacGPUState *s, uint32_t pos_dw);
+static bool cp_in_ring;             /* the CP thread is replaying the ring */
+
 static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                                      uint32_t *pm4_data,
                                      uint32_t size_dw)
@@ -7498,6 +7561,11 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
     g_in_pm4++;
     uint32_t i = 0;
     while (i < size_dw) {
+        /* Between two ring packets the CP thread may let others in. */
+        if (unlikely(cp_in_ring) && g_in_pm4 == 1 &&
+            ppc_mac_gpu_cp_yield(s, i)) {
+            break;
+        }
         uint32_t hdr = pm4_data[i];
         uint32_t type = (hdr >> 30) & 3;
         FILE *rd = r300_ringdump();
@@ -8861,13 +8929,93 @@ static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
  *   - RPTR and WPTR are in DWord units
  *   - Ring wraps at (ring_size_dw - 1)
  */
-static void ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
+/*
+ * The command processor on its own thread.
+ *
+ * A real Radeon executes its ring while the CPU goes on running, and the
+ * driver is written for that: it learns how far the card has got from
+ * the read pointer and from fences, never from the timing of its own
+ * register writes.  Here the ring used to run inside the guest's write to
+ * CP_RB_WPTR, on the vCPU thread, so the guest stood still while every
+ * packet was decoded, translated and handed to Metal.
+ *
+ * Now a WPTR write only records the pointer and wakes the "ppc-gpu-cp"
+ * thread.  That thread replays the ring holding the BQL, exactly as the
+ * vCPU used to, so every device path keeps the serialisation it was
+ * written for (registers, Metal, interrupts, the display refresh).  The
+ * gain is that TCG runs guest code without the BQL: the guest carries on
+ * building its next batch while this one is carried out.
+ *
+ * Ordering with everything the guest does by other routes is kept with
+ * one rule: any guest access to the card's registers or apertures first
+ * catches the ring up, on the accessing thread, before it is served (see
+ * ppc_mac_gpu_cp_sync).  That is precisely the state the guest saw when
+ * the ring ran synchronously, so fences, read-pointer write-backs, 2D
+ * blits through registers and CPU readbacks stay ordered as before.  The
+ * exceptions are the accesses that have no ordering to keep: the WPTR
+ * write itself, which goes through a small lock-free region so a submit
+ * never waits for the BQL, reads of the read pointer (the card's
+ * progress, which is what the driver wants), and the cursor.
+ *
+ * So that a long batch does not hold the BQL -- and with it other devices
+ * and further submits -- for its whole length, the thread lets go between
+ * packets every CP_SLICE_US.  It publishes its progress as the read
+ * pointer first; whoever takes the lock can catch up from there, and the
+ * thread notices (cp.epoch) and drops the rest of its copy.
+ *
+ * PPCGPU_CP_SYNC=1 restores the synchronous ring.
+ */
+static bool ppc_mac_gpu_cp_on_thread(void)
+{
+    return cp.started && qemu_thread_is_self(&cp.thread);
+}
+
+/*
+ * Called by the CP thread between two ring packets, BQL held.  Returns
+ * true if the ring was taken over while the lock was released, in which
+ * case the rest of this segment has been (or will be) run by someone else.
+ */
+static bool ppc_mac_gpu_cp_yield(PPCMacGPUState *s, uint32_t pos_dw)
+{
+    int64_t now;
+    unsigned epoch;
+    int nest;
+
+    if (++cp.pkts & 15) {
+        return false;
+    }
+    now = g_get_monotonic_time();
+    if (now < cp.yield_at) {
+        return false;
+    }
+    /* Publish progress: a catch-up starts here, and the guest may reuse
+     * the ring space behind it. */
+    s->regs.cp_rb_rptr = (cp.seg_rptr + pos_dw) & cp.ring_mask;
+    ppc_mac_gpu_rptr_writeback(s);
+    epoch = cp.epoch;
+    nest = g_in_pm4;
+    g_in_pm4 = 0;
+    cp_in_ring = false;
+    bql_unlock();
+    bql_lock();
+    g_in_pm4 = nest;
+    if (cp.epoch != epoch) {
+        cp.aborted = true;
+        return true;
+    }
+    cp_in_ring = true;
+    cp.yield_at = g_get_monotonic_time() + CP_SLICE_US;
+    return false;
+}
+
+/* Returns false if the ring was taken over part-way (CP thread only). */
+static bool ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
                                              uint32_t old_rptr,
                                              uint32_t new_wptr)
 {
     uint32_t rb_bufsz = s->regs.cp_rb_cntl & 0x3F;
     if (rb_bufsz == 0 || rb_bufsz > 25) {
-        return; /* Invalid or uninitialized */
+        return true; /* Invalid or uninitialized */
     }
     uint32_t ring_size_dw = 2U << rb_bufsz;
     uint32_t ring_mask = ring_size_dw - 1;
@@ -8875,13 +9023,13 @@ static void ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
     /* Calculate number of new DWords to process */
     uint32_t count = (new_wptr - old_rptr) & ring_mask;
     if (count == 0 || count > ring_size_dw) {
-        return;
+        return true;
     }
 
     /* Safety limit — don't process excessively large batches */
     if (count > 65536) {
         gpu_debug_log("RING: skipping oversized batch (%u dw)", count);
-        return;
+        return true;
     }
 
     /* Read ring buffer data via GART translation.
@@ -8901,7 +9049,7 @@ static void ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
                           "(rb_base=0x%x offset_dw=%u)",
                           gpu_addr, s->regs.cp_rb_base, offset_dw);
             g_free(rb_data);
-            return;
+            return true;
         }
 
         uint32_t raw = 0;
@@ -8910,7 +9058,7 @@ static void ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
         if (r != MEMTX_OK) {
             gpu_debug_log("RING: read failed at phys=0x%"PRIx64, (uint64_t)phys);
             g_free(rb_data);
-            return;
+            return true;
         }
 
         /* Ring buffer data is written by PPC CPU in big-endian */
@@ -8920,8 +9068,169 @@ static void ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
     gpu_debug_log("RING: processing %u dwords (rptr=%u wptr=%u rb_bufsz=%u)",
                   count, old_rptr, new_wptr, rb_bufsz);
 
+    bool on_thread = ppc_mac_gpu_cp_on_thread();
+    if (on_thread) {
+        cp.seg_rptr = old_rptr;
+        cp.ring_mask = ring_mask;
+        cp.aborted = false;
+        cp_in_ring = true;
+    }
     ppc_mac_gpu_process_pm4(s, rb_data, count);
+    cp_in_ring = false;
     g_free(rb_data);
+    return !(on_thread && cp.aborted);
+}
+
+/*
+ * Carry out the ring up to the newest write pointer, BQL held.  Runs on
+ * the CP thread, or on whichever thread must see the ring caught up.
+ */
+static void ppc_mac_gpu_cp_run(PPCMacGPUState *s)
+{
+    unsigned epoch = ++cp.epoch;    /* a yielded CP thread gives up its copy */
+
+    for (;;) {
+        uint32_t wptr = qatomic_read(&s->regs.cp_rb_wptr);
+        uint32_t rptr = s->regs.cp_rb_rptr;
+
+        if (wptr == rptr) {
+            return;
+        }
+        /*
+         * Process ring buffer commands if the microengine is started.
+         * CP_ME_CNTL bit 28 = ME_HALT: 0 = running, 1 = halted.
+         */
+        if (!(s->regs.cp_me_cntl & (1 << 28))) {
+            uint32_t n = (wptr >= rptr) ? (wptr - rptr) : wptr;
+
+            s->regs.stall_ring_dwords += n;
+            r200_traffic.ring_dwords += n;
+            if (!ppc_mac_gpu_process_ring_buffer(s, rptr, wptr)) {
+                return;             /* someone else caught the ring up */
+            }
+        }
+        if (cp.epoch != epoch) {
+            return;
+        }
+        /* Everything up to wptr is carried out: the ring is empty again --
+         * in the card's own register and in the copy the driver may be
+         * reading from memory instead. */
+        s->regs.cp_rb_rptr = wptr;
+        ppc_mac_gpu_rptr_writeback(s);
+        /* Bump CSQ stat counter so the kext's "wait for CSQ change" poll
+         * sees a different value after we process commands. */
+        s->regs.cp_csq_stat_counter++;
+    }
+}
+
+static bool ppc_mac_gpu_cp_pending(PPCMacGPUState *s)
+{
+    return qatomic_read(&s->regs.cp_rb_wptr) != s->regs.cp_rb_rptr;
+}
+
+/* Bring the ring up to date before the guest sees the card (BQL held). */
+static void ppc_mac_gpu_cp_sync(PPCMacGPUState *s, hwaddr why)
+{
+    if (!ppc_mac_gpu_cp_pending(s) || ppc_mac_gpu_cp_on_thread()) {
+        return;
+    }
+    cp.syncs++;
+    if (why < 0x10000 && cp.sync_reg[why / 4] < UINT16_MAX) {
+        cp.sync_reg[why / 4]++;
+    }
+    ppc_mac_gpu_cp_run(s);
+}
+
+/* The guest wrote CP_RB_WPTR.  May be called without the BQL. */
+static void ppc_mac_gpu_cp_kick(PPCMacGPUState *s, uint32_t wptr)
+{
+    qatomic_set(&s->regs.cp_rb_wptr, wptr);
+    if (cp.started) {
+        qatomic_inc(&cp.kicks);
+        qemu_event_set(&cp.kick);
+    } else {
+        ppc_mac_gpu_cp_run(s);
+    }
+}
+
+static void *ppc_mac_gpu_cp_thread(void *opaque)
+{
+    PPCMacGPUState *s = opaque;
+
+    rcu_register_thread();
+    for (;;) {
+        qemu_event_reset(&cp.kick);
+        if (qatomic_read(&cp.stop)) {
+            break;
+        }
+        if (qatomic_read(&s->regs.cp_rb_wptr) !=
+            qatomic_read(&s->regs.cp_rb_rptr)) {
+            bql_lock();
+            cp.yield_at = g_get_monotonic_time() + CP_SLICE_US;
+            ppc_mac_gpu_cp_run(s);
+            bql_unlock();
+            continue;
+        }
+        qemu_event_wait(&cp.kick);
+    }
+    rcu_unregister_thread();
+    return NULL;
+}
+
+/* Lock-free CP_RB_WPTR, so a submit never waits for the BQL. */
+static uint64_t ppc_mac_gpu_cp_wptr_read(void *opaque, hwaddr addr,
+                                         unsigned size)
+{
+    PPCMacGPUState *s = opaque;
+    return qatomic_read(&s->regs.cp_rb_wptr);
+}
+
+static void ppc_mac_gpu_cp_wptr_write(void *opaque, hwaddr addr,
+                                      uint64_t val, unsigned size)
+{
+    ppc_mac_gpu_cp_kick(opaque, val);
+}
+
+static const MemoryRegionOps ppc_mac_gpu_cp_wptr_ops = {
+    .read = ppc_mac_gpu_cp_wptr_read,
+    .write = ppc_mac_gpu_cp_wptr_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
+static void ppc_mac_gpu_cp_start(PPCMacGPUState *s)
+{
+    const char *e = getenv("PPCGPU_CP_SYNC");
+
+    if (e && e[0] == '1') {
+        return;
+    }
+    cp.s = s;
+    qemu_event_init(&cp.kick, false);
+    cp.started = true;
+    qemu_thread_create(&cp.thread, "ppc-gpu-cp", ppc_mac_gpu_cp_thread, s,
+                       QEMU_THREAD_JOINABLE);
+    memory_region_init_io(&s->cp_wptr_mr, OBJECT(s), &ppc_mac_gpu_cp_wptr_ops,
+                          s, "ppc-mac-gpu-cp-wptr", 4);
+    memory_region_enable_lockless_io(&s->cp_wptr_mr);
+    memory_region_add_subregion_overlap(&s->mmio, R200_CP_RB_WPTR,
+                                        &s->cp_wptr_mr, 1);
+}
+
+static void ppc_mac_gpu_cp_stop(void)
+{
+    if (!cp.started) {
+        return;
+    }
+    qatomic_set(&cp.stop, true);
+    qemu_event_set(&cp.kick);
+    bql_unlock();
+    qemu_thread_join(&cp.thread);
+    bql_lock();
+    cp.started = false;
 }
 
 /* The last command packets pushed in by hand, for the stall report. */
@@ -10644,34 +10953,13 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         ppc_mac_gpu_rptr_writeback(s);
         gpu_debug_log("CP_RING RPTR <- %u", val);
         break;
-    case R200_CP_RB_WPTR: {
-        uint32_t old_rptr = s->regs.cp_rb_rptr;
+    case R200_CP_RB_WPTR:
+        /* Normally the lock-free region takes this; MM_DATA lands here. */
         gpu_debug_log("CP_RING WPTR <- %u (prev=%u, delta=%d)",
-                      val, s->regs.cp_rb_wptr,
+                      (uint32_t)val, s->regs.cp_rb_wptr,
                       (int)val - (int)s->regs.cp_rb_wptr);
-        s->regs.cp_rb_wptr = val;
-
-        /*
-         * Process ring buffer commands if the microengine is started.
-         * CP_ME_CNTL bit 28 = ME_HALT: 0 = running, 1 = halted.
-         */
-        if (!(s->regs.cp_me_cntl & (1 << 28)) && val != old_rptr) {
-            s->regs.stall_ring_dwords += (val >= old_rptr) ? (val - old_rptr) : val;
-            r200_traffic.ring_dwords += (val >= old_rptr) ? (val - old_rptr)
-                                                          : val;
-            ppc_mac_gpu_process_ring_buffer(s, old_rptr, val);
-        }
-
-        /* Everything is carried out here, so the ring is empty again --
-         * in the card's own register and in the copy the driver may be
-         * reading from memory instead. */
-        s->regs.cp_rb_rptr = val;
-        ppc_mac_gpu_rptr_writeback(s);
-        /* Bump CSQ stat counter so the kext's "wait for CSQ change" poll
-         * sees a different value after we process commands. */
-        s->regs.cp_csq_stat_counter++;
+        ppc_mac_gpu_cp_kick(s, val);
         break;
-    }
     case R200_CP_ME_CNTL:
         s->regs.cp_me_cntl = val;
         gpu_debug_log("CP_SETUP ME_CNTL=0x%08x (ME_start=%d)", val, !(val & 0x10000000));
@@ -11069,9 +11357,39 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     }
 }
 
+/*
+ * The guest's view of the registers: the ring caught up first (see "The
+ * command processor on its own thread"), except for the few registers
+ * that need no ordering against it.  Type-0 ring packets call the inner
+ * handlers directly.
+ */
+static uint64_t ppc_mac_gpu_mmio_read_guest(void *opaque, hwaddr addr,
+                                            unsigned int size)
+{
+    PPCMacGPUState *s = opaque;
+
+    if (addr != R200_CP_RB_RPTR &&
+        !(addr >= PPC_MAC_GPU_HWC_BASE && addr < PPC_MAC_GPU_HWC_END)) {
+        ppc_mac_gpu_cp_sync(s, addr);
+    }
+    return ppc_mac_gpu_mmio_read(opaque, addr, size);
+}
+
+static void ppc_mac_gpu_mmio_write_guest(void *opaque, hwaddr addr,
+                                         uint64_t val, unsigned int size)
+{
+    PPCMacGPUState *s = opaque;
+
+    if (addr != R200_CP_RB_WPTR &&
+        !(addr >= PPC_MAC_GPU_HWC_BASE && addr < PPC_MAC_GPU_HWC_END)) {
+        ppc_mac_gpu_cp_sync(s, addr);
+    }
+    ppc_mac_gpu_mmio_write(opaque, addr, val, size);
+}
+
 static const MemoryRegionOps ppc_mac_gpu_mmio_ops = {
-    .read = ppc_mac_gpu_mmio_read,
-    .write = ppc_mac_gpu_mmio_write,
+    .read = ppc_mac_gpu_mmio_read_guest,
+    .write = ppc_mac_gpu_mmio_write_guest,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {
         .min_access_size = 1,
@@ -11134,6 +11452,8 @@ static uint64_t ppc_mac_gpu_vram_bswap_read(void *opaque, hwaddr addr,
     PPCMacGPUState *s = opaque;
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     uint64_t val = 0;
+
+    ppc_mac_gpu_cp_sync(s, 0xFFFFFFFF);     /* a readback: ring done first */
 
     if (addr + size > s->vram_size) {
         return 0;
@@ -11235,6 +11555,8 @@ static uint64_t r300_ap1_read(void *opaque, hwaddr addr, unsigned size)
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     hwaddr base = addr & ~3ull;
     uint8_t b[4];
+
+    ppc_mac_gpu_cp_sync(s, 0xFFFFFFFF);     /* a readback: ring done first */
     uint64_t v = 0;
 
     if (base + 4 > s->vram_size) {
@@ -11283,6 +11605,8 @@ static void r300_ap1_write(void *opaque, hwaddr addr, uint64_t val,
 static uint64_t r300_watch_read(void *opaque, hwaddr addr, unsigned size)
 {
     PPCMacGPUState *s = opaque;
+
+    ppc_mac_gpu_cp_sync(s, 0xFFFFFFFF);     /* a readback: ring done first */
     uint8_t *p = (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
                  s->r300_watch_base + addr;
     uint64_t v = 0;
@@ -11489,6 +11813,7 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
 {
     PPCMacGPUState *s = PPC_MAC_GPU(dev);
 
+    cp.epoch++;                 /* a CP thread mid-ring drops what it has */
     memset(&s->regs, 0, sizeof(s->regs));
     s->hwc_w = s->hwc_h = s->hwc_idx = 0;
     s->regs.regs_3d[R200_3D_IDX(0x3230)] = 0xFFFFFFFFu;  /* DEPTHCLEARVALUE */
@@ -11745,6 +12070,7 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
                           "ppc-mac-gpu-mmio", PPC_MAC_GPU_MMIO_SIZE);
     pci_register_bar(dev, PPC_MAC_GPU_MMIO_BAR,
                      PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
+    ppc_mac_gpu_cp_start(s);
 
     /* BAR1: I/O space alias to first 256 bytes of MMIO */
     memory_region_init_alias(&s->io, obj, "ppc-mac-gpu-io",
@@ -12109,6 +12435,7 @@ static void ppc_mac_gpu_exit(PCIDevice *dev)
 {
     PPCMacGPUState *s = PPC_MAC_GPU(dev);
 
+    ppc_mac_gpu_cp_stop();
     timer_del(&s->vblank_timer);
     g_free(s->shadow_buf);
     s->shadow_buf = NULL;
@@ -12225,6 +12552,12 @@ static char *ppc_mac_gpu_get_perf(Object *obj, Error **errp)
  * buffers are refilled by the driver.
  * ======================================================================== */
 
+static int ppc_mac_gpu_pre_save(void *opaque)
+{
+    ppc_mac_gpu_cp_sync(opaque, 0xFFFFFFFF);  /* save with the ring done */
+    return 0;
+}
+
 static int ppc_mac_gpu_post_load(void *opaque, int version_id)
 {
     PPCMacGPUState *s = opaque;
@@ -12260,6 +12593,7 @@ static const VMStateDescription vmstate_ppc_mac_gpu = {
     .name = "ppc-mac-gpu",
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_save = ppc_mac_gpu_pre_save,
     .post_load = ppc_mac_gpu_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_PCI_DEVICE(pci, PPCMacGPUState),
