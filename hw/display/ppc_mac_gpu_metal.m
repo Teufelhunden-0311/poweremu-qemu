@@ -7468,11 +7468,59 @@ static id<MTLFunction> r300_function(id<MTLDevice> dev, NSString *glsl,
  * for a colour-only pass (r300_fs), else the format of the depth/stencil
  * buffer bound as colour attachment ncb (r300_fs_z).
  */
+static id<MTLRenderPipelineState> r300_pipeline_by_text(id<MTLDevice> dev,
+                                                        const char *glsl,
+                                                        const MTLPixelFormat *cfmt,
+                                                        uint32_t ncb,
+                                                        MTLPixelFormat zfmt);
+
+/*
+ * Pipelines by (r300_us_glsl_cached id, formats), in front of the lookup
+ * by text: building a key from the whole source and hashing it cost more
+ * per draw than the draw.  Direct-mapped; a miss falls back to the text.
+ */
+typedef struct R300PipeSlot {
+    uint32_t id, ncb;
+    MTLPixelFormat cfmt[4], zfmt;
+    id<MTLRenderPipelineState> pipe;    /* owned by g_r300_pipes */
+} R300PipeSlot;
+
+static R300PipeSlot g_r300_pipe_slots[1024];
+
 static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
-                                                const char *glsl,
+                                                const char *glsl, uint32_t prog_id,
                                                 const MTLPixelFormat *cfmt,
                                                 uint32_t ncb,
                                                 MTLPixelFormat zfmt)
+{
+    if (!prog_id || ncb > 4) {
+        return r300_pipeline_by_text(dev, glsl, cfmt, ncb, zfmt);
+    }
+    uint32_t h = prog_id * 2654435761u ^ (uint32_t)zfmt * 40503u;
+    for (uint32_t k = 0; k < ncb; k++) {
+        h = h * 31u + (uint32_t)cfmt[k];
+    }
+    R300PipeSlot *sl = &g_r300_pipe_slots[(h ^ (h >> 16)) & 1023];
+    if (sl->pipe && sl->id == prog_id && sl->ncb == ncb && sl->zfmt == zfmt &&
+        memcmp(sl->cfmt, cfmt, ncb * sizeof(*cfmt)) == 0) {
+        return sl->pipe;
+    }
+    id<MTLRenderPipelineState> p = r300_pipeline_by_text(dev, glsl, cfmt, ncb, zfmt);
+    if (p) {
+        sl->id = prog_id;
+        sl->ncb = ncb;
+        sl->zfmt = zfmt;
+        memcpy(sl->cfmt, cfmt, ncb * sizeof(*cfmt));
+        sl->pipe = p;
+    }
+    return p;
+}
+
+static id<MTLRenderPipelineState> r300_pipeline_by_text(id<MTLDevice> dev,
+                                                        const char *glsl,
+                                                        const MTLPixelFormat *cfmt,
+                                                        uint32_t ncb,
+                                                        MTLPixelFormat zfmt)
 {
     NSString *src = [NSString stringWithUTF8String:glsl];
     NSMutableString *key = [NSMutableString stringWithString:src];
@@ -8090,7 +8138,7 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         if (ncb != MAX(pkt->num_cb, 1u)) {
             return -1;                  /* the MSL declares targets we cannot bind */
         }
-        id<MTLRenderPipelineState> pipe = r300_pipeline(dev, pkt->glsl, cpf, ncb, pass_zpf);
+        id<MTLRenderPipelineState> pipe = r300_pipeline(dev, pkt->glsl, pkt->glsl_id, cpf, ncb, pass_zpf);
         if (!pipe) {
             return -1;
         }

@@ -18,9 +18,41 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "r300_sb.h"
+
+/*
+ * While r300_us_glsl_cached() generates a program, every register the
+ * generator reads is recorded, so a later draw can reuse the text when
+ * those registers still hold the same values.  All reads in this file go
+ * through r300_reg(), which the macro below routes here.
+ */
+#define US_REC_MAX 512
+static struct {
+    bool on, overflow;
+    unsigned n;
+    uint16_t idx[US_REC_MAX];
+    uint8_t seen[R300_REG_COUNT];
+} us_rec;
+
+static inline uint32_t us_reg(const R300State *st, uint32_t addr)
+{
+    if (us_rec.on) {
+        unsigned i = (addr - R300_REG_BASE) / 4;
+        if (!us_rec.seen[i]) {
+            us_rec.seen[i] = 1;
+            if (us_rec.n < US_REC_MAX) {
+                us_rec.idx[us_rec.n++] = i;
+            } else {
+                us_rec.overflow = true;
+            }
+        }
+    }
+    return r300_reg(st, addr);
+}
+#define r300_reg(st, addr) us_reg(st, addr)
 
 #define US_CONFIG           0x4600
 #define US_CODE_OFFSET      0x4608
@@ -1529,4 +1561,85 @@ char *r300_us_disasm(const R300State *st)
         }
     }
     return r300_sb_steal(&sb);
+}
+
+/*
+ * A remembered program: the registers its generation read, their values,
+ * the other inputs and the text.  Games and the window server cycle
+ * through a handful of programs, thousands of draws a second; generating
+ * the text each time (printf-heavy) was about a sixth of the emulated
+ * CPU's time in Chess.
+ */
+typedef struct USMemo {
+    uint32_t flags, id;
+    R300FSDesc desc;
+    unsigned n;
+    uint16_t *idx;
+    uint32_t *val;
+    char *glsl;
+} USMemo;
+
+#define US_MEMO_SLOTS 64
+static USMemo us_memo[US_MEMO_SLOTS];   /* most recently used first */
+static uint32_t us_memo_next_id = 1;
+
+static bool us_memo_match(const USMemo *m, const R300State *st,
+                          const R300FSDesc *desc, uint32_t flags)
+{
+    if (!m->glsl || m->flags != flags ||
+        memcmp(&m->desc, desc, sizeof(*desc)) != 0) {
+        return false;
+    }
+    for (unsigned i = 0; i < m->n; i++) {
+        if (st->regs[m->idx[i]] != m->val[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+char *r300_us_glsl_cached(const R300State *st, const R300FSDesc *desc,
+                          uint32_t flags, uint32_t *id, const char **err)
+{
+    for (unsigned k = 0; k < US_MEMO_SLOTS; k++) {
+        if (us_memo_match(&us_memo[k], st, desc, flags)) {
+            USMemo hit = us_memo[k];
+            memmove(&us_memo[1], &us_memo[0], k * sizeof(USMemo));
+            us_memo[0] = hit;
+            *id = hit.id;
+            *err = NULL;
+            return strdup(hit.glsl);
+        }
+    }
+
+    memset(us_rec.seen, 0, sizeof(us_rec.seen));
+    us_rec.n = 0;
+    us_rec.overflow = false;
+    us_rec.on = true;
+    char *glsl = r300_us_to_glsl(st, desc, flags, err);
+    us_rec.on = false;
+    *id = 0;
+    if (!glsl || us_rec.overflow) {
+        return glsl;
+    }
+
+    USMemo *last = &us_memo[US_MEMO_SLOTS - 1];
+    free(last->idx);
+    free(last->val);
+    free(last->glsl);
+    memmove(&us_memo[1], &us_memo[0], (US_MEMO_SLOTS - 1) * sizeof(USMemo));
+    USMemo *m = &us_memo[0];
+    m->flags = flags;
+    m->desc = *desc;
+    m->n = us_rec.n;
+    m->idx = malloc(m->n * sizeof(*m->idx) + 1);
+    m->val = malloc(m->n * sizeof(*m->val) + 1);
+    for (unsigned i = 0; i < m->n; i++) {
+        m->idx[i] = us_rec.idx[i];
+        m->val[i] = st->regs[us_rec.idx[i]];
+    }
+    m->glsl = strdup(glsl);
+    m->id = us_memo_next_id++;
+    *id = m->id;
+    return glsl;
 }

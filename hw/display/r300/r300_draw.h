@@ -162,6 +162,7 @@ typedef struct R300DrawPacket {
 
     /* Fragment stage */
     char *glsl;                 /* r300_us_to_glsl() source; owned by the packet */
+    uint32_t glsl_id;           /* r300_us_glsl_cached() id of glsl, 0 if none */
     R300FSUniforms uniforms;
     R300TexDesc tex[R300_NUM_TEX_UNITS];
 

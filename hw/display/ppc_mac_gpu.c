@@ -3477,7 +3477,8 @@ static uint32_t *ppc_mac_gpu_read_ib_via_gart(PPCMacGPUState *s,
     uint32_t *buf = g_malloc(ib_size_dw * 4);
     AddressSpace *as = pci_get_address_space(&s->pci);
 
-    for (uint32_t i = 0; i < ib_size_dw; i++) {
+    /* One translation and one read per 4 KB page, not per dword. */
+    for (uint32_t i = 0; i < ib_size_dw;) {
         uint32_t gpu_addr = ib_base + i * 4;
         hwaddr phys;
 
@@ -3487,9 +3488,10 @@ static uint32_t *ppc_mac_gpu_read_ib_via_gart(PPCMacGPUState *s,
             return NULL;
         }
 
-        uint32_t raw = 0;
-        MemTxResult r = address_space_read(as, phys,
-                                            MEMTXATTRS_UNSPECIFIED, &raw, 4);
+        uint32_t n = MAX((0x1000 - (phys & 0xFFF)) / 4, 1u);
+        n = MIN(n, ib_size_dw - i);
+        MemTxResult r = address_space_read(as, phys, MEMTXATTRS_UNSPECIFIED,
+                                           &buf[i], n * 4);
         if (r != MEMTX_OK) {
             g_free(buf);
             return NULL;
@@ -3498,7 +3500,10 @@ static uint32_t *ppc_mac_gpu_read_ib_via_gart(PPCMacGPUState *s,
         /* Data in guest memory is big-endian (PPC native).
          * PM4 commands are written in CPU byte order.
          * Convert to host byte order for parsing. */
-        buf[i] = be32_to_cpu(raw);
+        for (uint32_t k = i; k < i + n; k++) {
+            buf[k] = be32_to_cpu(buf[k]);
+        }
+        i += n;
     }
     return buf;
 }
@@ -4078,6 +4083,59 @@ static bool blit_rect_untiled(PPCMacGPUState *s, uint8_t *vram,
  * If the address falls within a tiled surface, the tiling swizzle is
  * applied transparently.
  */
+/*
+ * Copy a rectangle from GART/AGP system RAM into untiled VRAM.
+ *
+ * Video frames and textures arrive this way every frame.  Translating and
+ * reading each pixel separately (a page-table read plus a memory lookup
+ * per pixel) took about 8% of the emulated CPU's time during video
+ * playback; this translates once per 4 KB page and moves whole runs.
+ * The byte swaps match the per-pixel path in ppc_mac_gpu_2d_blit_sep.
+ */
+static void gart_blit_rows(PPCMacGPUState *s, AddressSpace *as, bool gart,
+                           uint32_t src_offset, uint32_t src_pitch,
+                           uint32_t src_x, uint32_t src_y, uint8_t *vram,
+                           uint32_t dst_offset, uint32_t dst_pitch,
+                           uint32_t dst_x, uint32_t dst_y,
+                           uint32_t w, uint32_t h, uint32_t bpp)
+{
+    size_t row_bytes = (size_t)w * bpp;
+
+    for (uint32_t row = 0; row < h; row++) {
+        uint32_t gpu = src_offset + (src_y + row) * src_pitch + src_x * bpp;
+        uint64_t d = (uint64_t)dst_offset + (uint64_t)(dst_y + row) * dst_pitch +
+                     (uint64_t)dst_x * bpp;
+        if (d + row_bytes > s->vram_size) {
+            continue;
+        }
+        uint8_t *out = vram + d;
+
+        for (size_t done = 0; done < row_bytes;) {
+            hwaddr phys;
+            bool ok = gart ? ppc_mac_gpu_gart_translate(s, gpu + done, &phys)
+                           : ppc_mac_gpu_agp_translate(s, gpu + done, &phys);
+            size_t n = ok ? 0x1000 - (phys & 0xFFF) : 1;
+            n = MIN(n, row_bytes - done);
+            if (!ok || address_space_read(as, phys, MEMTXATTRS_UNSPECIFIED,
+                                          out + done, n) != MEMTX_OK) {
+                memset(out + done, 0, n);
+            }
+            done += n;
+        }
+
+        if (s->r300 && bpp == 4 && s->r300_src_swap != 2) {
+            for (size_t i = 0; i + 4 <= row_bytes; i += 4) {
+                uint32_t px = ldl_he_p(out + i);
+                stl_he_p(out + i, bswap32(r300_swap_mode(px, s->r300_src_swap)));
+            }
+        } else if (s->r300 && bpp == 2 && s->r300_src_swap == 0) {
+            for (size_t i = 0; i + 2 <= row_bytes; i += 2) {
+                stw_he_p(out + i, bswap16(lduw_he_p(out + i)));
+            }
+        }
+    }
+}
+
 static inline void mc_vram_write32(PPCMacGPUState *s, uint8_t *vram,
                                     uint64_t linear_addr, uint32_t value)
 {
@@ -4936,7 +4994,16 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
             /* Phase A deep: log AGP translate details for first upload */
             static int agp_detail_log = 0;
 
-            for (uint32_t row = 0; row < blit_h; row++) {
+            bool fast = !wup_log &&
+                        !mc_rect_is_tiled(s, dst_offset, dst_pitch,
+                                          dst_x, dst_y, bpp);
+            if (fast) {
+                gart_blit_rows(s, as, src_is_gart, src_offset, src_pitch,
+                               src_x, src_y, vram, dst_offset, dst_pitch,
+                               dst_x, dst_y, blit_w, blit_h, bpp);
+            }
+
+            for (uint32_t row = 0; !fast && row < blit_h; row++) {
                 uint32_t row_gpu_addr = src_offset +
                                         (src_y + row) * src_pitch +
                                         src_x * bpp;

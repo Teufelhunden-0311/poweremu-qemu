@@ -98,17 +98,20 @@ static float pvs_select(const float *v, unsigned sel)
 /* A regular source operand, swizzled, with abs and negate applied. */
 static void pvs_src(PVSCtx *c, uint32_t s, float o[4])
 {
-    const float *v = pvs_mem(c, s & 3, pvs_addr(c, s, (s >> 5) & 0xFF));
+    const float *v = pvs_mem(c, s & 3, (s & ((1u << 4) | (1u << 31))) ?
+                                       pvs_addr(c, s, (s >> 5) & 0xFF) :
+                                       (int)((s >> 5) & 0xFF));
+    /* Swizzle selects 0-3 a component, 5 one, 4/6/7 zero; abs and negate
+     * are sign-bit operations (the hottest code of the interpreter). */
+    float ext[8] = { v[0], v[1], v[2], v[3], 0.0f, 1.0f, 0.0f, 0.0f };
+    uint32_t clear = (s & (1u << 3)) ? 0x7FFFFFFFu : 0xFFFFFFFFu;
 
     for (int i = 0; i < 4; i++) {
-        float x = pvs_select(v, (s >> (13 + 3 * i)) & 7);
-        if (s & (1u << 3)) {
-            x = fabsf(x);
-        }
-        if (s & (1u << (25 + i))) {
-            x = -x;
-        }
-        o[i] = x;
+        uint32_t bits;
+        float x = ext[(s >> (13 + 3 * i)) & 7];
+        memcpy(&bits, &x, 4);
+        bits = (bits & clear) ^ (((s >> (25 + i)) & 1u) << 31);
+        memcpy(&o[i], &bits, 4);
     }
 }
 

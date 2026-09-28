@@ -1295,11 +1295,41 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     /* Transform every vertex in draw order (cheap next to the GPU work). */
     R300Vertex *xv = calloc(nsrc ? nsrc : 1, sizeof(R300Vertex));
     float (*outs)[R300_PVS_NUM_OUTPUTS][4] = calloc(nsrc ? nsrc : 1, sizeof(*outs));
+
+    /*
+     * Indexed meshes name most vertices several times; the result depends
+     * only on the index, so shade each one once (a post-transform cache,
+     * as the hardware has).  Open addressing on order[i] -> slot j.
+     */
+    uint32_t hmask = 0, *hkey = NULL, *hslot = NULL;
+    if (!rects && n > 3) {
+        uint32_t hn = 8;
+        while (hn < 2 * n) {
+            hn <<= 1;
+        }
+        hmask = hn - 1;
+        hkey = malloc(hn * sizeof(*hkey));
+        hslot = malloc(hn * sizeof(*hslot));
+        memset(hslot, 0xFF, hn * sizeof(*hslot));
+    }
     for (uint32_t i = 0, j = 0; i < n && j < nsrc; i++, j++) {
         float in[R300_PVS_NUM_INPUTS][4];
         float (*out)[4] = outs[j];
+        uint32_t h = 0;
 
+        if (hslot) {
+            h = (order[i] * 2654435761u) & hmask;
+            while (hslot[h] != UINT32_MAX && hkey[h] != order[i]) {
+                h = (h + 1) & hmask;
+            }
+            if (hslot[h] != UINT32_MAX) {
+                memcpy(out, outs[hslot[h]], sizeof(outs[j]));
+                continue;
+            }
+        }
         if (!fetch_vertex(&f, order[i], in)) {
+            free(hkey);
+            free(hslot);
             *err = f.why ? f.why : "vertex data out of range";
             free(outs);
             free(xv);
@@ -1317,6 +1347,10 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
                 pkt->warn |= R300_WARN_PVS;
             }
         }
+        if (hslot) {
+            hkey[h] = order[i];
+            hslot[h] = j;
+        }
         if (rects && i % 3 == 2) {
             j++;
             for (int o = 0; o < R300_PVS_NUM_OUTPUTS; o++) {
@@ -1326,6 +1360,8 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
             }
         }
     }
+    free(hkey);
+    free(hslot);
     for (uint32_t j = 0; j < nsrc; j++) {
         float (*out)[4] = outs[j];
         float cols[4][4];
@@ -1454,7 +1490,7 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     free(xv);
     free(order);
 
-    pkt->glsl = r300_us_to_glsl(st, &desc, st->glsl_flags, err);
+    pkt->glsl = r300_us_glsl_cached(st, &desc, st->glsl_flags, &pkt->glsl_id, err);
     if (!pkt->glsl) {
         r300_draw_free(pkt);
         return false;

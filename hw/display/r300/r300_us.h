@@ -136,6 +136,15 @@ char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
                       uint32_t flags, const char **err);
 
 /*
+ * r300_us_to_glsl(), remembered: returns the same text for the same
+ * inputs without regenerating it.  *id names the text (equal ids, equal
+ * text), so a renderer can cache per id without hashing the string; 0
+ * means none (not cacheable).  Not thread-safe.
+ */
+char *r300_us_glsl_cached(const R300State *st, const R300FSDesc *desc,
+                          uint32_t flags, uint32_t *id, const char **err);
+
+/*
  * Texture formats (TX_FORMAT1.TXFORMAT) the shader decodes itself from the
  * texel words, read through a uint view of guest memory: returns the texel
  * size in bytes, or 0 for the formats sampled through a float texture
