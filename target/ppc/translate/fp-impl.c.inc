@@ -51,6 +51,189 @@ static int fastfp_op(void *helper)
     return -1;
 }
 
+/*
+ * The A-form arithmetic ops on the host FPU, inline (fop_vec/ffma_vec).
+ *
+ * helper_fastfp_ab/acb already compute these with host floating point in
+ * the state Mac OS X runs applications in, but a guest fmadd still costs
+ * an out-of-line call: about 5.4 ns in a dependent chain on an M1, against
+ * 0.3 ns for an integer add.  This emits the host instruction instead, and
+ * keeps its result wherever the helper's fast path would return the same
+ * bits and FPSCR:
+ *  - FPSCR as fastfp_ok() wants it: no exception enabled, NI off, round to
+ *    nearest.  That is HFLAGS_FP_FAST, a TB flag, so it costs nothing at
+ *    run time; ppc_store_fpscr() recomputes it and the mtfs* instructions
+ *    end the TB;
+ *  - for single precision, inputs that are singles (converting them to
+ *    single and back gives the same bits), so the single-precision host
+ *    operation rounds once, like the helper's (float)x ops;
+ *  - a result that is not a NaN (the helper uses softfloat for those).
+ * The helper then sets FPRF only.  Here FPRF is left for later: the result
+ * goes to env->fprf_res, and ppc_fprf_sync() computes FPRF from it when
+ * something reads FPRF (mffs, mcrfs, a partial update, gdb, migration).
+ * That keeps the inline op down to the operation, one store, a NaN test
+ * and the FPR store; each extra host instruction here costs Geekbench
+ * points, as FP-heavy loops are bound by instruction throughput.
+ *
+ * If the checks fail, the op branches to a slow path that calls
+ * helper_fastfp_ab/acb exactly as before and then leaves the TB for the
+ * next instruction.  It never comes back: a label where the paths joined
+ * would make TCG write back and reload every global at every FP op (a
+ * conditional branch only writes back the dirty ones).  The slow paths are
+ * emitted after the TB's exit (native_fp_emit_slow_paths()).  Nothing
+ * there can raise an exception (no FP exception is enabled), so being
+ * outside the op's insn_start range does not matter.  The target FPR is
+ * written only after the branch, so the slow path finds the inputs intact.
+ *
+ * Needs a host with fop_vec (AArch64); PPC_STRICT_FP=1 or PPC_NATIVE_FP=0
+ * turn it off.
+ */
+static bool native_fp_on(void)
+{
+#ifdef CONFIG_USER_ONLY
+    /* linux-user sets env->fpscr directly, without the hflags update */
+    return false;
+#else
+    static int on = -1;
+    if (on < 0) {
+        const char *strict = getenv("PPC_STRICT_FP");
+        const char *nat = getenv("PPC_NATIVE_FP");
+        on = !(strict && strict[0] == '1') && !(nat && nat[0] == '0')
+             && tcg_can_emit_vec_op(INDEX_op_fop_vec, TCG_TYPE_V64, MO_64) > 0;
+    }
+    return on;
+#endif
+}
+
+static bool native_fp(DisasContext *ctx)
+{
+    /*
+     * The slow path leaves the TB without the guest's trace interrupt, PMU
+     * instruction counting or icount; Mac OS X applications use none.
+     */
+    return native_fp_on() && ctx->fp_fast
+           && ctx->n_nfp < ARRAY_SIZE(ctx->nfp)
+           && !ctx->singlestep_enabled && !ctx->pmu_insn_cnt
+           && !(tb_cflags(ctx->base.tb) & CF_USE_ICOUNT);
+}
+
+/* Before code that reads FPSCR[FPRF] from cpu_fpscr */
+static void gen_fprf_sync(void)
+{
+    if (native_fp_on()) {
+        gen_helper_fprf_sync(tcg_env);
+    }
+}
+
+/* The helpers' FF_* codes (fpu_helper.c): single-precision if odd. */
+static bool native_single(int op)
+{
+    return (op >= 16 ? op - 16 : op) & 1;
+}
+
+/*
+ * Load FPR regno, as a single if single; then ok is cleared (from all
+ * ones) if it does not convert to single and back unchanged.
+ */
+static TCGv_vec native_load(int regno, bool single, TCGv_vec ok)
+{
+    TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V64);
+
+    tcg_gen_ld_vec(v, tcg_env, fpr_offset(regno));
+    if (single) {
+        TCGv_vec s = tcg_temp_new_vec(TCG_TYPE_V64);
+        TCGv_vec d = tcg_temp_new_vec(TCG_TYPE_V64);
+
+        tcg_gen_fcvt_vec(false, s, v);
+        tcg_gen_fcvt_vec(true, d, s);
+        tcg_gen_cmp_vec(TCG_COND_EQ, MO_64, d, d, v);
+        tcg_gen_and_vec(MO_64, ok, ok, d);
+        return s;
+    }
+    return v;
+}
+
+/*
+ * Emit op (an FF_* code) on inputs x, y, z in the helper's order (z < 0
+ * for the two-operand ops), writing frt.  Only when native_fp(ctx).
+ */
+static void native_fp_op(DisasContext *ctx, int op, int frt,
+                         int x, int y, int z)
+{
+    NativeFPSlow *sp = &ctx->nfp[ctx->n_nfp++];
+    bool fma = op >= 16;
+    bool single = native_single(op);
+    unsigned vece = single ? MO_32 : MO_64;
+    TCGv_vec r = tcg_temp_new_vec(TCG_TYPE_V64);
+    TCGv_vec ok = NULL, vx, vy, vz = NULL;
+    TCGv_i64 res = tcg_temp_new_i64();
+
+    *sp = (NativeFPSlow) {
+        .slow = gen_new_label(), .next = ctx->base.pc_next,
+        .op = op, .frt = frt, .x = x, .y = y, .z = z,
+    };
+
+    if (single) {
+        ok = tcg_temp_new_vec(TCG_TYPE_V64);
+        tcg_gen_dupi_vec(MO_64, ok, -1);
+    }
+    vx = native_load(x, single, ok);
+    vy = native_load(y, single, ok);
+    if (fma) {
+        vz = native_load(z, single, ok);
+        tcg_gen_ffma_vec(vece, (op - 16) >> 1, r, vx, vy, vz);
+    } else {
+        tcg_gen_fop_vec(vece, op >> 1, r, vx, vy);
+    }
+    if (single) {
+        tcg_gen_fcvt_vec(true, r, r);
+        /* all ones, a NaN, unless every input was a single */
+        tcg_gen_orc_vec(MO_64, r, r, ok);
+    }
+
+    /*
+     * FPRF is now due from this result.  On the slow path the helper sets
+     * FPRF itself, which drops this.
+     */
+    tcg_gen_st_vec(r, tcg_env, offsetof(CPUPPCState, fprf_res));
+    tcg_gen_ld_i64(res, tcg_env, offsetof(CPUPPCState, fprf_res));
+    tcg_gen_shli_i64(res, res, 1);
+    tcg_gen_brcondi_i64(TCG_COND_GTU, res, 0xffe0000000000000ull, sp->slow);
+
+    tcg_gen_st_vec(r, tcg_env, fpr_offset(frt));
+    if (ctx->insns_flags2 & PPC2_VSX) {
+        /* as set_fpr(); without VSX nothing else writes doubleword 1 */
+        tcg_gen_st_i64(tcg_constant_i64(0), tcg_env, vsr64_offset(frt, false));
+    }
+}
+
+/* After the TB's exit: each slow path, then on to the next instruction. */
+static void native_fp_emit_slow_paths(DisasContext *ctx)
+{
+    for (int i = 0; i < ctx->n_nfp; i++) {
+        NativeFPSlow *sp = &ctx->nfp[i];
+        TCGv_i64 t0 = tcg_temp_new_i64();
+        TCGv_i64 t1 = tcg_temp_new_i64();
+        TCGv_i64 t3 = tcg_temp_new_i64();
+        TCGv_i32 op = tcg_constant_i32(sp->op);
+
+        gen_set_label(sp->slow);
+        get_fpr(t0, sp->x);
+        get_fpr(t1, sp->y);
+        if (sp->z >= 0) {
+            TCGv_i64 t2 = tcg_temp_new_i64();
+            get_fpr(t2, sp->z);
+            gen_helper_fastfp_acb(t3, tcg_env, t0, t1, t2, op);
+        } else {
+            gen_helper_fastfp_ab(t3, tcg_env, t0, t1, op);
+        }
+        set_fpr(sp->frt, t3);
+        gen_update_nip(ctx, sp->next);
+        tcg_gen_lookup_and_goto_ptr();
+    }
+    ctx->n_nfp = 0;
+}
+
 static bool do_helper_acb(DisasContext *ctx, arg_A *a,
                           void (*helper)(TCGv_i64, TCGv_ptr, TCGv_i64,
                                          TCGv_i64, TCGv_i64))
@@ -63,6 +246,10 @@ static bool do_helper_acb(DisasContext *ctx, arg_A *a,
     t2 = tcg_temp_new_i64();
     t3 = tcg_temp_new_i64();
     int op = fastfp_op((void *)helper);
+    if (op >= 0 && !a->rc && native_fp(ctx)) {
+        native_fp_op(ctx, op, a->frt, a->fra, a->frc, a->frb);
+        return true;
+    }
     if (op >= 0) {
         /* one call: fast host FP, or the full softfloat sequence */
         get_fpr(t0, a->fra);
@@ -96,6 +283,10 @@ static bool do_helper_ab(DisasContext *ctx, arg_A_tab *a,
     t1 = tcg_temp_new_i64();
     t2 = tcg_temp_new_i64();
     int op = fastfp_op((void *)helper);
+    if (op >= 0 && !a->rc && native_fp(ctx)) {
+        native_fp_op(ctx, op, a->frt, a->fra, a->frb, -1);
+        return true;
+    }
     get_fpr(t0, a->fra);
     get_fpr(t1, a->frb);
     if (op >= 0) {
@@ -124,6 +315,10 @@ static bool do_helper_ac(DisasContext *ctx, arg_A_tac *a,
     t1 = tcg_temp_new_i64();
     t2 = tcg_temp_new_i64();
     int op = fastfp_op((void *)helper);
+    if (op >= 0 && !a->rc && native_fp(ctx)) {
+        native_fp_op(ctx, op, a->frt, a->fra, a->frc, -1);
+        return true;
+    }
     get_fpr(t0, a->fra);
     get_fpr(t1, a->frc);
     if (op >= 0) {
@@ -515,6 +710,7 @@ static void gen_mcrfs(DisasContext *ctx)
     bfa = crfS(ctx->opcode);
     nibble = 7 - bfa;
     shift = 4 * nibble;
+    gen_fprf_sync();
     tcg_gen_shri_tl(tmp, cpu_fpscr, shift);
     tcg_gen_trunc_tl_i32(cpu_crf[crfD(ctx->opcode)], tmp);
     tcg_gen_andi_i32(cpu_crf[crfD(ctx->opcode)], cpu_crf[crfD(ctx->opcode)],
@@ -533,6 +729,7 @@ static TCGv_i64 place_from_fpscr(int rt, uint64_t mask)
     TCGv_i64 fpscr = tcg_temp_new_i64();
     TCGv_i64 fpscr_masked = tcg_temp_new_i64();
 
+    gen_fprf_sync();
     tcg_gen_extu_tl_i64(fpscr, cpu_fpscr);
     tcg_gen_andi_i64(fpscr_masked, fpscr, mask);
     set_fpr(rt, fpscr_masked);
@@ -588,6 +785,7 @@ static bool trans_MFFSCE(DisasContext *ctx, arg_X_t *a)
     gen_reset_fpstatus();
     fpscr = place_from_fpscr(a->rt, UINT64_MAX);
     store_fpscr_masked(fpscr, FP_ENABLES, tcg_constant_i64(0), 0x0003);
+    ctx->base.is_jmp = DISAS_CHAIN_UPDATE; /* HFLAGS_FP_FAST */
     return true;
 }
 
@@ -604,6 +802,7 @@ static bool trans_MFFSCRN(DisasContext *ctx, arg_X_tb *a)
     gen_reset_fpstatus();
     fpscr = place_from_fpscr(a->rt, FP_DRN | FP_ENABLES | FP_NI | FP_RN);
     store_fpscr_masked(fpscr, FP_RN, t1, 0x0001);
+    ctx->base.is_jmp = DISAS_CHAIN_UPDATE; /* HFLAGS_FP_FAST */
     return true;
 }
 
@@ -635,6 +834,7 @@ static bool trans_MFFSCRNI(DisasContext *ctx, arg_X_imm2 *a)
     gen_reset_fpstatus();
     fpscr = place_from_fpscr(a->rt, FP_DRN | FP_ENABLES | FP_NI | FP_RN);
     store_fpscr_masked(fpscr, FP_RN, t1, 0x0001);
+    ctx->base.is_jmp = DISAS_CHAIN_UPDATE; /* HFLAGS_FP_FAST */
     return true;
 }
 
@@ -680,6 +880,8 @@ static void gen_mtfsb0(DisasContext *ctx)
         tcg_gen_trunc_tl_i32(cpu_crf[1], cpu_fpscr);
         tcg_gen_shri_i32(cpu_crf[1], cpu_crf[1], FPSCR_OX);
     }
+    /* HFLAGS_FP_FAST may have changed: look up the next TB afresh */
+    ctx->base.is_jmp = DISAS_CHAIN_UPDATE;
 }
 
 /* mtfsb1 */
@@ -702,6 +904,8 @@ static void gen_mtfsb1(DisasContext *ctx)
     }
     /* We can raise a deferred exception */
     gen_helper_fpscr_check_status(tcg_env);
+    /* HFLAGS_FP_FAST may have changed: look up the next TB afresh */
+    ctx->base.is_jmp = DISAS_CHAIN_UPDATE;
 }
 
 /* mtfsf */
@@ -738,6 +942,8 @@ static void gen_mtfsf(DisasContext *ctx)
     }
     /* We can raise a deferred exception */
     gen_helper_fpscr_check_status(tcg_env);
+    /* HFLAGS_FP_FAST may have changed: look up the next TB afresh */
+    ctx->base.is_jmp = DISAS_CHAIN_UPDATE;
 }
 
 /* mtfsfi */
@@ -767,6 +973,8 @@ static void gen_mtfsfi(DisasContext *ctx)
     }
     /* We can raise a deferred exception */
     gen_helper_fpscr_check_status(tcg_env);
+    /* HFLAGS_FP_FAST may have changed: look up the next TB afresh */
+    ctx->base.is_jmp = DISAS_CHAIN_UPDATE;
 }
 
 static void gen_qemu_ld32fs(DisasContext *ctx, TCGv_i64 dest, TCGv addr)
