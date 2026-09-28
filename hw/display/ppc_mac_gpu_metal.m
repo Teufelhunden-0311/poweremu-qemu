@@ -7446,7 +7446,14 @@ static id<MTLFunction> r300_function(id<MTLDevice> dev, NSString *glsl,
         free(msg);
         return nil;
     }
-    id<MTLLibrary> lib = [dev newLibraryWithSource:@(msl) options:nil error:&err];
+    /* Vertex programs keep IEEE infinities and NaNs, as the interpreter
+     * does (fast math broke the specials the _DX/_FF opcodes produce). */
+    MTLCompileOptions *opt = [[MTLCompileOptions alloc] init];
+    if (stage == R300_STAGE_VS) {
+        opt.mathMode = MTLMathModeSafe;
+    }
+    id<MTLLibrary> lib = [dev newLibraryWithSource:@(msl) options:opt error:&err];
+    [opt release];
     if (!lib) {
         qemu_log("ppc-mac-gpu r300: shader compile failed: %s\n%s\n",
                  err.localizedDescription.UTF8String, msl);
@@ -7470,6 +7477,7 @@ static id<MTLFunction> r300_function(id<MTLDevice> dev, NSString *glsl,
  */
 static id<MTLRenderPipelineState> r300_pipeline_by_text(id<MTLDevice> dev,
                                                         const char *glsl,
+                                                        const char *vs_glsl,
                                                         const MTLPixelFormat *cfmt,
                                                         uint32_t ncb,
                                                         MTLPixelFormat zfmt);
@@ -7480,7 +7488,7 @@ static id<MTLRenderPipelineState> r300_pipeline_by_text(id<MTLDevice> dev,
  * per draw than the draw.  Direct-mapped; a miss falls back to the text.
  */
 typedef struct R300PipeSlot {
-    uint32_t id, ncb;
+    uint32_t id, vs_id, ncb;
     MTLPixelFormat cfmt[4], zfmt;
     id<MTLRenderPipelineState> pipe;    /* owned by g_r300_pipes */
 } R300PipeSlot;
@@ -7489,25 +7497,28 @@ static R300PipeSlot g_r300_pipe_slots[1024];
 
 static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
                                                 const char *glsl, uint32_t prog_id,
+                                                const char *vs_glsl, uint32_t vs_id,
                                                 const MTLPixelFormat *cfmt,
                                                 uint32_t ncb,
                                                 MTLPixelFormat zfmt)
 {
-    if (!prog_id || ncb > 4) {
-        return r300_pipeline_by_text(dev, glsl, cfmt, ncb, zfmt);
+    if (!prog_id || (vs_glsl && !vs_id) || ncb > 4) {
+        return r300_pipeline_by_text(dev, glsl, vs_glsl, cfmt, ncb, zfmt);
     }
-    uint32_t h = prog_id * 2654435761u ^ (uint32_t)zfmt * 40503u;
+    uint32_t h = prog_id * 2654435761u ^ (uint32_t)zfmt * 40503u ^ vs_id * 97u;
     for (uint32_t k = 0; k < ncb; k++) {
         h = h * 31u + (uint32_t)cfmt[k];
     }
     R300PipeSlot *sl = &g_r300_pipe_slots[(h ^ (h >> 16)) & 1023];
-    if (sl->pipe && sl->id == prog_id && sl->ncb == ncb && sl->zfmt == zfmt &&
+    if (sl->pipe && sl->id == prog_id && sl->vs_id == vs_id && sl->ncb == ncb &&
+        sl->zfmt == zfmt &&
         memcmp(sl->cfmt, cfmt, ncb * sizeof(*cfmt)) == 0) {
         return sl->pipe;
     }
-    id<MTLRenderPipelineState> p = r300_pipeline_by_text(dev, glsl, cfmt, ncb, zfmt);
+    id<MTLRenderPipelineState> p = r300_pipeline_by_text(dev, glsl, vs_glsl, cfmt, ncb, zfmt);
     if (p) {
         sl->id = prog_id;
+        sl->vs_id = vs_id;
         sl->ncb = ncb;
         sl->zfmt = zfmt;
         memcpy(sl->cfmt, cfmt, ncb * sizeof(*cfmt));
@@ -7518,11 +7529,13 @@ static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
 
 static id<MTLRenderPipelineState> r300_pipeline_by_text(id<MTLDevice> dev,
                                                         const char *glsl,
+                                                        const char *vs_glsl,
                                                         const MTLPixelFormat *cfmt,
                                                         uint32_t ncb,
                                                         MTLPixelFormat zfmt)
 {
     NSString *src = [NSString stringWithUTF8String:glsl];
+    NSString *vsrc = vs_glsl ? [NSString stringWithUTF8String:vs_glsl] : src;
     NSMutableString *key = [NSMutableString stringWithString:src];
     id<MTLRenderPipelineState> p;
     NSError *err = nil;
@@ -7531,6 +7544,9 @@ static id<MTLRenderPipelineState> r300_pipeline_by_text(id<MTLDevice> dev,
         [key appendFormat:@"\n// c%u %lu", k, (unsigned long)cfmt[k]];
     }
     [key appendFormat:@"\n// z %lu\n", (unsigned long)zfmt];
+    if (vs_glsl) {
+        [key appendString:vsrc];
+    }
     if (!g_r300_pipes) {
         g_r300_pipes = [[NSMutableDictionary alloc] init];
     }
@@ -7538,7 +7554,7 @@ static id<MTLRenderPipelineState> r300_pipeline_by_text(id<MTLDevice> dev,
     if (p) {
         return p;
     }
-    id<MTLFunction> vs = r300_function(dev, src, R300_STAGE_VS);
+    id<MTLFunction> vs = r300_function(dev, vsrc, R300_STAGE_VS);
     id<MTLFunction> fs = r300_function(dev, src, zfmt == MTLPixelFormatInvalid ?
                                        R300_STAGE_FS : R300_STAGE_FS_Z);
     if (!vs || !fs) {
@@ -7940,6 +7956,30 @@ static id<MTLTexture> r300_dummy(id<MTLDevice> dev, bool raw, uint32_t dim)
     return d[i];
 }
 
+/* Copy len bytes into this frame's arena and bind them as vertex buffer
+ * index (a one-off buffer when the arena can't take them). */
+static bool r300_bind_bytes(PPCMacGPUMetalState *st, id<MTLDevice> dev,
+                            id<MTLRenderCommandEncoder> enc, const void *data,
+                            size_t len, NSUInteger index)
+{
+    id<MTLBuffer> b = nil;
+    size_t off = 0;
+    void *dst = r200_arena_alloc(st, len ? len : 16, &b, &off);
+
+    if (dst) {
+        memcpy(dst, data, len);
+        [enc setVertexBuffer:b offset:off atIndex:index];
+        return true;
+    }
+    b = [dev newBufferWithBytes:data length:len options:MTLResourceStorageModeShared];
+    if (!b) {
+        return false;
+    }
+    [enc setVertexBuffer:b offset:0 atIndex:index];
+    [b release];
+    return true;
+}
+
 static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                            const R300DrawPacket *pkt)
 {
@@ -8138,7 +8178,8 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         if (ncb != MAX(pkt->num_cb, 1u)) {
             return -1;                  /* the MSL declares targets we cannot bind */
         }
-        id<MTLRenderPipelineState> pipe = r300_pipeline(dev, pkt->glsl, pkt->glsl_id, cpf, ncb, pass_zpf);
+        id<MTLRenderPipelineState> pipe = r300_pipeline(dev, pkt->glsl, pkt->glsl_id, pkt->vs_glsl, pkt->vs_id,
+                                                      cpf, ncb, pass_zpf);
         if (!pipe) {
             return -1;
         }
@@ -8152,19 +8193,30 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                            (pkt->cull & R300_CULL_BACK) ? MTLCullModeBack
                                                         : MTLCullModeNone;
 
-        uint32_t nv = pkt->num_verts + pkt->num_line_verts;
-        size_t vbytes = (size_t)nv * sizeof(R300Vertex);
-        id<MTLBuffer> vb = nil;
-        size_t voff = 0;
-        void *dst = r200_arena_alloc(st, vbytes, &vb, &voff);
-        if (dst) {
-            memcpy(dst, pkt->verts, vbytes);
-            [enc setVertexBuffer:vb offset:voff atIndex:0];
+        id<MTLBuffer> ib = nil;
+        size_t ioff = 0;
+        if (pkt->vs_glsl) {
+            /* Vertex program on the GPU: input vertices, their uniforms
+             * (R300_BIND_VSU = buffer 2) and the triangle list's indices. */
+            if (!r300_bind_bytes(st, dev, enc, pkt->vs_in, pkt->vs_in_vecs * 16u, 0) ||
+                !r300_bind_bytes(st, dev, enc, pkt->vs_u, sizeof(*pkt->vs_u), 2)) {
+                return -1;
+            }
+            size_t ibytes = (size_t)pkt->num_verts * 4;
+            void *idst = r200_arena_alloc(st, ibytes, &ib, &ioff);
+            if (idst) {
+                memcpy(idst, pkt->vs_idx, ibytes);
+                [ib retain];
+            } else {
+                ib = [dev newBufferWithBytes:pkt->vs_idx length:ibytes
+                                     options:MTLResourceStorageModeShared];
+                ioff = 0;
+            }
         } else {
-            id<MTLBuffer> one = [dev newBufferWithBytes:pkt->verts length:vbytes
-                                                options:MTLResourceStorageModeShared];
-            [enc setVertexBuffer:one offset:0 atIndex:0];
-            [one release];
+            uint32_t nv = pkt->num_verts + pkt->num_line_verts;
+            if (!r300_bind_bytes(st, dev, enc, pkt->verts, (size_t)nv * sizeof(R300Vertex), 0)) {
+                return -1;
+            }
         }
         [enc setFragmentBuffer:r300_zpass_buf(dev) offset:0 atIndex:1];
         for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
@@ -8191,7 +8243,13 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             [enc setVertexBytes:ms length:sizeof(ms) atIndex:1];
             [enc setFragmentBytes:&uk length:sizeof(uk) atIndex:0];
             [enc setCullMode:cull];
-            if (pkt->num_verts) {
+            if (pkt->num_verts && ib) {
+                [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                indexCount:pkt->num_verts
+                                 indexType:MTLIndexTypeUInt32
+                               indexBuffer:ib
+                         indexBufferOffset:ioff];
+            } else if (pkt->num_verts) {
                 [enc drawPrimitives:pkt->prim_class == 1 ? MTLPrimitiveTypeLine
                                                          : MTLPrimitiveTypeTriangle
                         vertexStart:0 vertexCount:pkt->num_verts];
@@ -8203,6 +8261,7 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                         vertexCount:pkt->num_line_verts];
             }
         }
+        [ib release];
         g_r200_stat_draws++;
         for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
             if (u.tex_info[t][0] && !pkt->tex[t].host_data) {
@@ -8226,6 +8285,7 @@ static PPCMacGPURenderer metal_renderer = {
     .srt_write_through = metal_srt_write_through,
     .draw_r200         = metal_draw_r200,
     .draw_r300         = metal_draw_r300,
+    .r300_glsl_flags   = R300_GLSL_GPU_VS,
     .zpass_r300        = metal_zpass_r300,
     .flush_r200        = metal_flush_r200,
     .submit_r200       = metal_submit_r200,

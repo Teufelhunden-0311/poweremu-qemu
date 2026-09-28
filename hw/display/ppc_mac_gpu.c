@@ -243,6 +243,7 @@ static uint64_t r200_flush_why[0x10000 / 4 + 8];
 static uint64_t r200_flush_total;
 static struct {
     uint64_t presents, draws, ops2d, flushes, flush_us, flips;
+    uint64_t gpu_vs;         /* R300 draws whose vertex program ran on the GPU */
     int64_t since;
 } r200_rate;
 
@@ -1512,10 +1513,11 @@ static void ppc_mac_gpu_display_update(void *opaque)
             if (r200_rate.draws || r200_rate.ops2d) {
                 double sec = (now - r200_rate.since) / 1e6;
                 qemu_log("ppc-mac-gpu rate: %.1f flips/s, %.1f present-ops/s, "
-                         "%.0f draws/s, "
+                         "%.0f draws/s (%.0f%% GPU vertex programs), "
                          "%.0f 2D ops/s, %.0f flushes/s, GPU wait %.1f%%\n",
                          r200_rate.flips / sec,
                          r200_rate.presents / sec, r200_rate.draws / sec,
+                         100.0 * r200_rate.gpu_vs / r200_rate.draws,
                          r200_rate.ops2d / sec, r200_rate.flushes / sec,
                          r200_rate.flush_us / (sec * 1e4));
             }
@@ -2867,6 +2869,16 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         }
     }
     s->r3->glsl_flags = s->renderer ? s->renderer->r300_glsl_flags : 0;
+    {
+        /* R300_CPU_VS=1: run every vertex program on the interpreter */
+        static int cpu_vs = -1;
+        if (cpu_vs < 0) {
+            cpu_vs = getenv("R300_CPU_VS") != NULL;
+        }
+        if (cpu_vs) {
+            s->r3->glsl_flags &= ~R300_GLSL_GPU_VS;
+        }
+    }
     bool build_ok = idx ?
         r300_draw_build_indexed(s->r3, &s->r3_arrays, d[0], idx, r300_read_raw,
                                 s, &pkt, &err) :
@@ -3015,6 +3027,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         if (sync_each < 0) {
             sync_each = getenv("R300_SYNC") != NULL;   /* debug: no batching */
         }
+        r200_rate.gpu_vs += pkt.vs_glsl != NULL;
         int rr = s->renderer->draw_r300(s->renderer_opaque, vram, s->vram_size, &pkt);
         if (s->r3_dump && g_r300_arm_rt && pkt.rt_gpu_addr == g_r300_arm_rt) {
             fprintf(s->r3_dump, "   renderer -> %d\n", rr);

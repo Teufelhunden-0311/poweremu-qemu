@@ -57,4 +57,18 @@ uint32_t r300_pvs_run(const R300PVSProgram *prog,
 /* One line of disassembly per instruction into buf; for traces. */
 void r300_pvs_disasm_inst(const uint32_t d[4], char *buf, unsigned len);
 
+/*
+ * The program as GLSL statements for the body of a vertex shader's main()
+ * (declarations first): inputs are read from locals iN (the caller loads
+ * those *in_used names), constants from uniform vs.c[] with a function
+ * vec4 pvs_c(int) for A0-relative reads (the caller defines it), and the
+ * outputs land in locals o0..o31.  r300_pvs_glsl_helpers goes at file
+ * scope.  False when the program needs the interpreter (flow control,
+ * predication, relative temporaries or outputs, unknown opcodes).
+ */
+struct R300Sb;
+extern const char r300_pvs_glsl_helpers[];
+bool r300_pvs_to_glsl(const R300PVSProgram *prog, struct R300Sb *sb,
+                      uint32_t *in_used);
+
 #endif

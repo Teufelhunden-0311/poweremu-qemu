@@ -19,7 +19,7 @@ for t in test_pvs test_us test_draw test_features; do
 done
 cc -O1 -Wall -o "$B/glsl2msl" glsl2msl.c $SPV
 clang -fobjc-arc -framework Metal -framework Foundation mslcheck.m -o "$B/mslcheck"
-for t in test_zs test_fmt test_raster; do
+for t in test_zs test_fmt test_raster test_gpuvs; do
     clang -O1 -fobjc-arc -framework Metal -framework Foundation $t.m $SRC $SPV -o "$B/$t"
 done
 "$B/test_pvs"
@@ -43,4 +43,5 @@ done
 "$B/test_zs"
 "$B/test_fmt"
 "$B/test_raster"
+"$B/test_gpuvs"
 echo "all R300 tests passed"

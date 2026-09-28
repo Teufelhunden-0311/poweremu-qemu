@@ -111,6 +111,7 @@ enum {
     R300_BIND_MS = 3,           /* UBO vec4: multisample clip-space shift */
     R300_BIND_VRAM = 4,         /* SSBO uint[]: VRAM (R300_GLSL_VRAM_SSBO) */
     R300_BIND_AUX = 5,          /* SSBO uint[]: GART texels (R300_GLSL_VRAM_SSBO) */
+    R300_BIND_VSU = 6,          /* UBO R300VSU: GPU vertex shader uniforms */
     R300_BIND_FB0 = 8,          /* input attachments: colour buffers, then Z */
     R300_BIND_TEX0 = 16,        /* combined image samplers, one per unit */
     R300_BIND_COUNT = 32,
@@ -119,6 +120,8 @@ enum {
 /* r300_us_to_glsl flags */
 #define R300_GLSL_VRAM_SSBO     (1u << 0)   /* raw units read VRAM from a storage
                                                buffer, not a uint texture view */
+#define R300_GLSL_GPU_VS        (1u << 1)   /* the renderer runs vertex programs
+                                               (r300_draw.h vs_glsl) */
 
 /*
  * Build the GLSL source for the current US program.  It compiles as three

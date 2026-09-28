@@ -125,6 +125,7 @@ char *r300_spirv_to_msl(const uint32_t *spv, size_t nwords, R300Stage stage,
     if (stage == R300_STAGE_VS) {
         msl_bind(c, model, R300_BIND_VERTS, 0, 0, 0);
         msl_bind(c, model, R300_BIND_MS, 1, 0, 0);
+        msl_bind(c, model, R300_BIND_VSU, 2, 0, 0);
     } else {
         msl_bind(c, model, R300_BIND_UNIFORMS, 0, 0, 0);
         msl_bind(c, model, R300_BIND_ZPASS, 1, 0, 0);

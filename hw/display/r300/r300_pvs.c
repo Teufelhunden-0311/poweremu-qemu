@@ -11,10 +11,13 @@
 
 #include "r300_pvs.h"
 
+#include <ctype.h>
 #include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+
+#include "r300_sb.h"
 
 /* Vector engine opcodes */
 enum {
@@ -380,7 +383,7 @@ static void pvs_exec(PVSCtx *c, const uint32_t *d)
     bool math = (d0 >> 6) & 1;
     bool macro = (d0 >> 7) & 1;
     bool dual = !math && !macro && ((d0 >> 28) & 1);
-    float a[4], b[4], cc[4], r[4];
+    float a[4], b[4], cc[4] = { 0 }, r[4];     /* dual: no third operand */
 
     if ((d0 >> 26) & 1) {
         c->unsup |= R300_PVS_UNSUP_PRED;
@@ -504,4 +507,359 @@ void r300_pvs_disasm_inst(const uint32_t d[4], char *buf, unsigned len)
                       s & 8 ? "|" : "", src_type[s & 3], (s >> 5) & 0xFF,
                       s & 16 ? "+a0" : "", sw);
     }
+}
+
+/*
+ * ---- PVS -> GLSL, for running the vertex program on the host GPU ----
+ *
+ * A translation of what r300_pvs_run() interprets, instruction for
+ * instruction, for straight-line programs.  Registers become locals
+ * (tN temporaries, atN alternate temporaries, oN outputs, iN inputs, a0),
+ * constants the uniform array vs.c[].  Anything the translation does not
+ * cover makes it return false and the draw stays on the interpreter.
+ */
+typedef struct PVSGlsl {
+    const R300PVSProgram *prog;
+    R300Sb *sb;
+    uint32_t in_used;
+    bool temp[R300_PVS_NUM_TEMPS], alt[R300_PVS_NUM_ALT_TEMPS];
+    bool ok;
+} PVSGlsl;
+
+static const char pvs_comp[] = "xyzw";
+
+/* The unswizzled operand, as an expression. */
+static void pg_base(PVSGlsl *g, uint32_t s, char *buf, size_t len)
+{
+    unsigned type = s & 3, idx = (s >> 5) & 0xFF;
+    unsigned mode = ((s >> 4) & 1) | ((s >> 31) << 1);
+
+    if (mode == 1) {
+        /* A0-relative: only for constants (bounds-checked at run time) */
+        if (type != SRC_CONST) {
+            g->ok = false;
+        }
+        snprintf(buf, len, "pvs_c(%d + a0[%u])", (int)idx, (s >> 29) & 3);
+        return;
+    }
+    /* Absolute; mode 2 adds the loop index, 0 without flow control. */
+    switch (type) {
+    case SRC_TEMP:
+        if (idx < R300_PVS_NUM_TEMPS) {
+            g->temp[idx] = true;
+            snprintf(buf, len, "t%u", idx);
+            return;
+        }
+        break;
+    case SRC_INPUT:
+        if (idx < R300_PVS_NUM_INPUTS) {
+            g->in_used |= 1u << idx;
+            snprintf(buf, len, "i%u", idx);
+            return;
+        }
+        break;
+    case SRC_CONST:
+        if ((int)idx <= g->prog->max_const) {
+            snprintf(buf, len, "vs.c[%u]", idx);
+            return;
+        }
+        break;
+    default:
+        if (idx < R300_PVS_NUM_ALT_TEMPS) {
+            g->alt[idx] = true;
+            snprintf(buf, len, "at%u", idx);
+            return;
+        }
+        break;
+    }
+    snprintf(buf, len, "vec4(0.0)");
+}
+
+static void pg_comp(char *buf, size_t len, unsigned sel, bool abs_, bool neg)
+{
+    const char *x = sel < 4 ? (const char[][5]){ "pb.x", "pb.y", "pb.z", "pb.w" }[sel]
+                  : sel == 5 ? "1.0" : "0.0";
+    snprintf(buf, len, "%s%s%s%s%s", neg ? "-(" : "", abs_ ? "abs(" : "", x,
+             abs_ ? ")" : "", neg ? ")" : "");
+}
+
+/* var = the swizzled operand s (abs, negate) */
+static void pg_src(PVSGlsl *g, const char *var, uint32_t s)
+{
+    char base[64], c[4][24];
+
+    pg_base(g, s, base, sizeof(base));
+    for (int i = 0; i < 4; i++) {
+        pg_comp(c[i], sizeof(c[i]), (s >> (13 + 3 * i)) & 7, s & (1u << 3),
+                s & (1u << (25 + i)));
+    }
+    r300_sb_printf(g->sb, "    pb = %s; %s = vec4(%s, %s, %s, %s);\n",
+                   base, var, c[0], c[1], c[2], c[3]);
+}
+
+/* The math engine on scalars a, b, c (expressions), as a vec4 expression. */
+static bool pg_math(unsigned op, const char *a, const char *b, const char *c,
+                    char *buf, size_t len)
+{
+    const char *f;
+
+    switch (op) {
+    case ME_EXP_BASE2_DX:
+        snprintf(buf, len, "vec4(exp2(floor(%s)), %s > 128.0 ? 0.0 : %s - floor(%s), "
+                 "exp2(%s), 1.0)", a, a, a, a, a);
+        return true;
+    case ME_LOG_BASE2_DX:
+        snprintf(buf, len, "pvs_log_dx(%s)", a);
+        return true;
+    case ME_LIGHT_COEFF_DX:
+        snprintf(buf, len, "vec4(1.0, max(%s, 0.0), %s > 0.0 ? pvs_pow_ff(max(%s, 0.0), "
+                 "clamp(%s, -128.0, 128.0)) : 0.0, 1.0)", b, b, a, c);
+        return true;
+    case ME_EXP_BASEE_FF:       f = "exp(A)"; break;
+    case ME_POWER_FUNC_FF:      f = "pvs_pow_ff(A, C)"; break;
+    case ME_RECIP_DX:           f = "(A == 0.0 ? PVS_FLT_MAX : 1.0 / A)"; break;
+    case ME_RECIP_FF:           f = "(A == 0.0 ? 0.0 : 1.0 / A)"; break;
+    case ME_RECIP_SQRT_DX:      f = "(A == 0.0 ? PVS_FLT_MAX : inversesqrt(abs(A)))"; break;
+    case ME_RECIP_SQRT_FF:      f = "(A == 0.0 ? 0.0 : inversesqrt(abs(A)))"; break;
+    case ME_MULTIPLY:           f = "(A * B)"; break;
+    case ME_EXP_BASE2_FULL_DX:  f = "exp2(A)"; break;
+    case ME_LOG_BASE2_FULL_DX:  f = "(A == 0.0 ? -PVS_FLT_MAX : log2(abs(A)))"; break;
+    case ME_POWER_FUNC_FF_CLAMP_B:
+        f = "(A < B ? 0.0 : pvs_pow_ff(A, C))"; break;
+    case ME_POWER_FUNC_FF_CLAMP_B1:
+        f = "(A < B ? 0.0 : A > 1.0 ? 1.0 : pvs_pow_ff(A, C))"; break;
+    case ME_POWER_FUNC_FF_CLAMP_01:
+        f = "(A <= 0.0 ? 0.0 : A > 1.0 ? 1.0 : pvs_pow_ff(A, C))"; break;
+    case ME_SIN:                f = "sin(clamp(A, -3.14159265, 3.14159265))"; break;
+    case ME_COS:                f = "cos(clamp(A, -3.14159265, 3.14159265))"; break;
+    case ME_LOG_BASE2_IEEE:     f = "log2(abs(A))"; break;
+    case ME_RECIP_IEEE:         f = "(1.0 / A)"; break;
+    case ME_RECIP_SQRT_IEEE:    f = "inversesqrt(abs(A))"; break;
+    case ME_NOP:                f = "0.0"; break;
+    default:
+        return false;
+    }
+    /* Substitute the operands for A, B and C. */
+    size_t n = 0;
+    n += snprintf(buf + n, len - n, "vec4(");
+    for (const char *p = f; *p && n < len; p++) {
+        const char *r = *p == 'A' ? a : *p == 'B' ? b : *p == 'C' ? c : NULL;
+        if (r && (p == f || !isalnum((unsigned char)p[-1]) || p[-1] == '(') &&
+            !isalnum((unsigned char)p[1]) && p[1] != '_') {
+            n += snprintf(buf + n, len - n, "%s", r);
+        } else {
+            buf[n++] = *p;
+            buf[n] = 0;
+        }
+    }
+    if (n < len) {
+        snprintf(buf + n, len - n, ")");
+    }
+    return n + 1 < len;
+}
+
+static bool pg_vector(unsigned op, char *buf, size_t len)
+{
+    const char *f;
+
+    switch (op) {
+    case VE_NOP:                    f = "vec4(0.0)"; break;
+    case VE_DOT_PRODUCT:            f = "vec4(dot(A, B))"; break;
+    case VE_MULTIPLY:               f = "A * B"; break;
+    case VE_ADD:                    f = "A + B"; break;
+    case VE_MULTIPLY_ADD:           f = "A * B + C"; break;
+    case VE_DISTANCE_VECTOR:        f = "vec4(1.0, A.y * B.y, A.z, B.w)"; break;
+    case VE_FRACTION:               f = "A - floor(A)"; break;
+    case VE_MAXIMUM:                f = "max(A, B)"; break;
+    case VE_MINIMUM:                f = "min(A, B)"; break;
+    case VE_SET_GREATER_THAN_EQUAL: f = "vec4(greaterThanEqual(A, B))"; break;
+    case VE_SET_LESS_THAN:          f = "vec4(lessThan(A, B))"; break;
+    case VE_MULTIPLYX2_ADD:         f = "2.0 * (A * B) + C"; break;
+    case VE_MULTIPLY_CLAMP:
+        f = "vec4(C.w < A.w * B.w ? C.w : C.x >= A.x * B.x ? C.x : A.x * B.x)"; break;
+    case VE_FLT2FIX_DX:             f = "floor(A)"; break;
+    case VE_FLT2FIX_DX_RND:         f = "floor(A + 0.5)"; break;
+    case VE_COND_MUX_EQ:            f = "mix(C, B, equal(A, vec4(0.0)))"; break;
+    case VE_COND_MUX_GT:            f = "mix(C, B, greaterThan(A, vec4(0.0)))"; break;
+    case VE_COND_MUX_GTE:           f = "mix(C, B, greaterThanEqual(A, vec4(0.0)))"; break;
+    case VE_SET_GREATER_THAN:       f = "vec4(greaterThan(A, B))"; break;
+    case VE_SET_EQUAL:              f = "vec4(equal(A, B))"; break;
+    case VE_SET_NOT_EQUAL:          f = "vec4(notEqual(A, B))"; break;
+    default:
+        return false;
+    }
+    snprintf(buf, len, "%s", f);
+    return true;
+}
+
+/* pvs_write(): r (a vec4 variable) into the destination d0 names. */
+static void pg_write(PVSGlsl *g, uint32_t d0, const char *r)
+{
+    unsigned type = (d0 >> 8) & 0xF;
+    unsigned mask = (d0 >> 20) & 0xF;
+    unsigned mode = ((d0 >> 31) & 1) | (((d0 >> 12) & 1) << 1);
+    unsigned idx = (d0 >> 13) & 0x7F;
+    char dst[16];
+
+    if (mode == 1) {
+        g->ok = false;              /* A0-relative destination */
+        return;
+    }
+    switch (type) {
+    case DST_TEMP:
+        if (idx >= R300_PVS_NUM_TEMPS) {
+            return;
+        }
+        g->temp[idx] = true;
+        snprintf(dst, sizeof(dst), "t%u", idx);
+        break;
+    case DST_A0:
+        for (int i = 0; i < 4; i++) {
+            if (mask & (1u << i)) {
+                r300_sb_printf(g->sb, "    a0[%d] = int(clamp(floor(%s.%c), -256.0, 255.0));\n",
+                               i, r, pvs_comp[i]);
+            }
+        }
+        return;
+    case DST_OUT:
+    case DST_OUT_REPL_X:
+        if (idx >= R300_PVS_NUM_OUTPUTS) {
+            return;
+        }
+        snprintf(dst, sizeof(dst), "o%u", idx);
+        break;
+    case DST_ALT:
+        if (idx >= R300_PVS_NUM_ALT_TEMPS) {
+            return;
+        }
+        g->alt[idx] = true;
+        snprintf(dst, sizeof(dst), "at%u", idx);
+        break;
+    default:
+        return;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (mask & (1u << i)) {
+            r300_sb_printf(g->sb, "    %s.%c = %s.%c;\n", dst, pvs_comp[i], r,
+                           type == DST_OUT_REPL_X ? 'x' : pvs_comp[i]);
+        }
+    }
+}
+
+static void pg_inst(PVSGlsl *g, const uint32_t *d)
+{
+    uint32_t d0 = d[0];
+    unsigned op = d0 & 0x3F;
+    bool math = (d0 >> 6) & 1;
+    bool macro = (d0 >> 7) & 1;
+    bool dual = !math && !macro && ((d0 >> 28) & 1);
+    char e[512];
+
+    if ((d0 >> 26) & 1) {
+        g->ok = false;              /* predication */
+        return;
+    }
+    pg_src(g, "A", d[1]);
+    pg_src(g, "B", d[2]);
+    if (!dual) {
+        pg_src(g, "C", d[3]);
+    } else {
+        r300_sb_printf(g->sb, "    C = vec4(0.0);\n");
+    }
+    if (math) {
+        if (!pg_math(op, "A.w", "B.w", "C.w", e, sizeof(e))) {
+            g->ok = false;
+            return;
+        }
+        r300_sb_printf(g->sb, "    R = %s;\n", e);
+        if ((d0 >> 25) & 1) {
+            r300_sb_printf(g->sb, "    R = clamp(R, 0.0, 1.0);\n");
+        }
+        pg_write(g, d0, "R");
+        return;
+    }
+    if (!pg_vector(macro ? ((op & 1) ? VE_MULTIPLYX2_ADD : VE_MULTIPLY_ADD) : op,
+                   e, sizeof(e))) {
+        g->ok = false;
+        return;
+    }
+    r300_sb_printf(g->sb, "    R = %s;\n", e);
+    if ((d0 >> 24) & 1) {
+        r300_sb_printf(g->sb, "    R = clamp(R, 0.0, 1.0);\n");
+    }
+    if (dual) {
+        uint32_t s = d[3];
+        unsigned mop = ((s >> 21) & 0xF) | (((s >> 2) & 1) << 4);
+        char base[64], x[24], y[24];
+
+        pg_base(g, s, base, sizeof(base));
+        pg_comp(x, sizeof(x), (s >> 13) & 7, s & (1u << 3), s & (1u << 25));
+        pg_comp(y, sizeof(y), (s >> 16) & 7, s & (1u << 3), s & (1u << 26));
+        r300_sb_printf(g->sb, "    pb = %s; M = vec4(%s, %s, 0.0, 0.0);\n", base, x, y);
+        if (!pg_math(mop, "M.x", "M.y", "M.y", e, sizeof(e))) {
+            g->ok = false;
+            return;
+        }
+        r300_sb_printf(g->sb, "    M = %s;\n", e);
+        if ((d0 >> 25) & 1) {
+            r300_sb_printf(g->sb, "    M = clamp(M, 0.0, 1.0);\n");
+        }
+        pg_write(g, d0, "R");
+        unsigned at = (s >> 19) & 3, comp = (s >> 27) & 3;
+        g->alt[at] = true;
+        r300_sb_printf(g->sb, "    at%u.%c = M.%c;\n", at, pvs_comp[comp], pvs_comp[comp]);
+        return;
+    }
+    pg_write(g, d0, "R");
+}
+
+const char r300_pvs_glsl_helpers[] =
+"#define PVS_FLT_MAX 3.40282347e38\n"
+"float pvs_pow_ff(float b, float e)\n"
+"{\n"
+"    if (b == 0.0) return e < 0.0 ? uintBitsToFloat(0x7F800000u) : 0.0;\n"
+"    if (e == 0.0) return 1.0;\n"
+"    return b < 0.0 ? -pow(-b, e) : pow(b, e);\n"
+"}\n"
+"vec4 pvs_log_dx(float a)\n"
+"{\n"
+"    if (a == 0.0) return vec4(-PVS_FLT_MAX, 1.0, -PVS_FLT_MAX, 1.0);\n"
+"    int e; float m = frexp(abs(a), e);\n"
+"    return vec4(float(e - 1), m * 2.0, log2(abs(a)), 1.0);\n"
+"}\n";
+
+bool r300_pvs_to_glsl(const R300PVSProgram *prog, R300Sb *sb, uint32_t *in_used)
+{
+    PVSGlsl g = { .prog = prog, .ok = prog->fc_opc == 0 };
+    R300Sb body;
+
+    if (!g.ok) {
+        return false;               /* flow control: the interpreter's */
+    }
+    r300_sb_init(&body);
+    g.sb = &body;
+    for (unsigned pc = prog->first_inst;
+         pc <= prog->last_inst && pc < R300_PVS_MAX_INSTS && g.ok; pc++) {
+        pg_inst(&g, &prog->code[pc * 4]);
+    }
+    if (g.ok) {
+        r300_sb_printf(sb, "    vec4 pb, A, B, C, R, M;\n    ivec4 a0 = ivec4(0);\n");
+        for (unsigned k = 0; k < R300_PVS_NUM_TEMPS; k++) {
+            if (g.temp[k]) {
+                r300_sb_printf(sb, "    vec4 t%u = vec4(0.0);\n", k);
+            }
+        }
+        for (unsigned k = 0; k < R300_PVS_NUM_ALT_TEMPS; k++) {
+            if (g.alt[k]) {
+                r300_sb_printf(sb, "    vec4 at%u = vec4(0.0);\n", k);
+            }
+        }
+        for (unsigned k = 0; k < R300_PVS_NUM_OUTPUTS; k++) {
+            r300_sb_printf(sb, "    vec4 o%u = vec4(0.0);\n", k);
+        }
+        r300_sb_printf(sb, "%s", body.buf);
+        *in_used = g.in_used;
+    }
+    r300_sb_free(&body);
+    return g.ok;
 }
