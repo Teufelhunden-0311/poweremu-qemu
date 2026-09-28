@@ -28,7 +28,9 @@ vaddfp vsubfp vmaxfp vminfp vmaddfp vnmsubfp vrefp vcfsx vcfux vctsxs vctuxs
 """.split()
 BENCH = ['vperm x4', 'vmrghb/vmrglh/vsldoi/vpkuhum',
          'vmuleub/vmsumubm/vpkshus/vupkhsb', 'vaddubm x4 (always inline)',
-         'vmaddfp x4 (float)']
+         'vmaddfp x4 (float)', 'lfs/fmadds/stfs x4 (scalar)',
+         'fmadd x4 dependent', 'fmadd x4 independent', 'fadd x4 dependent',
+         'add x4 dependent (integer)']
 
 
 def tool(name):
@@ -118,8 +120,15 @@ def main():
         tbfreq = 25_000_000  # mac99 timebase (TBFREQ)
         for name, t in zip(BENCH, mon.words(RESULTS + 0x800, len(BENCH))):
             print(f'bench {name:36s} {t / tbfreq * 1e3:8.1f} ms')
+        fchecks, ffails = mon.words(RESULTS + 0xa00, 2)
+        for k in range(min(ffails, 4)):
+            p = mon.words(RESULTS + 0xa80 + k * 32, 7)
+            what = ('lfs', 'stfs')[p[0]]
+            print(f'FAIL {what} in={p[1]:08x}{p[2]:08x} '
+                  f'got={p[3]:08x}{p[4]:08x} expected={p[5]:08x}{p[6]:08x}')
         print(f'{checks} checks, {fails} failures')
-        sys.exit(1 if fails else 0)
+        print(f'{fchecks} lfs/stfs checks, {ffails} failures')
+        sys.exit(1 if fails or ffails else 0)
     finally:
         q.kill()
 

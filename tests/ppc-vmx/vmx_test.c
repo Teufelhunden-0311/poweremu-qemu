@@ -584,6 +584,190 @@ static void bench(void)
                      : "+v"(a.v) : "v"(b.v), "v"(c.v));
     }
     res[0x204] = tb() - t0;
+
+    /* lfs; fmadds; stfs on an array of normal singles, x4 per iteration */
+    {
+        static float buf[64];
+        float k = 1.0f;
+        for (i = 0; i < 64; i++) {
+            buf[i] = 1.0f + i * 0.125f;
+        }
+        t0 = tb();
+        for (i = 0; i < BENCH_ITERS; i++) {
+            float *p = &buf[(i * 4) & 63];
+            asm volatile("lfs 1,0(%0)\n\tfmadds 1,1,%1,%1\n\tstfs 1,0(%0)\n\t"
+                         "lfs 2,4(%0)\n\tfmadds 2,2,%1,%1\n\tstfs 2,4(%0)\n\t"
+                         "lfs 3,8(%0)\n\tfmadds 3,3,%1,%1\n\tstfs 3,8(%0)\n\t"
+                         "lfs 4,12(%0)\n\tfmadds 4,4,%1,%1\n\tstfs 4,12(%0)"
+                         : : "b"(p), "f"(k) : "fr1", "fr2", "fr3", "fr4", "memory");
+            k = k * 0.5f + 0.25f;
+        }
+        res[0x205] = tb() - t0;
+    }
+
+    /* scalar FP latency: dependent chains vs independent vs integer */
+    {
+        double x = 1.0, y = 1.0, z = 1.0, w = 1.0, h = 0.5, q = 0.25;
+        uint32_t r = 1, k = 3;
+
+        t0 = tb();
+        for (i = 0; i < BENCH_ITERS; i++) {
+            asm volatile("fmadd %0,%0,%1,%2\n\tfmadd %0,%0,%1,%2\n\t"
+                         "fmadd %0,%0,%1,%2\n\tfmadd %0,%0,%1,%2"
+                         : "+f"(x) : "f"(h), "f"(q));
+        }
+        res[0x206] = tb() - t0;
+
+        t0 = tb();
+        for (i = 0; i < BENCH_ITERS; i++) {
+            asm volatile("fmadd %0,%0,%4,%5\n\tfmadd %1,%1,%4,%5\n\t"
+                         "fmadd %2,%2,%4,%5\n\tfmadd %3,%3,%4,%5"
+                         : "+f"(x), "+f"(y), "+f"(z), "+f"(w) : "f"(h), "f"(q));
+        }
+        res[0x207] = tb() - t0;
+
+        t0 = tb();
+        for (i = 0; i < BENCH_ITERS; i++) {
+            asm volatile("fadd %0,%0,%1\n\tfadd %0,%0,%1\n\t"
+                         "fadd %0,%0,%1\n\tfadd %0,%0,%1"
+                         : "+f"(x) : "f"(q));
+        }
+        res[0x208] = tb() - t0;
+
+        t0 = tb();
+        for (i = 0; i < BENCH_ITERS; i++) {
+            asm volatile("add %0,%0,%1\n\tadd %0,%0,%1\n\t"
+                         "add %0,%0,%1\n\tadd %0,%0,%1"
+                         : "+r"(r) : "r"(k));
+        }
+        res[0x209] = tb() - t0;
+        res[0x20a] = r ^ (uint32_t)(x + y + z + w);
+    }
+}
+
+/*
+ * Scalar lfs/stfs: single <-> double conversion, which the translator
+ * inlines for normal numbers (target/ppc/translate/fp-impl.c.inc).  The
+ * references are helper_todouble/helper_tosingle's logic in integer code.
+ * lfd/stfd move the 64-bit register image in and out unconverted.
+ */
+static uint64_t ref_todouble(uint32_t a)
+{
+    uint32_t abs = a & 0x7fffffff, e = (a >> 23) & 0xff;
+    uint64_t r = (uint64_t)(a >> 31) << 63;
+
+    if (abs >= 0x00800000) {
+        if (e == 0xff) {
+            return r | (0x7ffULL << 52) | (uint64_t)(a & 0x7fffff) << 29;
+        }
+        return r | (uint64_t)(e + 896) << 52 | (uint64_t)(a & 0x7fffff) << 29;
+    }
+    if (abs) {
+        int shift = __builtin_clz(abs) - 8;
+        r |= (uint64_t)(-126 - shift + 1023 - 1) << 52;
+        r += (uint64_t)abs << (52 - 23 + shift);
+    }
+    return r;
+}
+
+static uint32_t ref_tosingle(uint64_t a)
+{
+    int e = (a >> 52) & 0x7ff;
+    uint32_t r;
+
+    if (e > 896) {
+        return (uint32_t)(a >> 62) << 30 | (uint32_t)((a >> 29) & 0x3fffffff);
+    }
+    r = (uint32_t)(a >> 63) << 31;
+    if (e >= 874) {
+        r |= ((1ULL << 52) | (a & 0xfffffffffffffULL)) >> (896 + 30 - e);
+    }
+    return r;
+}
+
+static uint64_t hw_lfs(uint32_t s)
+{
+    volatile uint32_t in = s;
+    volatile uint64_t out;
+    double f;
+    asm volatile("lfs %0,0(%1)" : "=f"(f) : "b"(&in) : "memory");
+    asm volatile("stfd %0,0(%1)" : : "f"(f), "b"(&out) : "memory");
+    return out;
+}
+
+static uint32_t hw_stfs(uint64_t d)
+{
+    volatile uint64_t in = d;
+    volatile uint32_t out;
+    double f;
+    asm volatile("lfd %0,0(%1)" : "=f"(f) : "b"(&in) : "memory");
+    asm volatile("stfs %0,0(%1)" : : "f"(f), "b"(&out) : "memory");
+    return out;
+}
+
+static void fp_log(uint32_t kind, uint64_t in, uint64_t got, uint64_t exp)
+{
+    volatile uint32_t *p = res + 0x2a0 + (res[0x281] - 1) * 8;
+    if (res[0x281] > 4) {
+        return;
+    }
+    p[0] = kind;
+    p[1] = in >> 32;  p[2] = in;
+    p[3] = got >> 32; p[4] = got;
+    p[5] = exp >> 32; p[6] = exp;
+}
+
+static void check_lfs(uint32_t s)
+{
+    uint64_t got = hw_lfs(s), exp = ref_todouble(s);
+    res[0x280]++;
+    if (got != exp) {
+        res[0x281]++;
+        fp_log(0, s, got, exp);
+    }
+}
+
+static void check_stfs(uint64_t d)
+{
+    uint32_t got = hw_stfs(d), exp = ref_tosingle(d);
+    res[0x280]++;
+    if (got != exp) {
+        res[0x281]++;
+        fp_log(1, d, got, exp);
+    }
+}
+
+static void scalar_ldst(uint32_t *seed)
+{
+    static const uint32_t s_edge[] = {
+        0x00000000, 0x80000000, 0x00000001, 0x807fffff, 0x00400000,
+        0x00800000, 0x80800000, 0x3f800000, 0xbf800000, 0x7f7fffff,
+        0xff7fffff, 0x7f800000, 0xff800000, 0x7fc00000, 0x7f800001,
+        0xffbfffff, 0x40000000, 0x3fffffff, 0x7f000000, 0x00ffffff,
+    };
+    int i, e;
+
+    for (i = 0; i < (int)(sizeof(s_edge) / sizeof(s_edge[0])); i++) {
+        check_lfs(s_edge[i]);
+        check_stfs(ref_todouble(s_edge[i]));
+    }
+    /* stfs around its exponent boundaries (874, 896/897, 0x7ff) */
+    for (e = 860; e < 910; e++) {
+        for (i = 0; i < 20; i++) {
+            uint64_t m = (uint64_t)rnd(seed) << 32 | rnd(seed);
+            check_stfs((m & 0x800fffffffffffffULL) | (uint64_t)e << 52);
+        }
+    }
+    for (i = 0; i < 20; i++) {
+        uint64_t m = (uint64_t)rnd(seed) << 32 | rnd(seed);
+        check_stfs(m | 0x7ff0000000000000ULL);
+        check_stfs(m & 0x800fffffffffffffULL);
+    }
+    for (i = 0; i < 20000; i++) {
+        uint32_t s = rnd(seed);
+        check_lfs(s);
+        check_stfs((uint64_t)rnd(seed) << 32 | rnd(seed));
+    }
 }
 
 int main(void)
@@ -636,6 +820,7 @@ int main(void)
     }
     res[1] = checks;
     res[2] = fails;
+    scalar_ldst(&seed);
     bench();
     res[0] = 0x564d5854; /* 'VMXT' */
     return 0;
