@@ -923,6 +923,9 @@ static uint64_t fpd_pool(uint32_t *seed)
         0x3ff0000000000001ull, 0x4000000010000000ull,  /* inexact singles */
         0x4059000000000000ull, 0xc059000000000000ull,  /* +-100 */
         0x8000000000000001ull, 0x000fffffffffffffull,  /* -min, +max denormal */
+        0x380fffffffffffffull, 0xb80ffffff0000000ull,  /* just under 2^-126 */
+        0x47efffffefffffffull, 0xc7effffff0000000ull,  /* near single max */
+        0x3ff0000010000000ull, 0x3ff0000030000000ull,  /* single ties */
     };
     uint32_t r = rnd(seed);
     uint64_t m = (uint64_t)rnd(seed) << 32 | rnd(seed);
@@ -958,6 +961,11 @@ static uint64_t fpd_pool(uint32_t *seed)
     case 1: FPD_ASM(m " 2,2,4"); FPD_OUT(2); break; \
     case 2: FPD_ASM(m " 4,4,2"); FPD_OUT(4); break; \
     case 3: FPD_ASM(m " 4,2,4"); FPD_OUT(4); break;
+#define FPD_OPR(m) \
+    case 0: FPD_ASM(m " 1,4"); FPD_OUT(1); break; \
+    case 1: FPD_ASM(m " 4,4"); FPD_OUT(4); break; \
+    case 2: FPD_ASM(m " 1,2"); FPD_OUT(1); break; \
+    case 3: FPD_ASM(m " 2,2"); FPD_OUT(2); break;
 #define FPD_OPC(m) \
     case 0: FPD_ASM(m " 1,2,3"); FPD_OUT(1); break; \
     case 1: FPD_ASM(m " 2,2,3"); FPD_OUT(2); break; \
@@ -983,6 +991,7 @@ static void fpd_one(volatile uint64_t *buf, int op, int form)
     case 13: switch (form) { FPD_OP3("fnmadds") } break;
     case 14: switch (form) { FPD_OP3("fnmsub") }  break;
     case 15: switch (form) { FPD_OP3("fnmsubs") } break;
+    case 16: switch (form) { FPD_OPR("frsp") }    break;
     }
 }
 
@@ -1033,7 +1042,7 @@ static void fp_diff(uint32_t *seed)
             } else if ((k & 15) == 1) {
                 b = a ^ 0x8000000000000000ull;
             }
-            for (int op = 0; op < 16; op++) {
+            for (int op = 0; op < 17; op++) {
                 for (int form = 0; form < 4; form++) {
                     buf[0] = a; buf[1] = c; buf[2] = b;
                     buf[5] = 0x7ff8dead0000beefull;   /* old f1 */

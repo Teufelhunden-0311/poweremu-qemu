@@ -312,6 +312,80 @@ static void native_fcmpu(DisasContext *ctx, int crf, int ra, int rb)
                      offsetof(CPUPPCState, fp_status.float_exception_flags));
 }
 
+/* A NativeFPSlow op for frsp */
+#define NATIVE_FRSP (-2)
+
+/* PPC_NATIVE_FRSP=0 keeps frsp on the helpers (for A/B tests). */
+static bool native_frsp_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPC_NATIVE_FRSP");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/*
+ * frsp on the host: convert to single and back.  The helper sequence
+ * (reset status, frsp, FPRF, check status) also sets FPSCR XX and FX when
+ * the result is inexact, and FI to whether it is; that is the result's bits
+ * differing from the input's, so it is done here too.  Inputs that are
+ * tiny for a single (underflow, which softfloat detects before rounding),
+ * results that overflow, and NaNs take the slow path.  FPRF is left
+ * pending in fprf_res, as for the arithmetic.
+ */
+static void native_frsp(DisasContext *ctx, int frt, int frb)
+{
+    NativeFPSlow *sp = &ctx->nfp[ctx->n_nfp++];
+    TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V64);
+    TCGv_vec s = tcg_temp_new_vec(TCG_TYPE_V64);
+    TCGv_i64 x = tcg_temp_new_i64(), res = tcg_temp_new_i64();
+    TCGv_i64 t = tcg_temp_new_i64(), u = tcg_temp_new_i64();
+    TCGv_i32 r32 = tcg_temp_new_i32();
+    TCGv tl = tcg_temp_new();
+
+    *sp = (NativeFPSlow) {
+        .slow = gen_new_label(), .next = ctx->base.pc_next,
+        .op = NATIVE_FRSP, .frt = frt, .x = frb, .y = frb, .z = -1,
+    };
+
+    tcg_gen_ld_vec(v, tcg_env, fpr_offset(frb));
+    tcg_gen_fcvt_vec(false, s, v);
+    tcg_gen_fcvt_vec(true, v, s);
+    tcg_gen_st_vec(v, tcg_env, offsetof(CPUPPCState, fprf_res));
+    tcg_gen_ld_i64(res, tcg_env, offsetof(CPUPPCState, fprf_res));
+    get_fpr(x, frb);
+
+    /* slow: result Inf or NaN from a non-Inf input, or input below 2^-126 */
+    tcg_gen_shli_i64(t, res, 1);
+    tcg_gen_setcondi_i64(TCG_COND_GEU, t, t, 0xffe0000000000000ull);
+    tcg_gen_shli_i64(u, x, 1);
+    tcg_gen_setcondi_i64(TCG_COND_NE, u, u, 0xffe0000000000000ull);
+    tcg_gen_and_i64(t, t, u);
+    tcg_gen_brcondi_i64(TCG_COND_NE, t, 0, sp->slow);
+    tcg_gen_shli_i64(u, x, 1);
+    tcg_gen_subi_i64(u, u, 1);  /* +-0 wraps to the top: not tiny */
+    tcg_gen_brcondi_i64(TCG_COND_LTU, u, (0x381ull << 53) - 1, sp->slow);
+
+    tcg_gen_st_vec(v, tcg_env, fpr_offset(frt));
+    if (ctx->insns_flags2 & PPC2_VSX) {
+        tcg_gen_st_i64(tcg_constant_i64(0), tcg_env, vsr64_offset(frt, false));
+    }
+
+    /* inexact: XX and FX set, FI set or cleared; softfloat's flags too */
+    tcg_gen_setcond_i64(TCG_COND_NE, t, res, x);
+    tcg_gen_extrl_i64_i32(r32, t);
+    tcg_gen_shli_i32(r32, r32, 4);      /* float_flag_inexact */
+    tcg_gen_st16_i32(r32, tcg_env,
+                     offsetof(CPUPPCState, fp_status.float_exception_flags));
+    tcg_gen_neg_i64(t, t);
+    tcg_gen_andi_i64(t, t, FP_XX | FP_FX | FP_FI);
+    tcg_gen_trunc_i64_tl(tl, t);
+    tcg_gen_andi_tl(cpu_fpscr, cpu_fpscr, ~(target_ulong)FP_FI);
+    tcg_gen_or_tl(cpu_fpscr, cpu_fpscr, tl);
+}
+
 /* After the TB's exit: each slow path, then on to the next instruction. */
 static void native_fp_emit_slow_paths(DisasContext *ctx)
 {
@@ -328,6 +402,16 @@ static void native_fp_emit_slow_paths(DisasContext *ctx)
         if (sp->op == NATIVE_FCMPU) {
             gen_reset_fpstatus();
             gen_helper_fcmpu(tcg_env, t0, t1, tcg_constant_i32(sp->frt));
+            gen_helper_float_check_status(tcg_env);
+            gen_update_nip(ctx, sp->next);
+            tcg_gen_lookup_and_goto_ptr();
+            continue;
+        }
+        if (sp->op == NATIVE_FRSP) {
+            gen_reset_fpstatus();
+            gen_helper_frsp(t3, tcg_env, t0);
+            set_fpr(sp->frt, t3);
+            gen_helper_compute_fprf_float64(tcg_env, t3);
             gen_helper_float_check_status(tcg_env);
             gen_update_nip(ctx, sp->next);
             tcg_gen_lookup_and_goto_ptr();
@@ -573,7 +657,31 @@ GEN_FLOAT_B(ctiwz, 0x0F, 0x00, 0, PPC_FLOAT);
 /* fctiwuz */
 GEN_FLOAT_B(ctiwuz, 0x0F, 0x04, 0, PPC2_FP_CVT_ISA206);
 /* frsp */
-GEN_FLOAT_B(rsp, 0x0C, 0x00, 1, PPC_FLOAT);
+static void gen_frsp(DisasContext *ctx)
+{
+    TCGv_i64 t0, t1;
+
+    if (unlikely(!ctx->fpu_enabled)) {
+        gen_exception(ctx, POWERPC_EXCP_FPU);
+        return;
+    }
+    if (!Rc(ctx->opcode) && native_fp(ctx) && native_frsp_on()) {
+        native_frsp(ctx, rD(ctx->opcode), rB(ctx->opcode));
+        return;
+    }
+    /* as GEN_FLOAT_B(rsp, 0x0C, 0x00, 1, PPC_FLOAT) */
+    t0 = tcg_temp_new_i64();
+    t1 = tcg_temp_new_i64();
+    gen_reset_fpstatus();
+    get_fpr(t0, rB(ctx->opcode));
+    gen_helper_frsp(t1, tcg_env, t0);
+    set_fpr(rD(ctx->opcode), t1);
+    gen_helper_compute_fprf_float64(tcg_env, t1);
+    gen_helper_float_check_status(tcg_env);
+    if (unlikely(Rc(ctx->opcode) != 0)) {
+        gen_set_cr1_from_fpscr(ctx);
+    }
+}
 /* fcfid */
 GEN_FLOAT_B(cfid, 0x0E, 0x1A, 1, PPC2_FP_CVT_S64);
 /* fcfids */
