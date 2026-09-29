@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/atomic.h"
 #include "qemu/log.h"
 
 #ifdef CONFIG_DARWIN
@@ -1228,9 +1229,26 @@ static void metal_extract_vertices(const PPCMacGPU3DState *state,
     }
 }
 
+static bool rqueue_start(PPCMacGPUMetalState *st);
+static void rqueue_stop(void);
+
 /* ========================================================================
  * Renderer interface implementation
  * ======================================================================== */
+
+/*
+ * The render queue (implemented further down, with the R200 batch state
+ * it feeds): a lock-free ring of decoded draws, encoded by a thread that
+ * holds no QEMU lock.  g_render_lock serialises that thread against the
+ * renderer's other entry points, which the device calls under the BQL.
+ * Lock order is always BQL -> g_render_lock; the render thread takes
+ * only g_render_lock, so no cycle can form.
+ */
+static pthread_mutex_t g_render_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool rqueue_wanted(void);
+static bool rqueue_enabled(void);
+static bool rqueue_pending(void);
+static void rqueue_drain(void);
 
 static void *metal_init(uint8_t *vram_ptr, uint64_t vram_size)
 {
@@ -1396,6 +1414,8 @@ static void *metal_init(uint8_t *vram_ptr, uint64_t vram_size)
                  [[st->device name] UTF8String]);
     }
 
+    rqueue_start(st);
+
     return st;
 }
 
@@ -1403,6 +1423,8 @@ static void metal_fini(void *opaque)
 {
     PPCMacGPUMetalState *st = opaque;
     if (!st) return;
+
+    rqueue_stop();
 
     /* Free shadow RT buffers */
     for (int i = 0; i < SHADOW_RT_MAX; i++) {
@@ -1621,7 +1643,19 @@ static void shadow_rt_save_region(PPCMacGPUMetalState *st,
     }
 }
 
+static void *metal_scanout_locked(void *opaque, const PPCMacGPUScanout *desc);
+
 static void *metal_scanout(void *opaque, const PPCMacGPUScanout *desc)
+{
+    void *r;
+
+    pthread_mutex_lock(&g_render_lock);
+    r = metal_scanout_locked(opaque, desc);
+    pthread_mutex_unlock(&g_render_lock);
+    return r;
+}
+
+static void *metal_scanout_locked(void *opaque, const PPCMacGPUScanout *desc)
 {
     /* Metal backend doesn't handle scanout differently yet.
      * The 2D scanout path in the main device still works for display. */
@@ -1642,11 +1676,29 @@ static void *metal_scanout(void *opaque, const PPCMacGPUScanout *desc)
  *
  * Pixels are in BE format (same as VRAM / guest).
  */
+static void metal_srt_write_through_locked(void *opaque, uint8_t *vram_ptr,
+                                           uint32_t dst_offset, uint32_t dst_pitch,
+                                           uint32_t dst_x, uint32_t dst_y,
+                                           uint32_t width, uint32_t height,
+                                           uint32_t bpp);
+
 static void metal_srt_write_through(void *opaque, uint8_t *vram_ptr,
-                                     uint32_t dst_offset, uint32_t dst_pitch,
-                                     uint32_t dst_x, uint32_t dst_y,
-                                     uint32_t width, uint32_t height,
-                                     uint32_t bpp)
+                                    uint32_t dst_offset, uint32_t dst_pitch,
+                                    uint32_t dst_x, uint32_t dst_y,
+                                    uint32_t width, uint32_t height,
+                                    uint32_t bpp)
+{
+    pthread_mutex_lock(&g_render_lock);
+    metal_srt_write_through_locked(opaque, vram_ptr, dst_offset, dst_pitch,
+                                   dst_x, dst_y, width, height, bpp);
+    pthread_mutex_unlock(&g_render_lock);
+}
+
+static void metal_srt_write_through_locked(void *opaque, uint8_t *vram_ptr,
+                                           uint32_t dst_offset, uint32_t dst_pitch,
+                                           uint32_t dst_x, uint32_t dst_y,
+                                           uint32_t width, uint32_t height,
+                                           uint32_t bpp)
 {
     PPCMacGPUMetalState *st = opaque;
     if (!st || bpp != 32) return;
@@ -2056,8 +2108,25 @@ static void drag_body_paste(PPCMacGPUMetalState *st, uint8_t *vram)
      * No deferred paste needed. */
 }
 
+static int metal_blit_2d_locked(void *opaque, uint8_t *vram_ptr,
+                                const PPCMacGPUBlit *blit);
+
 static int metal_blit_2d(void *opaque, uint8_t *vram_ptr,
                           const PPCMacGPUBlit *blit)
+{
+    int r;
+
+    /* Shadow RTs and the drag trackers are shared with the render
+     * thread's encodes; serialise (the whole function reads and writes
+     * them throughout). */
+    pthread_mutex_lock(&g_render_lock);
+    r = metal_blit_2d_locked(opaque, vram_ptr, blit);
+    pthread_mutex_unlock(&g_render_lock);
+    return r;
+}
+
+static int metal_blit_2d_locked(void *opaque, uint8_t *vram_ptr,
+                                const PPCMacGPUBlit *blit)
 {
     PPCMacGPUMetalState *st = opaque;
     if (!st || !blit || blit->rop3 != 0xCC) {
@@ -3569,7 +3638,24 @@ static void metal_writeback_vram_region(PPCMacGPUMetalState *st,
     }
 }
 
+static int metal_draw_3d_locked(void *opaque, uint8_t *vram_ptr,
+                                uint64_t vram_size,
+                                const PPCMacGPU3DState *state,
+                                const PPCMacGPU3DDrawCmd *cmd);
+
 static int metal_draw_3d(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
+                          const PPCMacGPU3DState *state,
+                          const PPCMacGPU3DDrawCmd *cmd)
+{
+    int r;
+
+    pthread_mutex_lock(&g_render_lock);
+    r = metal_draw_3d_locked(opaque, vram_ptr, vram_size, state, cmd);
+    pthread_mutex_unlock(&g_render_lock);
+    return r;
+}
+
+static int metal_draw_3d_locked(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                           const PPCMacGPU3DState *state,
                           const PPCMacGPU3DDrawCmd *cmd)
 {
@@ -5562,7 +5648,12 @@ static int metal_draw_3d(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
 static void metal_mode_change(void *opaque, const PPCMacGPUScanout *new_mode)
 {
     PPCMacGPUMetalState *st = opaque;
-    if (!st || !new_mode) return;
+
+    pthread_mutex_lock(&g_render_lock);
+    if (!st || !new_mode) {
+        pthread_mutex_unlock(&g_render_lock);
+        return;
+    }
 
     st->scanout_width = new_mode->width;
     st->scanout_height = new_mode->height;
@@ -5574,6 +5665,7 @@ static void metal_mode_change(void *opaque, const PPCMacGPUScanout *new_mode)
         st->rt_width = 0;
         st->rt_height = 0;
     }
+    pthread_mutex_unlock(&g_render_lock);
 }
 
 static uint32_t metal_get_caps(void *opaque)
@@ -5680,6 +5772,7 @@ static bool metal_get_drag_state(void *opaque,
     PPCMacGPUMetalState *st = opaque;
     if (!st) return false;
 
+    pthread_mutex_lock(&g_render_lock);
     /* Find most recently active tracker */
     for (int i = 0; i < DRAG_TRACKER_MAX; i++) {
         if (st->drag_trackers[i].active &&
@@ -5689,9 +5782,11 @@ static bool metal_get_drag_state(void *opaque,
             *blit_w = st->drag_trackers[i].blit_w;
             *blit_h = st->drag_trackers[i].blit_h;
             *frame_gen = st->drag_trackers[i].cur_frame_gen;
+            pthread_mutex_unlock(&g_render_lock);
             return true;
         }
     }
+    pthread_mutex_unlock(&g_render_lock);
     return false;
 }
 
@@ -5699,7 +5794,9 @@ static void metal_flush_drag_paste(void *opaque, uint8_t *vram)
 {
     PPCMacGPUMetalState *st = opaque;
     if (st) {
+        pthread_mutex_lock(&g_render_lock);
         drag_body_paste(st, vram);
+        pthread_mutex_unlock(&g_render_lock);
     }
 }
 
@@ -6127,7 +6224,9 @@ static id<MTLRenderPipelineState> g_r200_clear_pipeline;
 static id<MTLSamplerState> g_r200_samplers[256];
 static id<MTLTexture> g_r200_dummy;
 
-static bool r200_metal_setup(id<MTLDevice> dev)
+static pthread_mutex_t g_r200_setup_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static bool r200_metal_setup_locked(id<MTLDevice> dev)
 {
     if (g_r200_pipeline) {
         return true;
@@ -6217,6 +6316,21 @@ static bool r200_metal_setup(id<MTLDevice> dev)
                       withBytes:&zero bytesPerRow:4];
     qemu_log("ppc-mac-gpu r200: direct renderer ready\n");
     return true;
+}
+
+/* Lazy pipeline compile, now reachable from two threads (the producer's
+ * draw validation and the render thread's encode). */
+static bool r200_metal_setup(id<MTLDevice> dev)
+{
+    bool ok;
+
+    if (g_r200_pipeline) {
+        return true;
+    }
+    pthread_mutex_lock(&g_r200_setup_lock);
+    ok = r200_metal_setup_locked(dev);
+    pthread_mutex_unlock(&g_r200_setup_lock);
+    return ok;
 }
 
 static MTLSamplerAddressMode r200_addr_mode(uint32_t clamp)
@@ -6441,6 +6555,303 @@ static bool r200_split_enabled(void)
     return on;
 }
 
+/*
+ * --------------------------------------------------------------------
+ * Render queue: Metal encoding off the BQL.
+ *
+ * The CP thread parses the ring under the BQL because registers, GART
+ * translation and interrupts are QEMU state.  The Metal half of a draw
+ * (view lookup, arena staging, the encoder, the commit) is not: it
+ * touches only this file's state and the GPU.  draw_r200/draw_r300
+ * therefore copy the decoded packet into a job and push it here, and
+ * the render thread encodes jobs in FIFO order with no QEMU lock held,
+ * so the vCPU, the CP thread and the GPU overlap completely.
+ *
+ * The ring itself is lock-free (one position counter per side, cells
+ * claimed by sequence number).  The pthread primitives appear only
+ * where a thread must sleep: producers when the ring is full (draw
+ * order must stay FIFO, so a draw can never be encoded on the
+ * producer's thread instead), the render thread when the ring is
+ * empty, and drain waiters until every pushed job has been encoded.
+ * A producer blocked on a full ring while holding the BQL cannot
+ * deadlock: whoever holds g_render_lock holds the BQL too, finishes
+ * without needing the queue, and the render thread drains.
+ *
+ * PPCGPU_RENDER_QUEUE=0 encodes synchronously on the caller's thread,
+ * as before (the device then also keeps taking the BQL around draws).
+ */
+
+enum { RQ_R200 = 0, RQ_R300 = 1 };
+
+/* Defined at the bottom of the file; rqueue_start flags it. */
+static PPCMacGPURenderer metal_renderer;
+
+typedef struct RQJob {
+    int kind;
+    R200DrawPacket r200;    /* owned copies: verts, indices, host_data */
+    R300DrawPacket r300;    /* owned copies: see r300_job_new */
+} RQJob;
+
+/* r200_decode_tex_unit()'s AGP copy is pitch*height (DXT: block rows). */
+static uint64_t r200_tex_host_bytes(const R200TexUnit *t)
+{
+    uint64_t len = (uint64_t)t->pitch * t->height;
+    if (t->format == 12 || t->format == 14 || t->format == 15) {
+        len = (uint64_t)t->pitch * ((t->height + 3) / 4);
+    }
+    return len;
+}
+
+static RQJob *r200_job_new(const R200DrawPacket *pkt)
+{
+    RQJob *job = g_new0(RQJob, 1);
+
+    job->kind = RQ_R200;
+    job->r200 = *pkt;
+    job->r200.verts = g_memdup2(pkt->verts,
+                                (size_t)pkt->num_verts * sizeof(R200Vertex));
+    job->r200.indices = g_memdup2(pkt->indices,
+                                  (size_t)pkt->num_indices * 4);
+    for (int t = 0; t < R200_MAX_TEX; t++) {
+        if (pkt->tex[t].host_data) {
+            job->r200.tex[t].host_data =
+                g_memdup2(pkt->tex[t].host_data,
+                          r200_tex_host_bytes(&pkt->tex[t]));
+        }
+    }
+    return job;
+}
+
+static void r200_job_free(RQJob *job)
+{
+    g_free((void *)job->r200.verts);
+    g_free((void *)job->r200.indices);
+    for (int t = 0; t < R200_MAX_TEX; t++) {
+        g_free((void *)job->r200.tex[t].host_data);
+    }
+    g_free(job);
+}
+
+/* The R300 packet's owned fields (r300_draw_free's list), copied so the
+ * device can free its packet as soon as draw_r300 returns. */
+static RQJob *r300_job_new(const R300DrawPacket *pkt)
+{
+    RQJob *job = g_new0(RQJob, 1);
+    R300DrawPacket *p = &job->r300;
+
+    job->kind = RQ_R300;
+    *p = *pkt;
+    p->glsl = g_strdup(pkt->glsl);
+    p->vs_glsl = g_strdup(pkt->vs_glsl);
+    p->verts = g_memdup2(pkt->verts,
+                         (size_t)(pkt->num_verts + pkt->num_line_verts) *
+                         sizeof(R300Vertex));
+    p->vs_in = g_memdup2(pkt->vs_in, (size_t)pkt->vs_in_vecs * 16);
+    p->vs_idx = g_memdup2(pkt->vs_idx, (size_t)pkt->num_verts * 4);
+    p->vs_u = g_memdup2(pkt->vs_u, sizeof(*pkt->vs_u));
+    for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
+        if (pkt->tex[t].host_data) {
+            p->tex[t].host_data = g_memdup2(pkt->tex[t].host_data,
+                                            pkt->tex[t].size_bytes);
+        }
+    }
+    return job;
+}
+
+static void r300_job_free(RQJob *job)
+{
+    R300DrawPacket *p = &job->r300;
+
+    g_free(p->glsl);
+    g_free(p->vs_glsl);
+    g_free(p->verts);
+    g_free(p->vs_in);
+    g_free(p->vs_idx);
+    g_free(p->vs_u);
+    for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
+        g_free(p->tex[t].host_data);
+    }
+    g_free(job);
+}
+
+#define RQ_BITS 10
+#define RQ_SIZE (1u << RQ_BITS)
+#define RQ_MASK (RQ_SIZE - 1)
+typedef struct { RQJob *job; uintptr_t seq; } RQCell;
+static RQCell g_rq_cells[RQ_SIZE];
+static uintptr_t g_rq_enq, g_rq_deq;    /* next position to fill / to take */
+static uintptr_t g_rq_done;             /* jobs encoded and freed */
+static pthread_mutex_t g_rq_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_rq_space = PTHREAD_COND_INITIALIZER;   /* ring not full */
+static pthread_cond_t g_rq_work = PTHREAD_COND_INITIALIZER;    /* work arrived */
+static pthread_cond_t g_rq_idle = PTHREAD_COND_INITIALIZER;    /* all encoded */
+static pthread_t g_rq_thread;
+static bool g_rq_thread_started;
+static volatile bool g_rq_stop;
+static PPCMacGPUMetalState *g_rq_st;
+static uint64_t g_rq_stat_jobs, g_rq_stat_full;
+
+static bool rqueue_wanted(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_RENDER_QUEUE");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+static bool rqueue_enabled(void)
+{
+    return rqueue_wanted() && g_rq_thread_started;
+}
+
+/* Anything queued or still being encoded: range checks say "busy". */
+static bool rqueue_pending(void)
+{
+    return g_rq_thread_started &&
+           (qatomic_read(&g_rq_deq) != qatomic_read(&g_rq_enq) ||
+            qatomic_read(&g_rq_done) != qatomic_read(&g_rq_enq));
+}
+
+/* Wait until every job pushed so far has been encoded and freed.  Never
+ * called while holding g_render_lock (the render thread is what makes
+ * progress), so this cannot self-deadlock. */
+static void rqueue_drain(void)
+{
+    pthread_mutex_lock(&g_rq_mtx);
+    while (qatomic_read(&g_rq_done) != qatomic_read(&g_rq_enq)) {
+        pthread_cond_wait(&g_rq_idle, &g_rq_mtx);
+    }
+    pthread_mutex_unlock(&g_rq_mtx);
+}
+
+static int r200_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
+                            uint64_t vram_size, const R200DrawPacket *pkt);
+static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
+                            uint64_t vram_size, const R300DrawPacket *pkt);
+
+/* Take the next job, or NULL when the ring is empty.  One consumer. */
+static RQJob *rq_pop(void)
+{
+    uintptr_t pos = qatomic_read(&g_rq_deq);
+    RQCell *c = &g_rq_cells[pos & RQ_MASK];
+
+    if ((uintptr_t)qatomic_read(&c->seq) != pos + 1) {
+        return NULL;
+    }
+    RQJob *job = c->job;
+    qatomic_set(&c->seq, pos + RQ_SIZE);      /* the cell is free again */
+    qatomic_set(&g_rq_deq, pos + 1);
+    return job;
+}
+
+static void *rqueue_thread(void *unused)
+{
+    PPCMacGPUMetalState *st = g_rq_st;
+
+    for (;;) {
+        RQJob *job = rq_pop();
+        if (!job) {
+            pthread_mutex_lock(&g_rq_mtx);
+            while (!g_rq_stop && !(job = rq_pop())) {
+                pthread_cond_wait(&g_rq_work, &g_rq_mtx);
+            }
+            pthread_mutex_unlock(&g_rq_mtx);
+            if (!job) {
+                break;      /* stopped, and the ring is empty */
+            }
+        }
+        pthread_mutex_lock(&g_render_lock);
+        if (job->kind == RQ_R200) {
+            r200_draw_encode(st, st->vram_ptr, st->vram_size, &job->r200);
+        } else {
+            r300_draw_encode(st, st->vram_ptr, st->vram_size, &job->r300);
+        }
+        pthread_mutex_unlock(&g_render_lock);
+        if (job->kind == RQ_R200) {
+            r200_job_free(job);
+        } else {
+            r300_job_free(job);
+        }
+        pthread_mutex_lock(&g_rq_mtx);
+        g_rq_done++;
+        pthread_cond_broadcast(&g_rq_idle);
+        pthread_cond_broadcast(&g_rq_space);
+        pthread_mutex_unlock(&g_rq_mtx);
+    }
+    return NULL;
+}
+
+static void rq_push(RQJob *job)
+{
+    uintptr_t pos = qatomic_fetch_add(&g_rq_enq, (uintptr_t)1);
+    RQCell *c = &g_rq_cells[pos & RQ_MASK];
+
+    /* Full: wait for the render thread to finish a job.  FIFO order
+     * means this draw cannot be encoded here instead. */
+    while ((uintptr_t)qatomic_read(&c->seq) != pos) {
+        pthread_mutex_lock(&g_rq_mtx);
+        if ((uintptr_t)qatomic_read(&c->seq) != pos) {
+            g_rq_stat_full++;
+            pthread_cond_wait(&g_rq_space, &g_rq_mtx);
+        }
+        pthread_mutex_unlock(&g_rq_mtx);
+    }
+    qatomic_set(&c->job, job);
+    qatomic_set(&c->seq, pos + 1);
+    if (pos == qatomic_read(&g_rq_deq)) {
+        /* the ring was empty: the render thread may be asleep */
+        pthread_mutex_lock(&g_rq_mtx);
+        pthread_cond_broadcast(&g_rq_work);
+        pthread_mutex_unlock(&g_rq_mtx);
+    }
+    g_rq_stat_jobs++;
+}
+
+static bool rqueue_start(PPCMacGPUMetalState *st)
+{
+    if (!rqueue_wanted()) {
+        return false;
+    }
+    for (uint32_t i = 0; i < RQ_SIZE; i++) {
+        g_rq_cells[i].seq = i;
+        g_rq_cells[i].job = NULL;
+    }
+    g_rq_enq = g_rq_deq = g_rq_done = 0;
+    g_rq_st = st;
+    g_rq_stop = false;
+    if (pthread_create(&g_rq_thread, NULL, rqueue_thread, NULL) != 0) {
+        qemu_log("ppc-mac-gpu-metal: render queue thread failed to start; "
+                 "encoding on the caller's thread\n");
+        return false;
+    }
+    g_rq_thread_started = true;
+    metal_renderer.draw_queue_async = true;
+    qemu_log("ppc-mac-gpu-metal: render queue on (%u draws deep, "
+             "Metal encode off the BQL)\n", RQ_SIZE);
+    return true;
+}
+
+static void rqueue_stop(void)
+{
+    if (!g_rq_thread_started) {
+        return;
+    }
+    pthread_mutex_lock(&g_rq_mtx);
+    g_rq_stop = true;
+    pthread_cond_broadcast(&g_rq_work);
+    pthread_mutex_unlock(&g_rq_mtx);
+    /* The thread exits only with the ring empty, so this is a drain. */
+    pthread_join(g_rq_thread, NULL);
+    g_rq_thread_started = false;
+    metal_renderer.draw_queue_async = false;
+    qemu_log("ppc-mac-gpu-metal: render queue off: %llu jobs, "
+             "%llu full-waits\n",
+             (unsigned long long)g_rq_stat_jobs,
+             (unsigned long long)g_rq_stat_full);
+}
+
 /* A new command buffer, ordered after everything committed before it. */
 static id<MTLCommandBuffer> r200_new_cb(PPCMacGPUMetalState *st)
 {
@@ -6584,8 +6995,25 @@ static void r200_note_read(uint64_t lo, uint64_t hi)
     g_r200_read[g_r200_nread++].hi = hi;
 }
 
+static bool metal_range_busy_r200_locked(uint64_t lo, uint64_t hi,
+                                         bool write_access);
+
 static bool metal_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi,
                                   bool write_access)
+{
+    /* Queued or mid-encode draws may touch anything: be conservative and
+     * let the caller drain.  (The caller's flush then waits for them.) */
+    if (rqueue_pending()) {
+        return true;
+    }
+    pthread_mutex_lock(&g_render_lock);
+    bool busy = metal_range_busy_r200_locked(lo, hi, write_access);
+    pthread_mutex_unlock(&g_render_lock);
+    return busy;
+}
+
+static bool metal_range_busy_r200_locked(uint64_t lo, uint64_t hi,
+                                         bool write_access)
 {
     if (!g_r200_cb && !g_r200_inflight) {
         return false;
@@ -6777,10 +7205,19 @@ static uint32_t r200_commit(void (*done)(void *, uint32_t), void *arg)
 static uint32_t metal_submit_r200(void *opaque,
                                   void (*done)(void *, uint32_t), void *arg)
 {
-    return r200_commit(done, arg);
+    uint32_t seq;
+
+    if (rqueue_enabled()) {
+        rqueue_drain();
+    }
+    pthread_mutex_lock(&g_render_lock);
+    seq = r200_commit(done, arg);
+    pthread_mutex_unlock(&g_render_lock);
+    return seq;
 }
 
-static bool metal_flush_r200(void *opaque)
+/* Commit and wait: the encode paths call this with g_render_lock held. */
+static bool r200_flush_locked(PPCMacGPUMetalState *st)
 {
     if (!g_r200_cb && !g_r200_inflight) {
         return false;
@@ -6801,10 +7238,45 @@ static bool metal_flush_r200(void *opaque)
     return true;
 }
 
+static bool metal_flush_r200(void *opaque)
+{
+    PPCMacGPUMetalState *st = opaque;
+    bool did;
+
+    /* The queued draws have to be encoded before anything can wait for
+     * them; drain first, then take the lock (never in the other order:
+     * the render thread is what drains). */
+    if (rqueue_enabled()) {
+        rqueue_drain();
+    }
+    pthread_mutex_lock(&g_render_lock);
+    did = r200_flush_locked(st);
+    pthread_mutex_unlock(&g_render_lock);
+    return did;
+}
+
 /* A 2D fill that lands on a guest depth buffer clears our private copy. */
+static void metal_fill_notify_r200_locked(void *opaque, uint32_t offset,
+                                          uint32_t pitch, uint32_t x, uint32_t y,
+                                          uint32_t w, uint32_t h, uint32_t bpp,
+                                          uint32_t value);
+
 static void metal_fill_notify_r200(void *opaque, uint32_t offset, uint32_t pitch,
                                    uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                                    uint32_t bpp, uint32_t value)
+{
+    /* Touches the open batch (g_r200_cb, encoders): serialise against
+     * the render thread. */
+    pthread_mutex_lock(&g_render_lock);
+    metal_fill_notify_r200_locked(opaque, offset, pitch, x, y, w, h, bpp,
+                                  value);
+    pthread_mutex_unlock(&g_render_lock);
+}
+
+static void metal_fill_notify_r200_locked(void *opaque, uint32_t offset,
+                                          uint32_t pitch, uint32_t x, uint32_t y,
+                                          uint32_t w, uint32_t h, uint32_t bpp,
+                                          uint32_t value)
 {
     PPCMacGPUMetalState *st = opaque;
     /* Depth lives in VRAM (attachment 1), so 2D fills already cleared it. */
@@ -6873,10 +7345,9 @@ static void metal_fill_notify_r200(void *opaque, uint32_t offset, uint32_t pitch
     }
 }
 
-static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
-                           const R200DrawPacket *pkt)
+static int r200_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
+                            uint64_t vram_size, const R200DrawPacket *pkt)
 {
-    PPCMacGPUMetalState *st = opaque;
     if (!st || !st->vramBuffer) {
         return -1;
     }
@@ -7214,7 +7685,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             }
         }
         if (full) {
-            metal_flush_r200(st);                  /* forget everything written */
+            r200_flush_locked(st);                 /* forget everything written */
         } else if (conflict) {
             g_r200_stat_conflicts++;
             if (r200_split_enabled()) {
@@ -7225,7 +7696,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                 g_r200_epoch++;
                 g_r200_stat_splits++;
             } else {
-                metal_flush_r200(st);
+                r200_flush_locked(st);
             }
         }
         if (!g_r200_cb) {
@@ -7375,7 +7846,7 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                 uint64_t a = (uint64_t)pkt->depth_offset +
                              (uint64_t)py * pkt->depth_pitch * 4 + px * 4;
                 const R200Vertex *v0 = &pkt->verts[pkt->indices[0]];
-                metal_flush_r200(st);
+                r200_flush_locked(st);
                 qemu_log("r200 zcheck: fl=%x z=%08x at (%u,%u) depthword=%02x%02x%02x%02x "
                          "v0=(%.1f,%.1f,%.3f,%.1f) sc=(%u,%u)-(%u,%u)\n",
                          u.zinfo[0], pkt->zstencil, px, py,
@@ -7394,7 +7865,8 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
 
     if (g_r200_stat_draws % 2000 == 0) {
         qemu_log("ppc-mac-gpu r200: %llu draws, %llu passes, %llu flushes "
-                 "(%llu hazard), avg flush %llu us, views %llu hit/%llu new\n",
+                 "(%llu hazard), avg flush %llu us, views %llu hit/%llu new, "
+                 "rq %llu jobs %llu full\n",
                  (unsigned long long)g_r200_stat_draws,
                  (unsigned long long)g_r200_stat_passes,
                  (unsigned long long)g_r200_stat_flushes,
@@ -7402,8 +7874,71 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                  (unsigned long long)(g_r200_stat_flushes ?
                      g_r200_stat_flush_us / g_r200_stat_flushes : 0),
                  (unsigned long long)g_r200_stat_view_hit,
-                 (unsigned long long)g_r200_stat_view_new);
+                 (unsigned long long)g_r200_stat_view_new,
+                 (unsigned long long)g_rq_stat_jobs,
+                 (unsigned long long)g_rq_stat_full);
     }
+    return 0;
+}
+
+/*
+ * A draw's deterministic rejections (format, alignment, empty scissor),
+ * so the producer still gets -1 synchronously; the encode side re-runs
+ * them.  Returns -1 (rejected), 1 (nothing to draw) or 0 (encode it).
+ */
+static int r200_draw_rejects(PPCMacGPUMetalState *st, const R200DrawPacket *pkt)
+{
+    if (!st || !st->vramBuffer) {
+        return -1;
+    }
+    id<MTLDevice> dev = st->vramBuffer.device;
+    if (!r200_metal_setup(dev)) {
+        return -1;
+    }
+    uint32_t sx0 = pkt->scissor[0], sy0 = pkt->scissor[1];
+    uint32_t sx1 = MIN(pkt->scissor[2], pkt->rt_width);
+    uint32_t sy1 = MIN(pkt->scissor[3], pkt->rt_height);
+    if (sx0 >= sx1 || sy0 >= sy1) {
+        return 1;
+    }
+    uint32_t cfmt = (pkt->rb3d_cntl >> 10) & 0xF;
+    bool rt16 = cfmt == 3 || cfmt == 4 || cfmt == 15;
+    if (cfmt != 6 && !rt16) {
+        r200_metal_warn(0x4000, "colour buffer format not supported", cfmt,
+                        pkt->rt_offset);
+        return -1;
+    }
+    if (rt16 && !g_r200_pipeline_c16) {
+        return -1;
+    }
+    MTLPixelFormat rtpf = rt16 ? MTLPixelFormatR16Uint : MTLPixelFormatBGRA8Unorm;
+    NSUInteger align = [dev minimumLinearTextureAlignmentForPixelFormat:rtpf];
+    uint32_t bpr = pkt->rt_pitch * (rt16 ? 2 : 4);
+    if ((pkt->rt_offset % align) || (bpr % align)) {
+        r200_metal_warn(2, "render target not aligned for a linear view",
+                        pkt->rt_offset, bpr);
+        return -1;
+    }
+    return 0;
+}
+
+static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
+                           const R200DrawPacket *pkt)
+{
+    PPCMacGPUMetalState *st = opaque;
+    int r;
+
+    if (!rqueue_enabled()) {
+        pthread_mutex_lock(&g_render_lock);
+        r = r200_draw_encode(st, vram_ptr, vram_size, pkt);
+        pthread_mutex_unlock(&g_render_lock);
+        return r;
+    }
+    r = r200_draw_rejects(st, pkt);
+    if (r) {
+        return r < 0 ? -1 : 0;      /* rejected, or nothing to draw */
+    }
+    rq_push(r200_job_new(pkt));
     return 0;
 }
 
@@ -7776,7 +8311,7 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
     }
     /* The CPU reads the texels: finish pending draws that write them. */
     if (!td->host_data && r200_batch_conflict(lo, hi, NULL)) {
-        metal_flush_r200(st);
+        r200_flush_locked(st);
     }
 
     R300TexCacheKey key = { td->gpu_addr, td->format, td->kind, td->width, td->height,
@@ -7862,7 +8397,7 @@ static id<MTLTexture> r300_texture_raw(PPCMacGPUMetalState *st, id<MTLDevice> de
     }
     if (!td->host_data && r200_batch_conflict(td->gpu_addr, (uint64_t)td->gpu_addr +
                                               td->size_bytes, NULL)) {
-        metal_flush_r200(st);
+        r200_flush_locked(st);
     }
     const uint8_t *src = td->host_data ? td->host_data : vram_ptr + td->gpu_addr;
     uint32_t n = (td->size_bytes + eb - 1) / eb;        /* elements */
@@ -7993,10 +8528,9 @@ static bool r300_bind_bytes(PPCMacGPUMetalState *st, id<MTLDevice> dev,
     return true;
 }
 
-static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
-                           const R300DrawPacket *pkt)
+static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
+                            uint64_t vram_size, const R300DrawPacket *pkt)
 {
-    PPCMacGPUMetalState *st = opaque;
     if (!st || !st->vramBuffer) {
         return -1;
     }
@@ -8116,7 +8650,7 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         }
         if (conflict) {
             g_r200_stat_conflicts++;
-            metal_flush_r200(st);
+            r200_flush_locked(st);
         }
         if (!g_r200_cb) {
             g_r200_cb = r200_new_cb(st);
@@ -8283,6 +8817,77 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             }
         }
     }
+    return 0;
+}
+
+/* A draw's deterministic rejections, as r200_draw_rejects().  Returns
+ * -1 (rejected), 1 (nothing to draw) or 0 (encode it). */
+static int r300_draw_rejects(PPCMacGPUMetalState *st, uint64_t vram_size,
+                             const R300DrawPacket *pkt)
+{
+    if (!st || !st->vramBuffer) {
+        return -1;
+    }
+    id<MTLDevice> dev = st->vramBuffer.device;
+    uint32_t ncb = MAX(pkt->num_cb, 1u);
+    uint32_t sx0 = pkt->scissor[0], sy0 = pkt->scissor[1];
+    uint32_t sx1 = MIN(pkt->scissor[2], pkt->rt_width);
+    uint32_t sy1 = MIN(pkt->scissor[3], pkt->rt_height);
+    uint32_t ns = MIN(MAX(pkt->aa_samples, 1u), 6u);
+
+    if (sx0 >= sx1 || sy0 >= sy1 || !(pkt->num_verts + pkt->num_line_verts)) {
+        return 1;
+    }
+    if (ns > 1) {
+        bool same_pitch = !pkt->depth.attach || pkt->depth.pitch == pkt->rt_pitch;
+        for (uint32_t k = 1; k < ncb; k++) {
+            same_pitch &= pkt->cb[k].pitch == pkt->rt_pitch;
+        }
+        if (!same_pitch || (uint64_t)ns * pkt->rt_pitch > 16384) {
+            r300_metal_warn(512, "multisampled buffers of different pitches");
+            return -1;
+        }
+    }
+    for (uint32_t k = 0; k < ncb; k++) {
+        uint32_t view = k ? pkt->cb[k].view : pkt->rt_view;
+        uint32_t addr = k ? pkt->cb[k].gpu_addr : pkt->rt_gpu_addr;
+        uint32_t bpr = ns * (k ? pkt->cb[k].pitch * pkt->cb[k].bpp
+                               : pkt->rt_pitch * pkt->rt_bpp);
+        MTLPixelFormat pf = r300_rt_pf(view);
+        NSUInteger align = [dev minimumLinearTextureAlignmentForPixelFormat:pf];
+        if ((addr % align) || (bpr % align) || !bpr ||
+            (uint64_t)addr + (uint64_t)bpr * pkt->rt_height > vram_size) {
+            if (k == 0) {
+                r300_metal_warn(1, "colour buffer unusable as a linear view");
+                return -1;
+            }
+            break;      /* targets B-D are dropped, as the encode side does */
+        }
+    }
+    if ((pkt->cull & (R300_CULL_FRONT | R300_CULL_BACK)) ==
+        (R300_CULL_FRONT | R300_CULL_BACK) && !pkt->num_line_verts) {
+        return 1;                   /* every polygon culled */
+    }
+    return 0;
+}
+
+static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
+                           const R300DrawPacket *pkt)
+{
+    PPCMacGPUMetalState *st = opaque;
+    int r;
+
+    if (!rqueue_enabled()) {
+        pthread_mutex_lock(&g_render_lock);
+        r = r300_draw_encode(st, vram_ptr, vram_size, pkt);
+        pthread_mutex_unlock(&g_render_lock);
+        return r;
+    }
+    r = r300_draw_rejects(st, vram_size, pkt);
+    if (r) {
+        return r < 0 ? -1 : 0;      /* rejected, or nothing to draw */
+    }
+    rq_push(r300_job_new(pkt));
     return 0;
 }
 

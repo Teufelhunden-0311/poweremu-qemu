@@ -247,6 +247,16 @@ typedef struct R200DrawPacket {
 typedef struct PPCMacGPURenderer {
     const char *name;           /* e.g. "software", "metal", "vulkan" */
 
+    /*
+     * draw_r200/draw_r300 only enqueue the draw and encode it on a
+     * backend thread, so they are safe to call without the BQL (the
+     * Metal render queue).  The device skips its big-lock dance for
+     * such a backend; flush_r200/submit_r200 still wait for everything.
+     * Deterministic rejections (bad format, alignment) are still
+     * returned synchronously.
+     */
+    bool draw_queue_async;
+
     /* r300_us_to_glsl() flags for the GLSL this backend compiles. */
     uint32_t r300_glsl_flags;
 

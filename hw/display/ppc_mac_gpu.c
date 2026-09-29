@@ -327,8 +327,11 @@ static struct {
 } r200_async;
 
 /* The command processor thread (see "The command processor on its own
- * thread" below). */
-#define CP_SLICE_US 200
+ * thread" below).  Metal encoding runs on the renderer's render queue
+ * thread, off the BQL, so a slice is pure ring parsing (register decode
+ * and vertex fetch); the yield only exists so a catch-up can take the
+ * ring over, and rarely fires. */
+#define CP_SLICE_US 2000
 
 static struct {
     PPCMacGPUState *s;
@@ -359,21 +362,27 @@ static bool r200_async_enabled(void)
 }
 
 /*
- * Submit to the renderer with the big lock held.
+ * Submit to the renderer.
+ *
+ * A queue-async renderer (the Metal render queue) only enqueues the draw
+ * and encodes it on its own thread, so no lock is needed here: the
+ * vertices and textures are copied into the job, and every flush, fence
+ * and CPU-side VRAM access drains the queue first.
  *
  * Every other caller of the renderer runs on the vCPU thread or the main
  * loop, and those are already serialised against each other by the BQL --
  * which is exactly why this device could call Metal freely before draws
- * moved off-thread, and why Metal asserted the moment they did. Taking the
- * same lock here restores that guarantee without touching the thirty other
- * call sites, and without serialising the part worth parallelising: by the
- * time a draw reaches this point its vertices are already fetched and
- * transformed, which is the expensive half.
+ * moved off-thread, and why Metal asserted the moment they did.  For a
+ * synchronous backend, taking the same lock here restores that guarantee
+ * without touching the thirty other call sites, and without serialising
+ * the part worth parallelising: by the time a draw reaches this point its
+ * vertices are already fetched and transformed, which is the expensive
+ * half.
  */
 static int r200_render_draw(PPCMacGPUState *s, uint8_t *vram,
                             const R200DrawPacket *pkt)
 {
-    bool need_bql = !bql_locked();
+    bool need_bql = !s->renderer->draw_queue_async && !bql_locked();
     int r;
 
     if (need_bql) {
@@ -3078,7 +3087,11 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         s->r3_cb_aa_ns = 1;
     }
     if (s->renderer && s->renderer->draw_r300) {
-        bool need_bql = !bql_locked();
+        /* A queue-async renderer enqueues the draw and encodes it on its
+         * own thread, so it needs no big lock (the Metal render queue).
+         * Everything else below this is QEMU state and still runs under
+         * the BQL the caller (or this block) holds. */
+        bool need_bql = !s->renderer->draw_queue_async && !bql_locked();
 
         if (need_bql) {
             bql_lock();
@@ -8962,6 +8975,13 @@ static void ppc_mac_gpu_execute_ib(PPCMacGPUState *s,
  * packets every CP_SLICE_US.  It publishes its progress as the read
  * pointer first; whoever takes the lock can catch up from there, and the
  * thread notices (cp.epoch) and drops the rest of its copy.
+ *
+ * The Metal half of each draw is not under the BQL at all: with the
+ * default renderer, the CP thread's draw calls enqueue the decoded packet
+ * on the Metal render queue (see ppc_mac_gpu_metal.m) and a backend
+ * thread encodes it, so a slice is parse work only and the yield almost
+ * never fires.  PPCGPU_RENDER_QUEUE=0 puts the encoding back on the
+ * caller's thread, as before.
  *
  * PPCGPU_CP_SYNC=1 restores the synchronous ring.
  */
