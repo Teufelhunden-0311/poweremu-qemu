@@ -135,6 +135,18 @@ bool translator_use_goto_tb(DisasContextBase *db, vaddr dest)
  * single-stepping, breakpoints on the page, plugins, exec logging) keeps
  * the helper, which handles it.
  */
+/* QEMU_TB_INLINE=0 always calls helper_lookup_tb_ptr (for A/B tests). */
+static bool tb_inline_lookup_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("QEMU_TB_INLINE");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc)
 {
     TranslationBlock *tb = db->tb;
@@ -148,7 +160,8 @@ void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc)
     if ((cf & (CF_COUNT_MASK | CF_NO_GOTO_TB | CF_NO_GOTO_PTR | CF_SINGLE_STEP |
                CF_MEMI_ONLY | CF_USE_ICOUNT | CF_NOIRQ | CF_PCREL |
                CF_BP_PAGE)) ||
-        db->plugin_enabled || qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC)) {
+        db->plugin_enabled || qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC) ||
+        !tb_inline_lookup_on()) {
         tcg_gen_lookup_and_goto_ptr();
         return;
     }
