@@ -207,6 +207,111 @@ static void native_fp_op(DisasContext *ctx, int op, int frt,
     }
 }
 
+/* A NativeFPSlow op for fcmpu, whose frt is the CR field */
+#define NATIVE_FCMPU (-1)
+
+/* PPC_NATIVE_FCMP=0 keeps fcmpu on the helpers (for A/B tests). */
+static bool native_fcmp_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPC_NATIVE_FCMP");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/*
+ * A non-NaN double's bits as a signed integer that orders like the double:
+ * negative doubles count down from zero, so -0 and +0 are both 0.
+ */
+static void native_fcmp_key(TCGv_i64 key, TCGv_i64 x)
+{
+    TCGv_i64 m = tcg_temp_new_i64();
+    TCGv_i64 n = tcg_temp_new_i64();
+
+    tcg_gen_andi_i64(m, x, INT64_MAX);
+    tcg_gen_neg_i64(n, m);
+    tcg_gen_movcond_i64(TCG_COND_LT, key, x, tcg_constant_i64(0), n, m);
+}
+
+/*
+ * fcmpu with integer ops: the helpers give FPCC and CR field 8, 4 or 2 for
+ * ordered inputs and clear FPSCR[FI] (float_check_status with nothing
+ * raised).  NaN inputs (unordered, maybe VXSNAN) take the slow path.
+ * FPCC is part of FPRF, whose C bit comes from the pending result if there
+ * is one (see ppc_fprf_sync): C is set for -0 and denormals, and native
+ * results are never NaN.
+ */
+static void native_fcmpu(DisasContext *ctx, int crf, int ra, int rb)
+{
+    NativeFPSlow *sp = &ctx->nfp[ctx->n_nfp++];
+    TCGv_i64 a = tcg_temp_new_i64(), b = tcg_temp_new_i64();
+    TCGv_i64 t = tcg_temp_new_i64(), u = tcg_temp_new_i64();
+    TCGv_i64 ka = tcg_temp_new_i64(), kb = tcg_temp_new_i64();
+    TCGv_i64 res = tcg_temp_new_i64(), c = tcg_temp_new_i64();
+    TCGv_i32 r32 = tcg_temp_new_i32();
+    TCGv tl = tcg_temp_new();
+
+    *sp = (NativeFPSlow) {
+        .slow = gen_new_label(), .next = ctx->base.pc_next,
+        .op = NATIVE_FCMPU, .frt = crf, .x = ra, .y = rb, .z = -1,
+    };
+
+    get_fpr(a, ra);
+    get_fpr(b, rb);
+    tcg_gen_shli_i64(t, a, 1);
+    tcg_gen_shli_i64(u, b, 1);
+    tcg_gen_umax_i64(t, t, u);
+    tcg_gen_brcondi_i64(TCG_COND_GTU, t, 0xffe0000000000000ull, sp->slow);
+
+    /* 8 if a < b, 4 if a > b, else 2 */
+    native_fcmp_key(ka, a);
+    native_fcmp_key(kb, b);
+    tcg_gen_setcond_i64(TCG_COND_LT, t, ka, kb);
+    tcg_gen_setcond_i64(TCG_COND_GT, u, ka, kb);
+    tcg_gen_shli_i64(t, t, 3);
+    tcg_gen_shli_i64(u, u, 2);
+    tcg_gen_or_i64(t, t, u);
+    tcg_gen_movcond_i64(TCG_COND_EQ, t, t, tcg_constant_i64(0),
+                        tcg_constant_i64(2), t);
+    tcg_gen_extrl_i64_i32(cpu_crf[crf], t);
+
+    /* C: from the pending result, else FPSCR's own */
+    tcg_gen_ld_i64(res, tcg_env, offsetof(CPUPPCState, fprf_res));
+    tcg_gen_shli_i64(u, res, 1);
+    tcg_gen_setcondi_i64(TCG_COND_LTU, u, u, 1ull << 53);
+    tcg_gen_setcondi_i64(TCG_COND_NE, c, res, 0);
+    tcg_gen_and_i64(u, u, c);
+    tcg_gen_extu_tl_i64(c, cpu_fpscr);
+    tcg_gen_shri_i64(c, c, FPSCR_C);
+    tcg_gen_andi_i64(c, c, 1);
+    tcg_gen_movcond_i64(TCG_COND_NE, c, res, tcg_constant_i64(PPC_FPRF_NONE),
+                        u, c);
+    /*
+     * Store with the vector unit, as the native ops do: on the M1 an
+     * integer store here, between their vector store and integer reload
+     * of fprf_res, cost 25% of Geekbench's Mandelbrot routine.
+     */
+    {
+        TCGv_vec none = tcg_temp_new_vec(TCG_TYPE_V64);
+
+        tcg_gen_dupi_vec(MO_64, none, PPC_FPRF_NONE);
+        tcg_gen_st_vec(none, tcg_env, offsetof(CPUPPCState, fprf_res));
+    }
+
+    tcg_gen_shli_i64(c, c, FPSCR_C);
+    tcg_gen_shli_i64(t, t, FPSCR_FPCC);
+    tcg_gen_or_i64(t, t, c);
+    tcg_gen_trunc_i64_tl(tl, t);
+    tcg_gen_andi_tl(cpu_fpscr, cpu_fpscr, ~(target_ulong)(FP_FPRF | FP_FI));
+    tcg_gen_or_tl(cpu_fpscr, cpu_fpscr, tl);
+    /* as after gen_reset_fpstatus and an ordered comparison */
+    tcg_gen_movi_i32(r32, 0);
+    tcg_gen_st16_i32(r32, tcg_env,
+                     offsetof(CPUPPCState, fp_status.float_exception_flags));
+}
+
 /* After the TB's exit: each slow path, then on to the next instruction. */
 static void native_fp_emit_slow_paths(DisasContext *ctx)
 {
@@ -220,6 +325,14 @@ static void native_fp_emit_slow_paths(DisasContext *ctx)
         gen_set_label(sp->slow);
         get_fpr(t0, sp->x);
         get_fpr(t1, sp->y);
+        if (sp->op == NATIVE_FCMPU) {
+            gen_reset_fpstatus();
+            gen_helper_fcmpu(tcg_env, t0, t1, tcg_constant_i32(sp->frt));
+            gen_helper_float_check_status(tcg_env);
+            gen_update_nip(ctx, sp->next);
+            tcg_gen_lookup_and_goto_ptr();
+            continue;
+        }
         if (sp->z >= 0) {
             TCGv_i64 t2 = tcg_temp_new_i64();
             get_fpr(t2, sp->z);
@@ -541,6 +654,10 @@ static void gen_fcmpu(DisasContext *ctx)
     TCGv_i64 t1;
     if (unlikely(!ctx->fpu_enabled)) {
         gen_exception(ctx, POWERPC_EXCP_FPU);
+        return;
+    }
+    if (native_fp(ctx) && native_fcmp_on()) {
+        native_fcmpu(ctx, crfD(ctx->opcode), rA(ctx->opcode), rB(ctx->opcode));
         return;
     }
     t0 = tcg_temp_new_i64();
