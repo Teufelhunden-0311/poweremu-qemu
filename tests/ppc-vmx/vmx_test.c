@@ -643,6 +643,127 @@ static void bench(void)
         res[0x209] = tb() - t0;
         res[0x20a] = r ^ (uint32_t)(x + y + z + w);
     }
+
+    /* Mandelbrot escape loop, as compiled C: fcmpu decides every exit */
+    {
+        uint32_t total = 0;
+        int px, py, n;
+
+        t0 = tb();
+        for (py = 0; py < 48; py++) {
+            for (px = 0; px < 64; px++) {
+                double cr = -2.0 + px * (2.5 / 64), ci = -1.25 + py * (2.5 / 48);
+                double zr = 0, zi = 0, zr2 = 0, zi2 = 0;
+                for (n = 0; n < 256 && zr2 + zi2 <= 4.0; n++) {
+                    zi = 2.0 * zr * zi + ci;
+                    zr = zr2 - zi2 + cr;
+                    zr2 = zr * zr;
+                    zi2 = zi * zi;
+                }
+                total += n;
+            }
+        }
+        res[0x20b] = tb() - t0;
+        res[0x20c] = total;
+    }
+
+    /* Geekbench 2.2's Mandelbrot inner loop (GCC 4.0), instruction for
+       instruction, points that never escape: 255 iterations each */
+    {
+        double c[4] = { 0.25, 0.0, 4.0, 0.0 };  /* cr, ci, escape radius^2 */
+        uint32_t n = 0;
+
+        t0 = tb();
+        for (i = 0; i < 1000; i++) {
+            if (i == 500) {
+                res[0x20f] = tb() - t0;     /* first half: never escapes */
+                c[0] = 1.5;                 /* then: escapes after 2 */
+                c[1] = 0.5;
+            }
+            if (i >= 500) {
+                int j;
+                for (j = 0; j < 100; j++) {
+                    asm volatile(
+                        "lfd 8,0(%1)\n\tlfd 6,8(%1)\n\tlfd 7,16(%1)\n\t"
+                        "fmr 9,6\n\tfmr 11,8\n\tfmr 10,9\n\t"
+                        "li 0,255\n\tmtctr 0\n"
+                        "1:\tfmul 0,10,10\n\taddi %0,%0,1\n\t"
+                        "fmsub 0,11,11,0\n\tfadd 11,8,0\n\tfadd 12,11,11\n\t"
+                        "fsub 13,11,8\n\tfmadd 10,10,12,9\n\tfsub 0,10,9\n\t"
+                        "fmul 0,0,0\n\tfmadd 13,13,13,0\n\tfcmpu 7,13,7\n\t"
+                        "cror 30,29,30\n\tbeq 7,2f\n\tbdnz 1b\n2:"
+                        : "+r"(n) : "b"(c)
+                        : "fr0", "fr6", "fr7", "fr8", "fr9", "fr10", "fr11", "fr12",
+                          "fr13", "ctr", "cr7", "r0");
+                }
+                continue;
+            }
+            asm volatile(
+                "lfd 8,0(%1)\n\tlfd 6,8(%1)\n\tlfd 7,16(%1)\n\t"
+                "fmr 9,6\n\tfmr 11,8\n\tfmr 10,9\n\t"
+                "li 0,255\n\tmtctr 0\n"
+                "1:\tfmul 0,10,10\n\taddi %0,%0,1\n\t"
+                "fmsub 0,11,11,0\n\tfadd 11,8,0\n\tfadd 12,11,11\n\t"
+                "fsub 13,11,8\n\tfmadd 10,10,12,9\n\tfsub 0,10,9\n\t"
+                "fmul 0,0,0\n\tfmadd 13,13,13,0\n\tfcmpu 7,13,7\n\t"
+                "cror 30,29,30\n\tbeq 7,2f\n\tbdnz 1b\n2:"
+                : "+r"(n) : "b"(c)
+                : "fr0", "fr6", "fr7", "fr8", "fr9", "fr10", "fr11", "fr12",
+                  "fr13", "ctr", "cr7", "r0");
+        }
+        res[0x20d] = tb() - t0;
+        res[0x20e] = n;
+    }
+
+    /* Geekbench 2.2's whole Mandelbrot routine (0x26ac0-0x26b98): rows and
+       columns converted to double through memory (stw, stw, lfd), the
+       loop, and the flop count kept in r27:r28 with addc/adde */
+    {
+        double k[5] = {
+            0.0, -2.0, 4.0, 1.25, 0.0,  /* magic (set below), cr0, esc, ci0 */
+        };
+        uint32_t buf[4];
+        uint32_t lo = 0, hi = 0;
+        union { uint64_t u; double d; } magic = { 0x4330000080000000ull };
+
+        k[0] = magic.d;
+        k[4] = 0.046875;                    /* 3/64: rows and columns */
+        t0 = tb();
+        for (i = 0; i < 4; i++) {
+            asm volatile(
+                "lfd 5,32(%[k])\n\t"            /* row scale */
+                "lfd 6,32(%[k])\n\t"            /* column scale */
+                "li 10,0\n\tli 26,48\n\tli 30,64\n\t"
+                "cmpwi 6,30,0\n"
+                "3:\txoris 2,10,0x8000\n\tlis 0,0x4330\n\tlfd 13,0(%[k])\n\t"
+                "li 9,0\n\tstw 2,12(%[b])\n\tstw 0,8(%[b])\n\t"
+                "lfd 0,8(%[b])\n\tfsub 0,0,13\n\tlfd 13,24(%[k])\n\t"
+                "fmsub 8,5,0,13\n"
+                "4:\txoris 2,9,0x8000\n\tlis 0,0x4330\n\tlfd 13,0(%[k])\n\t"
+                "lfd 12,8(%[k])\n\tfmr 11,8\n\tstw 0,0(%[b])\n\tstw 2,4(%[b])\n\t"
+                "li 0,0xff\n\tmtctr 0\n\tlfd 7,16(%[k])\n\tli 2,0\n\t"
+                "lfd 0,0(%[b])\n\tfsub 0,0,13\n\tfmadd 9,6,0,12\n\tfmr 10,9\n"
+                "1:\tfmul 0,10,10\n\taddi 2,2,1\n\t"
+                "fmsub 0,11,11,0\n\tfadd 11,8,0\n\tfadd 12,11,11\n\t"
+                "fsub 13,11,8\n\tfmadd 10,10,12,9\n\tfsub 0,10,9\n\t"
+                "fmul 0,0,0\n\tfmadd 13,13,13,0\n\tfcmpu 7,13,7\n\t"
+                "cror 30,29,30\n\tbeq 7,2f\n\tbdnz 1b\n"
+                "2:\taddi 9,9,1\n\tmulli 2,2,14\n\tcmpw 7,30,9\n\tmr 3,2\n\t"
+                "li 2,0\n\taddc %[lo],%[lo],3\n\tadde %[hi],%[hi],2\n\t"
+                "bne 7,4b\n\t"
+                "addi 10,10,1\n\tcmpw 7,26,10\n\tbeq 7,5f\n\t"
+                "ble 6,3b\n\tb 3b\n"
+                "5:"
+                : [lo] "+r"(lo), [hi] "+r"(hi)
+                : [k] "b"(k), [b] "b"(buf)
+                : "r0", "r2", "r3", "r9", "r10", "r26", "r30",
+                  "fr0", "fr5", "fr6", "fr7", "fr8", "fr9", "fr10", "fr11",
+                  "fr12", "fr13", "ctr", "cr6", "cr7", "xer", "memory");
+            k[4] = 0.046875 + i * 0.001;    /* a slightly different image each time */
+        }
+        res[0x210] = tb() - t0;
+        res[0x211] = lo;
+    }
 }
 
 /*
@@ -801,6 +922,7 @@ static uint64_t fpd_pool(uint32_t *seed)
         0x47efffffe0000000ull, 0x4800000000000000ull,  /* single max, just above */
         0x3ff0000000000001ull, 0x4000000010000000ull,  /* inexact singles */
         0x4059000000000000ull, 0xc059000000000000ull,  /* +-100 */
+        0x8000000000000001ull, 0x000fffffffffffffull,  /* -min, +max denormal */
     };
     uint32_t r = rnd(seed);
     uint64_t m = (uint64_t)rnd(seed) << 32 | rnd(seed);

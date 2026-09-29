@@ -182,6 +182,17 @@ def main():
         tbfreq = 25_000_000  # mac99 timebase (TBFREQ)
         for name, t in zip(BENCH, mon.words(RESULTS + 0x800, len(BENCH))):
             print(f'bench {name:36s} {t / tbfreq * 1e3:8.1f} ms')
+        mt, mn = mon.words(RESULTS + 0x20b * 4, 2)
+        print(f'bench {"mandelbrot 64x48x256 (fcmpu exits)":36s} {mt / tbfreq * 1e3:8.1f} ms'
+              f'  ({mn} iterations)')
+        gt, gn = mon.words(RESULTS + 0x20d * 4, 2)
+        g1 = mon.words(RESULTS + 0x20f * 4, 1)[0]
+        print(f'bench {"GB mandel: inside set (127500 it)":36s} {g1 / tbfreq * 1e3:8.1f} ms')
+        print(f'bench {"GB mandel: escaping (50000 pixels)":36s} {(gt - g1) / tbfreq * 1e3:8.1f} ms'
+              f'  ({gn} iterations total)')
+        ft, ff = mon.words(RESULTS + 0x210 * 4, 2)
+        print(f'bench {"GB mandel: whole routine x4":36s} {ft / tbfreq * 1e3:8.1f} ms'
+              f'  ({ff // 14} iterations)')
         fchecks, ffails = mon.words(RESULTS + 0xa00, 2)
         for k in range(min(ffails, 4)):
             p = mon.words(RESULTS + 0xa80 + k * 32, 7)
