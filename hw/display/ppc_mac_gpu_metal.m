@@ -6737,14 +6737,21 @@ static RQJob *rq_pop(void)
     uintptr_t pos = qatomic_read(&g_rq_deq);
     RQCell *c = &g_rq_cells[pos & RQ_MASK];
 
-    if ((uintptr_t)qatomic_read(&c->seq) != pos + 1) {
+    /* Acquire pairs with rq_push's release: once seq says the cell is
+     * full, its job pointer is the one just published (ARM reorders
+     * plain accesses; reading a stale pointer freed it twice). */
+    if ((uintptr_t)qatomic_load_acquire(&c->seq) != pos + 1) {
         return NULL;
     }
-    RQJob *job = c->job;
-    qatomic_set(&c->seq, pos + RQ_SIZE);      /* the cell is free again */
+    RQJob *job = qatomic_read(&c->job);
+    qatomic_store_release(&c->seq, pos + RQ_SIZE);   /* the cell is free again */
     qatomic_set(&g_rq_deq, pos + 1);
     return job;
 }
+
+static void r200_commit_fence(PPCMacGPUMetalState *st,
+                              void (*done)(void *, uint32_t), void *arg,
+                              uint32_t seq);
 
 static void *rqueue_thread(void *unused)
 {
@@ -6790,16 +6797,16 @@ static void rq_push(RQJob *job)
 
     /* Full: wait for the render thread to finish a job.  FIFO order
      * means this draw cannot be encoded here instead. */
-    while ((uintptr_t)qatomic_read(&c->seq) != pos) {
+    while ((uintptr_t)qatomic_load_acquire(&c->seq) != pos) {
         pthread_mutex_lock(&g_rq_mtx);
-        if ((uintptr_t)qatomic_read(&c->seq) != pos) {
+        if ((uintptr_t)qatomic_load_acquire(&c->seq) != pos) {
             g_rq_stat_full++;
             pthread_cond_wait(&g_rq_space, &g_rq_mtx);
         }
         pthread_mutex_unlock(&g_rq_mtx);
     }
     qatomic_set(&c->job, job);
-    qatomic_set(&c->seq, pos + 1);
+    qatomic_store_release(&c->seq, pos + 1);    /* publishes job */
     if (pos == qatomic_read(&g_rq_deq)) {
         /* the ring was empty: the render thread may be asleep */
         pthread_mutex_lock(&g_rq_mtx);
