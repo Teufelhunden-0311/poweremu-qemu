@@ -1599,7 +1599,30 @@ static void ppc_mac_gpu_display_update(void *opaque)
         uint64_t hi = lo + (uint64_t)s->disp.stride * s->disp.height;
         if (s->renderer && s->renderer->range_busy_r200 &&
             s->renderer->range_busy_r200(s->renderer_opaque, lo, hi, false)) {
+            /*
+             * The frame on screen is still being rendered.  Flushing here
+             * waits for the host GPU with the BQL held -- 17% of the time
+             * in Quake III, with the vCPU blocked behind it.  Instead kick
+             * the work off, keep showing the last frame, and look again
+             * next refresh; only after PPCGPU_DISPLAY_SKIP (default 2)
+             * busy refreshes in a row wait for it, so a buffer that is
+             * never idle (the desktop drawing to the front buffer) still
+             * shows up.
+             */
+            static int max_skip = -1;
+            if (max_skip < 0) {
+                const char *e = getenv("PPCGPU_DISPLAY_SKIP");
+                max_skip = e ? atoi(e) : 2;
+            }
+            if (s->disp_skipped < max_skip && s->renderer->submit_r200) {
+                s->disp_skipped++;
+                s->renderer->submit_r200(s->renderer_opaque, NULL, NULL);
+                return;
+            }
+            s->disp_skipped = 0;
             r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
+        } else {
+            s->disp_skipped = 0;
         }
     } else {
         r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));

@@ -803,6 +803,7 @@ struct PPCMacGPUState {
     uint32_t metal_rt_offsets[16];
     int      metal_rt_count;
     uint32_t metal_rt_frame_id;
+    int disp_skipped;           /* busy refreshes skipped in a row (display_update) */
 
     /* Diagnostic: enable the VRAM write watch in the PM4 processor. */
     bool vram_watch_active;
