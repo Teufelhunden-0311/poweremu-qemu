@@ -2296,17 +2296,21 @@ static QEMUBH *r200_fence_bh;
 /* Perform queued scratch writebacks whose GPU batch has completed. */
 static void r200_fence_drain(PPCMacGPUState *s, uint32_t done)
 {
-    uint32_t n = 0;
-    while (n < s->regs.r200_fence_n &&
-           (int32_t)(done - s->regs.r200_fence_q[n].seq) >= 0) {
-        ppc_mac_gpu_scratch_writeback_val(s, s->regs.r200_fence_q[n].reg,
-                                          s->regs.r200_fence_q[n].val);
-        n++;
-    }
-    if (n) {
-        memmove(s->regs.r200_fence_q, s->regs.r200_fence_q + n,
-                (s->regs.r200_fence_n - n) * sizeof(s->regs.r200_fence_q[0]));
-        s->regs.r200_fence_n -= n;
+    /*
+     * Take each fence off the queue before writing it back: the write-back
+     * is a guest memory write that can land on the card again, run the ring
+     * and drain (or queue) fences re-entrantly.  Counting first and
+     * trimming afterwards then trimmed more than was left -- a memmove of
+     * ~50 GB and a crashed QEMU in Quake III.
+     */
+    while (s->regs.r200_fence_n &&
+           (int32_t)(done - s->regs.r200_fence_q[0].seq) >= 0) {
+        int reg = s->regs.r200_fence_q[0].reg;
+        uint32_t val = s->regs.r200_fence_q[0].val;
+        s->regs.r200_fence_n--;
+        memmove(s->regs.r200_fence_q, s->regs.r200_fence_q + 1,
+                s->regs.r200_fence_n * sizeof(s->regs.r200_fence_q[0]));
+        ppc_mac_gpu_scratch_writeback_val(s, reg, val);
     }
 }
 
