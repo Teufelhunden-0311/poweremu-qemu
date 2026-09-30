@@ -640,6 +640,77 @@ void r300_border_color(uint32_t fmt, uint32_t v, float c[4])
     }
 }
 
+/*
+ * 32-bit colour buffers the card rendered with COLOR_ENDIAN 0.
+ *
+ * VRAM holds what the big-endian CPU wrote, so a W8Z8Y8X8 texel is read
+ * byte-reversed (see r300_tpost).  A surface the card itself rendered
+ * without the swap is in the card's own order instead: Doom 3's heat haze
+ * renders the screen into a texture that way and samples it back, and
+ * reversed its black read as bright red.  Remember where such surfaces
+ * are, until a swapped render or an upload through the GART lands on
+ * them.  R300_RT_LE=0 turns this off.
+ */
+#define RT_LE_SLOTS 16
+static struct { uint32_t lo, hi; } rt_le[RT_LE_SLOTS];
+static unsigned rt_le_n;
+
+static bool rt_le_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("R300_RT_LE");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+void r300_rt_forget(uint64_t lo, uint64_t hi)
+{
+    for (unsigned i = 0; i < rt_le_n;) {
+        if (rt_le[i].lo < hi && lo < rt_le[i].hi) {
+            rt_le[i] = rt_le[--rt_le_n];
+        } else {
+            i++;
+        }
+    }
+}
+
+static void rt_note(uint32_t lo, uint32_t hi, bool le)
+{
+    if (!rt_le_on() || hi <= lo) {
+        return;
+    }
+    for (unsigned i = 0; i < rt_le_n; i++) {
+        if (rt_le[i].lo == lo && rt_le[i].hi == hi) {
+            if (!le) {
+                rt_le[i] = rt_le[--rt_le_n];
+            }
+            return;
+        }
+    }
+    r300_rt_forget(lo, hi);
+    if (le) {
+        if (rt_le_n == RT_LE_SLOTS) {
+            memmove(&rt_le[0], &rt_le[1], (RT_LE_SLOTS - 1) * sizeof(rt_le[0]));
+            rt_le_n--;
+        }
+        rt_le[rt_le_n].lo = lo;
+        rt_le[rt_le_n].hi = hi;
+        rt_le_n++;
+    }
+}
+
+static bool rt_le_holds(uint32_t addr)
+{
+    for (unsigned i = 0; i < rt_le_n; i++) {
+        if (addr >= rt_le[i].lo && addr < rt_le[i].hi) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void set_textures(const R300State *st, R300DrawPacket *pkt)
 {
     uint32_t enable = r300_reg(st, TX_ENABLE);
@@ -723,6 +794,9 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         }
         r300_tex_layout(t, bpp, dxt, f0 >> 31);
         t->pitch_bytes = t->lvl_pitch[0];
+        if (t->kind == R300_TEXK_RGBA8 && decode && rt_le_holds(t->gpu_addr)) {
+            decode = 0;                 /* rendered by the card, unswapped */
+        }
         t->format = fmt;
         t->filter0 = r300_reg(st, TX_FILTER0_0 + 4 * k);
         t->filter1 = r300_reg(st, TX_FILTER1_0 + 4 * k);
@@ -1583,6 +1657,10 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         *err = "empty colour buffer";
         free(order);
         return false;
+    }
+    if (pkt->rt_bpp == 4) {
+        rt_note(pkt->rt_gpu_addr, pkt->rt_gpu_addr + pkt->rt_pitch * 4u * pkt->rt_height,
+                ((pitch_reg >> 19) & 3) == 0);
     }
 
     pkt->aa_samples = r300_aa_samples(st);
