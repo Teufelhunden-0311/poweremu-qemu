@@ -286,6 +286,10 @@ uint32_t r300_assemble_prov(unsigned prim, uint32_t n, uint32_t *list,
 
 void r300_draw_free(R300DrawPacket *pkt);
 
+/* VRAM [lo, hi) was written by something other than the card's own
+ * unswapped rendering (an upload); see rt_note in r300_draw.c. */
+void r300_rt_forget(uint64_t lo, uint64_t hi);
+
 /*
  * One face/slice of mip level l of a texture a renderer uploads (kinds
  * other than R300_TEXK_RAW), repacked with tight rows: 16bpp formats

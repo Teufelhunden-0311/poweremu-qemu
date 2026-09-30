@@ -5260,6 +5260,11 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
             /* Phase A deep: log AGP translate details for first upload */
             static int agp_detail_log = 0;
 
+            if (s->r300) {
+                r300_rt_forget((uint64_t)dst_offset + (uint64_t)dst_y * dst_pitch,
+                               (uint64_t)dst_offset +
+                               (uint64_t)(dst_y + blit_h) * dst_pitch);
+            }
             bool fast = !wup_log &&
                         !mc_rect_is_tiled(s, dst_offset, dst_pitch,
                                           dst_x, dst_y, bpp);
