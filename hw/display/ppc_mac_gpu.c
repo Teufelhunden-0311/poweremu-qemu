@@ -246,8 +246,13 @@ static uint64_t r200_flush_total;
 static struct {
     uint64_t presents, draws, ops2d, flushes, flush_us, flips;
     uint64_t gpu_vs;         /* R300 draws whose vertex program ran on the GPU */
+    /* display refresh pacing: refreshes that presented, busy ones skipped,
+     * forced waits, and "distinct" = presented refreshes whose 1024-word
+     * sample of the scanout differs from the previous presented one */
+    uint64_t disp_refresh, disp_skip, disp_wait, disp_distinct;
     int64_t since;
 } r200_rate;
+static uint64_t disp_last_sample;
 
 /*
  * Running totals for PowerEmu's performance overlay (the "perf" property):
@@ -1554,6 +1559,37 @@ static void ppc_mac_gpu_cp_rate_log(double sec)
     memset(cp.sync_reg, 0, sizeof(cp.sync_reg));
 }
 
+/*
+ * The display refresh's flush, waiting for the host GPU without the BQL
+ * when the renderer encodes off it (the render queue): held, it blocked
+ * the vCPU for the whole wait.  The refresh runs from a timer, not in the
+ * middle of a ring packet, so nothing is half-done while unlocked; the
+ * rest of display_update reads the scanout state afresh afterwards.
+ * PPCGPU_DISPLAY_UNLOCK=0 keeps the BQL.
+ */
+static void r200_flush_display(PPCMacGPUState *s)
+{
+    static int unlock = -1;
+    if (unlock < 0) {
+        const char *e = getenv("PPCGPU_DISPLAY_UNLOCK");
+        unlock = !(e && e[0] == '0');
+    }
+    if (!unlock || !s->renderer || !s->renderer->flush_r200 ||
+        !s->renderer->draw_queue_async || !bql_locked()) {
+        r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
+        return;
+    }
+    r200_async_drain();
+    int64_t t0 = g_get_monotonic_time();
+    bql_unlock();
+    bool did = s->renderer->flush_r200(s->renderer_opaque);
+    bql_lock();
+    if (did) {
+        r200_rate.flushes++;
+        r200_rate.flush_us += g_get_monotonic_time() - t0;
+    }
+}
+
 static void ppc_mac_gpu_display_update(void *opaque)
 {
     PPCMacGPUState *s = opaque;
@@ -1589,6 +1625,13 @@ static void ppc_mac_gpu_display_update(void *opaque)
                          r200_rate.ops2d / sec, r200_rate.flushes / sec,
                          r200_rate.flush_us / (sec * 1e4));
             }
+            {
+                double sec = (now - r200_rate.since) / 1e6;
+                qemu_log("ppc-mac-gpu display: %.1f refreshes/s, %.1f skipped/s, "
+                         "%.1f waited/s, %.1f distinct/s\n",
+                         r200_rate.disp_refresh / sec, r200_rate.disp_skip / sec,
+                         r200_rate.disp_wait / sec, r200_rate.disp_distinct / sec);
+            }
             ppc_mac_gpu_cp_rate_log((now - r200_rate.since) / 1e6);
             memset(&r200_rate, 0, sizeof(r200_rate));
             r200_rate.since = now;
@@ -1602,27 +1645,47 @@ static void ppc_mac_gpu_display_update(void *opaque)
             /*
              * The frame on screen is still being rendered.  Flushing here
              * waits for the host GPU with the BQL held -- 17% of the time
-             * in Quake III, with the vCPU blocked behind it.  Instead kick
-             * the work off, keep showing the last frame, and look again
-             * next refresh; only after PPCGPU_DISPLAY_SKIP (default 2)
-             * busy refreshes in a row wait for it, so a buffer that is
-             * never idle (the desktop drawing to the front buffer) still
-             * shows up.
+             * in Quake III, with the vCPU blocked behind it.  Optionally
+             * kick the work off, keep showing the last frame, and look
+             * again next refresh, waiting only after PPCGPU_DISPLAY_SKIP
+             * busy refreshes in a row.  Off by default: since the wait
+             * no longer holds the BQL (r200_flush_display) skipping gains
+             * nothing (Quake III 79.0 vs 79.4 fps) and shows far fewer
+             * frames (46 vs 18 distinct frames/s).
              */
             static int max_skip = -1;
             if (max_skip < 0) {
                 const char *e = getenv("PPCGPU_DISPLAY_SKIP");
-                max_skip = e ? atoi(e) : 2;
+                max_skip = e ? atoi(e) : 0;
             }
             if (s->disp_skipped < max_skip && s->renderer->submit_r200) {
                 s->disp_skipped++;
+                r200_rate.disp_skip++;
                 s->renderer->submit_r200(s->renderer_opaque, NULL, NULL);
                 return;
             }
             s->disp_skipped = 0;
-            r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
+            r200_rate.disp_wait++;
+            r200_flush_display(s);
         } else {
             s->disp_skipped = 0;
+        }
+        /* pacing: did this refresh show something new? */
+        {
+            const uint8_t *v = memory_region_get_ram_ptr(&s->vram);
+            uint64_t h = 0, span = hi - lo;
+            if (hi <= s->vram_size && span >= 4096) {
+                for (uint64_t i = 0; i < 1024; i++) {
+                    uint32_t w;
+                    memcpy(&w, v + lo + ((span / 1024) * i & ~3ull), 4);
+                    h = (h ^ w) * 0x100000001B3ull;
+                }
+            }
+            r200_rate.disp_refresh++;
+            if (h != disp_last_sample) {
+                r200_rate.disp_distinct++;
+                disp_last_sample = h;
+            }
         }
     } else {
         r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
