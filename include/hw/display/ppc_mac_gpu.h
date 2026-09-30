@@ -745,6 +745,21 @@ struct PPCMacGPUState {
     void *surface_data;
     uint32_t shadow_buf_size;
 
+    /* Dirty-region scanout (see ppc_mac_gpu_display_update): the VRAM dirty
+     * log is consumed here, so the last scanout this copy served is remembered
+     * to force a full copy across a page flip (the log was cleared while the
+     * buffer we are flipping *to* was still the back buffer). */
+    uint64_t scanout_offset;      /* crtc_offset the shadow buffer mirrors */
+    bool scanout_dirty_valid;     /* shadow_buf/dirty log are in sync */
+    bool scanout_log_owner;       /* this device consumes the VGA dirty log */
+    int scanout_defers;           /* deferrals of the frame we are after */
+
+    /* Deferred present (PPCGPU_ASYNC_PRESENT): display updates skipped while
+     * in-flight GPU work still owned the scanout range. */
+    uint32_t present_wait_seq;    /* submit_r200 seq we are waiting on, 0 = no */
+    int64_t present_defer_us;     /* monotonic us the current wait started */
+    int64_t last_flip_kick;       /* monotonic us of the last refresh kick */
+
     /* Compositor-direct display: instead of reading the framebuffer
      * (which may have gaps during drag due to missing screen-to-screen
      * scroll), read directly from the compositor buffer that WindowServer
