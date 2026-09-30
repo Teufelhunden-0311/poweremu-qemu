@@ -2061,12 +2061,35 @@ uint8_t *r300_tex_level_bytes(const R300TexDesc *td, const uint8_t *src,
     case R300_TEXK_DXT1:
     case R300_TEXK_DXT3:
     case R300_TEXK_DXT5: {
+        /*
+         * VRAM holds the guest CPU's big-endian words, as for RGBA8 above:
+         * each 32-bit word of a block is byte-reversed.  A Doom 3 texture
+         * dumped from VRAM settles it: as they lie the blocks are noise,
+         * word-reversed they are the Mars map (DXT1) and its normal map
+         * (DXT5).  The r200 path's Halo textures come the other way; that
+         * is a different driver.  GART texels are left alone.
+         * R300_DXT_SWAP=0 copies VRAM blocks as they lie.
+         */
+        static int swap = -1;
+        if (swap < 0) {
+            const char *e = getenv("R300_DXT_SWAP");
+            swap = !(e && e[0] == '0');
+        }
         uint32_t bs = td->kind == R300_TEXK_DXT1 ? 8 : 16;
         uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4;
+        size_t row = (size_t)bw * bs;
         *bpr = bw * bs;
-        out = malloc((size_t)bw * bh * bs);
+        out = malloc(row * bh);
         for (uint32_t y = 0; y < bh; y++) {
-            memcpy(out + (size_t)y * bw * bs, src + (uint64_t)y * pitch, (size_t)bw * bs);
+            memcpy(out + y * row, src + (uint64_t)y * pitch, row);
+        }
+        if (swap && !td->host_data) {
+            for (size_t i = 0; i < row * bh; i += 4) {
+                uint32_t v;
+                memcpy(&v, out + i, 4);
+                v = __builtin_bswap32(v);
+                memcpy(out + i, &v, 4);
+            }
         }
         return out;
     }
