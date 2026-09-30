@@ -6581,7 +6581,7 @@ static bool r200_split_enabled(void)
  * as before (the device then also keeps taking the BQL around draws).
  */
 
-enum { RQ_R200 = 0, RQ_R300 = 1 };
+enum { RQ_R200 = 0, RQ_R300 = 1, RQ_SUBMIT = 2 };
 
 /* Defined at the bottom of the file; rqueue_start flags it. */
 static PPCMacGPURenderer metal_renderer;
@@ -6590,6 +6590,11 @@ typedef struct RQJob {
     int kind;
     R200DrawPacket r200;    /* owned copies: verts, indices, host_data */
     R300DrawPacket r300;    /* owned copies: see r300_job_new */
+    struct {                /* RQ_SUBMIT: commit, then done(arg, seq) */
+        void (*done)(void *, uint32_t);
+        void *arg;
+        uint32_t seq;
+    } sub;
 } RQJob;
 
 /* r200_decode_tex_unit()'s AGP copy is pitch*height (DXT: block rows). */
@@ -6772,14 +6777,18 @@ static void *rqueue_thread(void *unused)
         pthread_mutex_lock(&g_render_lock);
         if (job->kind == RQ_R200) {
             r200_draw_encode(st, st->vram_ptr, st->vram_size, &job->r200);
-        } else {
+        } else if (job->kind == RQ_R300) {
             r300_draw_encode(st, st->vram_ptr, st->vram_size, &job->r300);
+        } else {
+            r200_commit_fence(st, job->sub.done, job->sub.arg, job->sub.seq);
         }
         pthread_mutex_unlock(&g_render_lock);
         if (job->kind == RQ_R200) {
             r200_job_free(job);
-        } else {
+        } else if (job->kind == RQ_R300) {
             r300_job_free(job);
+        } else {
+            g_free(job);
         }
         pthread_mutex_lock(&g_rq_mtx);
         g_rq_done++;
@@ -7175,7 +7184,9 @@ static id<MTLTexture> r200_view(PPCMacGPUMetalState *st, R200TexKey k,
 static uint32_t g_r200_seq;
 
 /* Close the open batch and commit it; returns its sequence number or 0. */
-static uint32_t r200_commit(void (*done)(void *, uint32_t), void *arg)
+/* fseq, if not 0, is the number done() reports instead of the commit's own. */
+static uint32_t r200_commit_as(void (*done)(void *, uint32_t), void *arg,
+                               uint32_t fseq)
 {
     if (!g_r200_cb) {
         return 0;
@@ -7191,8 +7202,9 @@ static uint32_t r200_commit(void (*done)(void *, uint32_t), void *arg)
         seq = ++g_r200_seq;
     }
     if (done) {
+        uint32_t report = fseq ? fseq : seq;
         [g_r200_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-            done(arg, seq);
+            done(arg, report);
         }];
     }
     if (g_r200_event) {
@@ -7209,11 +7221,57 @@ static uint32_t r200_commit(void (*done)(void *, uint32_t), void *arg)
     return seq;
 }
 
+static uint32_t r200_commit(void (*done)(void *, uint32_t), void *arg)
+{
+    return r200_commit_as(done, arg, 0);
+}
+
+/*
+ * A fence submit on the render thread, in order behind the draws queued
+ * before it.  With nothing to commit it commits an empty command buffer,
+ * so its completion still comes after everything already in flight.
+ */
+static void r200_commit_fence(PPCMacGPUMetalState *st,
+                              void (*done)(void *, uint32_t), void *arg,
+                              uint32_t seq)
+{
+    if (!g_r200_cb) {
+        g_r200_cb = r200_new_cb(st);
+    }
+    r200_commit_as(done, arg, seq);
+}
+
 static uint32_t metal_submit_r200(void *opaque,
                                   void (*done)(void *, uint32_t), void *arg)
 {
     uint32_t seq;
 
+    /*
+     * With the render queue the submit is queued too, under a number of
+     * its own: waiting here for the queue to drain held the BQL for the
+     * whole encode, and the vCPU spent a quarter of Quake III blocked on
+     * it.  Fences complete in queue order, so their numbers stay ordered.
+     * PPCGPU_QUEUED_SUBMIT=0 drains and commits here instead.
+     */
+    static int queued = -1;
+    static uint32_t fence_seq;
+    if (queued < 0) {
+        const char *e = getenv("PPCGPU_QUEUED_SUBMIT");
+        queued = !(e && e[0] == '0');
+    }
+    if (rqueue_enabled() && queued) {
+        RQJob *job = g_new0(RQJob, 1);
+        seq = ++fence_seq;
+        if (seq == 0) {
+            seq = ++fence_seq;
+        }
+        job->kind = RQ_SUBMIT;
+        job->sub.done = done;
+        job->sub.arg = arg;
+        job->sub.seq = seq;
+        rq_push(job);
+        return seq;
+    }
     if (rqueue_enabled()) {
         rqueue_drain();
     }
