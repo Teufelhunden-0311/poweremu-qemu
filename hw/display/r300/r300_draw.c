@@ -648,8 +648,13 @@ void r300_border_color(uint32_t fmt, uint32_t v, float c[4])
  * without the swap is in the card's own order instead: Doom 3's heat haze
  * renders the screen into a texture that way and samples it back, and
  * reversed its black read as bright red.  Remember where such surfaces
- * are, until a swapped render or an upload through the GART lands on
- * them.  R300_RT_LE=0 turns this off.
+ * are, until a swapped render or another writer lands on them: the 2D
+ * engine, host-data and GART uploads, and CPU writes through the
+ * byte-swapping apertures all call r300_rt_forget (vram_mark in
+ * ppc_mac_gpu.c).  CPU writes through the plain linear aperture do not
+ * trap, so a surface the CPU rewrites that way stays recorded -- the
+ * proper fix is modelling the apertures' byte swap.  R300_RT_LE=0 turns
+ * this off.
  */
 #define RT_LE_SLOTS 16
 static struct { uint32_t lo, hi; } rt_le[RT_LE_SLOTS];
