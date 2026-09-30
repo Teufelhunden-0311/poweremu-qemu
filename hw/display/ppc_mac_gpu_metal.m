@@ -6805,7 +6805,124 @@ static void *rqueue_thread(void *unused)
     return NULL;
 }
 
-static void rq_push(RQJob *job)
+/*
+ * VRAM ranges that queued, not yet encoded jobs will read (textures) or
+ * write (colour and depth buffers).  metal_range_busy_r200 used to call
+ * everything busy while the queue was not empty, so every 2D blit --
+ * each of Doom 3's texture uploads -- drained the queue with the BQL
+ * held, and the vCPU and main loop (and with it the audio pacing timer)
+ * stood still behind it.  Entries are dropped once their job has been
+ * encoded; the batch's own read/written lists cover them from then on.
+ * Past RQ_RANGES entries it falls back to "busy" until the queue drains.
+ * PPCGPU_RQ_RANGES=0 restores the old answer.
+ */
+#define RQ_RANGES 512
+typedef struct { uint64_t lo, hi; uintptr_t pos; bool write; } RQRange;
+static RQRange g_rq_ranges[RQ_RANGES];
+static int g_rq_nranges;
+static bool g_rq_range_overflow;
+static pthread_mutex_t g_rq_range_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+static bool rq_ranges_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_RQ_RANGES");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* Drop entries of jobs already encoded.  Called with g_rq_range_mtx. */
+static void rq_ranges_prune(void)
+{
+    uintptr_t done = qatomic_read(&g_rq_done);
+    int k = 0;
+    for (int i = 0; i < g_rq_nranges; i++) {
+        if ((intptr_t)(g_rq_ranges[i].pos - done) >= 0) {
+            g_rq_ranges[k++] = g_rq_ranges[i];
+        }
+    }
+    g_rq_nranges = k;
+    if (g_rq_range_overflow && done == qatomic_read(&g_rq_enq)) {
+        g_rq_range_overflow = false;
+    }
+}
+
+static void rq_range_add(uintptr_t pos, uint64_t lo, uint64_t len, bool write)
+{
+    if (!len) {
+        return;
+    }
+    if (g_rq_nranges == RQ_RANGES) {
+        rq_ranges_prune();
+    }
+    if (g_rq_nranges == RQ_RANGES) {
+        g_rq_range_overflow = true;
+        return;
+    }
+    g_rq_ranges[g_rq_nranges++] = (RQRange){ lo, lo + len, pos, write };
+}
+
+static void rq_ranges_r300(uintptr_t pos, const R300DrawPacket *p)
+{
+    uint64_t rows = (uint64_t)p->rt_height * MAX(p->aa_samples, 1u);
+    pthread_mutex_lock(&g_rq_range_mtx);
+    rq_range_add(pos, p->rt_gpu_addr, (uint64_t)p->rt_pitch * p->rt_bpp * rows, true);
+    for (uint32_t k = 1; k < p->num_cb && k < R300_US_MAX_TARGETS; k++) {
+        rq_range_add(pos, p->cb[k].gpu_addr, (uint64_t)p->cb[k].pitch * p->cb[k].bpp * rows,
+                     true);
+    }
+    if (p->depth.attach) {
+        rq_range_add(pos, p->depth.gpu_addr, (uint64_t)p->depth.pitch * p->depth.bpp * rows,
+                     true);
+    }
+    for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
+        if (p->tex[t].bound && !p->tex[t].host_data) {
+            rq_range_add(pos, p->tex[t].gpu_addr, p->tex[t].size_bytes, false);
+        }
+    }
+    pthread_mutex_unlock(&g_rq_range_mtx);
+}
+
+static void rq_ranges_r200(uintptr_t pos, const R200DrawPacket *p)
+{
+    pthread_mutex_lock(&g_rq_range_mtx);
+    rq_range_add(pos, p->rt_offset, (uint64_t)p->rt_pitch * 4 * p->rt_height, true);
+    if (p->depth_enable || p->stencil_enable) {
+        rq_range_add(pos, p->depth_offset,
+                     (uint64_t)p->depth_pitch * p->depth_bpp * p->rt_height, true);
+    }
+    for (int t = 0; t < R200_MAX_TEX; t++) {
+        if (p->tex[t].enabled && !p->tex[t].host_data) {
+            /* mip levels are not described here: twice the base level
+             * bounds a full chain */
+            rq_range_add(pos, p->tex[t].offset, 2 * r200_tex_host_bytes(&p->tex[t]), false);
+        }
+    }
+    pthread_mutex_unlock(&g_rq_range_mtx);
+}
+
+/* Does a queued, not yet encoded job touch [lo, hi) in a conflicting way? */
+static bool rq_ranges_busy(uint64_t lo, uint64_t hi, bool write_access)
+{
+    bool busy = false;
+    pthread_mutex_lock(&g_rq_range_mtx);
+    rq_ranges_prune();
+    if (g_rq_range_overflow) {
+        busy = true;
+    }
+    for (int i = 0; !busy && i < g_rq_nranges; i++) {
+        const RQRange *r = &g_rq_ranges[i];
+        if (lo < r->hi && r->lo < hi && (write_access || r->write)) {
+            busy = true;
+        }
+    }
+    pthread_mutex_unlock(&g_rq_range_mtx);
+    return busy;
+}
+
+static uintptr_t rq_push(RQJob *job)
 {
     uintptr_t pos = qatomic_fetch_add(&g_rq_enq, (uintptr_t)1);
     RQCell *c = &g_rq_cells[pos & RQ_MASK];
@@ -6829,6 +6946,7 @@ static void rq_push(RQJob *job)
         pthread_mutex_unlock(&g_rq_mtx);
     }
     g_rq_stat_jobs++;
+    return pos;
 }
 
 static bool rqueue_start(PPCMacGPUMetalState *st)
@@ -6996,25 +7114,62 @@ static void r200_note_written(uint64_t lo, uint64_t hi, const R200TexKey *key)
     g_r200_nwritten++;
 }
 
-/* VRAM ranges read (as textures) by draws in the open or in-flight batches. */
-#define R200_MAX_READ 64
-static struct { uint64_t lo, hi; } g_r200_read[R200_MAX_READ];
-static int g_r200_nread;
-static bool g_r200_read_overflow;
+/*
+ * VRAM read (as textures) by draws in the open or in-flight batches: for
+ * every 4 KiB page, the number of the last batch that read it (0 never).
+ * A page is busy while that batch has not completed on the GPU
+ * (g_r200_done_seq, set by every commit's completion handler).
+ *
+ * This used to be a list of 64 ranges that, once full, called every range
+ * busy until the next full flush.  Doom 3 reads hundreds of textures a
+ * frame, so it was always full: each 2D blit (every texture upload) and
+ * every render-to-texture then flushed and waited with the BQL held.
+ */
+#define R200_READ_PAGE_SHIFT 12
+#define R200_READ_MAX_VRAM (1ull << 30)
+static uint32_t *g_r200_read_seq;       /* per page */
+static bool g_r200_read_overflow;       /* a read beyond R200_READ_MAX_VRAM */
+static uint32_t g_r200_seq;             /* number of the last commit */
+static uint32_t g_r200_done_seq;        /* newest completed commit (atomic) */
 
 static void r200_note_read(uint64_t lo, uint64_t hi)
 {
-    for (int i = 0; i < g_r200_nread; i++) {
-        if (g_r200_read[i].lo == lo && g_r200_read[i].hi == hi) {
-            return;
-        }
+    if (hi <= lo) {
+        return;
     }
-    if (g_r200_nread == R200_MAX_READ) {
+    if (hi > R200_READ_MAX_VRAM) {
         g_r200_read_overflow = true;         /* be conservative */
         return;
     }
-    g_r200_read[g_r200_nread].lo = lo;
-    g_r200_read[g_r200_nread++].hi = hi;
+    if (!g_r200_read_seq) {
+        g_r200_read_seq = g_new0(uint32_t, R200_READ_MAX_VRAM >> R200_READ_PAGE_SHIFT);
+    }
+    uint32_t open = g_r200_seq + 1 ? g_r200_seq + 1 : 1;    /* the open batch's number */
+    for (uint64_t p = lo >> R200_READ_PAGE_SHIFT;
+         p <= (hi - 1) >> R200_READ_PAGE_SHIFT; p++) {
+        g_r200_read_seq[p] = open;
+    }
+}
+
+/* Is any page of [lo, hi) read by a batch that has not completed? */
+static bool r200_read_busy(uint64_t lo, uint64_t hi)
+{
+    if (g_r200_read_overflow) {
+        return true;
+    }
+    if (!g_r200_read_seq || hi <= lo) {
+        return false;
+    }
+    uint32_t done = qatomic_read(&g_r200_done_seq);
+    uint64_t end = MIN(hi, R200_READ_MAX_VRAM);
+    for (uint64_t p = lo >> R200_READ_PAGE_SHIFT;
+         p < end && p <= (end - 1) >> R200_READ_PAGE_SHIFT; p++) {
+        uint32_t r = g_r200_read_seq[p];
+        if (r && (int32_t)(r - done) > 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool metal_range_busy_r200_locked(uint64_t lo, uint64_t hi,
@@ -7023,10 +7178,13 @@ static bool metal_range_busy_r200_locked(uint64_t lo, uint64_t hi,
 static bool metal_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi,
                                   bool write_access)
 {
-    /* Queued or mid-encode draws may touch anything: be conservative and
-     * let the caller drain.  (The caller's flush then waits for them.) */
+    /* Queued or mid-encode draws: busy if one of them touches the range
+     * (rq_ranges_busy), or -- PPCGPU_RQ_RANGES=0 -- whenever any is
+     * pending.  The caller's flush then waits for them. */
     if (rqueue_pending()) {
-        return true;
+        if (!rq_ranges_on() || rq_ranges_busy(lo, hi, write_access)) {
+            return true;
+        }
     }
     pthread_mutex_lock(&g_render_lock);
     bool busy = metal_range_busy_r200_locked(lo, hi, write_access);
@@ -7045,15 +7203,8 @@ static bool metal_range_busy_r200_locked(uint64_t lo, uint64_t hi,
             return true;
         }
     }
-    if (write_access) {
-        if (g_r200_read_overflow) {
-            return true;
-        }
-        for (int i = 0; i < g_r200_nread; i++) {
-            if (lo < g_r200_read[i].hi && g_r200_read[i].lo < hi) {
-                return true;
-            }
-        }
+    if (write_access && r200_read_busy(lo, hi)) {
+        return true;
     }
     return false;
 }
@@ -7187,7 +7338,6 @@ static id<MTLTexture> r200_view(PPCMacGPUMetalState *st, R200TexKey k,
     return t;
 }
 
-static uint32_t g_r200_seq;
 
 /* Close the open batch and commit it; returns its sequence number or 0. */
 /* fseq, if not 0, is the number done() reports instead of the commit's own. */
@@ -7207,6 +7357,11 @@ static uint32_t r200_commit_as(void (*done)(void *, uint32_t), void *arg,
     if (seq == 0) {
         seq = ++g_r200_seq;
     }
+    /* Pages read by this batch stop being busy when it completes
+     * (r200_read_busy); command buffers complete in commit order. */
+    [g_r200_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        qatomic_set(&g_r200_done_seq, seq);
+    }];
     if (done) {
         uint32_t report = fseq ? fseq : seq;
         [g_r200_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
@@ -7302,7 +7457,7 @@ static bool r200_flush_locked(PPCMacGPUMetalState *st)
     [g_r200_inflight release];
     g_r200_inflight = nil;
     g_r200_nwritten = 0;
-    g_r200_nread = 0;
+    qatomic_set(&g_r200_done_seq, g_r200_seq);  /* everything has completed */
     g_r200_read_overflow = false;
     g_r200_stat_flushes++;
     g_r200_stat_flush_us += g_get_monotonic_time() - t0;
@@ -8009,7 +8164,10 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     if (r) {
         return r < 0 ? -1 : 0;      /* rejected, or nothing to draw */
     }
-    rq_push(r200_job_new(pkt));
+    {
+        uintptr_t pos = rq_push(r200_job_new(pkt));
+        rq_ranges_r200(pos, pkt);
+    }
     return 0;
 }
 
@@ -8298,28 +8456,8 @@ static id<MTLSamplerState> r300_sampler(id<MTLDevice> dev, uint32_t f0,
  */
 static bool r300_read_conflict(uint64_t lo, uint64_t hi, const R200TexKey *rt)
 {
-    if (g_r200_enc && !memcmp(&g_r200_enc_key, rt, sizeof(*rt)) &&
-        !g_r200_read_overflow) {
-        bool any = false;
-        for (int i = 0; i < g_r200_nread; i++) {
-            if (lo < g_r200_read[i].hi && g_r200_read[i].lo < hi) {
-                any = true;
-                break;
-            }
-        }
-        if (!any) {
-            return false;
-        }
-    }
-    if (g_r200_read_overflow) {
-        return g_r200_cb != nil;
-    }
-    for (int i = 0; i < g_r200_nread; i++) {
-        if (lo < g_r200_read[i].hi && g_r200_read[i].lo < hi) {
-            return true;
-        }
-    }
-    return false;
+    (void)rt;
+    return r200_read_busy(lo, hi);
 }
 
 /* Metal format of a colour-buffer view (R300_RTV_*). */
@@ -8958,7 +9096,10 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     if (r) {
         return r < 0 ? -1 : 0;      /* rejected, or nothing to draw */
     }
-    rq_push(r300_job_new(pkt));
+    {
+        uintptr_t pos = rq_push(r300_job_new(pkt));
+        rq_ranges_r300(pos, pkt);
+    }
     return 0;
 }
 
