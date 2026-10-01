@@ -147,7 +147,7 @@ static void booke206_flush_tlb(CPUPPCState *env, int flags,
 /* BATs management */
 #if !defined(FLUSH_ALL_TLBS)
 static inline void do_invalidate_BAT(CPUPPCState *env, target_ulong BATu,
-                                     target_ulong mask)
+                                     target_ulong mask, bool data)
 {
     CPUState *cs = env_cpu(env);
     target_ulong base, end, page;
@@ -180,6 +180,27 @@ static inline void do_invalidate_BAT(CPUPPCState *env, target_ulong BATu,
     qemu_log_mask(CPU_LOG_MMU, "Flush BAT from " TARGET_FMT_lx
                   " to " TARGET_FMT_lx " (" TARGET_FMT_lx ")\n",
                   base, end, mask);
+    /*
+     * A data BAT translates only data accesses made with translation on:
+     * no instruction fetch, and no real-mode index (bit 1 of the PPC MMU
+     * index set; 0x3333 are the others, with the SR slots' bits 2-3).  So
+     * leave the jump cache and the other indexes alone -- Tiger rewrites
+     * DBAT0/1 tens of thousands of times a second during file I/O, and
+     * flushing every page of every index plus the jump cache was three
+     * quarters of the vCPU's time in a file copy.  PPC_DBAT_FAST=0 flushes
+     * as for any page.
+     */
+    static int fast = -1;
+    if (fast < 0) {
+        const char *e = getenv("PPC_DBAT_FAST");
+        fast = !(e && e[0] == '0');
+    }
+    if (data && fast && env->mmu_model == POWERPC_MMU_32B) {
+        tlb_flush_data_pages_by_mmuidx(cs, base, (end - base) >> TARGET_PAGE_BITS,
+                                       0x3333);
+        qemu_log_mask(CPU_LOG_MMU, "Flush done\n");
+        return;
+    }
     for (page = base; page != end; page += TARGET_PAGE_SIZE) {
         tlb_flush_page(cs, page);
     }
@@ -204,7 +225,7 @@ void helper_store_ibatu(CPUPPCState *env, uint32_t nr, target_ulong value)
         /* the old range, sized by the old BL (the new one may be smaller) */
         mask = (env->IBAT[0][nr] << 15) & 0x0FFE0000UL;
 #if !defined(FLUSH_ALL_TLBS)
-        do_invalidate_BAT(env, env->IBAT[0][nr], mask);
+        do_invalidate_BAT(env, env->IBAT[0][nr], mask, false);
 #endif
         /*
          * When storing valid upper BAT, mask BEPI and BRPN and
@@ -216,7 +237,7 @@ void helper_store_ibatu(CPUPPCState *env, uint32_t nr, target_ulong value)
         env->IBAT[1][nr] = (env->IBAT[1][nr] & 0x0000007B) |
             (env->IBAT[1][nr] & ~0x0001FFFF & ~mask);
 #if !defined(FLUSH_ALL_TLBS)
-        do_invalidate_BAT(env, env->IBAT[0][nr], mask);
+        do_invalidate_BAT(env, env->IBAT[0][nr], mask, false);
 #else
         tlb_flush(env_cpu(env));
 #endif
@@ -242,7 +263,7 @@ void helper_store_dbatu(CPUPPCState *env, uint32_t nr, target_ulong value)
         /* the old range, sized by the old BL (the new one may be smaller) */
         mask = (env->DBAT[0][nr] << 15) & 0x0FFE0000UL;
 #if !defined(FLUSH_ALL_TLBS)
-        do_invalidate_BAT(env, env->DBAT[0][nr], mask);
+        do_invalidate_BAT(env, env->DBAT[0][nr], mask, true);
 #endif
         mask = (value << 15) & 0x0FFE0000UL;
         env->DBAT[0][nr] = (value & 0x00001FFFUL) |
@@ -250,7 +271,7 @@ void helper_store_dbatu(CPUPPCState *env, uint32_t nr, target_ulong value)
         env->DBAT[1][nr] = (env->DBAT[1][nr] & 0x0000007B) |
             (env->DBAT[1][nr] & ~0x0001FFFF & ~mask);
 #if !defined(FLUSH_ALL_TLBS)
-        do_invalidate_BAT(env, env->DBAT[0][nr], mask);
+        do_invalidate_BAT(env, env->DBAT[0][nr], mask, true);
 #else
         tlb_flush(env_cpu(env));
 #endif
