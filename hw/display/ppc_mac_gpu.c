@@ -250,9 +250,38 @@ static struct {
      * forced waits, and "distinct" = presented refreshes whose 1024-word
      * sample of the scanout differs from the previous presented one */
     uint64_t disp_refresh, disp_skip, disp_wait, disp_distinct;
+    uint64_t co_copies, co_partials, co_skips, co_defers;  /* scanout path */
     int64_t since;
 } r200_rate;
 static uint64_t disp_last_sample;
+
+/*
+ * Scanout-path switches, all default-on, each settable to 0 to get the
+ * pre-optimisation behaviour back for A/B testing:
+ *   PPCGPU_DIRTY_SCANOUT  consume the VRAM dirty log to copy and publish
+ *                         only the rows that changed
+ *   PPCGPU_FLIP_KICK      refresh the UI on a page flip instead of waiting
+ *                         for the polling tick
+ *   PPCGPU_ASYNC_PRESENT  hand in-flight GPU work its completion callback
+ *                         instead of draining it on the UI thread
+ *   PPCGPU_DIAG           per-frame diagnostic VRAM scans (default off)
+ */
+static bool ppc_gpu_env_on(const char *name)
+{
+    const char *v = getenv(name);
+
+    return !v || strcmp(v, "0") != 0;
+}
+
+static bool ppc_gpu_env_diag(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        cached = getenv("PPCGPU_DIAG") != NULL;
+    }
+    return cached;
+}
 
 /*
  * Running totals for PowerEmu's performance overlay (the "perf" property):
@@ -1515,10 +1544,42 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
  * expecting LE XRGB: bytes [B, G, R, X] in memory.
  * A bswap32 per pixel converts between the two.
  */
-static void ppc_mac_gpu_bswap_line32(uint32_t *dst, const uint32_t *src,
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#elif defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+
+static void ppc_mac_gpu_bswap_line32(uint32_t *restrict dst,
+                                     const uint32_t *restrict src,
                                      int width)
 {
-    for (int i = 0; i < width; i++) {
+    int i = 0;
+
+#if defined(__ARM_NEON)
+    /* reverse the bytes of each 32-bit pixel; 16 bytes = 4 pixels a round,
+     * four vectors a pass so the loads and stores overlap. */
+    for (; i + 16 <= width; i += 16) {
+        uint8x16_t a = vrev32q_u8(vld1q_u8((const uint8_t *)(src + i)));
+        uint8x16_t b = vrev32q_u8(vld1q_u8((const uint8_t *)(src + i + 4)));
+        uint8x16_t c = vrev32q_u8(vld1q_u8((const uint8_t *)(src + i + 8)));
+        uint8x16_t d = vrev32q_u8(vld1q_u8((const uint8_t *)(src + i + 12)));
+        vst1q_u8((uint8_t *)(dst + i), a);
+        vst1q_u8((uint8_t *)(dst + i + 4), b);
+        vst1q_u8((uint8_t *)(dst + i + 8), c);
+        vst1q_u8((uint8_t *)(dst + i + 12), d);
+    }
+#elif defined(__SSE2__)
+    const __m128i m = _mm_set1_epi32(0x00FF00FF);
+    for (; i + 4 <= width; i += 4) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(src + i));
+        v = _mm_or_si128(_mm_srli_epi32(v, 16), _mm_slli_epi32(v, 16));
+        v = _mm_or_si128(_mm_slli_epi16(_mm_and_si128(v, m), 8),
+                         _mm_srli_epi16(_mm_and_si128(v, m), 8));
+        _mm_storeu_si128((__m128i *)(dst + i), v);
+    }
+#endif
+    for (; i < width; i++) {
         dst[i] = bswap32(src[i]);
     }
 }
@@ -1590,6 +1651,24 @@ static void r200_flush_display(PPCMacGPUState *s)
     }
 }
 
+static bool ppc_gpu_dirty_scanout = true;   /* read from env in realize */
+static bool ppc_gpu_flip_kick = true;
+static bool ppc_gpu_async_present = true;
+
+/*
+ * Render-queue completion for a deferred present (see the head of
+ * ppc_mac_gpu_display_update): runs on a backend completion thread, so it
+ * touches nothing but the console, asking the main loop to run the refresh
+ * we skipped -- with the batch now finished, that pass copies for real.
+ */
+static void ppc_mac_gpu_present_done(void *arg, uint32_t seq)
+{
+    PPCMacGPUState *s = arg;
+
+    (void)seq;
+    dpy_refresh_soon(s->con);
+}
+
 static void ppc_mac_gpu_display_update(void *opaque)
 {
     PPCMacGPUState *s = opaque;
@@ -1624,6 +1703,16 @@ static void ppc_mac_gpu_display_update(void *opaque)
                          100.0 * r200_rate.gpu_vs / r200_rate.draws,
                          r200_rate.ops2d / sec, r200_rate.flushes / sec,
                          r200_rate.flush_us / (sec * 1e4));
+                if (r200_rate.co_copies || r200_rate.co_skips ||
+                    r200_rate.co_defers) {
+                    qemu_log("ppc-mac-gpu scanout: %.0f copies/s "
+                             "(%.0f partial, %.0f unchanged/s skipped), "
+                             "%.0f presents deferred/s\n",
+                             r200_rate.co_copies / sec,
+                             r200_rate.co_partials / sec,
+                             r200_rate.co_skips / sec,
+                             r200_rate.co_defers / sec);
+                }
             }
             {
                 double sec = (now - r200_rate.since) / 1e6;
@@ -1643,32 +1732,26 @@ static void ppc_mac_gpu_display_update(void *opaque)
         if (s->renderer && s->renderer->range_busy_r200 &&
             s->renderer->range_busy_r200(s->renderer_opaque, lo, hi, false)) {
             /*
-             * The frame on screen is still being rendered.  Flushing here
-             * waits for the host GPU with the BQL held -- 17% of the time
-             * in Quake III, with the vCPU blocked behind it.  Optionally
-             * kick the work off, keep showing the last frame, and look
-             * again next refresh, waiting only after PPCGPU_DISPLAY_SKIP
-             * busy refreshes in a row.  Off by default: since the wait
-             * no longer holds the BQL (r200_flush_display) skipping gains
-             * nothing (Quake III 79.0 vs 79.4 fps) and shows far fewer
-             * frames (46 vs 18 distinct frames/s).
+             * Unfinished 3D work may still write the scanout.  With an
+             * asynchronous render queue there is a cheaper answer than
+             * blocking this thread until it drains: commit the batch, take
+             * the completion callback, and come back when it fires.  A
+             * handful of deferrals is a frame of latency; after that fall
+             * back to the synchronous flush, so a busy queue can never
+             * starve the display.  The fallback waits for the host GPU
+             * without the BQL where it can (r200_flush_display).
              */
-            static int max_skip = -1;
-            if (max_skip < 0) {
-                const char *e = getenv("PPCGPU_DISPLAY_SKIP");
-                max_skip = e ? atoi(e) : 0;
-            }
-            if (s->disp_skipped < max_skip && s->renderer->submit_r200) {
-                s->disp_skipped++;
-                r200_rate.disp_skip++;
-                s->renderer->submit_r200(s->renderer_opaque, NULL, NULL);
+            if (s->renderer->draw_queue_async && s->scanout_log_owner &&
+                ppc_gpu_async_present && s->renderer->submit_r200 &&
+                s->scanout_defers < 4) {
+                s->scanout_defers++;
+                r200_rate.co_defers++;
+                s->renderer->submit_r200(s->renderer_opaque,
+                                         ppc_mac_gpu_present_done, s);
                 return;
             }
-            s->disp_skipped = 0;
             r200_rate.disp_wait++;
-            r200_flush_display(s);
-        } else {
-            s->disp_skipped = 0;
+            r200_flush_display(s);     /* without the BQL when it can */
         }
         /* pacing: did this refresh show something new? */
         {
@@ -1714,7 +1797,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
     /* Phase D — Post-present tile range check: sample the window texture
      * range every 200 frames (after boot) to detect late population by
      * direct guest CPU writes. */
-    {
+    if (ppc_gpu_env_diag()) {
         static int phase_d_frame = 0;
         phase_d_frame++;
         if (phase_d_frame == 500 || phase_d_frame == 700 ||
@@ -1835,7 +1918,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
      * We scan MULTIPLE potential RT offsets since the compositor
      * offset varies per session (0x300000, 0x900000, 0x940000, etc.)
      */
-    {
+    if (ppc_gpu_env_diag()) {
         static uint32_t trap_frame = 0;
         static uint32_t prev_fb_crc = 0;
         static uint32_t prev_rt_crcs[4] = {0};
@@ -1974,7 +2057,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
      *
      * Also sample at the OLD position for comparison.
      */
-    if (s->renderer && s->renderer->get_drag_state) {
+    if (ppc_gpu_env_diag() && s->renderer && s->renderer->get_drag_state) {
         static uint32_t prev_diag_ox = 0, prev_diag_oy = 0;
         static uint32_t prev_diag_gen = 0;
         static bool prev_diag_valid = false;
@@ -2059,18 +2142,74 @@ static void ppc_mac_gpu_display_update(void *opaque)
         s->renderer->flush_drag_paste(s->renderer_opaque, vram_ptr);
     }
 
+    /*
+     * Which scanout rows to copy.
+     *
+     * The VRAM dirty log (kept on for renderers that do not consume it,
+     * and fed by every guest CPU store and every device and render-queue
+     * write) knows which rows of the framebuffer were written since the
+     * last copy.  A page flip invalidates the partial view -- writes to
+     * the buffer being flipped *to* may have been consumed by an earlier
+     * snapshot while it was still the back buffer -- so the frame after
+     * the offset moves is copied whole, as is the frame after any mode
+     * change.  Skipping the copy entirely when no row is dirty also
+     * skips the UI's full-frame CGImage refresh.
+     */
+    int y0 = 0, y1 = (int)height;
+    DirtyBitmapSnapshot *snap = NULL;
+
+    if (s->scanout_log_owner && ppc_gpu_dirty_scanout) {
+        snap = memory_region_snapshot_and_clear_dirty(
+                   &s->vram, s->disp.offset, frame_size, DIRTY_MEMORY_VGA);
+    }
+    if (snap && s->scanout_dirty_valid && !mode_changed &&
+        s->scanout_offset == s->disp.offset) {
+        int lo = -1, hi = -1, y;
+        for (y = 0; y < (int)height; y++) {
+            if (memory_region_snapshot_get_dirty(&s->vram, snap,
+                    s->disp.offset + (uint64_t)y * stride, width * 4)) {
+                if (lo < 0) {
+                    lo = y;
+                }
+                hi = y + 1;
+            }
+        }
+        g_free(snap);
+        snap = NULL;
+        if (lo < 0) {
+            r200_rate.co_skips++;
+            return;                 /* nothing was written: nothing to show */
+        }
+        y0 = lo;
+        y1 = hi;
+    } else if (snap) {
+        g_free(snap);
+        snap = NULL;
+    }
+
     /* Bswap copy: VRAM (BE) → shadow buffer (LE) */
     const uint32_t *src = (const uint32_t *)(vram_ptr + s->disp.offset);
     uint32_t *dst = (uint32_t *)s->shadow_buf;
     uint32_t stride_u32 = stride / 4;
     int y;
-    for (y = 0; y < (int)height; y++) {
+    r200_rate.co_copies++;
+    if (y0 != 0 || y1 != (int)height) {
+        r200_rate.co_partials++;
+    }
+    for (y = y0; y < y1; y++) {
         ppc_mac_gpu_bswap_line32(dst + y * stride_u32,
                                   src + y * stride_u32,
                                   width);
     }
+    s->scanout_offset = s->disp.offset;
+    s->scanout_dirty_valid = s->scanout_log_owner;
+    s->scanout_defers = 0;
 
-    dpy_gfx_update_full(s->con);
+    if (y0 == 0 && y1 == (int)height) {
+        dpy_gfx_update_full(s->con);
+    } else {
+        dpy_gfx_update(s->con, 0, y0, width, y1 - y0);
+    }
 }
 
 static const GraphicHwOps ppc_mac_gpu_gfx_ops = {
@@ -10836,6 +10975,21 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
                           s->regs.crtc_offset, val);
             r200_rate.flips++;             /* page flip: one frame */
             r200_perf_present();
+            /*
+             * A flip is the frame boundary the guest itself defines: go
+             * get it now instead of waiting for the next poll, so a
+             * 60 Hz video is not sampled and presented on a 30 Hz grid.
+             * Kicks no closer than ~8 ms apart coalesce anyway (the UI
+             * refresh re-reads the current state), so this is a floor on
+             * the cost, not a per-flip interrupt storm.
+             */
+            if (ppc_gpu_flip_kick) {
+                int64_t now = g_get_monotonic_time();
+                if (now - s->last_flip_kick >= 8000) {
+                    s->last_flip_kick = now;
+                    dpy_refresh_soon(s->con);
+                }
+            }
         }
         s->regs.crtc_offset = val;
         s->display_invalid = true;
@@ -12016,6 +12170,7 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
 
     s->mode = PPC_MAC_GPU_MODE_EXT;
     s->display_invalid = true;
+    s->scanout_dirty_valid = false;   /* next copy is a whole frame */
 
     /*
      * State kept outside the register file must come back to what realize
@@ -12486,6 +12641,16 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         s->renderer->set_dirty_source(s->renderer_opaque, ppc_mac_gpu_vram_dirty, s);
     }
 
+    /*
+     * Scanout-path switches (see ppc_mac_gpu_display_update).  The VRAM
+     * dirty log belongs to the renderer when one consumes it (Vulkan);
+     * that combination keeps copying whole frames, deferring nothing.
+     */
+    ppc_gpu_dirty_scanout = ppc_gpu_env_on("PPCGPU_DIRTY_SCANOUT");
+    ppc_gpu_flip_kick = ppc_gpu_env_on("PPCGPU_FLIP_KICK");
+    ppc_gpu_async_present = ppc_gpu_env_on("PPCGPU_ASYNC_PRESENT");
+    s->scanout_log_owner = !s->renderer || !s->renderer->set_dirty_source;
+
     /* Set PCI config space fields */
     pci_set_byte(&dev->config[PCI_REVISION_ID],
                  s->r300 ? 0x00 : PPC_MAC_GPU_PCI_REVISION);
@@ -12696,6 +12861,7 @@ static int ppc_mac_gpu_post_load(void *opaque, int version_id)
 
     /* Ask for one full screen update; everything derived follows from it. */
     s->display_invalid = true;
+    s->scanout_dirty_valid = false;
     /* Force the mode -- and the surface handed to the window -- to be
      * built again from the restored registers. */
     s->disp.width = 0;
