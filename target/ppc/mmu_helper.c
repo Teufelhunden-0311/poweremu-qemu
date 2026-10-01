@@ -152,6 +152,22 @@ static inline void do_invalidate_BAT(CPUPPCState *env, target_ulong BATu,
     CPUState *cs = env_cpu(env);
     target_ulong base, end, page;
 
+    /*
+     * A BAT with neither Vs nor Vp set maps nothing, so no TLB entry can
+     * have come from it: when it became invalid its old range was flushed.
+     * Mac OS X's physical-copy window sets DBAT0/1 and clears them again
+     * around every copy -- tens of thousands of times a second -- and
+     * flushing the invalid side each time was half of its BAT cost.
+     * PPC_BAT_SKIP_INVALID=0 flushes them anyway.
+     */
+    static int skip_invalid = -1;
+    if (skip_invalid < 0) {
+        const char *e = getenv("PPC_BAT_SKIP_INVALID");
+        skip_invalid = !(e && e[0] == '0');
+    }
+    if (skip_invalid && !(BATu & (BATU32_VS | BATU32_VP))) {
+        return;
+    }
     base = BATu & ~0x0001FFFF;
     end = base + mask + 0x00020000;
     if (((end - base) >> TARGET_PAGE_BITS) > 1024) {
@@ -185,7 +201,8 @@ void helper_store_ibatu(CPUPPCState *env, uint32_t nr, target_ulong value)
 
     dump_store_bat(env, 'I', 0, nr, value);
     if (env->IBAT[0][nr] != value) {
-        mask = (value << 15) & 0x0FFE0000UL;
+        /* the old range, sized by the old BL (the new one may be smaller) */
+        mask = (env->IBAT[0][nr] << 15) & 0x0FFE0000UL;
 #if !defined(FLUSH_ALL_TLBS)
         do_invalidate_BAT(env, env->IBAT[0][nr], mask);
 #endif
@@ -222,7 +239,8 @@ void helper_store_dbatu(CPUPPCState *env, uint32_t nr, target_ulong value)
          * When storing valid upper BAT, mask BEPI and BRPN and
          * invalidate all TLBs covered by this BAT
          */
-        mask = (value << 15) & 0x0FFE0000UL;
+        /* the old range, sized by the old BL (the new one may be smaller) */
+        mask = (env->DBAT[0][nr] << 15) & 0x0FFE0000UL;
 #if !defined(FLUSH_ALL_TLBS)
         do_invalidate_BAT(env, env->DBAT[0][nr], mask);
 #endif
