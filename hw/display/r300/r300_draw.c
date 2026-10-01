@@ -2105,15 +2105,51 @@ static void r300_decode16(uint32_t fmt, uint16_t v, uint8_t out[4])
     out[0] = x; out[1] = y; out[2] = z; out[3] = w;
 }
 
+/*
+ * Four independent lanes over consecutive 8-byte words, combined at the
+ * end: the same mix as one lane, but the lanes' multiply chains overlap.
+ * One serial chain hashed ~5 GB/s and was 88% of the Metal render
+ * thread's work in Doom 3, where it checks every bound texture.
+ */
 uint64_t r300_hash_bytes(const uint8_t *p, size_t n)
 {
     const uint64_t m = 0x9E3779B97F4A7C15ull;
-    uint64_t h = n * m, v;
+    static int one_lane = -1;               /* PPCGPU_HASH_1LANE=1: the old loop */
+    if (one_lane < 0) {
+        one_lane = getenv("PPCGPU_HASH_1LANE") != NULL;
+    }
+    if (one_lane) {
+        uint64_t h = n * m, v;
+        size_t i = 0;
+        for (; i + 8 <= n; i += 8) {
+            memcpy(&v, p + i, 8);
+            h = (h ^ v) * m;
+            h ^= h >> 29;
+        }
+        for (; i < n; i++) {
+            h = (h ^ p[i]) * m;
+        }
+        return h ^ (h >> 32);
+    }
+    uint64_t h0 = n * m, h1 = h0 ^ 0x243F6A8885A308D3ull,
+             h2 = h0 ^ 0x13198A2E03707344ull, h3 = h0 ^ 0xA4093822299F31D0ull;
+    uint64_t v0, v1, v2, v3;
     size_t i = 0;
 
+    for (; i + 32 <= n; i += 32) {
+        memcpy(&v0, p + i, 8);
+        memcpy(&v1, p + i + 8, 8);
+        memcpy(&v2, p + i + 16, 8);
+        memcpy(&v3, p + i + 24, 8);
+        h0 = (h0 ^ v0) * m; h0 ^= h0 >> 29;
+        h1 = (h1 ^ v1) * m; h1 ^= h1 >> 29;
+        h2 = (h2 ^ v2) * m; h2 ^= h2 >> 29;
+        h3 = (h3 ^ v3) * m; h3 ^= h3 >> 29;
+    }
+    uint64_t h = ((h0 * m ^ h1) * m ^ h2) * m ^ h3;
     for (; i + 8 <= n; i += 8) {
-        memcpy(&v, p + i, 8);
-        h = (h ^ v) * m;
+        memcpy(&v0, p + i, 8);
+        h = (h ^ v0) * m;
         h ^= h >> 29;
     }
     for (; i < n; i++) {
