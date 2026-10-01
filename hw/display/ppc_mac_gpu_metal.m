@@ -8485,18 +8485,90 @@ static MTLPixelFormat r300_raw_pf(uint32_t view_bpp)
  * unit's layout and a hash of its bytes, so unchanged textures cost a
  * hash, not an upload.
  */
-#define R300_TCACHE 48
+/*
+ * Entries are found by the unit's layout (where and what the texture is)
+ * through a hash index, and the content hash decides whether the copy is
+ * still current; a texture whose bytes changed is replaced in place.  It
+ * held 48 textures, fewer than a Quake III frame binds: ~6,000 of its
+ * ~9,000 lookups a second missed and rebuilt the texture.  Now up to
+ * R300_TCACHE entries within R300_TCACHE_BYTES of texel data, LRU.
+ */
+#define R300_TCACHE 1024
+#define R300_TCACHE_IDX 4096                    /* power of two */
+#define R300_TCACHE_BYTES (512ull << 20)
 typedef struct R300TexCacheKey {
     uint32_t addr, format, kind, width, height, depth, dim, levels, pitch;
     uint32_t host;
-    uint64_t hash;
 } R300TexCacheKey;
 static struct {
     R300TexCacheKey key;
+    uint64_t hash;                              /* of the texels it holds */
     id<MTLTexture> tex;
-    uint64_t used;
+    uint64_t used;                              /* 0: free */
+    uint64_t bytes;
 } g_r300_tcache[R300_TCACHE];
-static uint64_t g_r300_tcache_clock;
+static uint16_t g_r300_tcache_idx[R300_TCACHE_IDX];    /* slot + 1, 0 none */
+static uint64_t g_r300_tcache_clock, g_r300_tcache_bytes;
+
+static uint32_t r300_tcache_bucket(const R300TexCacheKey *k)
+{
+    uint64_t h = r300_hash_bytes((const uint8_t *)k, sizeof(*k));
+    return (uint32_t)h & (R300_TCACHE_IDX - 1);
+}
+
+/* The slot holding layout k, or -1. */
+static int r300_tcache_find(const R300TexCacheKey *k)
+{
+    uint16_t v = g_r300_tcache_idx[r300_tcache_bucket(k)];
+    if (v && g_r300_tcache[v - 1].used &&
+        !memcmp(&g_r300_tcache[v - 1].key, k, sizeof(*k))) {
+        return v - 1;
+    }
+    for (int i = 0; i < R300_TCACHE; i++) {     /* bucket collision */
+        if (g_r300_tcache[i].used && !memcmp(&g_r300_tcache[i].key, k, sizeof(*k))) {
+            g_r300_tcache_idx[r300_tcache_bucket(k)] = i + 1;
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void r300_tcache_drop(int i)
+{
+    g_r300_tcache_bytes -= g_r300_tcache[i].bytes;
+    [g_r300_tcache[i].tex release];
+    g_r300_tcache[i].tex = nil;
+    g_r300_tcache[i].used = 0;
+    g_r300_tcache[i].bytes = 0;
+}
+
+/* A slot for a new texture of @bytes, evicting least recently used. */
+static int r300_tcache_slot(uint64_t bytes)
+{
+    /* PPCGPU_TCACHE=n caps the entries (48 was the old size). */
+    static int cap = -1;
+    if (cap < 0) {
+        const char *e = getenv("PPCGPU_TCACHE");
+        cap = e && atoi(e) > 0 ? MIN(atoi(e), R300_TCACHE) : R300_TCACHE;
+    }
+    for (;;) {
+        int lru = -1, free_ = -1;
+        for (int i = 0; i < cap; i++) {
+            if (!g_r300_tcache[i].used) {
+                free_ = i;
+            } else if (lru < 0 || g_r300_tcache[i].used < g_r300_tcache[lru].used) {
+                lru = i;
+            }
+        }
+        if (free_ >= 0 && g_r300_tcache_bytes + bytes <= R300_TCACHE_BYTES) {
+            return free_;
+        }
+        if (lru < 0) {
+            return free_;
+        }
+        r300_tcache_drop(lru);
+    }
+}
 
 static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> dev,
                                         uint8_t *vram_ptr, const R300TexDesc *td)
@@ -8523,18 +8595,19 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
         r200_flush_locked(st);
     }
 
-    R300TexCacheKey key = { td->gpu_addr, td->format, td->kind, td->width, td->height,
-                            td->depth, td->dim, td->levels, td->pitch_bytes,
-                            td->host_data != NULL, r300_hash_bytes(src, td->size_bytes) };
-    int lru = 0;
-    for (int i = 0; i < R300_TCACHE; i++) {
-        if (g_r300_tcache[i].tex && !memcmp(&g_r300_tcache[i].key, &key, sizeof(key))) {
-            g_r300_tcache[i].used = ++g_r300_tcache_clock;
-            return g_r300_tcache[i].tex;
+    R300TexCacheKey key;
+    memset(&key, 0, sizeof(key));
+    key = (R300TexCacheKey){ td->gpu_addr, td->format, td->kind, td->width, td->height,
+                             td->depth, td->dim, td->levels, td->pitch_bytes,
+                             td->host_data != NULL };
+    uint64_t hash = r300_hash_bytes(src, td->size_bytes);
+    int hit = r300_tcache_find(&key);
+    if (hit >= 0) {
+        if (g_r300_tcache[hit].hash == hash) {
+            g_r300_tcache[hit].used = ++g_r300_tcache_clock;
+            return g_r300_tcache[hit].tex;
         }
-        if (g_r300_tcache[i].used < g_r300_tcache[lru].used) {
-            lru = i;
-        }
+        r300_tcache_drop(hit);                  /* content changed */
     }
 
     MTLTextureDescriptor *d = [[MTLTextureDescriptor alloc] init];
@@ -8572,10 +8645,17 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
             free(bytes);
         }
     }
-    [g_r300_tcache[lru].tex release];
-    g_r300_tcache[lru].key = key;
-    g_r300_tcache[lru].tex = t;
-    g_r300_tcache[lru].used = ++g_r300_tcache_clock;
+    int slot = r300_tcache_slot(td->size_bytes);
+    if (slot < 0) {
+        return [t autorelease];                 /* cannot cache it */
+    }
+    g_r300_tcache[slot].key = key;
+    g_r300_tcache[slot].hash = hash;
+    g_r300_tcache[slot].tex = t;
+    g_r300_tcache[slot].used = ++g_r300_tcache_clock;
+    g_r300_tcache[slot].bytes = td->size_bytes;
+    g_r300_tcache_bytes += td->size_bytes;
+    g_r300_tcache_idx[r300_tcache_bucket(&key)] = slot + 1;
     return t;
 }
 
