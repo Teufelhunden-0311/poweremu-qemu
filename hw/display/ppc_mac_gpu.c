@@ -4548,12 +4548,24 @@ static inline void mc_vram_write32(PPCMacGPUState *s, uint8_t *vram,
  * Copies were given this treatment long ago (blit_rect_untiled); fills never
  * were, and they are what draws every window background, every menu, every
  * list row and the desktop.  A pixel at a time costs two 64-bit multiplies
- * and a call each; a row at a time is one memset_pattern4.  Measured over a
+ * and a call each; a row at a time is one fill_pattern4.  Measured over a
  * full screen: 3.14 ms against 0.22.
  *
  * Returns false if the rectangle is tiled or runs off the end of VRAM, in
  * which case the caller keeps to the slow path that knows how to handle it.
  */
+/* n copies of the 4-byte pixel px at dst.  memset_pattern4 is macOS's. */
+static inline void fill_pattern4(uint8_t *dst, uint32_t px, size_t n)
+{
+#ifdef __APPLE__
+    memset_pattern4(dst, &px, n * 4);
+#else
+    for (size_t i = 0; i < n; i++) {
+        memcpy(dst + i * 4, &px, 4);
+    }
+#endif
+}
+
 static bool fill_rect_fast(PPCMacGPUState *s, uint8_t *vram,
                            uint32_t dst_offset, uint32_t dst_pitch,
                            uint32_t dst_x, uint32_t dst_y,
@@ -4578,8 +4590,7 @@ static bool fill_rect_fast(PPCMacGPUState *s, uint8_t *vram,
     {
         uint32_t px = be32_to_cpu(color);
         for (row = 0; row < h; row++) {
-            memset_pattern4(vram + first + (uint64_t)row * dst_pitch,
-                            &px, (size_t)w * 4);
+            fill_pattern4(vram + first + (uint64_t)row * dst_pitch, px, w);
         }
     }
     return true;
