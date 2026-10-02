@@ -459,22 +459,16 @@ static void screamer_codec_write(ScreamerState *s, hwaddr addr, uint64_t val)
 {
     //SCREAMER_DPRINTF("%s: addr " HWADDR_PRIx " val %" PRIx64 "\n", __func__, addr, val);
 
-    switch (addr) {
-    case 0x1:
-        /* Clear recalibrate if set */
-        val = val & ~CODEC_CTRL1_RECALIBRATE;    
-
-        /* Update volume in case mute set */
-        screamer_update_volume(s);
-        break;
-
-    case 0x4:
-        /* Speaker attenuation */
-        screamer_update_volume(s);
-        break;
+    if (addr == 0x1) {
+        val = val & ~CODEC_CTRL1_RECALIBRATE;   /* clear recalibrate if set */
     }
-    
     s->codec_ctrl_regs[addr] = val;
+
+    /* Mute (register 1) and speaker attenuation (register 4) take effect
+     * from the value just written, not the one it replaced. */
+    if (addr == 0x1 || addr == 0x4) {
+        screamer_update_volume(s);
+    }
 }
 
 static uint64_t screamer_read(void *opaque, hwaddr addr, unsigned size)
@@ -543,6 +537,11 @@ static void screamer_write(void *opaque, hwaddr addr,
     case CODEC_STAT_REG:
     case CLIP_CNT_REG:
     case BYTE_SWAP_REG:
+        s->regs[addr] = val & 0xffffffff;
+        break;
+    case FRAME_CNT_REG:
+        /* AppleScreamerAudio zeroes it before starting output DMA, and its
+         * engine times the stream from it. */
         s->regs[addr] = val & 0xffffffff;
         break;
     default:
