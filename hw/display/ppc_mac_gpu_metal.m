@@ -5897,8 +5897,10 @@ static bool metal_get_drag_state(void *opaque,
 static void metal_flush_drag_paste(void *opaque, uint8_t *vram)
 {
     PPCMacGPUMetalState *st = opaque;
-    if (st) {
-        pthread_mutex_lock(&g_render_lock);
+    /* Called from every display refresh: if the render thread is encoding,
+     * paste at the next refresh rather than wait for it (the wait held up
+     * the main loop and its audio timers). */
+    if (st && !pthread_mutex_trylock(&g_render_lock)) {
         drag_body_paste(st, vram);
         pthread_mutex_unlock(&g_render_lock);
     }
