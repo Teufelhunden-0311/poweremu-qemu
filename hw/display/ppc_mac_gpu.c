@@ -1703,15 +1703,20 @@ static void ppc_mac_gpu_cp_rate_log(double sec)
  * rest of display_update reads the scanout state afresh afterwards.
  * PPCGPU_DISPLAY_UNLOCK=0 keeps the BQL.
  */
-static void r200_flush_display(PPCMacGPUState *s)
+static bool display_unlock_ok(PPCMacGPUState *s)
 {
     static int unlock = -1;
     if (unlock < 0) {
         const char *e = getenv("PPCGPU_DISPLAY_UNLOCK");
         unlock = !(e && e[0] == '0');
     }
-    if (!unlock || !s->renderer || !s->renderer->flush_r200 ||
-        !s->renderer->draw_queue_async || !bql_locked()) {
+    return unlock && s->renderer && s->renderer->draw_queue_async &&
+           bql_locked();
+}
+
+static void r200_flush_display(PPCMacGPUState *s)
+{
+    if (!display_unlock_ok(s) || !s->renderer->flush_r200) {
         r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
         return;
     }
@@ -1724,6 +1729,39 @@ static void r200_flush_display(PPCMacGPUState *s)
         r200_rate.flushes++;
         r200_rate.flush_us += g_get_monotonic_time() - t0;
     }
+}
+
+/*
+ * The display refresh's other questions for the renderer -- is the scanout
+ * still being rendered, and the window-drag paste -- take the render lock,
+ * which the render thread holds for a whole encode: tens of milliseconds
+ * when Doom 3 uploads textures.  Waiting for it with the BQL held froze
+ * the vCPU and the main loop's audio timers with it (sampled: a third of
+ * a second of BQL-held waiting per 30 s of play, the stutters and audio
+ * skips).  Ask without the BQL, as r200_flush_display waits.
+ */
+static bool display_range_busy(PPCMacGPUState *s, uint64_t lo, uint64_t hi)
+{
+    bool busy;
+
+    if (!display_unlock_ok(s)) {
+        return s->renderer->range_busy_r200(s->renderer_opaque, lo, hi, false);
+    }
+    bql_unlock();
+    busy = s->renderer->range_busy_r200(s->renderer_opaque, lo, hi, false);
+    bql_lock();
+    return busy;
+}
+
+static void display_drag_paste(PPCMacGPUState *s, uint8_t *vram_ptr)
+{
+    if (!display_unlock_ok(s)) {
+        s->renderer->flush_drag_paste(s->renderer_opaque, vram_ptr);
+        return;
+    }
+    bql_unlock();
+    s->renderer->flush_drag_paste(s->renderer_opaque, vram_ptr);
+    bql_lock();
 }
 
 static bool ppc_gpu_dirty_scanout = true;   /* read from env in realize */
@@ -1805,7 +1843,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
         uint64_t lo = s->regs.crtc_offset;
         uint64_t hi = lo + (uint64_t)s->disp.stride * s->disp.height;
         if (s->renderer && s->renderer->range_busy_r200 &&
-            s->renderer->range_busy_r200(s->renderer_opaque, lo, hi, false)) {
+            display_range_busy(s, lo, hi)) {
             /*
              * Unfinished 3D work may still write the scanout.  With an
              * asynchronous render queue there is a cheaper answer than
@@ -2215,7 +2253,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
     /* Flush any pending drag body paste — pastes saved body pixels
      * to the new position AFTER all compositor rendering is done. */
     if (s->renderer && s->renderer->flush_drag_paste) {
-        s->renderer->flush_drag_paste(s->renderer_opaque, vram_ptr);
+        display_drag_paste(s, vram_ptr);
     }
 
     /*
