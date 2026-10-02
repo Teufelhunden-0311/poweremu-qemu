@@ -8994,6 +8994,38 @@ static struct {
  * is not vouched for; the next use hashes it again.  PPCGPU_TEX_DIRTY=0
  * hashes every time, as before.
  */
+/*
+ * PPCGPU_TEX_VERIFY=N: hash every Nth texture the write count vouches for
+ * anyway, and report any whose bytes changed regardless -- a writer the
+ * dirty log did not see.  Off (0) by default; it costs a hash per check.
+ */
+static void r300_tex_verify(const R300TexCacheKey *key, uint64_t hash,
+                            const uint8_t *src, uint32_t size)
+{
+    static int every = -1;
+    static uint64_t n, checked, wrong;
+    if (every < 0) {
+        const char *e = getenv("PPCGPU_TEX_VERIFY");
+        every = e ? atoi(e) : 0;
+    }
+    if (every <= 0 || ++n % every) {
+        return;
+    }
+    checked++;
+    if (r300_hash_bytes(src, size) != hash) {
+        wrong++;
+        if (wrong <= 16) {
+            fprintf(stderr, "ppc-mac-gpu: texture at %06x (%ux%u fmt %u, %u "
+                    "bytes) changed without a dirty-log write\n", key->addr,
+                    key->width, key->height, key->format, size);
+        }
+    }
+    if (!(checked % 10000)) {
+        fprintf(stderr, "ppc-mac-gpu: texture verify %" PRIu64 " checked, %"
+                PRIu64 " changed unseen\n", checked, wrong);
+    }
+}
+
 static bool r300_tex_gen(const R300TexDesc *td, uint64_t *gen)
 {
     uint64_t lo = td->gpu_addr, hi = lo + td->size_bytes;
@@ -9108,6 +9140,8 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
     if (hit >= 0 && gen_ok && g_r300_tcache[hit].gen_ok &&
         g_r300_tcache[hit].gen == gen) {
         g_r300_tcache[hit].used = ++g_r300_tcache_clock;
+        r300_tex_verify(&g_r300_tcache[hit].key, g_r300_tcache[hit].hash,
+                        src, td->size_bytes);
         return g_r300_tcache[hit].tex;          /* not written since */
     }
     uint64_t hash = r300_hash_bytes(src, td->size_bytes);
