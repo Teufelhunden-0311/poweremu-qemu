@@ -7307,6 +7307,15 @@ static void ppc_cpu_reset_hold(Object *obj, ResetType type)
                               &env->fp_status);
     /* Similarly for flush-to-zero */
     set_float_ftz_detection(float_ftz_before_rounding, &env->fp_status);
+    /*
+     * AltiVec too: in non-Java mode a result that is tiny before rounding
+     * becomes zero, even when rounding would have made it the smallest
+     * normal (7447A: 0x00800000 * 0x3f7fffff + 0 is 0 with VSCR[NJ] set,
+     * 0x00800000 with it clear).
+     */
+    set_float_detect_tininess(float_tininess_before_rounding,
+                              &env->vec_status);
+    set_float_ftz_detection(float_ftz_before_rounding, &env->vec_status);
 
     /*
      * PowerPC propagation rules:
