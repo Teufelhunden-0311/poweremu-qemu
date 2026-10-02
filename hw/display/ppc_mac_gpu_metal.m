@@ -6922,6 +6922,21 @@ static bool rq_ranges_busy(uint64_t lo, uint64_t hi, bool write_access)
     return busy;
 }
 
+/* Does a queued draw known to write [lo, hi)?  Unlike rq_ranges_busy,
+ * an overflowed list answers no: the caller drains to find out. */
+static bool rq_ranges_written(uint64_t lo, uint64_t hi)
+{
+    bool hit = false;
+    pthread_mutex_lock(&g_rq_range_mtx);
+    rq_ranges_prune();
+    for (int i = 0; !hit && i < g_rq_nranges; i++) {
+        const RQRange *r = &g_rq_ranges[i];
+        hit = r->write && lo < r->hi && r->lo < hi;
+    }
+    pthread_mutex_unlock(&g_rq_range_mtx);
+    return hit;
+}
+
 static uintptr_t rq_push(RQJob *job)
 {
     uintptr_t pos = qatomic_fetch_add(&g_rq_enq, (uintptr_t)1);
@@ -7175,15 +7190,46 @@ static bool r200_read_busy(uint64_t lo, uint64_t hi)
 static bool metal_range_busy_r200_locked(uint64_t lo, uint64_t hi,
                                          bool write_access);
 
+/*
+ * PPCGPU_2D_DRAIN=0: a 2D access that overlaps queued draws flushes (and
+ * waits for the GPU) instead of letting the render queue encode them first.
+ */
+static bool r200_2d_drain_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_2D_DRAIN");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 static bool metal_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi,
                                   bool write_access)
 {
-    /* Queued or mid-encode draws: busy if one of them touches the range
-     * (rq_ranges_busy), or -- PPCGPU_RQ_RANGES=0 -- whenever any is
-     * pending.  The caller's flush then waits for them. */
+    /* Queued or mid-encode draws touching the range (rq_ranges_busy), or
+     * -- PPCGPU_RQ_RANGES=0 -- any queued draw at all. */
     if (rqueue_pending()) {
         if (!rq_ranges_on() || rq_ranges_busy(lo, hi, write_access)) {
-            return true;
+            /*
+             * A 2D write over bytes that queued draws only read -- four in
+             * five of Doom 3's busy 2D blits, its texture uploads -- needs
+             * just those draws encoded: the encode turns a texture read
+             * into a CPU copy (or, for a view, a read recorded against its
+             * batch).  Let the queue catch up and then ask about the GPU
+             * alone.  Anything else (a read of what queued draws write,
+             * such as Quake III reading back its frame, about 50 times a
+             * second) needs the GPU finished anyway, and draining first
+             * only added a wait of 4-6 ms: flush, as before.  When the
+             * range list has overflowed, as Doom 3's does, draining is how
+             * to find out: a write it turns up is then in the batch's
+             * written list, and the GPU check below sees it.
+             */
+            if (!r200_2d_drain_on() || !write_access ||
+                rq_ranges_written(lo, hi)) {
+                return true;            /* the caller's flush waits for them */
+            }
+            rqueue_drain();
         }
     }
     pthread_mutex_lock(&g_render_lock);
