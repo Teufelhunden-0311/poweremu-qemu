@@ -544,6 +544,30 @@ static inline bool vfp_st_checked(ppc_avr_t *r, float32x4_t x)
     return true;
 }
 
+/*
+ * The same for a computed result: also hand softfloat any lane in the
+ * lowest normal binade.  In non-Java mode a result that was tiny before
+ * rounding is zero even if rounding brought it up to the smallest normal,
+ * which the host cannot tell apart from an exact one (7447A, VSCR[NJ]=1:
+ * vmaddfp 0x00800000 * 0x3f7fffff + 0 = 0).  Min and max select an
+ * operand and keep vfp_st_checked.
+ */
+static inline bool vfp_st_arith(ppc_avr_t *r, float32x4_t x)
+{
+    uint32x4_t u = vreinterpretq_u32_f32(x);
+    uint32x4_t e = vandq_u32(u, vdupq_n_u32(0x7f800000));
+    /* NaN/infinity, denormal, or the lowest normal binade (or zero: free) */
+    uint32x4_t bad = vorrq_u32(vceqq_u32(e, vdupq_n_u32(0x7f800000)),
+                               vcleq_u32(e, vdupq_n_u32(0x00800000)));
+    uint32x4_t zero = vceqzq_u32(vandq_u32(u, vdupq_n_u32(0x7fffffff)));
+
+    if (vmaxvq_u32(vbicq_u32(bad, zero))) {
+        return false;
+    }
+    vst1q_u32(r->u32, u);
+    return true;
+}
+
 enum { VFP_ADD, VFP_SUB, VFP_MIN, VFP_MAX, VFP_MADD, VFP_NMSUB,
        VFP_RE, VFP_RSQRTE };
 
@@ -558,9 +582,9 @@ static inline bool vfp_fast(int op, ppc_avr_t *r, ppc_avr_t *a,
     }
     switch (op) {
     case VFP_RE:
-        return vfp_st_checked(r, vdivq_f32(vdupq_n_f32(1.0f), fa));
+        return vfp_st_arith(r, vdivq_f32(vdupq_n_f32(1.0f), fa));
     case VFP_RSQRTE:
-        return vfp_st_checked(r, vdivq_f32(vdupq_n_f32(1.0f), vsqrtq_f32(fa)));
+        return vfp_st_arith(r, vdivq_f32(vdupq_n_f32(1.0f), vsqrtq_f32(fa)));
     }
     fb = vfp_ld(b);
     if (!vfp_all_zon(fb)) {
@@ -591,7 +615,8 @@ static inline bool vfp_fast(int op, ppc_avr_t *r, ppc_avr_t *a,
         }
         break;
     }
-    return vfp_st_checked(r, x);
+    return (op == VFP_MIN || op == VFP_MAX) ? vfp_st_checked(r, x)
+                                            : vfp_st_arith(r, x);
 }
 
 /* vcfux/vcfsx: r = (float)b / 2^uim. */
