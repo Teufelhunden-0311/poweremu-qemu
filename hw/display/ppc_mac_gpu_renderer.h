@@ -391,6 +391,14 @@ typedef struct PPCMacGPURenderer {
     bool (*range_busy_r200)(void *opaque, uint64_t lo, uint64_t hi,
                             bool write_access);
 
+    /*
+     * Optional: range_busy_r200 for a reader that does not modify the range
+     * and must not wait (the display refresh, which shares its thread with
+     * the audio timers): true whenever the answer would take waiting --
+     * the renderer is mid-encode -- as well as when the range is busy.
+     */
+    bool (*range_busy_try_r200)(void *opaque, uint64_t lo, uint64_t hi);
+
     void (*fill_notify_r200)(void *opaque, uint32_t offset, uint32_t pitch,
                              uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                              uint32_t bpp, uint32_t value);

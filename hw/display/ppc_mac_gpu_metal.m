@@ -5897,8 +5897,10 @@ static bool metal_get_drag_state(void *opaque,
 static void metal_flush_drag_paste(void *opaque, uint8_t *vram)
 {
     PPCMacGPUMetalState *st = opaque;
-    if (st) {
-        pthread_mutex_lock(&g_render_lock);
+    /* Called from every display refresh: if the render thread is encoding,
+     * paste at the next refresh rather than wait for it (the wait held up
+     * the main loop's audio timers). */
+    if (st && !pthread_mutex_trylock(&g_render_lock)) {
         drag_body_paste(st, vram);
         pthread_mutex_unlock(&g_render_lock);
     }
@@ -7502,6 +7504,39 @@ static bool metal_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi,
     }
     pthread_mutex_lock(&g_render_lock);
     bool busy = metal_range_busy_r200_locked(lo, hi, write_access);
+    pthread_mutex_unlock(&g_render_lock);
+    return busy;
+}
+
+/* range_busy_try_r200: a read-only question, answered without waiting. */
+static bool metal_range_busy_try_r200(void *opaque, uint64_t lo, uint64_t hi)
+{
+    if (g_rq_thread_started) {
+        bool busy = false;
+        pthread_mutex_lock(&g_rq_mtx);      /* held only for scans and pops */
+        if (g_rq_enc_valid && rq_ranges_busy(&g_rq_enc_ranges, lo, hi, false)) {
+            busy = true;
+        }
+        uintptr_t deq = qatomic_read(&g_rq_deq);
+        uintptr_t enq = qatomic_read(&g_rq_enq);
+        for (uintptr_t pos = deq; pos < enq && !busy; pos++) {
+            RQCell *c = &g_rq_cells[pos & RQ_MASK];
+            if ((uintptr_t)qatomic_load_acquire(&c->seq) != pos + 1 ||
+                rq_ranges_busy(&c->ranges, lo, hi, false)) {
+                busy = true;
+            }
+        }
+        pthread_mutex_unlock(&g_rq_mtx);
+        if (busy) {
+            return true;
+        }
+    }
+    /* The render thread holds the lock for a whole encode: it is rendering,
+     * so call the range busy rather than wait to find out. */
+    if (pthread_mutex_trylock(&g_render_lock)) {
+        return true;
+    }
+    bool busy = metal_range_busy_r200_locked(lo, hi, false);
     pthread_mutex_unlock(&g_render_lock);
     return busy;
 }
@@ -9855,6 +9890,7 @@ static PPCMacGPURenderer metal_renderer = {
     .submit_r200       = metal_submit_r200,
     .fill_notify_r200  = metal_fill_notify_r200,
     .range_busy_r200   = metal_range_busy_r200,
+    .range_busy_try_r200 = metal_range_busy_try_r200,
     .get_caps          = metal_get_caps,
     .get_drag_state    = metal_get_drag_state,
     .get_drag_snap     = NULL,

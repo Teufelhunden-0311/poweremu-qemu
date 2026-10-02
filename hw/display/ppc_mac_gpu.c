@@ -1766,6 +1766,10 @@ static bool display_range_busy(PPCMacGPUState *s, uint64_t lo, uint64_t hi)
 {
     bool busy;
 
+    if (s->renderer->range_busy_try_r200 && display_unlock_ok(s)) {
+        /* Never waits: the refresh shares its thread with the audio timers. */
+        return s->renderer->range_busy_try_r200(s->renderer_opaque, lo, hi);
+    }
     if (!display_unlock_ok(s)) {
         return s->renderer->range_busy_r200(s->renderer_opaque, lo, hi, false);
     }
