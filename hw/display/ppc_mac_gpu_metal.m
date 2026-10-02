@@ -8506,7 +8506,39 @@ static struct {
     id<MTLTexture> tex;
     uint64_t used;                              /* 0: free */
     uint64_t bytes;
+    uint64_t gen;                               /* r300_tex_gen when hashed */
+    bool gen_ok;                                /* gen can vouch for it */
 } g_r300_tcache[R300_TCACHE];
+
+/*
+ * Skipping the hash.  Hashing every texture of every draw was the render
+ * thread's main cost, and it sits in front of every fence: Doom 3 ran 28%
+ * faster with it gone.  The device counts writes to the pages under each
+ * texture when it queues the draw (R300TexDesc.vram_gen, from the VRAM
+ * dirty log); a cached texture keeps the count it was hashed at, and the
+ * same count later means none of its bytes were written since.
+ *
+ * GPU writes are the exception: a draw marks its colour buffer dirty when
+ * it is queued, but Metal writes it later, after the mark may have been
+ * counted.  So a texture copied while an in-flight batch writes its bytes
+ * is not vouched for; the next use hashes it again.  PPCGPU_TEX_DIRTY=0
+ * hashes every time, as before.
+ */
+static bool r300_tex_gen(const R300TexDesc *td, uint64_t *gen)
+{
+    uint64_t lo = td->gpu_addr, hi = lo + td->size_bytes;
+
+    if (!td->vram_gen_ok) {
+        return false;
+    }
+    for (int i = 0; i < g_r200_nwritten; i++) {
+        if (lo < g_r200_written[i].hi && g_r200_written[i].lo < hi) {
+            return false;                       /* the GPU may still write it */
+        }
+    }
+    *gen = td->vram_gen;
+    return true;
+}
 static uint16_t g_r300_tcache_idx[R300_TCACHE_IDX];    /* slot + 1, 0 none */
 static uint64_t g_r300_tcache_clock, g_r300_tcache_bytes;
 
@@ -8600,11 +8632,20 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
     key = (R300TexCacheKey){ td->gpu_addr, td->format, td->kind, td->width, td->height,
                              td->depth, td->dim, td->levels, td->pitch_bytes,
                              td->host_data != NULL };
-    uint64_t hash = r300_hash_bytes(src, td->size_bytes);
+    uint64_t gen = 0;
+    bool gen_ok = !td->host_data && r300_tex_gen(td, &gen);
     int hit = r300_tcache_find(&key);
+    if (hit >= 0 && gen_ok && g_r300_tcache[hit].gen_ok &&
+        g_r300_tcache[hit].gen == gen) {
+        g_r300_tcache[hit].used = ++g_r300_tcache_clock;
+        return g_r300_tcache[hit].tex;          /* not written since */
+    }
+    uint64_t hash = r300_hash_bytes(src, td->size_bytes);
     if (hit >= 0) {
         if (g_r300_tcache[hit].hash == hash) {
             g_r300_tcache[hit].used = ++g_r300_tcache_clock;
+            g_r300_tcache[hit].gen = gen;
+            g_r300_tcache[hit].gen_ok = gen_ok;
             return g_r300_tcache[hit].tex;
         }
         r300_tcache_drop(hit);                  /* content changed */
@@ -8651,6 +8692,8 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
     }
     g_r300_tcache[slot].key = key;
     g_r300_tcache[slot].hash = hash;
+    g_r300_tcache[slot].gen = gen;
+    g_r300_tcache[slot].gen_ok = gen_ok;
     g_r300_tcache[slot].tex = t;
     g_r300_tcache[slot].used = ++g_r300_tcache_clock;
     g_r300_tcache[slot].bytes = td->size_bytes;
