@@ -7087,13 +7087,16 @@ static RQJob *rq_pop_locked(void)
     uintptr_t pos = qatomic_read(&g_rq_deq);
     RQCell *c = &g_rq_cells[pos & RQ_MASK];
 
-    if ((uintptr_t)qatomic_read(&c->seq) != pos + 1) {
+    /* Acquire pairs with rq_push's release: once seq says the cell is
+     * full, its job pointer and ranges are the ones just published (ARM
+     * reorders plain accesses; reading a stale pointer freed it twice). */
+    if ((uintptr_t)qatomic_load_acquire(&c->seq) != pos + 1) {
         return NULL;
     }
-    RQJob *job = c->job;
+    RQJob *job = qatomic_read(&c->job);
     g_rq_enc_ranges = c->ranges;
     g_rq_enc_valid = true;
-    qatomic_set(&c->seq, pos + RQ_SIZE);      /* the cell is free again */
+    qatomic_store_release(&c->seq, pos + RQ_SIZE);   /* the cell is free again */
     qatomic_set(&g_rq_deq, pos + 1);
     return job;
 }
@@ -7155,17 +7158,17 @@ static void rq_push(RQJob *job)
 
     /* Full: wait for the render thread to finish a job.  FIFO order
      * means this draw cannot be encoded here instead. */
-    while ((uintptr_t)qatomic_read(&c->seq) != pos) {
+    while ((uintptr_t)qatomic_load_acquire(&c->seq) != pos) {
         pthread_mutex_lock(&g_rq_mtx);
-        if ((uintptr_t)qatomic_read(&c->seq) != pos) {
+        if ((uintptr_t)qatomic_load_acquire(&c->seq) != pos) {
             g_rq_stat_full++;
             pthread_cond_wait(&g_rq_space, &g_rq_mtx);
         }
         pthread_mutex_unlock(&g_rq_mtx);
     }
     qatomic_set(&c->job, job);
-    c->ranges = job->ranges;      /* published by the seq store below */
-    qatomic_set(&c->seq, pos + 1);
+    c->ranges = job->ranges;
+    qatomic_store_release(&c->seq, pos + 1);    /* publishes job and ranges */
     if (pos == qatomic_read(&g_rq_deq)) {
         /* the ring was empty: the render thread may be asleep */
         pthread_mutex_lock(&g_rq_mtx);
@@ -7387,7 +7390,7 @@ static bool metal_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi,
         uintptr_t enq = qatomic_read(&g_rq_enq);
         for (uintptr_t pos = deq; pos < enq && !busy; pos++) {
             RQCell *c = &g_rq_cells[pos & RQ_MASK];
-            if ((uintptr_t)qatomic_read(&c->seq) != pos + 1) {
+            if ((uintptr_t)qatomic_load_acquire(&c->seq) != pos + 1) {
                 busy = true;          /* being published right now */
                 break;
             }
