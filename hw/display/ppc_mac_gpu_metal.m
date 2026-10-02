@@ -7072,8 +7072,14 @@ static bool rqueue_enabled(void)
  * progress), so this cannot self-deadlock. */
 static void rqueue_drain(void)
 {
+    /* Only the jobs pushed before the call: a caller that waits without
+     * the BQL (the display refresh) must not chase producers that keep
+     * pushing meanwhile.  Jobs finish in order, so done >= target means
+     * all of them are through. */
+    uintptr_t target = qatomic_read(&g_rq_enq);
+
     pthread_mutex_lock(&g_rq_mtx);
-    while (qatomic_read(&g_rq_done) != qatomic_read(&g_rq_enq)) {
+    while ((intptr_t)(qatomic_read(&g_rq_done) - target) < 0) {
         pthread_cond_wait(&g_rq_idle, &g_rq_mtx);
     }
     pthread_mutex_unlock(&g_rq_mtx);
