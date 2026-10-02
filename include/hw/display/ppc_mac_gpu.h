@@ -226,6 +226,8 @@ struct R200Vertex;
 #define R200_CP_RB_RPTR               0x0710
 #define R200_CP_RB_WPTR               0x0714
 #define R200_CP_RB_WPTR_DELAY         0x0718
+#define R200_CP_RB_RPTR_WR            0x071C  /* when RB_CNTL.RB_RPTR_WR_ENA */
+#define R200_RB_RPTR_WR_ENA           (1u << 31)          /* in CP_RB_CNTL */
 #define R200_CP_CSQ_CNTL              0x0740
 /* 0x0770/0x0774 are SCRATCH_UMSK/SCRATCH_ADDR on R200 */
 #define R200_SCRATCH_UMSK             0x0770

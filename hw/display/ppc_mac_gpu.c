@@ -1163,6 +1163,7 @@ static const char *ppc_mac_gpu_reg_name(hwaddr addr)
     case R200_DP_MIX:              return "DP_MIX";
     case R200_CP_RB_BASE:          return "CP_RB_BASE";
     case R200_CP_RB_CNTL:          return "CP_RB_CNTL";
+    case R200_CP_RB_RPTR_WR:       return "CP_RB_RPTR_WR";
     case R200_CP_RB_RPTR:          return "CP_RB_RPTR";
     case R200_CP_RB_WPTR:          return "CP_RB_WPTR";
     case R200_CP_ME_CNTL:          return "CP_ME_CNTL";
@@ -11297,6 +11298,30 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         s->regs.cp_rb_rptr = val;
         ppc_mac_gpu_rptr_writeback(s);
         gpu_debug_log("CP_RING RPTR <- %u", val);
+        break;
+    case R200_CP_RB_RPTR_WR:
+        /*
+         * How the driver resets the ring: RB_CNTL with RB_RPTR_WR_ENA set,
+         * the new read pointer here (0), then WPTR = 0.  Mac OS X's ATI
+         * driver does it at start-up and again later (three times in a
+         * Quake III timedemo run, the last as the game starts).  Ignoring
+         * it left the read pointer where it was, so the WPTR = 0 that
+         * followed made the rest of the ring look new: the previous lap,
+         * replayed -- IBs whose buffers had since been refilled, run at
+         * their old sizes, until a draw's index data parsed as a packet
+         * that kicked an IB of garbage, which kicked itself forever.
+         * The CP thread may be part-way through a copy of the old ring;
+         * bump the epoch so it drops it.
+         */
+        if (s->regs.cp_rb_cntl & R200_RB_RPTR_WR_ENA) {
+            uint32_t rb_bufsz = s->regs.cp_rb_cntl & 0x3F;
+            uint32_t mask = rb_bufsz && rb_bufsz <= 25 ?
+                            (2U << rb_bufsz) - 1 : UINT32_MAX;
+            s->regs.cp_rb_rptr = val & mask;
+            cp.epoch++;
+            ppc_mac_gpu_rptr_writeback(s);
+            gpu_debug_log("CP_RING RPTR_WR <- %u", val);
+        }
         break;
     case R200_CP_RB_WPTR:
         /* Normally the lock-free region takes this; MM_DATA lands here. */
