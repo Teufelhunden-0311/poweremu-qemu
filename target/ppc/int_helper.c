@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <math.h>
 #include "cpu.h"
 #include "internal.h"
 #include "qemu/host-utils.h"
@@ -1795,12 +1796,38 @@ VRLMI(VRLWMI, 32, u32, 1);
 VRLMI(VRLDNM, 64, u64, 0);
 VRLMI(VRLWNM, 32, u32, 0);
 
+/*
+ * 2^x estimate.  softfloat's float32_exp2 is a series that is only right
+ * near zero: for large |x| it gave -inf, or large negative numbers, where
+ * the 7447A gives +0 or +inf (2^-652.5 -> 0, 2^809 -> +inf, 2^-2.9e11 -> 0).
+ * The architecture asks for an estimate; the host's exp2f is well inside
+ * it.  NaNs propagate quieted; in non-Java mode denormal inputs count as
+ * zero and denormal results become +0, as the hardware does.
+ */
+static float32 vexpte_one(float32 x, float_status *s, bool nj)
+{
+    union { uint32_t u; float f; } v = { .u = float32_val(x) };
+
+    if (float32_is_any_nan(x)) {
+        return float32_is_signaling_nan(x, s) ? float32_silence_nan(x, s) : x;
+    }
+    if (nj && float32_is_zero_or_denormal(x)) {
+        v.f = 0.0f;
+    }
+    v.f = exp2f(v.f);
+    if (nj && float32_is_denormal(make_float32(v.u))) {
+        v.u = 0;
+    }
+    return make_float32(v.u);
+}
+
 void helper_vexptefp(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *b)
 {
+    bool nj = (env->vscr >> VSCR_NJ) & 1;
     int i;
 
     for (i = 0; i < ARRAY_SIZE(r->f32); i++) {
-        r->f32[i] = float32_exp2(b->f32[i], &env->vec_status);
+        r->f32[i] = vexpte_one(b->f32[i], &env->vec_status, nj);
     }
 }
 
