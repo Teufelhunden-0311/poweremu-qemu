@@ -83,6 +83,18 @@ static const char *s_spk = "screamer";
  * so the backend's timer and the DMA pacing timer can drift in phase. */
 #define SCREAMER_PRIME_MS 40
 
+/* SCREAMER_PRIME_MS=<ms> overrides the jitter buffer (for tuning); kept
+ * below the ring's capacity, or output could never start. */
+static int screamer_prime_frames(ScreamerState *s)
+{
+    static int ms = -1;
+    if (ms < 0) {
+        const char *e = getenv("SCREAMER_PRIME_MS");
+        ms = e && atoi(e) > 0 ? atoi(e) : SCREAMER_PRIME_MS;
+    }
+    return MIN((int64_t)s->rate * ms / 1000, s->samples * 3 / 4);
+}
+
 static struct {
     int64_t last;
     uint64_t pulled, written, underruns, zero_runs, zero_frames, reads[16];
@@ -181,7 +193,18 @@ static void screamer_pace_cb(void *opaque)
     s->pace_last = now;
     int64_t due = s->pace_frac / NANOSECONDS_PER_SECOND;
     s->pace_frac -= due * NANOSECONDS_PER_SECOND;
-    due = MIN(due, (int64_t)s->rate / 20);    /* at most 50 ms after a stall */
+    /*
+     * At most 50 ms of DMA a tick, but what a stall left over is owed, not
+     * forgiven: dropping it shrank the buffered audio by the excess after
+     * every long main-loop stall, until the host queue ran short at the
+     * slightest delay.  Up to 250 ms is carried to the next ticks; a longer
+     * stall drops the rest rather than burst through the guest's ring.
+     */
+    if (due > (int64_t)s->rate / 20) {
+        int64_t owed = MIN(due - s->rate / 20, (int64_t)s->rate / 4);
+        s->pace_frac += owed * NANOSECONDS_PER_SECOND;
+        due = s->rate / 20;
+    }
 
     int moved = 0;
     while (due > 0 && s->io.len) {
@@ -314,7 +337,7 @@ static void screamerspk_callback(void *opaque, int free_b)
         return;
     }
     if (!s->primed) {
-        if (s->wpos - s->rpos < s->rate * SCREAMER_PRIME_MS / 1000) {
+        if (s->wpos - s->rpos < screamer_prime_frames(s)) {
             return;
         }
         s->primed = true;
