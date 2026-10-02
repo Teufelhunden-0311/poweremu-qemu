@@ -6959,6 +6959,21 @@ static bool rq_ranges_busy(const RQRanges *r, uint64_t lo, uint64_t hi,
     return false;
 }
 
+/* Is the job known to write [lo, hi)?  Unlike rq_ranges_busy, a job whose
+ * ranges did not fit answers no: the caller drains to find out. */
+static bool rq_ranges_written(const RQRanges *r, uint64_t lo, uint64_t hi)
+{
+    if (r->all) {
+        return false;
+    }
+    for (unsigned i = 0; i < r->nwr; i++) {
+        if (lo < r->wr[i][1] && r->wr[i][0] < hi) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /*
  * The queued job takes the packet's heap buffers over (nulling them in
  * pkt, whose owner then frees only what is left): copying kilobytes of
@@ -7387,6 +7402,20 @@ static void r200_note_read(uint64_t lo, uint64_t hi)
 static bool metal_range_busy_r200_locked(uint64_t lo, uint64_t hi,
                                          bool write_access);
 
+/*
+ * PPCGPU_2D_DRAIN=0: a 2D access that overlaps queued draws flushes (and
+ * waits for the GPU) instead of letting the render queue encode them first.
+ */
+static bool r200_2d_drain_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_2D_DRAIN");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 static bool metal_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi,
                                   bool write_access)
 {
@@ -7399,15 +7428,19 @@ static bool metal_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi,
      * conservatively.
      */
     if (g_rq_thread_started) {
-        bool busy = false;
+        bool busy = false, written = false;
         pthread_mutex_lock(&g_rq_mtx);
         if (g_rq_enc_valid && rq_ranges_busy(&g_rq_enc_ranges, lo, hi,
                                              write_access)) {
             busy = true;
+            written |= rq_ranges_written(&g_rq_enc_ranges, lo, hi);
         }
         uintptr_t deq = qatomic_read(&g_rq_deq);
         uintptr_t enq = qatomic_read(&g_rq_enq);
-        for (uintptr_t pos = deq; pos < enq && !busy; pos++) {
+        /* A write keeps looking past the first busy job for one known to
+         * write the range, which decides between draining and flushing. */
+        for (uintptr_t pos = deq; pos < enq &&
+             (!busy || (write_access && !written)); pos++) {
             RQCell *c = &g_rq_cells[pos & RQ_MASK];
             if ((uintptr_t)qatomic_load_acquire(&c->seq) != pos + 1) {
                 busy = true;          /* being published right now */
@@ -7415,6 +7448,7 @@ static bool metal_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi,
             }
             if (rq_ranges_busy(&c->ranges, lo, hi, write_access)) {
                 busy = true;
+                written |= rq_ranges_written(&c->ranges, lo, hi);
             }
             if ((uintptr_t)qatomic_read(&c->seq) != pos + 1) {
                 busy = true;          /* recycled while being read */
@@ -7422,7 +7456,24 @@ static bool metal_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi,
         }
         pthread_mutex_unlock(&g_rq_mtx);
         if (busy) {
-            return true;
+            /*
+             * A 2D write over bytes that queued draws only read -- four in
+             * five of Doom 3's busy 2D blits, its texture uploads -- needs
+             * just those draws encoded: the encode turns a texture read
+             * into a CPU copy (or, for a view, a read recorded against its
+             * batch).  Let the queue catch up and then ask about the GPU
+             * alone.  Anything else (a read of what queued draws write,
+             * such as Quake III reading back its frame, about 50 times a
+             * second) needs the GPU finished anyway, and draining first
+             * only added a wait of 4-6 ms: busy, as before.  A job whose
+             * ranges did not fit is drained to find out: a write it turns
+             * up is then in the batch's written list, which the GPU check
+             * below sees.
+             */
+            if (!r200_2d_drain_on() || !write_access || written) {
+                return true;            /* the caller's flush waits for them */
+            }
+            rqueue_drain();
         }
     }
     pthread_mutex_lock(&g_render_lock);
