@@ -9142,6 +9142,26 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
  * GART dwords byte-reversed to VRAM's side of the aperture (see
  * r300_tex_raw_bpp).
  */
+/*
+ * Set by r300_texture when what it returns is a view over VRAM, which the
+ * GPU reads when the batch runs.  Everything else (cached CPU conversions,
+ * GART uploads, copies) was read from VRAM before the draw was encoded, so
+ * a 2D write to those bytes need not wait for the batch to complete.
+ * Render thread only.  PPCGPU_TEX_READ_ALL=1 counts every texture as read
+ * by the GPU, as before.
+ */
+static bool g_r300_tex_is_view;
+
+static bool r300_tex_read_all(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_TEX_READ_ALL");
+        on = e && e[0] == '1';
+    }
+    return on;
+}
+
 static id<MTLTexture> r300_texture_raw(PPCMacGPUMetalState *st, id<MTLDevice> dev,
                                        uint8_t *vram_ptr, uint64_t vram_size,
                                        const R300TexDesc *td, uint32_t *rowel)
@@ -9156,6 +9176,7 @@ static id<MTLTexture> r300_texture_raw(PPCMacGPUMetalState *st, id<MTLDevice> de
         if (rows <= 16384 && (uint64_t)td->gpu_addr + (uint64_t)rows * p0 <= vram_size) {
             R200TexKey k = { td->gpu_addr, p0 / eb, rows, p0, (uint32_t)rpf };
             *rowel = p0 / eb;
+            g_r300_tex_is_view = true;
             return r200_view(st, k, rpf, false);
         }
     }
@@ -9217,6 +9238,7 @@ static id<MTLTexture> r300_texture(PPCMacGPUMetalState *st, id<MTLDevice> dev,
     uint64_t hi = lo + td->size_bytes;
     MTLPixelFormat pf;
 
+    g_r300_tex_is_view = false;
     if (!td->host_data && hi > vram_size) {
         r300_metal_warn(2, "texture outside VRAM");
         return nil;
@@ -9247,6 +9269,7 @@ static id<MTLTexture> r300_texture(PPCMacGPUMetalState *st, id<MTLDevice> dev,
         }
         R200TexKey k = { td->gpu_addr, td->width, td->height, td->pitch_bytes,
                          (uint32_t)pf };
+        g_r300_tex_is_view = true;
         return r200_view(st, k, pf, false);
     }
     /* 16bpp formats and DXT: converted or copied by the CPU (cached). */
@@ -9384,6 +9407,7 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
 
         id<MTLTexture> tex[R300_NUM_TEX_UNITS];
         id<MTLSamplerState> smp[R300_NUM_TEX_UNITS];
+        bool tex_view[R300_NUM_TEX_UNITS] = { false };
         R300FSUniforms u = pkt->uniforms;
         for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
             const R300TexDesc *td = &pkt->tex[t];
@@ -9396,6 +9420,7 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             }
             uint32_t rowel = u.tex_info[t][1];
             id<MTLTexture> x = r300_texture(st, dev, vram_ptr, vram_size, td, &rowel);
+            tex_view[t] = g_r300_tex_is_view || r300_tex_read_all();
             if (!x) {
                 u.tex_info[t][0] = 0;
                 continue;
@@ -9583,7 +9608,7 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
         [ib release];
         g_r200_stat_draws++;
         for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
-            if (u.tex_info[t][0] && !pkt->tex[t].host_data) {
+            if (u.tex_info[t][0] && !pkt->tex[t].host_data && tex_view[t]) {
                 r200_note_read(pkt->tex[t].gpu_addr,
                                (uint64_t)pkt->tex[t].gpu_addr + pkt->tex[t].size_bytes);
             }
