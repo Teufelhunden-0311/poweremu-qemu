@@ -334,6 +334,10 @@ typedef struct PPCMacGPURenderer {
      * May be batched; the caller calls flush_r200() before touching VRAM.
      * Returns 0 on success, -1 if the packet uses something the backend
      * cannot render.
+     *
+     * A queue-async backend that enqueues the draw takes the tex[].host_data
+     * buffers over (nulling them in pkt, which the caller may then read
+     * only for its scalar fields); the caller frees what is left.
      */
     int (*draw_r200)(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                      const R200DrawPacket *pkt);
@@ -342,6 +346,12 @@ typedef struct PPCMacGPURenderer {
      * Render one assembled R300 draw (see hw/display/r300/r300_draw.h);
      * rt_gpu_addr and tex[].gpu_addr are already VRAM offsets.  Batched
      * with draw_r200 work: flush_r200() finishes both.
+     *
+     * A queue-async backend that enqueues the draw takes the packet's owned
+     * buffers over (glsl, vs_glsl, verts, vs_in, vs_idx, vs_u and
+     * tex[].host_data, nulling them in pkt); after the call the packet's
+     * scalar fields may still be read, and r300_draw_free() frees what is
+     * left.
      */
     int (*draw_r300)(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                      const struct R300DrawPacket *pkt);

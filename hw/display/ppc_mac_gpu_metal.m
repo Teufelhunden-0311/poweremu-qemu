@@ -1247,8 +1247,111 @@ static void rqueue_stop(void);
 static pthread_mutex_t g_render_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool rqueue_wanted(void);
 static bool rqueue_enabled(void);
-static bool rqueue_pending(void);
 static void rqueue_drain(void);
+
+/*
+ * A persistent Metal binary archive of compiled pipeline states, in
+ * ~/Library/Caches: PSO creation on a later run then skips the GPU-specific
+ * compile step (the MSL source compile itself still runs once per program).
+ * Stale or missing entries are harmless misses.
+ */
+static id<MTLBinaryArchive> g_bin_archive;
+static NSString *g_bin_archive_path;
+static bool g_bin_archive_dirty;
+/* MTLBinaryArchive is not thread-safe: adds come from whichever thread
+ * compiles a pipeline (setup can run on a draw caller while the render
+ * thread encodes), and serialization must not overlap them. */
+static pthread_mutex_t g_bin_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static id<MTLBinaryArchive> bin_archive(id<MTLDevice> dev)
+{
+    static int tried;
+
+    if (qatomic_read(&tried)) {
+        return g_bin_archive;
+    }
+    pthread_mutex_lock(&g_bin_lock);
+    if (tried) {
+        pthread_mutex_unlock(&g_bin_lock);
+        return g_bin_archive;
+    }
+    if (@available(macOS 11.0, *)) {
+        @autoreleasepool {
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSString *dir = [NSSearchPathForDirectoriesInDomains(
+                                NSCachesDirectory, NSUserDomainMask, YES).firstObject
+                             stringByAppendingPathComponent:@"ppcosxkvm"];
+            NSOperatingSystemVersion osv =
+                [[NSProcessInfo processInfo] operatingSystemVersion];
+            NSString *name = [NSString stringWithFormat:@"metal-pso-%ld.%ld-%@.bin",
+                              (long)osv.majorVersion, (long)osv.minorVersion,
+                              [dev.name stringByReplacingOccurrencesOfString:@"/"
+                                                                  withString:@"-"]];
+            [fm createDirectoryAtPath:dir
+          withIntermediateDirectories:YES attributes:nil error:NULL];
+            g_bin_archive_path = [[dir stringByAppendingPathComponent:name] copy];
+            MTLBinaryArchiveDescriptor *ad = [[MTLBinaryArchiveDescriptor alloc] init];
+            NSError *err = nil;
+            if ([fm fileExistsAtPath:g_bin_archive_path]) {
+                ad.url = [NSURL fileURLWithPath:g_bin_archive_path];
+            }
+            g_bin_archive = [dev newBinaryArchiveWithDescriptor:ad error:&err];
+            if (!g_bin_archive && ad.url) {
+                ad.url = nil;       /* a corrupt cache file: start a new one */
+                g_bin_archive = [dev newBinaryArchiveWithDescriptor:ad error:&err];
+            }
+            [ad release];
+            if (!g_bin_archive) {
+                qemu_log("ppc-mac-gpu-metal: binary archive unavailable: %s\n",
+                         err ? [[err localizedDescription] UTF8String] : "?");
+            }
+        }
+    }
+    qatomic_set(&tried, 1);     /* publishes g_bin_archive to the fast path */
+    pthread_mutex_unlock(&g_bin_lock);
+    return g_bin_archive;
+}
+
+/* Only at teardown: serialization must not overlap function adds, and
+ * those can come from any thread that compiles a pipeline. */
+static void bin_archive_serialize(void)
+{
+    if (@available(macOS 11.0, *)) {
+    } else {
+        return;
+    }
+    pthread_mutex_lock(&g_bin_lock);
+    if (g_bin_archive && g_bin_archive_dirty && g_bin_archive_path) {
+        [g_bin_archive serializeToURL:[NSURL fileURLWithPath:g_bin_archive_path]
+                                error:NULL];
+        g_bin_archive_dirty = false;
+    }
+    pthread_mutex_unlock(&g_bin_lock);
+}
+
+/* newRenderPipelineStateWithDescriptor through the archive, and into it. */
+static id<MTLRenderPipelineState> bin_pso(id<MTLDevice> dev,
+                                          MTLRenderPipelineDescriptor *pd,
+                                          NSError **err)
+{
+    id<MTLBinaryArchive> a = bin_archive(dev);
+    id<MTLRenderPipelineState> p;
+
+    if (a) {
+        @autoreleasepool {
+            pd.binaryArchives = @[ a ];
+        }
+    }
+    p = [dev newRenderPipelineStateWithDescriptor:pd error:err];
+    if (a && p) {
+        pthread_mutex_lock(&g_bin_lock);
+        if ([a addRenderPipelineFunctionsWithDescriptor:pd error:NULL]) {
+            g_bin_archive_dirty = true;
+        }
+        pthread_mutex_unlock(&g_bin_lock);
+    }
+    return p;
+}
 
 static void *metal_init(uint8_t *vram_ptr, uint64_t vram_size)
 {
@@ -1425,6 +1528,7 @@ static void metal_fini(void *opaque)
     if (!st) return;
 
     rqueue_stop();
+    bin_archive_serialize();
 
     /* Free shadow RT buffers */
     for (int i = 0; i < SHADOW_RT_MAX; i++) {
@@ -5838,6 +5942,10 @@ typedef struct R200Uniforms {
 static NSString *const kR200ShaderSource = @
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"
+/* Specialization: how many combiner stages run and which texture units are
+ * bound, per pipeline (the defaults keep the generic pipelines as before). */
+"constant uint FC_STAGES [[function_constant(0)]] = 8;\n"
+"constant uint FC_TEXMASK [[function_constant(1)]] = 0x3F;\n"
 "struct Vtx { float4 pos; float4 color; float4 spec; float4 tex[6]; };\n"
 "struct U {\n"
 "    float2 rt_size; uint pp_cntl; uint pp_misc;\n"
@@ -6013,16 +6121,16 @@ static NSString *const kR200ShaderSource = @
 "        if (all(in.position.xy >= r.xy) && all(in.position.xy < r.zw)) discard_fragment();\n"
 "    }\n"
 "    float4 R[6];\n"
-"    R[0] = texel(x0, s0, in.t0, u.texinfo[0], u.texsize[0], u.texfilt[0].x);\n"
-"    R[1] = texel(x1, s1, in.t1, u.texinfo[1], u.texsize[1], u.texfilt[1].x);\n"
-"    R[2] = texel(x2, s2, in.t2, u.texinfo[2], u.texsize[2], u.texfilt[2].x);\n"
-"    R[3] = texel(x3, s3, in.t3, u.texinfo[3], u.texsize[3], u.texfilt[3].x);\n"
-"    R[4] = texel(x4, s4, in.t4, u.texinfo[4], u.texsize[4], u.texfilt[4].x);\n"
-"    R[5] = texel(x5, s5, in.t5, u.texinfo[5], u.texsize[5], u.texfilt[5].x);\n"
+"    R[0] = (FC_TEXMASK & 1u) != 0u ? texel(x0, s0, in.t0, u.texinfo[0], u.texsize[0], u.texfilt[0].x) : float4(0.0);\n"
+"    R[1] = (FC_TEXMASK & 2u) != 0u ? texel(x1, s1, in.t1, u.texinfo[1], u.texsize[1], u.texfilt[1].x) : float4(0.0);\n"
+"    R[2] = (FC_TEXMASK & 4u) != 0u ? texel(x2, s2, in.t2, u.texinfo[2], u.texsize[2], u.texfilt[2].x) : float4(0.0);\n"
+"    R[3] = (FC_TEXMASK & 8u) != 0u ? texel(x3, s3, in.t3, u.texinfo[3], u.texsize[3], u.texfilt[3].x) : float4(0.0);\n"
+"    R[4] = (FC_TEXMASK & 16u) != 0u ? texel(x4, s4, in.t4, u.texinfo[4], u.texsize[4], u.texfilt[4].x) : float4(0.0);\n"
+"    R[5] = (FC_TEXMASK & 32u) != 0u ? texel(x5, s5, in.t5, u.texinfo[5], u.texsize[5], u.texfilt[5].x) : float4(0.0);\n"
 "    float4 dif = in.color, spc = in.spec;\n"
 "    float4 cur = dif;\n"
 "    bool any = false;\n"
-"    for (uint st = 0; st < 8; st++) {\n"
+"    for (uint st = 0; st < FC_STAGES; st++) {\n"
 "        uint en = st == 7u ? 0x800u : (0x1000u << st);\n"
 "        if ((u.pp_cntl & en) == 0u) continue;\n"
 "        any = true;\n"
@@ -6220,6 +6328,100 @@ static id<MTLRenderPipelineState> g_r200_pipeline_c16;      /* 16-bit colour tar
 static id<MTLRenderPipelineState> g_r200_pipeline_c16_z32;
 static id<MTLRenderPipelineState> g_r200_pipeline_c16_z16;
 static id<MTLRenderPipelineState> g_r200_clear_pipeline;
+
+/*
+ * Function-constant specialization of the uber-shader: a pass's fragment
+ * function is recompiled with the number of combiner stages that run and
+ * the bound texture units, so a two-stage, one-texture compositor draw no
+ * longer pays for six texel() fetches and an eight-iteration stage loop.
+ * Variants are indexed as the generic pipelines (below) and cached; the
+ * generic pipeline remains the fallback.
+ */
+static id<MTLLibrary> g_r200_lib;
+/* 0 fs, 1 fs_z+R32Uint, 2 fs_z+R16Uint, 3 fs16, 4 fs16_z+R32Uint,
+ * 5 fs16_z+R16Uint */
+static id<MTLRenderPipelineState> g_r200_pipes_gen[6];
+
+#define R200_SPEC_SLOTS 256
+static struct { uint32_t key; id<MTLRenderPipelineState> pso; } g_r200_spec[R200_SPEC_SLOTS];
+
+static id<MTLRenderPipelineState> r200_spec_pso(id<MTLDevice> dev,
+                                                uint32_t variant,
+                                                uint32_t stages, uint32_t mask)
+{
+    static const char *const fname[6] = {
+        "r200_fs", "r200_fs_z", "r200_fs_z", "r200_fs16", "r200_fs16_z", "r200_fs16_z",
+    };
+    static const MTLPixelFormat cfmt[6] = {
+        MTLPixelFormatBGRA8Unorm, MTLPixelFormatBGRA8Unorm, MTLPixelFormatBGRA8Unorm,
+        MTLPixelFormatR16Uint, MTLPixelFormatR16Uint, MTLPixelFormatR16Uint,
+    };
+    static const MTLPixelFormat zfmt[6] = {
+        MTLPixelFormatInvalid, MTLPixelFormatR32Uint, MTLPixelFormatR16Uint,
+        MTLPixelFormatInvalid, MTLPixelFormatR32Uint, MTLPixelFormatR16Uint,
+    };
+
+    if (!g_r200_lib || variant >= 6) {
+        return nil;
+    }
+    if (stages >= 8 && mask == 0x3F) {
+        return g_r200_pipes_gen[variant];
+    }
+    uint32_t key = variant | stages << 3 | mask << 7;
+    uint32_t slot = ((key * 2654435761u) >> 20) & (R200_SPEC_SLOTS - 1);
+    for (uint32_t probe = 0; probe < 4; probe++) {
+        uint32_t i = (slot + probe) & (R200_SPEC_SLOTS - 1);
+        if (!g_r200_spec[i].pso) {
+            break;
+        }
+        if (g_r200_spec[i].key == key) {
+            return g_r200_spec[i].pso;
+        }
+    }
+    @autoreleasepool {
+        NSError *err = nil;
+        MTLFunctionConstantValues *fcv = [[MTLFunctionConstantValues alloc] init];
+        [fcv setConstantValue:&stages type:MTLDataTypeUInt atIndex:0];
+        [fcv setConstantValue:&mask type:MTLDataTypeUInt atIndex:1];
+        id<MTLFunction> vs = [g_r200_lib newFunctionWithName:@"r200_vs"];
+        id<MTLFunction> fs = [g_r200_lib
+            newFunctionWithName:[NSString stringWithUTF8String:fname[variant]]
+                 constantValues:fcv error:&err];
+        [fcv release];
+        if (!vs || !fs) {
+            [vs release];
+            [fs release];
+            return g_r200_pipes_gen[variant];
+        }
+        MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
+        pd.vertexFunction = vs;
+        pd.fragmentFunction = fs;
+        pd.colorAttachments[0].pixelFormat = cfmt[variant];
+        pd.colorAttachments[0].blendingEnabled = NO;
+        if (zfmt[variant] != MTLPixelFormatInvalid) {
+            pd.colorAttachments[1].pixelFormat = zfmt[variant];
+        }
+        id<MTLRenderPipelineState> p = bin_pso(dev, pd, &err);
+        [pd release];
+        [vs release];
+        [fs release];
+        if (!p) {
+            return g_r200_pipes_gen[variant];
+        }
+        uint32_t store = slot;
+        for (uint32_t probe = 0; probe < 4; probe++) {
+            uint32_t i = (slot + probe) & (R200_SPEC_SLOTS - 1);
+            if (!g_r200_spec[i].pso) {
+                store = i;
+                break;
+            }
+        }
+        [g_r200_spec[store].pso release];
+        g_r200_spec[store].key = key;
+        g_r200_spec[store].pso = p;   /* table keeps the reference */
+        return p;
+    }
+}
 #define R200_DS_FORMAT MTLPixelFormatDepth32Float_Stencil8
 static id<MTLSamplerState> g_r200_samplers[256];
 static id<MTLTexture> g_r200_dummy;
@@ -6246,15 +6448,15 @@ static bool r200_metal_setup_locked(id<MTLDevice> dev)
     pd.fragmentFunction = fs;
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     pd.colorAttachments[0].blendingEnabled = NO;
-    g_r200_pipeline = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    g_r200_pipeline = bin_pso(dev, pd, &err);
     {
         id<MTLFunction> zfs = [lib newFunctionWithName:@"r200_fs_z"];
         MTLRenderPipelineDescriptor *zd = [pd copy];
         zd.fragmentFunction = zfs;
         zd.colorAttachments[1].pixelFormat = MTLPixelFormatR32Uint;
-        g_r200_pipeline_z32 = [dev newRenderPipelineStateWithDescriptor:zd error:&err];
+        g_r200_pipeline_z32 = bin_pso(dev, zd, &err);
         zd.colorAttachments[1].pixelFormat = MTLPixelFormatR16Uint;
-        g_r200_pipeline_z16 = [dev newRenderPipelineStateWithDescriptor:zd error:&err];
+        g_r200_pipeline_z16 = bin_pso(dev, zd, &err);
         [zd release];
         [zfs release];
     }
@@ -6264,12 +6466,12 @@ static bool r200_metal_setup_locked(id<MTLDevice> dev)
         MTLRenderPipelineDescriptor *cd = [pd copy];
         cd.colorAttachments[0].pixelFormat = MTLPixelFormatR16Uint;
         cd.fragmentFunction = f16;
-        g_r200_pipeline_c16 = [dev newRenderPipelineStateWithDescriptor:cd error:&err];
+        g_r200_pipeline_c16 = bin_pso(dev, cd, &err);
         cd.fragmentFunction = f16z;
         cd.colorAttachments[1].pixelFormat = MTLPixelFormatR32Uint;
-        g_r200_pipeline_c16_z32 = [dev newRenderPipelineStateWithDescriptor:cd error:&err];
+        g_r200_pipeline_c16_z32 = bin_pso(dev, cd, &err);
         cd.colorAttachments[1].pixelFormat = MTLPixelFormatR16Uint;
-        g_r200_pipeline_c16_z16 = [dev newRenderPipelineStateWithDescriptor:cd error:&err];
+        g_r200_pipeline_c16_z16 = bin_pso(dev, cd, &err);
         if (!g_r200_pipeline_c16 || !g_r200_pipeline_c16_z32 || !g_r200_pipeline_c16_z16) {
             qemu_log("ppc-mac-gpu r200: 16-bit colour pipelines failed: %s\n",
                      err ? [[err localizedDescription] UTF8String] : "?");
@@ -6280,8 +6482,14 @@ static bool r200_metal_setup_locked(id<MTLDevice> dev)
     }
     pd.depthAttachmentPixelFormat = R200_DS_FORMAT;
     pd.stencilAttachmentPixelFormat = R200_DS_FORMAT;
-    g_r200_pipeline_ds = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    g_r200_pipeline_ds = bin_pso(dev, pd, &err);
     [pd release];
+    g_r200_pipes_gen[0] = g_r200_pipeline;
+    g_r200_pipes_gen[1] = g_r200_pipeline_z32;
+    g_r200_pipes_gen[2] = g_r200_pipeline_z16;
+    g_r200_pipes_gen[3] = g_r200_pipeline_c16;
+    g_r200_pipes_gen[4] = g_r200_pipeline_c16_z32;
+    g_r200_pipes_gen[5] = g_r200_pipeline_c16_z16;
     {
         MTLRenderPipelineDescriptor *cd = [[MTLRenderPipelineDescriptor alloc] init];
         id<MTLFunction> cvs = [lib newFunctionWithName:@"r200_clear_vs"];
@@ -6290,14 +6498,14 @@ static bool r200_metal_setup_locked(id<MTLDevice> dev)
         cd.fragmentFunction = cfs;
         cd.depthAttachmentPixelFormat = R200_DS_FORMAT;
         cd.stencilAttachmentPixelFormat = R200_DS_FORMAT;
-        g_r200_clear_pipeline = [dev newRenderPipelineStateWithDescriptor:cd error:&err];
+        g_r200_clear_pipeline = bin_pso(dev, cd, &err);
         [cd release];
         [cvs release];
         [cfs release];
     }
     [vs release];
     [fs release];
-    [lib release];
+    g_r200_lib = lib;           /* kept: r200_spec_pso specializes from it */
     if (!g_r200_pipeline_z16) {
         qemu_log("ppc-mac-gpu r200: 16-bit depth pipeline unavailable: %s\n",
                  err ? [[err localizedDescription] UTF8String] : "?");
@@ -6519,6 +6727,8 @@ static id<MTLCommandBuffer> g_r200_inflight;   /* newest committed, unwaited */
 static id<MTLRenderCommandEncoder> g_r200_enc;
 static R200TexKey g_r200_enc_key;
 static bool g_r300_enc_mine;        /* open encoder belongs to draw_r300 */
+static uint32_t g_r200_enc_variant;                 /* g_r200_pipes_gen index */
+static id<MTLRenderPipelineState> g_r200_enc_pipe;  /* last set on the pass */
 static uint32_t g_r200_enc_depth_off = ~0u, g_r200_enc_depth_pitch; /* ~0: none */
 static bool g_r200_enc_depth_z16;
 static uint64_t g_r200_stat_draws, g_r200_stat_passes, g_r200_stat_flushes,
@@ -6581,35 +6791,179 @@ static bool r200_split_enabled(void)
  * as before (the device then also keeps taking the BQL around draws).
  */
 
-enum { RQ_R200 = 0, RQ_R300 = 1, RQ_SUBMIT = 2 };
+enum { RQ_R200 = 0, RQ_R300 = 1 };
 
 /* Defined at the bottom of the file; rqueue_start flags it. */
 static PPCMacGPURenderer metal_renderer;
 
+static pthread_mutex_t g_rq_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * The VRAM ranges a queued job will touch, recorded when it is pushed so
+ * that a CPU-side access to unrelated VRAM neither drains the queue nor
+ * waits for the GPU (metal_range_busy_r200).  Overestimating is safe (an
+ * unnecessary flush); underestimating would race, so anything that does
+ * not fit marks the job as touching all of VRAM.
+ */
+#define RQ_MAX_WR (R300_US_MAX_TARGETS + 2)
+#define RQ_MAX_RD R300_NUM_TEX_UNITS
+typedef struct RQRanges {
+    uint64_t wr[RQ_MAX_WR][2];
+    uint64_t rd[RQ_MAX_RD][2];
+    unsigned nwr, nrd;
+    bool all;
+} RQRanges;
+
 typedef struct RQJob {
     int kind;
-    R200DrawPacket r200;    /* owned copies: verts, indices, host_data */
-    R300DrawPacket r300;    /* owned copies: see r300_job_new */
-    struct {                /* RQ_SUBMIT: commit, then done(arg, seq) */
-        void (*done)(void *, uint32_t);
-        void *arg;
-        uint32_t seq;
-    } sub;
+    R200DrawPacket r200;    /* copies of verts/indices; host_data taken over */
+    R300DrawPacket r300;    /* the packet's owned buffers, taken over */
+    RQRanges ranges;
+    struct RQJob *next;     /* the free list */
 } RQJob;
 
-/* r200_decode_tex_unit()'s AGP copy is pitch*height (DXT: block rows). */
-static uint64_t r200_tex_host_bytes(const R200TexUnit *t)
+/* Jobs are recycled: the packets they embed are kilobytes each, and a
+ * busy guest pushes thousands of draws a second. */
+static RQJob *g_rq_pool;        /* g_rq_mtx */
+
+static RQJob *rq_job_alloc(void)
 {
-    uint64_t len = (uint64_t)t->pitch * t->height;
-    if (t->format == 12 || t->format == 14 || t->format == 15) {
-        len = (uint64_t)t->pitch * ((t->height + 3) / 4);
+    RQJob *job;
+
+    pthread_mutex_lock(&g_rq_mtx);
+    job = g_rq_pool;
+    if (job) {
+        g_rq_pool = job->next;
     }
-    return len;
+    pthread_mutex_unlock(&g_rq_mtx);
+    if (!job) {
+        job = g_new(RQJob, 1);
+    }
+    return job;
 }
 
-static RQJob *r200_job_new(const R200DrawPacket *pkt)
+static void rq_job_release(RQJob *job)
 {
-    RQJob *job = g_new0(RQJob, 1);
+    pthread_mutex_lock(&g_rq_mtx);
+    job->next = g_rq_pool;
+    g_rq_pool = job;
+    pthread_mutex_unlock(&g_rq_mtx);
+}
+
+static void r200_job_ranges(RQJob *job)
+{
+    const R200DrawPacket *p = &job->r200;
+    RQRanges *r = &job->ranges;
+    uint32_t cfmt = (p->rb3d_cntl >> 10) & 0xF;
+    uint32_t bpr = p->rt_pitch * (cfmt == 3 || cfmt == 4 || cfmt == 15 ? 2 : 4);
+
+    r->nwr = r->nrd = 0;
+    r->all = false;
+    if (bpr && p->rt_height) {
+        r->wr[r->nwr][0] = p->rt_offset;
+        r->wr[r->nwr++][1] = p->rt_offset + (uint64_t)bpr * p->rt_height;
+    }
+    if (p->depth_enable || p->stencil_enable) {
+        if (r->nwr == RQ_MAX_WR) {
+            r->all = true;
+            return;
+        }
+        r->wr[r->nwr][0] = p->depth_offset;
+        r->wr[r->nwr++][1] = p->depth_offset + (uint64_t)p->depth_pitch *
+                             p->depth_bpp * p->rt_height;
+    }
+    for (int t = 0; t < R200_MAX_TEX; t++) {
+        const R200TexUnit *tu = &p->tex[t];
+        if (!tu->enabled || tu->host_data) {
+            continue;
+        }
+        if (r->nrd == RQ_MAX_RD) {
+            r->all = true;
+            return;
+        }
+        r->rd[r->nrd][0] = tu->offset;
+        r->rd[r->nrd++][1] = tu->offset + (uint64_t)tu->pitch * tu->height;
+    }
+}
+
+static void r300_job_ranges(RQJob *job)
+{
+    const R300DrawPacket *p = &job->r300;
+    RQRanges *r = &job->ranges;
+    uint32_t ns = MIN(MAX(p->aa_samples, 1u), 6u);
+    uint32_t ncb = MAX(p->num_cb, 1u);
+
+    r->nwr = r->nrd = 0;
+    r->all = false;
+    if (ncb > R300_US_MAX_TARGETS) {
+        r->all = true;
+        return;
+    }
+    for (uint32_t k = 0; k < ncb; k++) {
+        uint32_t addr = k ? p->cb[k].gpu_addr : p->rt_gpu_addr;
+        uint64_t bpr = (uint64_t)ns * (k ? (uint64_t)p->cb[k].pitch * p->cb[k].bpp
+                                         : (uint64_t)p->rt_pitch * p->rt_bpp);
+        if (r->nwr == RQ_MAX_WR) {
+            r->all = true;
+            return;
+        }
+        r->wr[r->nwr][0] = addr;
+        r->wr[r->nwr++][1] = addr + bpr * p->rt_height;
+    }
+    if (p->depth.attach) {
+        if (r->nwr == RQ_MAX_WR) {
+            r->all = true;
+            return;
+        }
+        r->wr[r->nwr][0] = p->depth.gpu_addr;
+        r->wr[r->nwr++][1] = p->depth.gpu_addr + (uint64_t)ns * p->depth.pitch *
+                             p->depth.bpp * p->rt_height;
+    }
+    for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
+        const R300TexDesc *td = &p->tex[t];
+        if (!td->bound || td->host_data) {
+            continue;
+        }
+        if (r->nrd == RQ_MAX_RD) {
+            r->all = true;
+            return;
+        }
+        r->rd[r->nrd][0] = td->gpu_addr;
+        r->rd[r->nrd++][1] = td->gpu_addr + td->size_bytes;
+    }
+}
+
+static bool rq_ranges_busy(const RQRanges *r, uint64_t lo, uint64_t hi,
+                           bool write_access)
+{
+    if (r->all) {
+        return true;
+    }
+    for (unsigned i = 0; i < r->nwr; i++) {
+        if (lo < r->wr[i][1] && r->wr[i][0] < hi) {
+            return true;
+        }
+    }
+    if (write_access) {
+        for (unsigned i = 0; i < r->nrd; i++) {
+            if (lo < r->rd[i][1] && r->rd[i][0] < hi) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/*
+ * The queued job takes the packet's heap buffers over (nulling them in
+ * pkt, whose owner then frees only what is left): copying kilobytes of
+ * vertices, texels and shader text per draw -- twice, producer and again
+ * here -- was pure allocator and memcpy traffic.  The R200 vertices and
+ * indices are the device's reusable scratch, so those are still copied.
+ */
+static RQJob *r200_job_new(R200DrawPacket *pkt)
+{
+    RQJob *job = rq_job_alloc();
 
     job->kind = RQ_R200;
     job->r200 = *pkt;
@@ -6618,12 +6972,9 @@ static RQJob *r200_job_new(const R200DrawPacket *pkt)
     job->r200.indices = g_memdup2(pkt->indices,
                                   (size_t)pkt->num_indices * 4);
     for (int t = 0; t < R200_MAX_TEX; t++) {
-        if (pkt->tex[t].host_data) {
-            job->r200.tex[t].host_data =
-                g_memdup2(pkt->tex[t].host_data,
-                          r200_tex_host_bytes(&pkt->tex[t]));
-        }
+        pkt->tex[t].host_data = NULL;
     }
+    r200_job_ranges(job);
     return job;
 }
 
@@ -6634,32 +6985,28 @@ static void r200_job_free(RQJob *job)
     for (int t = 0; t < R200_MAX_TEX; t++) {
         g_free((void *)job->r200.tex[t].host_data);
     }
-    g_free(job);
+    rq_job_release(job);
 }
 
-/* The R300 packet's owned fields (r300_draw_free's list), copied so the
- * device can free its packet as soon as draw_r300 returns. */
-static RQJob *r300_job_new(const R300DrawPacket *pkt)
+/* The R300 packet's owned fields (r300_draw_free's list) are taken over;
+ * the device's r300_draw_free then frees only what was not queued. */
+static RQJob *r300_job_new(R300DrawPacket *pkt)
 {
-    RQJob *job = g_new0(RQJob, 1);
+    RQJob *job = rq_job_alloc();
     R300DrawPacket *p = &job->r300;
 
     job->kind = RQ_R300;
     *p = *pkt;
-    p->glsl = g_strdup(pkt->glsl);
-    p->vs_glsl = g_strdup(pkt->vs_glsl);
-    p->verts = g_memdup2(pkt->verts,
-                         (size_t)(pkt->num_verts + pkt->num_line_verts) *
-                         sizeof(R300Vertex));
-    p->vs_in = g_memdup2(pkt->vs_in, (size_t)pkt->vs_in_vecs * 16);
-    p->vs_idx = g_memdup2(pkt->vs_idx, (size_t)pkt->num_verts * 4);
-    p->vs_u = g_memdup2(pkt->vs_u, sizeof(*pkt->vs_u));
+    pkt->glsl = NULL;
+    pkt->vs_glsl = NULL;
+    pkt->verts = NULL;
+    pkt->vs_in = NULL;
+    pkt->vs_idx = NULL;
+    pkt->vs_u = NULL;
     for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
-        if (pkt->tex[t].host_data) {
-            p->tex[t].host_data = g_memdup2(pkt->tex[t].host_data,
-                                            pkt->tex[t].size_bytes);
-        }
+        pkt->tex[t].host_data = NULL;
     }
+    r300_job_ranges(job);
     return job;
 }
 
@@ -6667,26 +7014,30 @@ static void r300_job_free(RQJob *job)
 {
     R300DrawPacket *p = &job->r300;
 
-    g_free(p->glsl);
-    g_free(p->vs_glsl);
-    g_free(p->verts);
-    g_free(p->vs_in);
-    g_free(p->vs_idx);
-    g_free(p->vs_u);
+    free(p->glsl);
+    free(p->vs_glsl);
+    free(p->verts);
+    free(p->vs_in);
+    free(p->vs_idx);
+    free(p->vs_u);
     for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
-        g_free(p->tex[t].host_data);
+        free(p->tex[t].host_data);
     }
-    g_free(job);
+    rq_job_release(job);
 }
 
 #define RQ_BITS 10
 #define RQ_SIZE (1u << RQ_BITS)
 #define RQ_MASK (RQ_SIZE - 1)
-typedef struct { RQJob *job; uintptr_t seq; } RQCell;
+typedef struct { RQJob *job; RQRanges ranges; uintptr_t seq; } RQCell;
 static RQCell g_rq_cells[RQ_SIZE];
 static uintptr_t g_rq_enq, g_rq_deq;    /* next position to fill / to take */
 static uintptr_t g_rq_done;             /* jobs encoded and freed */
-static pthread_mutex_t g_rq_mtx = PTHREAD_MUTEX_INITIALIZER;
+/* The job being encoded right now: its ranges move here when the cell is
+ * freed, and stay until the encode has recorded them in g_r200_written /
+ * g_r200_read (g_rq_mtx guards the handover and the range scan). */
+static RQRanges g_rq_enc_ranges;
+static bool g_rq_enc_valid;
 static pthread_cond_t g_rq_space = PTHREAD_COND_INITIALIZER;   /* ring not full */
 static pthread_cond_t g_rq_work = PTHREAD_COND_INITIALIZER;    /* work arrived */
 static pthread_cond_t g_rq_idle = PTHREAD_COND_INITIALIZER;    /* all encoded */
@@ -6711,27 +7062,13 @@ static bool rqueue_enabled(void)
     return rqueue_wanted() && g_rq_thread_started;
 }
 
-/* Anything queued or still being encoded: range checks say "busy". */
-static bool rqueue_pending(void)
-{
-    return g_rq_thread_started &&
-           (qatomic_read(&g_rq_deq) != qatomic_read(&g_rq_enq) ||
-            qatomic_read(&g_rq_done) != qatomic_read(&g_rq_enq));
-}
-
 /* Wait until every job pushed so far has been encoded and freed.  Never
  * called while holding g_render_lock (the render thread is what makes
  * progress), so this cannot self-deadlock. */
 static void rqueue_drain(void)
 {
-    /* Only the jobs pushed before the call: a caller that waits without
-     * the BQL (the display refresh) must not chase producers that keep
-     * pushing meanwhile.  Jobs finish in order, so done >= target means
-     * all of them are through. */
-    uintptr_t target = qatomic_read(&g_rq_enq);
-
     pthread_mutex_lock(&g_rq_mtx);
-    while ((intptr_t)(qatomic_read(&g_rq_done) - target) < 0) {
+    while (qatomic_read(&g_rq_done) != qatomic_read(&g_rq_enq)) {
         pthread_cond_wait(&g_rq_idle, &g_rq_mtx);
     }
     pthread_mutex_unlock(&g_rq_mtx);
@@ -6742,27 +7079,34 @@ static int r200_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
 static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                             uint64_t vram_size, const R300DrawPacket *pkt);
 
-/* Take the next job, or NULL when the ring is empty.  One consumer. */
-static RQJob *rq_pop(void)
+/* Take the next job, or NULL when the ring is empty.  One consumer;
+ * g_rq_mtx held, so a range scan never sees a job in neither the cell
+ * nor the encoding slot. */
+static RQJob *rq_pop_locked(void)
 {
     uintptr_t pos = qatomic_read(&g_rq_deq);
     RQCell *c = &g_rq_cells[pos & RQ_MASK];
 
-    /* Acquire pairs with rq_push's release: once seq says the cell is
-     * full, its job pointer is the one just published (ARM reorders
-     * plain accesses; reading a stale pointer freed it twice). */
-    if ((uintptr_t)qatomic_load_acquire(&c->seq) != pos + 1) {
+    if ((uintptr_t)qatomic_read(&c->seq) != pos + 1) {
         return NULL;
     }
-    RQJob *job = qatomic_read(&c->job);
-    qatomic_store_release(&c->seq, pos + RQ_SIZE);   /* the cell is free again */
+    RQJob *job = c->job;
+    g_rq_enc_ranges = c->ranges;
+    g_rq_enc_valid = true;
+    qatomic_set(&c->seq, pos + RQ_SIZE);      /* the cell is free again */
     qatomic_set(&g_rq_deq, pos + 1);
     return job;
 }
 
-static void r200_commit_fence(PPCMacGPUMetalState *st,
-                              void (*done)(void *, uint32_t), void *arg,
-                              uint32_t seq);
+static RQJob *rq_pop(void)
+{
+    RQJob *job;
+
+    pthread_mutex_lock(&g_rq_mtx);
+    job = rq_pop_locked();
+    pthread_mutex_unlock(&g_rq_mtx);
+    return job;
+}
 
 static void *rqueue_thread(void *unused)
 {
@@ -6772,7 +7116,7 @@ static void *rqueue_thread(void *unused)
         RQJob *job = rq_pop();
         if (!job) {
             pthread_mutex_lock(&g_rq_mtx);
-            while (!g_rq_stop && !(job = rq_pop())) {
+            while (!g_rq_stop && !(job = rq_pop_locked())) {
                 pthread_cond_wait(&g_rq_work, &g_rq_mtx);
             }
             pthread_mutex_unlock(&g_rq_mtx);
@@ -6783,177 +7127,45 @@ static void *rqueue_thread(void *unused)
         pthread_mutex_lock(&g_render_lock);
         if (job->kind == RQ_R200) {
             r200_draw_encode(st, st->vram_ptr, st->vram_size, &job->r200);
-        } else if (job->kind == RQ_R300) {
-            r300_draw_encode(st, st->vram_ptr, st->vram_size, &job->r300);
         } else {
-            r200_commit_fence(st, job->sub.done, job->sub.arg, job->sub.seq);
+            r300_draw_encode(st, st->vram_ptr, st->vram_size, &job->r300);
         }
         pthread_mutex_unlock(&g_render_lock);
-        if (job->kind == RQ_R200) {
-            r200_job_free(job);
-        } else if (job->kind == RQ_R300) {
-            r300_job_free(job);
-        } else {
-            g_free(job);
-        }
         pthread_mutex_lock(&g_rq_mtx);
+        /* The encode recorded the job's writes and reads in the batch
+         * trackers, which the range checks see from here on. */
+        g_rq_enc_valid = false;
         g_rq_done++;
         pthread_cond_broadcast(&g_rq_idle);
         pthread_cond_broadcast(&g_rq_space);
         pthread_mutex_unlock(&g_rq_mtx);
+        if (job->kind == RQ_R200) {
+            r200_job_free(job);
+        } else {
+            r300_job_free(job);
+        }
     }
     return NULL;
 }
 
-/*
- * VRAM ranges that queued, not yet encoded jobs will read (textures) or
- * write (colour and depth buffers).  metal_range_busy_r200 used to call
- * everything busy while the queue was not empty, so every 2D blit --
- * each of Doom 3's texture uploads -- drained the queue with the BQL
- * held, and the vCPU and main loop (and with it the audio pacing timer)
- * stood still behind it.  Entries are dropped once their job has been
- * encoded; the batch's own read/written lists cover them from then on.
- * Past RQ_RANGES entries it falls back to "busy" until the queue drains.
- * PPCGPU_RQ_RANGES=0 restores the old answer.
- */
-#define RQ_RANGES 512
-typedef struct { uint64_t lo, hi; uintptr_t pos; bool write; } RQRange;
-static RQRange g_rq_ranges[RQ_RANGES];
-static int g_rq_nranges;
-static bool g_rq_range_overflow;
-static pthread_mutex_t g_rq_range_mtx = PTHREAD_MUTEX_INITIALIZER;
-
-static bool rq_ranges_on(void)
-{
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("PPCGPU_RQ_RANGES");
-        on = !(e && e[0] == '0');
-    }
-    return on;
-}
-
-/* Drop entries of jobs already encoded.  Called with g_rq_range_mtx. */
-static void rq_ranges_prune(void)
-{
-    uintptr_t done = qatomic_read(&g_rq_done);
-    int k = 0;
-    for (int i = 0; i < g_rq_nranges; i++) {
-        if ((intptr_t)(g_rq_ranges[i].pos - done) >= 0) {
-            g_rq_ranges[k++] = g_rq_ranges[i];
-        }
-    }
-    g_rq_nranges = k;
-    if (g_rq_range_overflow && done == qatomic_read(&g_rq_enq)) {
-        g_rq_range_overflow = false;
-    }
-}
-
-static void rq_range_add(uintptr_t pos, uint64_t lo, uint64_t len, bool write)
-{
-    if (!len) {
-        return;
-    }
-    if (g_rq_nranges == RQ_RANGES) {
-        rq_ranges_prune();
-    }
-    if (g_rq_nranges == RQ_RANGES) {
-        g_rq_range_overflow = true;
-        return;
-    }
-    g_rq_ranges[g_rq_nranges++] = (RQRange){ lo, lo + len, pos, write };
-}
-
-static void rq_ranges_r300(uintptr_t pos, const R300DrawPacket *p)
-{
-    uint64_t rows = (uint64_t)p->rt_height * MAX(p->aa_samples, 1u);
-    pthread_mutex_lock(&g_rq_range_mtx);
-    rq_range_add(pos, p->rt_gpu_addr, (uint64_t)p->rt_pitch * p->rt_bpp * rows, true);
-    for (uint32_t k = 1; k < p->num_cb && k < R300_US_MAX_TARGETS; k++) {
-        rq_range_add(pos, p->cb[k].gpu_addr, (uint64_t)p->cb[k].pitch * p->cb[k].bpp * rows,
-                     true);
-    }
-    if (p->depth.attach) {
-        rq_range_add(pos, p->depth.gpu_addr, (uint64_t)p->depth.pitch * p->depth.bpp * rows,
-                     true);
-    }
-    for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
-        if (p->tex[t].bound && !p->tex[t].host_data) {
-            rq_range_add(pos, p->tex[t].gpu_addr, p->tex[t].size_bytes, false);
-        }
-    }
-    pthread_mutex_unlock(&g_rq_range_mtx);
-}
-
-static void rq_ranges_r200(uintptr_t pos, const R200DrawPacket *p)
-{
-    pthread_mutex_lock(&g_rq_range_mtx);
-    rq_range_add(pos, p->rt_offset, (uint64_t)p->rt_pitch * 4 * p->rt_height, true);
-    if (p->depth_enable || p->stencil_enable) {
-        rq_range_add(pos, p->depth_offset,
-                     (uint64_t)p->depth_pitch * p->depth_bpp * p->rt_height, true);
-    }
-    for (int t = 0; t < R200_MAX_TEX; t++) {
-        if (p->tex[t].enabled && !p->tex[t].host_data) {
-            /* mip levels are not described here: twice the base level
-             * bounds a full chain */
-            rq_range_add(pos, p->tex[t].offset, 2 * r200_tex_host_bytes(&p->tex[t]), false);
-        }
-    }
-    pthread_mutex_unlock(&g_rq_range_mtx);
-}
-
-/* Does a queued, not yet encoded job touch [lo, hi) in a conflicting way? */
-static bool rq_ranges_busy(uint64_t lo, uint64_t hi, bool write_access)
-{
-    bool busy = false;
-    pthread_mutex_lock(&g_rq_range_mtx);
-    rq_ranges_prune();
-    if (g_rq_range_overflow) {
-        busy = true;
-    }
-    for (int i = 0; !busy && i < g_rq_nranges; i++) {
-        const RQRange *r = &g_rq_ranges[i];
-        if (lo < r->hi && r->lo < hi && (write_access || r->write)) {
-            busy = true;
-        }
-    }
-    pthread_mutex_unlock(&g_rq_range_mtx);
-    return busy;
-}
-
-/* Does a queued draw known to write [lo, hi)?  Unlike rq_ranges_busy,
- * an overflowed list answers no: the caller drains to find out. */
-static bool rq_ranges_written(uint64_t lo, uint64_t hi)
-{
-    bool hit = false;
-    pthread_mutex_lock(&g_rq_range_mtx);
-    rq_ranges_prune();
-    for (int i = 0; !hit && i < g_rq_nranges; i++) {
-        const RQRange *r = &g_rq_ranges[i];
-        hit = r->write && lo < r->hi && r->lo < hi;
-    }
-    pthread_mutex_unlock(&g_rq_range_mtx);
-    return hit;
-}
-
-static uintptr_t rq_push(RQJob *job)
+static void rq_push(RQJob *job)
 {
     uintptr_t pos = qatomic_fetch_add(&g_rq_enq, (uintptr_t)1);
     RQCell *c = &g_rq_cells[pos & RQ_MASK];
 
     /* Full: wait for the render thread to finish a job.  FIFO order
      * means this draw cannot be encoded here instead. */
-    while ((uintptr_t)qatomic_load_acquire(&c->seq) != pos) {
+    while ((uintptr_t)qatomic_read(&c->seq) != pos) {
         pthread_mutex_lock(&g_rq_mtx);
-        if ((uintptr_t)qatomic_load_acquire(&c->seq) != pos) {
+        if ((uintptr_t)qatomic_read(&c->seq) != pos) {
             g_rq_stat_full++;
             pthread_cond_wait(&g_rq_space, &g_rq_mtx);
         }
         pthread_mutex_unlock(&g_rq_mtx);
     }
     qatomic_set(&c->job, job);
-    qatomic_store_release(&c->seq, pos + 1);    /* publishes job */
+    c->ranges = job->ranges;      /* published by the seq store below */
+    qatomic_set(&c->seq, pos + 1);
     if (pos == qatomic_read(&g_rq_deq)) {
         /* the ring was empty: the render thread may be asleep */
         pthread_mutex_lock(&g_rq_mtx);
@@ -6961,7 +7173,6 @@ static uintptr_t rq_push(RQJob *job)
         pthread_mutex_unlock(&g_rq_mtx);
     }
     g_rq_stat_jobs++;
-    return pos;
 }
 
 static bool rqueue_start(PPCMacGPUMetalState *st)
@@ -6974,6 +7185,7 @@ static bool rqueue_start(PPCMacGPUMetalState *st)
         g_rq_cells[i].job = NULL;
     }
     g_rq_enq = g_rq_deq = g_rq_done = 0;
+    g_rq_enc_valid = false;
     g_rq_st = st;
     g_rq_stop = false;
     if (pthread_create(&g_rq_thread, NULL, rqueue_thread, NULL) != 0) {
@@ -7129,107 +7341,66 @@ static void r200_note_written(uint64_t lo, uint64_t hi, const R200TexKey *key)
     g_r200_nwritten++;
 }
 
-/*
- * VRAM read (as textures) by draws in the open or in-flight batches: for
- * every 4 KiB page, the number of the last batch that read it (0 never).
- * A page is busy while that batch has not completed on the GPU
- * (g_r200_done_seq, set by every commit's completion handler).
- *
- * This used to be a list of 64 ranges that, once full, called every range
- * busy until the next full flush.  Doom 3 reads hundreds of textures a
- * frame, so it was always full: each 2D blit (every texture upload) and
- * every render-to-texture then flushed and waited with the BQL held.
- */
-#define R200_READ_PAGE_SHIFT 12
-#define R200_READ_MAX_VRAM (1ull << 30)
-static uint32_t *g_r200_read_seq;       /* per page */
-static bool g_r200_read_overflow;       /* a read beyond R200_READ_MAX_VRAM */
-static uint32_t g_r200_seq;             /* number of the last commit */
-static uint32_t g_r200_done_seq;        /* newest completed commit (atomic) */
+/* VRAM ranges read (as textures) by draws in the open or in-flight batches. */
+#define R200_MAX_READ 64
+static struct { uint64_t lo, hi; } g_r200_read[R200_MAX_READ];
+static int g_r200_nread;
+static bool g_r200_read_overflow;
 
 static void r200_note_read(uint64_t lo, uint64_t hi)
 {
-    if (hi <= lo) {
-        return;
+    for (int i = 0; i < g_r200_nread; i++) {
+        if (g_r200_read[i].lo == lo && g_r200_read[i].hi == hi) {
+            return;
+        }
     }
-    if (hi > R200_READ_MAX_VRAM) {
+    if (g_r200_nread == R200_MAX_READ) {
         g_r200_read_overflow = true;         /* be conservative */
         return;
     }
-    if (!g_r200_read_seq) {
-        g_r200_read_seq = g_new0(uint32_t, R200_READ_MAX_VRAM >> R200_READ_PAGE_SHIFT);
-    }
-    uint32_t open = g_r200_seq + 1 ? g_r200_seq + 1 : 1;    /* the open batch's number */
-    for (uint64_t p = lo >> R200_READ_PAGE_SHIFT;
-         p <= (hi - 1) >> R200_READ_PAGE_SHIFT; p++) {
-        g_r200_read_seq[p] = open;
-    }
-}
-
-/* Is any page of [lo, hi) read by a batch that has not completed? */
-static bool r200_read_busy(uint64_t lo, uint64_t hi)
-{
-    if (g_r200_read_overflow) {
-        return true;
-    }
-    if (!g_r200_read_seq || hi <= lo) {
-        return false;
-    }
-    uint32_t done = qatomic_read(&g_r200_done_seq);
-    uint64_t end = MIN(hi, R200_READ_MAX_VRAM);
-    for (uint64_t p = lo >> R200_READ_PAGE_SHIFT;
-         p < end && p <= (end - 1) >> R200_READ_PAGE_SHIFT; p++) {
-        uint32_t r = g_r200_read_seq[p];
-        if (r && (int32_t)(r - done) > 0) {
-            return true;
-        }
-    }
-    return false;
+    g_r200_read[g_r200_nread].lo = lo;
+    g_r200_read[g_r200_nread++].hi = hi;
 }
 
 static bool metal_range_busy_r200_locked(uint64_t lo, uint64_t hi,
                                          bool write_access);
 
-/*
- * PPCGPU_2D_DRAIN=0: a 2D access that overlaps queued draws flushes (and
- * waits for the GPU) instead of letting the render queue encode them first.
- */
-static bool r200_2d_drain_on(void)
-{
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("PPCGPU_2D_DRAIN");
-        on = !(e && e[0] == '0');
-    }
-    return on;
-}
-
 static bool metal_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi,
                                   bool write_access)
 {
-    /* Queued or mid-encode draws touching the range (rq_ranges_busy), or
-     * -- PPCGPU_RQ_RANGES=0 -- any queued draw at all. */
-    if (rqueue_pending()) {
-        if (!rq_ranges_on() || rq_ranges_busy(lo, hi, write_access)) {
-            /*
-             * A 2D write over bytes that queued draws only read -- four in
-             * five of Doom 3's busy 2D blits, its texture uploads -- needs
-             * just those draws encoded: the encode turns a texture read
-             * into a CPU copy (or, for a view, a read recorded against its
-             * batch).  Let the queue catch up and then ask about the GPU
-             * alone.  Anything else (a read of what queued draws write,
-             * such as Quake III reading back its frame, about 50 times a
-             * second) needs the GPU finished anyway, and draining first
-             * only added a wait of 4-6 ms: flush, as before.  When the
-             * range list has overflowed, as Doom 3's does, draining is how
-             * to find out: a write it turns up is then in the batch's
-             * written list, and the GPU check below sees it.
-             */
-            if (!r200_2d_drain_on() || !write_access ||
-                rq_ranges_written(lo, hi)) {
-                return true;            /* the caller's flush waits for them */
+    /*
+     * Queued and mid-encode draws say which VRAM ranges they touch, so an
+     * access to unrelated memory keeps the GPU running instead of draining
+     * the queue and waiting for it.  A cell is only read while its seq says
+     * "published at this position", checked again afterwards: a producer
+     * mid-push or a wraparound lands in one of the checks and is treated
+     * conservatively.
+     */
+    if (g_rq_thread_started) {
+        bool busy = false;
+        pthread_mutex_lock(&g_rq_mtx);
+        if (g_rq_enc_valid && rq_ranges_busy(&g_rq_enc_ranges, lo, hi,
+                                             write_access)) {
+            busy = true;
+        }
+        uintptr_t deq = qatomic_read(&g_rq_deq);
+        uintptr_t enq = qatomic_read(&g_rq_enq);
+        for (uintptr_t pos = deq; pos < enq && !busy; pos++) {
+            RQCell *c = &g_rq_cells[pos & RQ_MASK];
+            if ((uintptr_t)qatomic_read(&c->seq) != pos + 1) {
+                busy = true;          /* being published right now */
+                break;
             }
-            rqueue_drain();
+            if (rq_ranges_busy(&c->ranges, lo, hi, write_access)) {
+                busy = true;
+            }
+            if ((uintptr_t)qatomic_read(&c->seq) != pos + 1) {
+                busy = true;          /* recycled while being read */
+            }
+        }
+        pthread_mutex_unlock(&g_rq_mtx);
+        if (busy) {
+            return true;
         }
     }
     pthread_mutex_lock(&g_render_lock);
@@ -7249,8 +7420,15 @@ static bool metal_range_busy_r200_locked(uint64_t lo, uint64_t hi,
             return true;
         }
     }
-    if (write_access && r200_read_busy(lo, hi)) {
-        return true;
+    if (write_access) {
+        if (g_r200_read_overflow) {
+            return true;
+        }
+        for (int i = 0; i < g_r200_nread; i++) {
+            if (lo < g_r200_read[i].hi && g_r200_read[i].lo < hi) {
+                return true;
+            }
+        }
     }
     return false;
 }
@@ -7384,11 +7562,86 @@ static id<MTLTexture> r200_view(PPCMacGPUMetalState *st, R200TexKey k,
     return t;
 }
 
+static uint32_t g_r200_seq;
+
+/* r200_decode_tex_unit()'s AGP copy is pitch*height (DXT: block rows). */
+static uint64_t r200_tex_host_bytes(const R200TexUnit *t)
+{
+    uint64_t len = (uint64_t)t->pitch * t->height;
+    if (t->format == 12 || t->format == 14 || t->format == 15) {
+        len = (uint64_t)t->pitch * ((t->height + 3) / 4);
+    }
+    return len;
+}
+
+/* POWEREMU_TEX_TRACE, cached: getenv() per draw was a linear environ scan. */
+static bool metal_tex_trace(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("POWEREMU_TEX_TRACE") != NULL;
+    }
+    return on;
+}
+
+/*
+ * Textures that cannot be views over VRAM -- AGP/host copies, converted
+ * YUV frames, DXT blocks -- were rebuilt and re-uploaded every draw.
+ * Cache them by a hash of their source bytes instead: an unchanged
+ * texture (a glyph atlas, a menu, a paused video frame) then costs a
+ * hash, not a conversion and an upload.  g_render_lock serialises all
+ * users (the encode paths).
+ */
+#define AUX_TEX_CACHE 32
+typedef struct {
+    uint64_t hash;
+    uint32_t k[6];
+    id<MTLTexture> tex;         /* retained */
+    uint64_t used;
+} AuxTex;
+static AuxTex g_aux_tex[AUX_TEX_CACHE];
+static uint64_t g_aux_tex_clock;
+
+static id<MTLTexture> aux_tex_find(uint64_t hash, const uint32_t k[6])
+{
+    for (int i = 0; i < AUX_TEX_CACHE; i++) {
+        if (g_aux_tex[i].tex && g_aux_tex[i].hash == hash &&
+            !memcmp(g_aux_tex[i].k, k, sizeof(g_aux_tex[i].k))) {
+            g_aux_tex[i].used = ++g_aux_tex_clock;
+            return g_aux_tex[i].tex;
+        }
+    }
+    return nil;
+}
+
+static void aux_tex_store(uint64_t hash, const uint32_t k[6], id<MTLTexture> t)
+{
+    int lru = 0;
+
+    for (int i = 0; i < AUX_TEX_CACHE; i++) {
+        if (g_aux_tex[i].used < g_aux_tex[lru].used) {
+            lru = i;
+        }
+    }
+    [g_aux_tex[lru].tex release];
+    g_aux_tex[lru].hash = hash;
+    memcpy(g_aux_tex[lru].k, k, sizeof(g_aux_tex[lru].k));
+    g_aux_tex[lru].tex = [t retain];
+    g_aux_tex[lru].used = ++g_aux_tex_clock;
+}
+
+/* Finish pending GPU writes to VRAM [lo, hi) before the CPU reads it. */
+static bool r200_flush_locked(PPCMacGPUMetalState *st);
+
+static void aux_tex_sync_vram(PPCMacGPUMetalState *st, uint64_t lo, uint64_t hi)
+{
+    if (metal_range_busy_r200_locked(lo, hi, false)) {
+        r200_flush_locked(st);
+    }
+}
 
 /* Close the open batch and commit it; returns its sequence number or 0. */
-/* fseq, if not 0, is the number done() reports instead of the commit's own. */
-static uint32_t r200_commit_as(void (*done)(void *, uint32_t), void *arg,
-                               uint32_t fseq)
+static uint32_t r200_commit(void (*done)(void *, uint32_t), void *arg)
 {
     if (!g_r200_cb) {
         return 0;
@@ -7403,15 +7656,9 @@ static uint32_t r200_commit_as(void (*done)(void *, uint32_t), void *arg,
     if (seq == 0) {
         seq = ++g_r200_seq;
     }
-    /* Pages read by this batch stop being busy when it completes
-     * (r200_read_busy); command buffers complete in commit order. */
-    [g_r200_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-        qatomic_set(&g_r200_done_seq, seq);
-    }];
     if (done) {
-        uint32_t report = fseq ? fseq : seq;
         [g_r200_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-            done(arg, report);
+            done(arg, seq);
         }];
     }
     if (g_r200_event) {
@@ -7428,57 +7675,11 @@ static uint32_t r200_commit_as(void (*done)(void *, uint32_t), void *arg,
     return seq;
 }
 
-static uint32_t r200_commit(void (*done)(void *, uint32_t), void *arg)
-{
-    return r200_commit_as(done, arg, 0);
-}
-
-/*
- * A fence submit on the render thread, in order behind the draws queued
- * before it.  With nothing to commit it commits an empty command buffer,
- * so its completion still comes after everything already in flight.
- */
-static void r200_commit_fence(PPCMacGPUMetalState *st,
-                              void (*done)(void *, uint32_t), void *arg,
-                              uint32_t seq)
-{
-    if (!g_r200_cb) {
-        g_r200_cb = r200_new_cb(st);
-    }
-    r200_commit_as(done, arg, seq);
-}
-
 static uint32_t metal_submit_r200(void *opaque,
                                   void (*done)(void *, uint32_t), void *arg)
 {
     uint32_t seq;
 
-    /*
-     * With the render queue the submit is queued too, under a number of
-     * its own: waiting here for the queue to drain held the BQL for the
-     * whole encode, and the vCPU spent a quarter of Quake III blocked on
-     * it.  Fences complete in queue order, so their numbers stay ordered.
-     * PPCGPU_QUEUED_SUBMIT=0 drains and commits here instead.
-     */
-    static int queued = -1;
-    static uint32_t fence_seq;
-    if (queued < 0) {
-        const char *e = getenv("PPCGPU_QUEUED_SUBMIT");
-        queued = !(e && e[0] == '0');
-    }
-    if (rqueue_enabled() && queued) {
-        RQJob *job = g_new0(RQJob, 1);
-        seq = ++fence_seq;
-        if (seq == 0) {
-            seq = ++fence_seq;
-        }
-        job->kind = RQ_SUBMIT;
-        job->sub.done = done;
-        job->sub.arg = arg;
-        job->sub.seq = seq;
-        rq_push(job);
-        return seq;
-    }
     if (rqueue_enabled()) {
         rqueue_drain();
     }
@@ -7503,7 +7704,7 @@ static bool r200_flush_locked(PPCMacGPUMetalState *st)
     [g_r200_inflight release];
     g_r200_inflight = nil;
     g_r200_nwritten = 0;
-    qatomic_set(&g_r200_done_seq, g_r200_seq);  /* everything has completed */
+    g_r200_nread = 0;
     g_r200_read_overflow = false;
     g_r200_stat_flushes++;
     g_r200_stat_flush_us += g_get_monotonic_time() - t0;
@@ -7731,65 +7932,80 @@ static int r200_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                     continue;
                 }
                 const uint8_t *src = tu->host_data ? tu->host_data : vram_ptr + tu->offset;
-                uint8_t *out = g_malloc((size_t)w * h * 4);
-                for (uint32_t y = 0; y < h; y++) {
-                    const uint8_t *row = src + (uint64_t)y * tu->pitch;
-                    uint8_t *o = out + (size_t)y * w * 4;
-                    for (uint32_t x = 0; x + 1 < w + 1; x += 2) {
-                        uint8_t b[4] = { row[x * 2], row[x * 2 + 1],
-                                         row[x * 2 + 2], row[x * 2 + 3] };
-                        uint8_t g[4];
-                        switch (tu->swap) {
-                        case 1: g[0] = b[1]; g[1] = b[0]; g[2] = b[3]; g[3] = b[2]; break;
-                        case 2: g[0] = b[3]; g[1] = b[2]; g[2] = b[1]; g[3] = b[0]; break;
-                        case 3: g[0] = b[2]; g[1] = b[3]; g[2] = b[0]; g[3] = b[1]; break;
-                        default: memcpy(g, b, 4); break;
-                        }
-                        int cb, y0, cr, y1;
-                        if (luma_first) {       /* 'yuvs': Y0 Cb Y1 Cr */
-                            y0 = g[0]; cb = g[1]; y1 = g[2]; cr = g[3];
-                        } else {                /* '2vuy': Cb Y0 Cr Y1 */
-                            cb = g[0]; y0 = g[1]; cr = g[2]; y1 = g[3];
-                        }
-                        for (int k = 0; k < 2 && x + k < w; k++) {
-                            float yy = 1.164f * ((k ? y1 : y0) - 16);
-                            float r = yy + 1.596f * (cr - 128);
-                            float gg = yy - 0.813f * (cr - 128) - 0.391f * (cb - 128);
-                            float bb = yy + 2.018f * (cb - 128);
-                            uint8_t *p8 = o + (x + k) * 4;
-                            p8[0] = (uint8_t)MIN(MAX(bb, 0.0f), 255.0f);
-                            p8[1] = (uint8_t)MIN(MAX(gg, 0.0f), 255.0f);
-                            p8[2] = (uint8_t)MIN(MAX(r, 0.0f), 255.0f);
-                            p8[3] = 255;
+                uint64_t slen = (uint64_t)tu->pitch * h;
+                if (!tu->host_data) {
+                    aux_tex_sync_vram(st, tu->offset, tu->offset + slen);
+                }
+                uint64_t yhash = r300_hash_bytes(src, slen);
+                uint32_t akey[6] = { 0, tu->format,
+                                     tu->swap | (luma_first ? 8u : 0) |
+                                     (tu->host_data ? 16u : 0),
+                                     w, h, tu->pitch };
+                id<MTLTexture> yt = aux_tex_find(yhash, akey);
+                if (!yt) {
+                    uint8_t *out = g_malloc((size_t)w * h * 4);
+                    for (uint32_t y = 0; y < h; y++) {
+                        const uint8_t *row = src + (uint64_t)y * tu->pitch;
+                        uint8_t *o = out + (size_t)y * w * 4;
+                        for (uint32_t x = 0; x + 1 < w + 1; x += 2) {
+                            uint8_t b[4] = { row[x * 2], row[x * 2 + 1],
+                                             row[x * 2 + 2], row[x * 2 + 3] };
+                            uint8_t g[4];
+                            switch (tu->swap) {
+                            case 1: g[0] = b[1]; g[1] = b[0]; g[2] = b[3]; g[3] = b[2]; break;
+                            case 2: g[0] = b[3]; g[1] = b[2]; g[2] = b[1]; g[3] = b[0]; break;
+                            case 3: g[0] = b[2]; g[1] = b[3]; g[2] = b[0]; g[3] = b[1]; break;
+                            default: memcpy(g, b, 4); break;
+                            }
+                            int cb, y0, cr, y1;
+                            if (luma_first) {       /* 'yuvs': Y0 Cb Y1 Cr */
+                                y0 = g[0]; cb = g[1]; y1 = g[2]; cr = g[3];
+                            } else {                /* '2vuy': Cb Y0 Cr Y1 */
+                                cb = g[0]; y0 = g[1]; cr = g[2]; y1 = g[3];
+                            }
+                            for (int k = 0; k < 2 && x + k < w; k++) {
+                                float yy = 1.164f * ((k ? y1 : y0) - 16);
+                                float r = yy + 1.596f * (cr - 128);
+                                float gg = yy - 0.813f * (cr - 128) - 0.391f * (cb - 128);
+                                float bb = yy + 2.018f * (cb - 128);
+                                uint8_t *p8 = o + (x + k) * 4;
+                                p8[0] = (uint8_t)MIN(MAX(bb, 0.0f), 255.0f);
+                                p8[1] = (uint8_t)MIN(MAX(gg, 0.0f), 255.0f);
+                                p8[2] = (uint8_t)MIN(MAX(r, 0.0f), 255.0f);
+                                p8[3] = 255;
+                            }
                         }
                     }
-                }
-                if (getenv("POWEREMU_TEX_TRACE")) {
-                    static uint64_t last_kind;
-                    static int yuv_drawn;
-                    uint64_t kind = ((uint64_t)tu->format << 40) | ((uint64_t)tu->swap << 36)
-                                  | ((uint64_t)w << 20) | ((uint64_t)h << 4)
-                                  | (tu->host_data ? 1 : 0);
-                    if (kind != last_kind && yuv_drawn++ < 40) {
-                        last_kind = kind;
-                        fprintf(stderr, "ppc-mac-gpu yuv draw: fmt %u %ux%u swap %u%s "
-                                "src=%02x %02x %02x %02x -> bgra=%02x %02x %02x %02x\n",
-                                tu->format, w, h, tu->swap,
-                                luma_first ? " (AGP, luma first)" :
-                                tu->host_data ? " (AGP)" : " (VRAM)",
-                                src[0], src[1], src[2], src[3],
-                                out[0], out[1], out[2], out[3]);
+                    if (metal_tex_trace()) {
+                        static uint64_t last_kind;
+                        static int yuv_drawn;
+                        uint64_t kind = ((uint64_t)tu->format << 40) | ((uint64_t)tu->swap << 36)
+                                      | ((uint64_t)w << 20) | ((uint64_t)h << 4)
+                                      | (tu->host_data ? 1 : 0);
+                        if (kind != last_kind && yuv_drawn++ < 40) {
+                            last_kind = kind;
+                            fprintf(stderr, "ppc-mac-gpu yuv draw: fmt %u %ux%u swap %u%s "
+                                    "src=%02x %02x %02x %02x -> bgra=%02x %02x %02x %02x\n",
+                                    tu->format, w, h, tu->swap,
+                                    luma_first ? " (AGP, luma first)" :
+                                    tu->host_data ? " (AGP)" : " (VRAM)",
+                                    src[0], src[1], src[2], src[3],
+                                    out[0], out[1], out[2], out[3]);
+                        }
                     }
+                    MTLTextureDescriptor *yd = [MTLTextureDescriptor
+                        texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                        width:w height:h mipmapped:NO];
+                    yd.usage = MTLTextureUsageShaderRead;
+                    yt = [dev newTextureWithDescriptor:yd];
+                    [yt replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
+                            withBytes:out bytesPerRow:w * 4];
+                    g_free(out);
+                    if (yt) {
+                        aux_tex_store(yhash, akey, yt);
+                    }
+                    [yt autorelease];
                 }
-                MTLTextureDescriptor *yd = [MTLTextureDescriptor
-                    texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                    width:w height:h mipmapped:NO];
-                yd.usage = MTLTextureUsageShaderRead;
-                id<MTLTexture> yt = [dev newTextureWithDescriptor:yd];
-                [yt replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
-                        withBytes:out bytesPerRow:w * 4];
-                g_free(out);
-                [yt autorelease];
                 tex[t] = yt;
                 smp[t] = r200_sampler(dev, tu->filter);
                 u.texinfo[t][0] = 1;
@@ -7841,24 +8057,37 @@ static int r200_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                     r200_metal_warn(64, "DXT texture unusable", tu->format, tu->offset);
                     continue;
                 }
-                uint32_t *blk = g_malloc((size_t)bw * bs * bh);
-                for (uint32_t y = 0; y < bh; y++) {
-                    const uint32_t *srow = (const uint32_t *)
-                        ((tu->host_data ? tu->host_data : vram_ptr + tu->offset) +
-                         (uint64_t)y * row);
-                    memcpy(blk + y * (bw * bs / 4), srow, bw * bs);
+                const uint8_t *dsrc = tu->host_data ? tu->host_data
+                                                    : vram_ptr + tu->offset;
+                if (!tu->host_data) {
+                    aux_tex_sync_vram(st, tu->offset,
+                                      tu->offset + (uint64_t)row * bh);
                 }
-                MTLTextureDescriptor *cd = [MTLTextureDescriptor
-                    texture2DDescriptorWithPixelFormat:
-                        tu->format == 12 ? MTLPixelFormatBC1_RGBA :
-                        tu->format == 14 ? MTLPixelFormatBC2_RGBA : MTLPixelFormatBC3_RGBA
-                    width:bw * 4 height:bh * 4 mipmapped:NO];
-                cd.usage = MTLTextureUsageShaderRead;
-                id<MTLTexture> ct = [dev newTextureWithDescriptor:cd];
-                [ct replaceRegion:MTLRegionMake2D(0, 0, bw * 4, bh * 4) mipmapLevel:0
-                        withBytes:blk bytesPerRow:bw * bs];
-                g_free(blk);
-                [ct autorelease];          /* the command buffer retains it */
+                uint64_t dhash = r300_hash_bytes(dsrc, (size_t)row * bh);
+                uint32_t dkey[6] = { 1, tu->format, tu->host_data ? 1u : 0u,
+                                     bw * 4, bh * 4, row };
+                id<MTLTexture> ct = aux_tex_find(dhash, dkey);
+                if (!ct) {
+                    uint32_t *blk = g_malloc((size_t)bw * bs * bh);
+                    for (uint32_t y = 0; y < bh; y++) {
+                        memcpy(blk + y * (bw * bs / 4), dsrc + (uint64_t)y * row,
+                               bw * bs);
+                    }
+                    MTLTextureDescriptor *cd = [MTLTextureDescriptor
+                        texture2DDescriptorWithPixelFormat:
+                            tu->format == 12 ? MTLPixelFormatBC1_RGBA :
+                            tu->format == 14 ? MTLPixelFormatBC2_RGBA : MTLPixelFormatBC3_RGBA
+                        width:bw * 4 height:bh * 4 mipmapped:NO];
+                    cd.usage = MTLTextureUsageShaderRead;
+                    ct = [dev newTextureWithDescriptor:cd];
+                    [ct replaceRegion:MTLRegionMake2D(0, 0, bw * 4, bh * 4) mipmapLevel:0
+                            withBytes:blk bytesPerRow:bw * bs];
+                    g_free(blk);
+                    if (ct) {
+                        aux_tex_store(dhash, dkey, ct);
+                    }
+                    [ct autorelease];      /* the cache or command buffer retains it */
+                }
                 tex[t] = ct;
                 smp[t] = r200_sampler(dev, tu->filter);
                 u.texinfo[t][0] = 1;
@@ -7872,7 +8101,7 @@ static int r200_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                 u.texfilt[t][0] = tu->filter;
                 static int dxt_logged;
                 if (dxt_logged++ < 3 ||
-                    (getenv("POWEREMU_TEX_TRACE") && dxt_logged < 12)) {
+                    (metal_tex_trace() && dxt_logged < 12)) {
                     fprintf(stderr, "ppc-mac-gpu dxt: DXT%u %ux%u pitch %u at 0x%x%s\n",
                             tu->format == 12 ? 1 : tu->format == 14 ? 3 : 5,
                             tu->width, tu->height, row, tu->offset,
@@ -7894,15 +8123,25 @@ static int r200_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                 continue;
             }
             if (tu->host_data) {
-                /* AGP texture: upload the copied texels into a temporary */
-                MTLTextureDescriptor *hd = [MTLTextureDescriptor
-                    texture2DDescriptorWithPixelFormat:pf width:tu->width
-                                                height:tu->height mipmapped:NO];
-                hd.usage = MTLTextureUsageShaderRead;
-                id<MTLTexture> ht = [dev newTextureWithDescriptor:hd];
-                [ht replaceRegion:MTLRegionMake2D(0, 0, tu->width, tu->height)
-                      mipmapLevel:0 withBytes:tu->host_data bytesPerRow:tu->pitch];
-                [ht autorelease];
+                /* AGP texture: the copied texels, cached by content */
+                uint64_t hlen = r200_tex_host_bytes(tu);
+                uint64_t hhash = r300_hash_bytes(tu->host_data, hlen);
+                uint32_t hkey[6] = { 2, (uint32_t)pf, tu->format,
+                                     tu->width, tu->height, tu->pitch };
+                id<MTLTexture> ht = aux_tex_find(hhash, hkey);
+                if (!ht) {
+                    MTLTextureDescriptor *hd = [MTLTextureDescriptor
+                        texture2DDescriptorWithPixelFormat:pf width:tu->width
+                                                    height:tu->height mipmapped:NO];
+                    hd.usage = MTLTextureUsageShaderRead;
+                    ht = [dev newTextureWithDescriptor:hd];
+                    [ht replaceRegion:MTLRegionMake2D(0, 0, tu->width, tu->height)
+                          mipmapLevel:0 withBytes:tu->host_data bytesPerRow:tu->pitch];
+                    if (ht) {
+                        aux_tex_store(hhash, hkey, ht);
+                    }
+                    [ht autorelease];
+                }
                 tex[t] = ht;
                 smp[t] = r200_sampler(dev, tu->filter);
                 u.texinfo[t][0] = 1;
@@ -8031,13 +8270,10 @@ static int r200_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             /* The R200 does not clip on z for these draws: a depth clear drawn
              * exactly at z = 1.0 (Chess) would be clipped away by Metal. */
             [g_r200_enc setDepthClipMode:MTLDepthClipModeClamp];
-            [g_r200_enc setRenderPipelineState:
-                rt16 ? (!dtex ? g_r200_pipeline_c16 :
-                        pkt->depth_bpp == 2 ? g_r200_pipeline_c16_z16
-                                            : g_r200_pipeline_c16_z32)
-                     : (!dtex ? g_r200_pipeline :
-                        pkt->depth_bpp == 2 ? g_r200_pipeline_z16
-                                            : g_r200_pipeline_z32)];
+            g_r200_enc_variant = rt16 ? (!dtex ? 3 : pkt->depth_bpp == 2 ? 5 : 4)
+                                      : (!dtex ? 0 : pkt->depth_bpp == 2 ? 2 : 1);
+            g_r200_enc_pipe = g_r200_pipes_gen[g_r200_enc_variant];
+            [g_r200_enc setRenderPipelineState:g_r200_enc_pipe];
             [g_r200_enc setViewport:(MTLViewport){ 0, 0, pkt->rt_width,
                                                   pkt->rt_height, 0, 1 }];
             g_r200_enc_key = rk;
@@ -8076,27 +8312,93 @@ static int r200_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             }
         }
 
-        /* Expand the index list straight into the staging buffer. */
-        size_t vbytes = (size_t)pkt->num_indices * sizeof(R200Vertex);
-        id<MTLBuffer> vb = nil;
-        size_t voff = 0;
-        R200Vertex *flat = r200_arena_alloc(st, vbytes, &vb, &voff);
-        if (flat) {
-            for (uint32_t i = 0; i < pkt->num_indices; i++) {
-                flat[i] = pkt->verts[pkt->indices[i]];
+        /* Specialize the uber-shader to this draw's actual stage count and
+         * bound texture units (the generic pipeline stays the fallback). */
+        {
+            uint32_t stages = 0, tmask = 0;
+            for (int st = 7; st >= 0; st--) {
+                if (pkt->pp_cntl & (st == 7 ? 0x800u : 0x1000u << st)) {
+                    stages = (uint32_t)st + 1;
+                    break;
+                }
             }
-            [enc setVertexBuffer:vb offset:voff atIndex:0];
-        } else {
-            /* Larger than the arena: a one-off buffer for this draw. */
-            R200Vertex *tmp = g_malloc(vbytes);
-            for (uint32_t i = 0; i < pkt->num_indices; i++) {
-                tmp[i] = pkt->verts[pkt->indices[i]];
+            for (int t = 0; t < R200_MAX_TEX; t++) {
+                tmask |= u.texinfo[t][0] ? 1u << t : 0u;
             }
-            id<MTLBuffer> one = [dev newBufferWithBytes:tmp length:vbytes
-                                                options:MTLResourceStorageModeShared];
-            [enc setVertexBuffer:one offset:0 atIndex:0];
-            [one release];
-            g_free(tmp);
+            id<MTLRenderPipelineState> p =
+                r200_spec_pso(dev, g_r200_enc_variant, stages, tmask);
+            if (p && p != g_r200_enc_pipe) {
+                [enc setRenderPipelineState:p];
+                g_r200_enc_pipe = p;
+            }
+        }
+
+        /*
+         * Geometry staging.  When the index list reuses vertices (strips,
+         * fans, quads), uploading the vertex list and the indices and
+         * drawing indexed moves far fewer bytes than expanding every
+         * index into a 144-byte vertex; for a plain list (indices ==
+         * vertices in order) the expansion is the same size without the
+         * index buffer, so keep it.  The vertex shader addresses v[vid],
+         * which an indexed draw feeds from the index buffer.
+         */
+        size_t vbytes = (size_t)pkt->num_verts * sizeof(R200Vertex);
+        size_t ibytes = (size_t)pkt->num_indices * 4;
+        size_t fbytes = (size_t)pkt->num_indices * sizeof(R200Vertex);
+        id<MTLBuffer> ib = nil;
+        size_t ioff = 0;
+        bool indexed = false;
+        if (pkt->num_verts && vbytes + ibytes < fbytes) {
+            id<MTLBuffer> vb = nil;
+            size_t voff = 0;
+            R200Vertex *vp = r200_arena_alloc(st, vbytes, &vb, &voff);
+            uint32_t *ip = vp ? r200_arena_alloc(st, ibytes, &ib, &ioff) : NULL;
+            if (ip) {
+                memcpy(vp, pkt->verts, vbytes);
+                memcpy(ip, pkt->indices, ibytes);
+                [enc setVertexBuffer:vb offset:voff atIndex:0];
+                [ib retain];      /* released after the draw */
+                indexed = true;
+            } else {
+                /* Larger than the arena: one-off buffers for this draw. */
+                id<MTLBuffer> v1 = [dev newBufferWithBytes:pkt->verts length:vbytes
+                                                   options:MTLResourceStorageModeShared];
+                ib = [dev newBufferWithBytes:pkt->indices length:ibytes
+                                     options:MTLResourceStorageModeShared];
+                if (v1 && ib) {
+                    [enc setVertexBuffer:v1 offset:0 atIndex:0];
+                    ioff = 0;
+                    indexed = true;
+                } else {
+                    [ib release];
+                    ib = nil;
+                }
+                [v1 release];
+                /* a retained ib is released after the draw */
+            }
+        }
+        if (!indexed) {
+            /* Expand the index list straight into the staging buffer. */
+            id<MTLBuffer> vb = nil;
+            size_t voff = 0;
+            R200Vertex *flat = r200_arena_alloc(st, fbytes, &vb, &voff);
+            if (flat) {
+                for (uint32_t i = 0; i < pkt->num_indices; i++) {
+                    flat[i] = pkt->verts[pkt->indices[i]];
+                }
+                [enc setVertexBuffer:vb offset:voff atIndex:0];
+            } else {
+                /* Larger than the arena: a one-off buffer for this draw. */
+                R200Vertex *tmp = g_malloc(fbytes);
+                for (uint32_t i = 0; i < pkt->num_indices; i++) {
+                    tmp[i] = pkt->verts[pkt->indices[i]];
+                }
+                id<MTLBuffer> one = [dev newBufferWithBytes:tmp length:fbytes
+                                                    options:MTLResourceStorageModeShared];
+                [enc setVertexBuffer:one offset:0 atIndex:0];
+                [one release];
+                g_free(tmp);
+            }
         }
         [enc setVertexBytes:&u length:sizeof(u) atIndex:1];
         [enc setFragmentBytes:&u length:sizeof(u) atIndex:0];
@@ -8104,10 +8406,21 @@ static int r200_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             [enc setFragmentTexture:tex[t] atIndex:t];
             [enc setFragmentSamplerState:smp[t] atIndex:t];
         }
-        [enc drawPrimitives:pkt->prim_class == 2 ? MTLPrimitiveTypePoint :
-                            pkt->prim_class == 1 ? MTLPrimitiveTypeLine :
-                                                   MTLPrimitiveTypeTriangle
-                vertexStart:0 vertexCount:pkt->num_indices];
+        if (indexed) {
+            [enc drawIndexedPrimitives:pkt->prim_class == 2 ? MTLPrimitiveTypePoint :
+                                       pkt->prim_class == 1 ? MTLPrimitiveTypeLine :
+                                                              MTLPrimitiveTypeTriangle
+                            indexCount:pkt->num_indices
+                             indexType:MTLIndexTypeUInt32
+                           indexBuffer:ib
+                     indexBufferOffset:ioff];
+            [ib release];
+        } else {
+            [enc drawPrimitives:pkt->prim_class == 2 ? MTLPrimitiveTypePoint :
+                                pkt->prim_class == 1 ? MTLPrimitiveTypeLine :
+                                                       MTLPrimitiveTypeTriangle
+                    vertexStart:0 vertexCount:pkt->num_indices];
+        }
         g_r200_stat_draws++;
         {   /* debug: read the depth word back after the first depth draws */
             static int zchk;
@@ -8210,10 +8523,9 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     if (r) {
         return r < 0 ? -1 : 0;      /* rejected, or nothing to draw */
     }
-    {
-        uintptr_t pos = rq_push(r200_job_new(pkt));
-        rq_ranges_r200(pos, pkt);
-    }
+    /* The packet the device passes is its own; the job takes its heap
+     * buffers over (see r200_job_new). */
+    rq_push(r200_job_new((R200DrawPacket *)(uintptr_t)pkt));
     return 0;
 }
 
@@ -8230,7 +8542,14 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
  * ======================================================================== */
 
 static NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *g_r300_pipes;
-static NSMutableDictionary<NSNumber *, id<MTLSamplerState>> *g_r300_samplers;
+
+/*
+ * Samplers in a direct-mapped table: an NSNumber box and a dictionary
+ * hash for each of 16 units each draw added up.  A collision evicts;
+ * distinct sampler states in real workloads number in the tens.
+ */
+#define R300_SMP_SLOTS 512
+static struct { uint32_t key; id<MTLSamplerState> smp; } g_r300_smp[R300_SMP_SLOTS];
 
 static void r300_metal_warn(uint32_t bit, const char *msg)
 {
@@ -8390,7 +8709,7 @@ static id<MTLRenderPipelineState> r300_pipeline_by_text(id<MTLDevice> dev,
         pd.colorAttachments[k].pixelFormat = cfmt[k];
     }
     pd.colorAttachments[ncb].pixelFormat = zfmt;
-    p = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    p = bin_pso(dev, pd, &err);
     [pd release];
     if (!p) {
         qemu_log("ppc-mac-gpu r300: pipeline failed: %s\n",
@@ -8459,14 +8778,17 @@ static id<MTLSamplerState> r300_sampler(id<MTLDevice> dev, uint32_t f0,
                                         uint32_t levels)
 {
     uint32_t key = (f0 & 0xFFFFFF) | (MIN(levels, 15u) << 24);
+    uint32_t slot = (key * 2654435761u) >> 20;      /* spread over the table */
     id<MTLSamplerState> s;
 
-    if (!g_r300_samplers) {
-        g_r300_samplers = [[NSMutableDictionary alloc] init];
-    }
-    s = g_r300_samplers[@(key)];
-    if (s) {
-        return s;
+    for (uint32_t probe = 0; probe < 4; probe++) {
+        uint32_t i = (slot + probe) & (R300_SMP_SLOTS - 1);
+        if (!g_r300_smp[i].smp) {
+            break;
+        }
+        if (g_r300_smp[i].key == key) {
+            return g_r300_smp[i].smp;
+        }
     }
     uint32_t mag = (f0 >> 9) & 3, min = (f0 >> 11) & 3, mip = (f0 >> 13) & 3;
     MTLSamplerDescriptor *d = [[MTLSamplerDescriptor alloc] init];
@@ -8485,8 +8807,18 @@ static id<MTLSamplerState> r300_sampler(id<MTLDevice> dev, uint32_t f0,
     d.lodMaxClamp = levels ? levels - 1 : 0;
     s = [dev newSamplerStateWithDescriptor:d];
     [d release];
-    g_r300_samplers[@(key)] = s;
-    [s release];
+    /* First free probe slot, else the base slot (evicting its sampler). */
+    uint32_t store = slot & (R300_SMP_SLOTS - 1);
+    for (uint32_t probe = 0; probe < 4; probe++) {
+        uint32_t i = (slot + probe) & (R300_SMP_SLOTS - 1);
+        if (!g_r300_smp[i].smp) {
+            store = i;
+            break;
+        }
+    }
+    [g_r300_smp[store].smp release];
+    g_r300_smp[store].key = key;
+    g_r300_smp[store].smp = s;      /* table keeps the reference */
     return s;
 }
 
@@ -8502,8 +8834,28 @@ static id<MTLSamplerState> r300_sampler(id<MTLDevice> dev, uint32_t f0,
  */
 static bool r300_read_conflict(uint64_t lo, uint64_t hi, const R200TexKey *rt)
 {
-    (void)rt;
-    return r200_read_busy(lo, hi);
+    if (g_r200_enc && !memcmp(&g_r200_enc_key, rt, sizeof(*rt)) &&
+        !g_r200_read_overflow) {
+        bool any = false;
+        for (int i = 0; i < g_r200_nread; i++) {
+            if (lo < g_r200_read[i].hi && g_r200_read[i].lo < hi) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) {
+            return false;
+        }
+    }
+    if (g_r200_read_overflow) {
+        return g_r200_cb != nil;
+    }
+    for (int i = 0; i < g_r200_nread; i++) {
+        if (lo < g_r200_read[i].hi && g_r200_read[i].lo < hi) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* Metal format of a colour-buffer view (R300_RTV_*). */
@@ -8531,154 +8883,18 @@ static MTLPixelFormat r300_raw_pf(uint32_t view_bpp)
  * unit's layout and a hash of its bytes, so unchanged textures cost a
  * hash, not an upload.
  */
-/*
- * Entries are found by the unit's layout (where and what the texture is)
- * through a hash index, and the content hash decides whether the copy is
- * still current; a texture whose bytes changed is replaced in place.  It
- * held 48 textures, fewer than a Quake III frame binds: ~6,000 of its
- * ~9,000 lookups a second missed and rebuilt the texture.  Now up to
- * R300_TCACHE entries within R300_TCACHE_BYTES of texel data, LRU.
- */
-#define R300_TCACHE 1024
-#define R300_TCACHE_IDX 4096                    /* power of two */
-#define R300_TCACHE_BYTES (512ull << 20)
+#define R300_TCACHE 48
 typedef struct R300TexCacheKey {
     uint32_t addr, format, kind, width, height, depth, dim, levels, pitch;
     uint32_t host;
+    uint64_t hash;
 } R300TexCacheKey;
 static struct {
     R300TexCacheKey key;
-    uint64_t hash;                              /* of the texels it holds */
     id<MTLTexture> tex;
-    uint64_t used;                              /* 0: free */
-    uint64_t bytes;
-    uint64_t gen;                               /* r300_tex_gen when hashed */
-    bool gen_ok;                                /* gen can vouch for it */
+    uint64_t used;
 } g_r300_tcache[R300_TCACHE];
-
-/*
- * Skipping the hash.  Hashing every texture of every draw was the render
- * thread's main cost, and it sits in front of every fence: Doom 3 ran 28%
- * faster with it gone.  The device counts writes to the pages under each
- * texture when it queues the draw (R300TexDesc.vram_gen, from the VRAM
- * dirty log); a cached texture keeps the count it was hashed at, and the
- * same count later means none of its bytes were written since.
- *
- * GPU writes are the exception: a draw marks its colour buffer dirty when
- * it is queued, but Metal writes it later, after the mark may have been
- * counted.  So a texture copied while an in-flight batch writes its bytes
- * is not vouched for; the next use hashes it again.  PPCGPU_TEX_DIRTY=0
- * hashes every time, as before.
- */
-/*
- * PPCGPU_TEX_VERIFY=N: hash every Nth texture the write count vouches for
- * anyway, and report any whose bytes changed regardless -- a writer the
- * dirty log did not see.  Off (0) by default; it costs a hash per check.
- */
-static void r300_tex_verify(const R300TexCacheKey *key, uint64_t hash,
-                            const uint8_t *src, uint32_t size)
-{
-    static int every = -1;
-    static uint64_t n, checked, wrong;
-    if (every < 0) {
-        const char *e = getenv("PPCGPU_TEX_VERIFY");
-        every = e ? atoi(e) : 0;
-    }
-    if (every <= 0 || ++n % every) {
-        return;
-    }
-    checked++;
-    if (r300_hash_bytes(src, size) != hash) {
-        wrong++;
-        if (wrong <= 16) {
-            fprintf(stderr, "ppc-mac-gpu: texture at %06x (%ux%u fmt %u, %u "
-                    "bytes) changed without a dirty-log write\n", key->addr,
-                    key->width, key->height, key->format, size);
-        }
-    }
-    if (!(checked % 10000)) {
-        fprintf(stderr, "ppc-mac-gpu: texture verify %" PRIu64 " checked, %"
-                PRIu64 " changed unseen\n", checked, wrong);
-    }
-}
-
-static bool r300_tex_gen(const R300TexDesc *td, uint64_t *gen)
-{
-    uint64_t lo = td->gpu_addr, hi = lo + td->size_bytes;
-
-    if (!td->vram_gen_ok) {
-        return false;
-    }
-    for (int i = 0; i < g_r200_nwritten; i++) {
-        if (lo < g_r200_written[i].hi && g_r200_written[i].lo < hi) {
-            return false;                       /* the GPU may still write it */
-        }
-    }
-    *gen = td->vram_gen;
-    return true;
-}
-static uint16_t g_r300_tcache_idx[R300_TCACHE_IDX];    /* slot + 1, 0 none */
-static uint64_t g_r300_tcache_clock, g_r300_tcache_bytes;
-
-static uint32_t r300_tcache_bucket(const R300TexCacheKey *k)
-{
-    uint64_t h = r300_hash_bytes((const uint8_t *)k, sizeof(*k));
-    return (uint32_t)h & (R300_TCACHE_IDX - 1);
-}
-
-/* The slot holding layout k, or -1. */
-static int r300_tcache_find(const R300TexCacheKey *k)
-{
-    uint16_t v = g_r300_tcache_idx[r300_tcache_bucket(k)];
-    if (v && g_r300_tcache[v - 1].used &&
-        !memcmp(&g_r300_tcache[v - 1].key, k, sizeof(*k))) {
-        return v - 1;
-    }
-    for (int i = 0; i < R300_TCACHE; i++) {     /* bucket collision */
-        if (g_r300_tcache[i].used && !memcmp(&g_r300_tcache[i].key, k, sizeof(*k))) {
-            g_r300_tcache_idx[r300_tcache_bucket(k)] = i + 1;
-            return i;
-        }
-    }
-    return -1;
-}
-
-static void r300_tcache_drop(int i)
-{
-    g_r300_tcache_bytes -= g_r300_tcache[i].bytes;
-    [g_r300_tcache[i].tex release];
-    g_r300_tcache[i].tex = nil;
-    g_r300_tcache[i].used = 0;
-    g_r300_tcache[i].bytes = 0;
-}
-
-/* A slot for a new texture of @bytes, evicting least recently used. */
-static int r300_tcache_slot(uint64_t bytes)
-{
-    /* PPCGPU_TCACHE=n caps the entries (48 was the old size). */
-    static int cap = -1;
-    if (cap < 0) {
-        const char *e = getenv("PPCGPU_TCACHE");
-        cap = e && atoi(e) > 0 ? MIN(atoi(e), R300_TCACHE) : R300_TCACHE;
-    }
-    for (;;) {
-        int lru = -1, free_ = -1;
-        for (int i = 0; i < cap; i++) {
-            if (!g_r300_tcache[i].used) {
-                free_ = i;
-            } else if (lru < 0 || g_r300_tcache[i].used < g_r300_tcache[lru].used) {
-                lru = i;
-            }
-        }
-        if (free_ >= 0 && g_r300_tcache_bytes + bytes <= R300_TCACHE_BYTES) {
-            return free_;
-        }
-        if (lru < 0) {
-            return free_;
-        }
-        r300_tcache_drop(lru);
-    }
-}
+static uint64_t g_r300_tcache_clock;
 
 static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> dev,
                                         uint8_t *vram_ptr, const R300TexDesc *td)
@@ -8705,30 +8921,18 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
         r200_flush_locked(st);
     }
 
-    R300TexCacheKey key;
-    memset(&key, 0, sizeof(key));
-    key = (R300TexCacheKey){ td->gpu_addr, td->format, td->kind, td->width, td->height,
-                             td->depth, td->dim, td->levels, td->pitch_bytes,
-                             td->host_data != NULL };
-    uint64_t gen = 0;
-    bool gen_ok = !td->host_data && r300_tex_gen(td, &gen);
-    int hit = r300_tcache_find(&key);
-    if (hit >= 0 && gen_ok && g_r300_tcache[hit].gen_ok &&
-        g_r300_tcache[hit].gen == gen) {
-        g_r300_tcache[hit].used = ++g_r300_tcache_clock;
-        r300_tex_verify(&g_r300_tcache[hit].key, g_r300_tcache[hit].hash,
-                        src, td->size_bytes);
-        return g_r300_tcache[hit].tex;          /* not written since */
-    }
-    uint64_t hash = r300_hash_bytes(src, td->size_bytes);
-    if (hit >= 0) {
-        if (g_r300_tcache[hit].hash == hash) {
-            g_r300_tcache[hit].used = ++g_r300_tcache_clock;
-            g_r300_tcache[hit].gen = gen;
-            g_r300_tcache[hit].gen_ok = gen_ok;
-            return g_r300_tcache[hit].tex;
+    R300TexCacheKey key = { td->gpu_addr, td->format, td->kind, td->width, td->height,
+                            td->depth, td->dim, td->levels, td->pitch_bytes,
+                            td->host_data != NULL, r300_hash_bytes(src, td->size_bytes) };
+    int lru = 0;
+    for (int i = 0; i < R300_TCACHE; i++) {
+        if (g_r300_tcache[i].tex && !memcmp(&g_r300_tcache[i].key, &key, sizeof(key))) {
+            g_r300_tcache[i].used = ++g_r300_tcache_clock;
+            return g_r300_tcache[i].tex;
         }
-        r300_tcache_drop(hit);                  /* content changed */
+        if (g_r300_tcache[i].used < g_r300_tcache[lru].used) {
+            lru = i;
+        }
     }
 
     MTLTextureDescriptor *d = [[MTLTextureDescriptor alloc] init];
@@ -8766,19 +8970,10 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
             free(bytes);
         }
     }
-    int slot = r300_tcache_slot(td->size_bytes);
-    if (slot < 0) {
-        return [t autorelease];                 /* cannot cache it */
-    }
-    g_r300_tcache[slot].key = key;
-    g_r300_tcache[slot].hash = hash;
-    g_r300_tcache[slot].gen = gen;
-    g_r300_tcache[slot].gen_ok = gen_ok;
-    g_r300_tcache[slot].tex = t;
-    g_r300_tcache[slot].used = ++g_r300_tcache_clock;
-    g_r300_tcache[slot].bytes = td->size_bytes;
-    g_r300_tcache_bytes += td->size_bytes;
-    g_r300_tcache_idx[r300_tcache_bucket(&key)] = slot + 1;
+    [g_r300_tcache[lru].tex release];
+    g_r300_tcache[lru].key = key;
+    g_r300_tcache[lru].tex = t;
+    g_r300_tcache[lru].used = ++g_r300_tcache_clock;
     return t;
 }
 
@@ -8790,26 +8985,6 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
  * GART dwords byte-reversed to VRAM's side of the aperture (see
  * r300_tex_raw_bpp).
  */
-/*
- * Set by r300_texture when what it returns is a view over VRAM, which the
- * GPU reads when the batch runs.  Everything else (cached CPU conversions,
- * GART uploads, copies) was read from VRAM before the draw was encoded, so
- * a 2D write to those bytes need not wait for the batch to complete.
- * Render thread only.  PPCGPU_TEX_READ_ALL=1 counts every texture as read
- * by the GPU, as before.
- */
-static bool g_r300_tex_is_view;
-
-static bool r300_tex_read_all(void)
-{
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("PPCGPU_TEX_READ_ALL");
-        on = e && e[0] == '1';
-    }
-    return on;
-}
-
 static id<MTLTexture> r300_texture_raw(PPCMacGPUMetalState *st, id<MTLDevice> dev,
                                        uint8_t *vram_ptr, uint64_t vram_size,
                                        const R300TexDesc *td, uint32_t *rowel)
@@ -8824,7 +8999,6 @@ static id<MTLTexture> r300_texture_raw(PPCMacGPUMetalState *st, id<MTLDevice> de
         if (rows <= 16384 && (uint64_t)td->gpu_addr + (uint64_t)rows * p0 <= vram_size) {
             R200TexKey k = { td->gpu_addr, p0 / eb, rows, p0, (uint32_t)rpf };
             *rowel = p0 / eb;
-            g_r300_tex_is_view = true;
             return r200_view(st, k, rpf, false);
         }
     }
@@ -8844,6 +9018,17 @@ static id<MTLTexture> r300_texture_raw(PPCMacGPUMetalState *st, id<MTLDevice> de
         return nil;
     }
     size_t bytes = (size_t)w * h * eb;
+    /* GART texels: the swapped copy is cached by content, since rebuilding
+     * it every draw costs a full copy, bswap and upload. */
+    uint64_t rhash = td->host_data ? r300_hash_bytes(td->host_data, td->size_bytes) : 0;
+    uint32_t rkey[6] = { 3, eb, w, h, td->gpu_addr, td->size_bytes };
+    if (td->host_data) {
+        id<MTLTexture> c = aux_tex_find(rhash, rkey);
+        if (c) {
+            *rowel = w;
+            return c;
+        }
+    }
     uint8_t *buf = g_malloc0(bytes);
     memcpy(buf, src, td->size_bytes);
     if (td->host_data) {
@@ -8859,6 +9044,9 @@ static id<MTLTexture> r300_texture_raw(PPCMacGPUMetalState *st, id<MTLDevice> de
     [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
            withBytes:buf bytesPerRow:(size_t)w * eb];
     g_free(buf);
+    if (td->host_data && t) {
+        aux_tex_store(rhash, rkey, t);
+    }
     *rowel = w;
     return t;
 }
@@ -8872,7 +9060,6 @@ static id<MTLTexture> r300_texture(PPCMacGPUMetalState *st, id<MTLDevice> dev,
     uint64_t hi = lo + td->size_bytes;
     MTLPixelFormat pf;
 
-    g_r300_tex_is_view = false;
     if (!td->host_data && hi > vram_size) {
         r300_metal_warn(2, "texture outside VRAM");
         return nil;
@@ -8890,15 +9077,9 @@ static id<MTLTexture> r300_texture(PPCMacGPUMetalState *st, id<MTLDevice> dev,
     default:              pf = MTLPixelFormatInvalid; break;
     }
     if (pf != MTLPixelFormatInvalid && td->host_data) {
-        /* Copied out of the GART by the device: upload as it lies. */
-        MTLTextureDescriptor *d = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:pf width:td->width
-                                        height:td->height mipmapped:NO];
-        d.usage = MTLTextureUsageShaderRead;
-        id<MTLTexture> t = [[dev newTextureWithDescriptor:d] autorelease];
-        [t replaceRegion:MTLRegionMake2D(0, 0, td->width, td->height)
-             mipmapLevel:0 withBytes:td->host_data bytesPerRow:td->pitch_bytes];
-        return t;
+        /* Copied out of the GART by the device: uploaded through the
+         * content-hash cache, so an unchanged texture costs a hash. */
+        return r300_texture_full(st, dev, vram_ptr, td);
     }
     if (pf != MTLPixelFormatInvalid) {
         /* Zero-copy view over VRAM. */
@@ -8909,7 +9090,6 @@ static id<MTLTexture> r300_texture(PPCMacGPUMetalState *st, id<MTLDevice> dev,
         }
         R200TexKey k = { td->gpu_addr, td->width, td->height, td->pitch_bytes,
                          (uint32_t)pf };
-        g_r300_tex_is_view = true;
         return r200_view(st, k, pf, false);
     }
     /* 16bpp formats and DXT: converted or copied by the CPU (cached). */
@@ -9047,7 +9227,6 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
 
         id<MTLTexture> tex[R300_NUM_TEX_UNITS];
         id<MTLSamplerState> smp[R300_NUM_TEX_UNITS];
-        bool tex_view[R300_NUM_TEX_UNITS] = { false };
         R300FSUniforms u = pkt->uniforms;
         for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
             const R300TexDesc *td = &pkt->tex[t];
@@ -9060,7 +9239,6 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             }
             uint32_t rowel = u.tex_info[t][1];
             id<MTLTexture> x = r300_texture(st, dev, vram_ptr, vram_size, td, &rowel);
-            tex_view[t] = g_r300_tex_is_view || r300_tex_read_all();
             if (!x) {
                 u.tex_info[t][0] = 0;
                 continue;
@@ -9248,7 +9426,7 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
         [ib release];
         g_r200_stat_draws++;
         for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
-            if (u.tex_info[t][0] && !pkt->tex[t].host_data && tex_view[t]) {
+            if (u.tex_info[t][0] && !pkt->tex[t].host_data) {
                 r200_note_read(pkt->tex[t].gpu_addr,
                                (uint64_t)pkt->tex[t].gpu_addr + pkt->tex[t].size_bytes);
             }
@@ -9324,10 +9502,9 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     if (r) {
         return r < 0 ? -1 : 0;      /* rejected, or nothing to draw */
     }
-    {
-        uintptr_t pos = rq_push(r300_job_new(pkt));
-        rq_ranges_r300(pos, pkt);
-    }
+    /* The job takes the packet's heap buffers over (see r300_job_new);
+     * the device's r300_draw_free frees what is left. */
+    rq_push(r300_job_new((R300DrawPacket *)(uintptr_t)pkt));
     return 0;
 }
 
