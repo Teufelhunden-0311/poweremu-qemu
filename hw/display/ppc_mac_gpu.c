@@ -607,6 +607,34 @@ static void r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
     (uint64_t)(off) + (uint64_t)(y) * (pitch), \
     (uint64_t)(off) + ((uint64_t)(y) + (h)) * (pitch)
 
+/*
+ * Fill len bytes at dst with a repeating 2/4-byte little-endian value:
+ * write the pattern once and double the filled span with memcpy, which
+ * for a megabyte-scale clear beats a per-pixel store loop by an order
+ * of magnitude.
+ */
+static void r200_pattern_fill(uint8_t *dst, uint64_t len, uint32_t v,
+                              uint32_t bpp)
+{
+    uint8_t pat[4];
+    uint64_t done = bpp;
+
+    if (!len) {
+        return;
+    }
+    if (bpp == 4) {
+        stl_le_p(pat, v);
+    } else {
+        stw_le_p(pat, v);
+    }
+    memcpy(dst, pat, bpp);
+    while (done < len) {
+        uint64_t n = MIN(done, len - done);
+        memcpy(dst + done, dst, n);
+        done += n;
+    }
+}
+
 /* -1 until asked; reset to -1 when the trace property changes it, so a log
  * can be turned on in a machine that is already running. */
 static int g_seq_log_enabled = -1;
@@ -2527,12 +2555,12 @@ static bool r300_write_raw(PPCMacGPUState *s, uint32_t gpu_addr,
     hwaddr phys;
 
     if (gpu_addr >= fb_base && (uint64_t)gpu_addr - fb_base + 4 <= s->vram_size) {
-        if (s->renderer && s->renderer->flush_r200) {
-            s->renderer->flush_r200(s->renderer_opaque);
-        }
-        memcpy((uint8_t *)memory_region_get_ram_ptr(&s->vram) +
-               (gpu_addr - fb_base), bytes, 4);
-        memory_region_set_dirty(&s->vram, gpu_addr - fb_base, 4);
+        uint64_t off = gpu_addr - fb_base;
+        /* Only batched work that touches these four bytes has to finish
+         * first; a write-back next to rendering keeps the GPU running. */
+        r200_vram_access(s, off, off + 4, true, 6);
+        memcpy((uint8_t *)memory_region_get_ram_ptr(&s->vram) + off, bytes, 4);
+        memory_region_set_dirty(&s->vram, off, 4);
         return true;
     }
     if (ppc_mac_gpu_agp_translate(s, gpu_addr, &phys) ||
@@ -2634,16 +2662,8 @@ static void r300_zmask_clear(PPCMacGPUState *s)
     if (off + bpr * rows > s->vram_size) {
         rows = (s->vram_size - off) / bpr;
     }
-    if (s->renderer && s->renderer->flush_r200) {
-        s->renderer->flush_r200(s->renderer_opaque);
-    }
-    for (uint64_t i = 0; i < bpr * rows; i += bpp) {
-        if (bpp == 4) {
-            stl_le_p(vram + off + i, v);
-        } else {
-            stw_le_p(vram + off + i, v);
-        }
-    }
+    r200_vram_access(s, off, off + bpr * rows, true, 7);
+    r200_pattern_fill(vram + off, bpr * rows, v, bpp);
     memory_region_set_dirty(&s->vram, off, bpr * rows);
     static int logged;
     if (logged++ < 4) {
@@ -2695,19 +2715,12 @@ static void r300_cmask_clear(PPCMacGPUState *s)
     if (off + bpr * rows > s->vram_size) {
         rows = (s->vram_size - off) / bpr;
     }
-    if (s->renderer && s->renderer->flush_r200) {
-        s->renderer->flush_r200(s->renderer_opaque);
-    }
+    r200_vram_access(s, off, off + bpr * rows, true, 8);
     if (bpp == 4) {
-        uint32_t w = r300_swap_mode(v, endian);
-        for (uint64_t i = 0; i < bpr * rows; i += 4) {
-            stl_le_p(vram + off + i, w);
-        }
+        r200_pattern_fill(vram + off, bpr * rows, r300_swap_mode(v, endian), 4);
     } else {
-        uint16_t w = endian == 1 || endian == 2 ? bswap16(v) : v;
-        for (uint64_t i = 0; i < bpr * rows; i += 2) {
-            stw_le_p(vram + off + i, w);
-        }
+        r200_pattern_fill(vram + off, bpr * rows,
+                          endian == 1 || endian == 2 ? bswap16(v) : v, 2);
     }
     memory_region_set_dirty(&s->vram, off, bpr * rows);
     static int logged;
@@ -2946,12 +2959,16 @@ static void r300_aa_resolve(PPCMacGPUState *s, const R300DrawPacket *pkt)
         r300_warn_once("multisampled colour buffer outside VRAM", NULL);
         return;
     }
-    if (s->renderer && s->renderer->flush_r200) {
+    {
         bool need_bql = !bql_locked();
         if (need_bql) {
             bql_lock();
         }
-        s->renderer->flush_r200(s->renderer_opaque);
+        /* Wait only for batched work that races the read of the samples
+         * or the write of the resolve buffer. */
+        r200_vram_access(s, pkt->rt_gpu_addr,
+                         pkt->rt_gpu_addr + srow * iy1, false, 9);
+        r200_vram_access(s, dst, dst + (uint64_t)dpitch * iy1, true, 10);
         if (need_bql) {
             bql_unlock();
         }
@@ -3319,7 +3336,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                             pkt.uniforms.cliprect[0][1], pkt.uniforms.cliprect[0][2],
                             pkt.uniforms.cliprect[0][3], pkt.scissor[0],
                             pkt.scissor[1], pkt.scissor[2], pkt.scissor[3]);
-                    for (uint32_t v = 0; v < pkt.num_verts && v < 6; v++) {
+                    for (uint32_t v = 0; pkt.verts && v < pkt.num_verts && v < 6; v++) {
                         const R300Vertex *x = &pkt.verts[v];
                         fprintf(s->r3_dump, "   v%u pos %.3f %.3f %.3f %.3f  v0 %.4f %.4f %.4f %.4f"
                                 "  v1 %.4f %.4f %.4f %.4f\n", v, x->pos[0], x->pos[1],
@@ -5959,10 +5976,14 @@ static void r200_decode_tex_unit(PPCMacGPUState *s, int n, R200TexUnit *t)
         t->pitch  = t->width * bpp;
     }
     /* The swap only matters where byte order within a texel group does:
-     * YUV 4:2:2 (the backend applies it).  VRAM already holds the CPU's
-     * byte order, which is what 16/32-bit texel decoding expects. */
+      * YUV 4:2:2 (the backend applies it).  VRAM already holds the CPU's
+      * byte order, which is what 16/32-bit texel decoding expects. */
     t->swap = offset & 3;
-    if (getenv("POWEREMU_TEX_TRACE")) {          /* every texture format, once */
+    static int tex_trace = -1;                   /* getenv is an environ scan */
+    if (tex_trace < 0) {
+        tex_trace = getenv("POWEREMU_TEX_TRACE") != NULL;
+    }
+    if (tex_trace) {                             /* every texture format, once */
         static uint32_t seen_tex;
         if (t->format < 32 && !(seen_tex & (1u << t->format))) {
             seen_tex |= 1u << t->format;
@@ -5971,8 +5992,12 @@ static void r200_decode_tex_unit(PPCMacGPUState *s, int n, R200TexUnit *t)
         }
     }
     /* POWEREMU_YUV_TRACE: what a YUV texture really holds, to tell the
-     * 4:2:2 orderings apart (Tiger's welcome movie vs Halo's logos). */
-    if ((t->format == 10 || t->format == 11) && getenv("POWEREMU_YUV_TRACE")) {
+      * 4:2:2 orderings apart (Tiger's welcome movie vs Halo's logos). */
+    static int yuv_trace = -1;
+    if (yuv_trace < 0) {
+        yuv_trace = getenv("POWEREMU_YUV_TRACE") != NULL;
+    }
+    if ((t->format == 10 || t->format == 11) && yuv_trace) {
         static int yuv_raw_logged;
         if (yuv_raw_logged++ < 12) {
             uint32_t o = offset & ~0x1Fu;
@@ -6029,8 +6054,8 @@ static void r200_decode_tex_unit(PPCMacGPUState *s, int n, R200TexUnit *t)
                      t->width, t->height, t->format, offset);
         }
         /* POWEREMU_YUV_TRACE: the frame's own bytes, from the middle row,
-         * which say which 4:2:2 order a program really uses. */
-        if ((t->format == 10 || t->format == 11) && getenv("POWEREMU_YUV_TRACE")) {
+          * which say which 4:2:2 order a program really uses. */
+        if ((t->format == 10 || t->format == 11) && yuv_trace) {
             /* Log each new kind of frame, not just the first ones: a game
              * plays several videos and only some come out wrong. */
             static uint64_t last_kind;
@@ -7235,8 +7260,11 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
                 if (j < 256) {
                     tl[j].off = u->offset; tl[j].key = key; tl[j].crc = crc;
                 }
-                static int ndump;
-                if (getenv("PPCGPU_TEXDUMP") && ndump < 600 &&
+                static int ndump, texdump = -1;
+                if (texdump < 0) {
+                    texdump = getenv("PPCGPU_TEXDUMP") != NULL;
+                }
+                if (texdump && ndump < 600 &&
                     (u->format != 6 || u->host_data) &&
                     u->pitch * u->height <= 4 * 1024 * 1024 &&
                     (u->host_data || u->offset + (uint64_t)u->pitch * u->height
@@ -7363,6 +7391,12 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
     uint32_t rt_cfmt = (pkt.rb3d_cntl >> 10) & 0xF;
     uint32_t rt_bpp = (rt_cfmt == 3 || rt_cfmt == 4 || rt_cfmt == 15) ? 2 : 4;
+    /* A queue-async renderer takes the AGP texture copies over with the
+     * draw; note which units had one before handing it over. */
+    bool tex_agp[R200_MAX_TEX];
+    for (int t = 0; t < R200_MAX_TEX; t++) {
+        tex_agp[t] = pkt.tex[t].host_data != NULL;
+    }
     if (pkt.rt_pitch == 0 ||
         (uint64_t)pkt.rt_offset + (uint64_t)pkt.rt_height * pkt.rt_pitch * rt_bpp >
         s->vram_size) {
@@ -7386,7 +7420,7 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
                 continue;
             }
             uint64_t bytes = (uint64_t)pkt.tex[t].pitch * pkt.tex[t].height;
-            if (pkt.tex[t].host_data) {
+            if (tex_agp[t]) {
                 r200_perf.tex_agp++;
                 r200_perf.agp_bytes += bytes;
             } else {
@@ -9222,35 +9256,47 @@ static bool ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
 
     /* Read ring buffer data via GART translation.
      * The ring buffer base (CP_RB_BASE) is an AGP address that needs
-     * GART translation to access system RAM. */
+     * GART translation to access system RAM.  Fetch page-sized runs at
+     * a time: one translation and one bulk read per run instead of one
+     * per dword, which for a big submit was thousands of address-space
+     * dispatches on the CP thread. */
     uint32_t *rb_data = g_malloc(count * 4);
     AddressSpace *as = pci_get_address_space(&s->pci);
 
-    for (uint32_t i = 0; i < count; i++) {
+    for (uint32_t i = 0; i < count;) {
         uint32_t offset_dw = (old_rptr + i) & ring_mask;
         uint32_t gpu_addr = s->regs.cp_rb_base + offset_dw * 4;
-        hwaddr phys;
+        /* Run length: to the end of the page, of the ring, of the batch. */
+        uint32_t n = count - i;
+        n = MIN(n, (0x1000 - (gpu_addr & 0xFFF)) / 4);
+        n = MIN(n, ring_size_dw - offset_dw);
+        uint8_t *page = r200_agp_page(s, gpu_addr);
+        if (page) {
+            memcpy(rb_data + i, page + (gpu_addr & 0xFFF), n * 4);
+        } else {
+            hwaddr phys;
 
-        if (!ppc_mac_gpu_gart_translate(s, gpu_addr, &phys) &&
-            !ppc_mac_gpu_agp_translate(s, gpu_addr, &phys)) {
-            gpu_debug_log("RING: GART translate failed at gpu_addr=0x%x "
-                          "(rb_base=0x%x offset_dw=%u)",
-                          gpu_addr, s->regs.cp_rb_base, offset_dw);
-            g_free(rb_data);
-            return true;
+            if (!ppc_mac_gpu_gart_translate(s, gpu_addr, &phys) &&
+                !ppc_mac_gpu_agp_translate(s, gpu_addr, &phys)) {
+                gpu_debug_log("RING: GART translate failed at gpu_addr=0x%x "
+                              "(rb_base=0x%x offset_dw=%u)",
+                              gpu_addr, s->regs.cp_rb_base, offset_dw);
+                g_free(rb_data);
+                return true;
+            }
+            if (address_space_read(as, phys, MEMTXATTRS_UNSPECIFIED,
+                                   rb_data + i, n * 4) != MEMTX_OK) {
+                gpu_debug_log("RING: read failed at phys=0x%"PRIx64,
+                              (uint64_t)phys);
+                g_free(rb_data);
+                return true;
+            }
         }
-
-        uint32_t raw = 0;
-        MemTxResult r = address_space_read(as, phys,
-                                            MEMTXATTRS_UNSPECIFIED, &raw, 4);
-        if (r != MEMTX_OK) {
-            gpu_debug_log("RING: read failed at phys=0x%"PRIx64, (uint64_t)phys);
-            g_free(rb_data);
-            return true;
-        }
-
         /* Ring buffer data is written by PPC CPU in big-endian */
-        rb_data[i] = be32_to_cpu(raw);
+        for (uint32_t k = 0; k < n; k++) {
+            rb_data[i + k] = be32_to_cpu(rb_data[i + k]);
+        }
+        i += n;
     }
 
     gpu_debug_log("RING: processing %u dwords (rptr=%u wptr=%u rb_bufsz=%u)",
