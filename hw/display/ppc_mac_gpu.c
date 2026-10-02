@@ -569,6 +569,42 @@ static bool r200_async_submit(PPCMacGPUState *s, const uint32_t *d,
     return true;
 }
 
+/* The BQL-side half of a flush: statistics and the fences it completed. */
+static void r200_flush_done(PPCMacGPUState *s, uint32_t why, bool did,
+                            int64_t t0)
+{
+    if (did) {
+        r200_rate.flushes++;
+        r200_rate.flush_us += g_get_monotonic_time() - t0;
+        r200_flush_why[MIN(why, (uint32_t)ARRAY_SIZE(r200_flush_why) - 1)]++;
+        if (++r200_flush_total % 1000 == 0) {
+            GString *g = g_string_new("ppc-mac-gpu r200: flush causes:");
+            for (int k = 0; k < 5; k++) {
+                uint32_t best = 0;
+                for (uint32_t i = 1; i < ARRAY_SIZE(r200_flush_why); i++) {
+                    if (r200_flush_why[i] > r200_flush_why[best]) {
+                        best = i;
+                    }
+                }
+                if (!r200_flush_why[best]) {
+                    break;
+                }
+                g_string_append_printf(g, " %s0x%x=%llu",
+                    best >= 0x4000 ? "tag" : "reg", best >= 0x4000 ?
+                    best - 0x4000 : best * 4,
+                    (unsigned long long)r200_flush_why[best]);
+                r200_flush_why[best] = 0;
+            }
+            qemu_log("%s\n", g->str);
+            g_string_free(g, TRUE);
+            memset(r200_flush_why, 0, sizeof(r200_flush_why));
+        }
+    }
+    if (s->regs.r200_fence_n) {
+        r200_fence_drain(s, s->regs.r200_fence_last_seq);
+    }
+}
+
 static void r200_flush_at(PPCMacGPUState *s, uint32_t why)
 {
     /*
@@ -580,38 +616,7 @@ static void r200_flush_at(PPCMacGPUState *s, uint32_t why)
     if (s->renderer && s->renderer->flush_r200) {
         int64_t t0 = g_get_monotonic_time();
         bool did = s->renderer->flush_r200(s->renderer_opaque);
-        if (did) {
-            r200_rate.flushes++;
-            r200_rate.flush_us += g_get_monotonic_time() - t0;
-        }
-        if (did) {
-            r200_flush_why[MIN(why, (uint32_t)ARRAY_SIZE(r200_flush_why) - 1)]++;
-            if (++r200_flush_total % 1000 == 0) {
-                GString *g = g_string_new("ppc-mac-gpu r200: flush causes:");
-                for (int k = 0; k < 5; k++) {
-                    uint32_t best = 0;
-                    for (uint32_t i = 1; i < ARRAY_SIZE(r200_flush_why); i++) {
-                        if (r200_flush_why[i] > r200_flush_why[best]) {
-                            best = i;
-                        }
-                    }
-                    if (!r200_flush_why[best]) {
-                        break;
-                    }
-                    g_string_append_printf(g, " %s0x%x=%llu",
-                        best >= 0x4000 ? "tag" : "reg", best >= 0x4000 ?
-                        best - 0x4000 : best * 4,
-                        (unsigned long long)r200_flush_why[best]);
-                    r200_flush_why[best] = 0;
-                }
-                qemu_log("%s\n", g->str);
-                g_string_free(g, TRUE);
-                memset(r200_flush_why, 0, sizeof(r200_flush_why));
-            }
-        }
-        if (s->regs.r200_fence_n) {
-            r200_fence_drain(s, s->regs.r200_fence_last_seq);
-        }
+        r200_flush_done(s, why, did, t0);
     }
 }
 /* Register-access flushes are tagged by register; others by a tag below. */
@@ -643,12 +648,29 @@ static void r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
     if (!s->renderer || !s->renderer->range_busy_r200 || hi <= lo) {
         return;
     }
-    /* It may wait for the render queue: not with the BQL held. */
+    /*
+     * It may wait for the render queue, and then for the GPU: not with the
+     * BQL held.  The CP thread is parked for both (a flush waiting for the
+     * GPU with the lock held was the longest BQL hold left in Doom 3, up
+     * to 53 ms, and the main loop and its audio timers waited behind it);
+     * the statistics and fence write-backs need the lock and come after.
+     * A synchronous renderer relies on the BQL to order draws: keep it.
+     */
     int w = cp_wait_unlock();
     bool busy = s->renderer->range_busy_r200(s->renderer_opaque, lo, hi,
                                              write_access);
+    bool flushed = false, did = false;
+    int64_t t0 = 0;
+    if (busy && w && s->renderer->draw_queue_async && s->renderer->flush_r200) {
+        r200_async_drain();
+        t0 = g_get_monotonic_time();
+        did = s->renderer->flush_r200(s->renderer_opaque);
+        flushed = true;
+    }
     cp_wait_relock(w);
-    if (busy) {
+    if (flushed) {
+        r200_flush_done(s, R200_WHY_TAG(R200_WHY_2D + tag), did, t0);
+    } else if (busy) {
         r200_flush_at(s, R200_WHY_TAG(R200_WHY_2D + tag));
     }
 }
