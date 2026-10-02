@@ -410,6 +410,11 @@ static struct {
     uint32_t ring_mask;
     unsigned pkts;
     int64_t yield_at;
+    /* Lets go of the BQL inside an IB too (see ppc_mac_gpu_cp_park). */
+    bool parked;                /* a segment is part-way, its rptr unpublished */
+    unsigned waiters;           /* cp_sync callers waiting for it to finish */
+    QemuCond park_cond;
+    int64_t park_at;
     /* Statistics (BQL): catch-ups the guest forced, by register. */
     uint32_t syncs, kicks;
     uint16_t sync_reg[0x10000 / 4];
@@ -616,6 +621,9 @@ enum { R200_WHY_T3 = 1, R200_WHY_DISPLAY, R200_WHY_FENCE, R200_WHY_OTHER };
 #define r200_flush(s) r200_flush_at((s), R200_WHY_TAG(R200_WHY_OTHER))
 enum { R200_WHY_2D = 0x40 };
 
+static int cp_wait_unlock(void);
+static void cp_wait_relock(int saved);
+
 /*
  * A CPU-side 2D operation is about to read (write_access=false) or write
  * VRAM rows [lo, hi).  Flush batched 3D work only if it overlaps: work in
@@ -635,7 +643,12 @@ static void r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
     if (!s->renderer || !s->renderer->range_busy_r200 || hi <= lo) {
         return;
     }
-    if (s->renderer->range_busy_r200(s->renderer_opaque, lo, hi, write_access)) {
+    /* It may wait for the render queue: not with the BQL held. */
+    int w = cp_wait_unlock();
+    bool busy = s->renderer->range_busy_r200(s->renderer_opaque, lo, hi,
+                                             write_access);
+    cp_wait_relock(w);
+    if (busy) {
         r200_flush_at(s, R200_WHY_TAG(R200_WHY_2D + tag));
     }
 }
@@ -7904,6 +7917,7 @@ static FILE *r300_ringdump(void)
 }
 
 static bool ppc_mac_gpu_cp_yield(PPCMacGPUState *s, uint32_t pos_dw);
+static void ppc_mac_gpu_cp_park(PPCMacGPUState *s);
 static bool cp_in_ring;             /* the CP thread is replaying the ring */
 
 static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
@@ -7917,6 +7931,10 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
         if (unlikely(cp_in_ring) && g_in_pm4 == 1 &&
             ppc_mac_gpu_cp_yield(s, i)) {
             break;
+        }
+        /* Inside an IB it may let go too, without giving the ring away. */
+        if (unlikely(cp_in_ring) && g_in_pm4 > 1) {
+            ppc_mac_gpu_cp_park(s);
         }
         uint32_t hdr = pm4_data[i];
         uint32_t type = (hdr >> 30) & 3;
@@ -9330,6 +9348,100 @@ static bool ppc_mac_gpu_cp_on_thread(void)
 }
 
 /*
+ * Letting go inside an IB.  The yield below only happens between ring
+ * packets, but a game's frame is one IB of tens of thousands of dwords:
+ * Doom 3's held the BQL for milliseconds at a time, and the vCPU, which
+ * needs the lock for every mtmsr and interrupt, spent a fifth of its time
+ * waiting for it.  Mid-IB nothing can be published -- the read pointer
+ * still points at the packet that kicked the IB, and a catch-up from there
+ * would run the IB's first half again -- so a parked segment cannot be
+ * taken over: ppc_mac_gpu_cp_sync waits for the CP thread to reach a point
+ * where it can (a ring-level yield, which publishes, or the segment's end)
+ * instead of catching up.  The short sleep is the hand-off: the BQL is not
+ * fair, and an unlock followed at once by a lock almost always wins it back
+ * before a waiting thread wakes.  PPCGPU_CP_PARK_US sets the interval
+ * (default 250); 0 turns parking off.
+ */
+static int64_t cp_park_us(void)
+{
+    static int64_t us = -1;
+    if (us < 0) {
+        const char *e = getenv("PPCGPU_CP_PARK_US");
+        us = e ? atoi(e) : 250;
+    }
+    return us;
+}
+
+static void ppc_mac_gpu_cp_unpark(void)
+{
+    if (cp.parked) {
+        cp.parked = false;
+        qemu_cond_broadcast(&cp.park_cond);
+    }
+}
+
+/*
+ * The CP thread is about to wait for the renderer (the render queue or the
+ * GPU): park for the length of the wait instead of holding the BQL through
+ * it.  The vCPU needs the lock for every mtmsr and interrupt, and waits
+ * like these held it for a tenth of Doom 3's run.  Returns what
+ * cp_wait_relock needs, 0 if the lock was kept (not the CP thread, or
+ * parking off).
+ */
+static int cp_wait_unlock(void)
+{
+    int nest;
+
+    if (!cp_in_ring || !cp_park_us() || !ppc_mac_gpu_cp_on_thread()) {
+        return 0;
+    }
+    nest = g_in_pm4;
+    cp.parked = true;
+    g_in_pm4 = 0;
+    cp_in_ring = false;
+    bql_unlock();
+    return nest + 1;
+}
+
+static void cp_wait_relock(int saved)
+{
+    if (!saved) {
+        return;
+    }
+    bql_lock();
+    g_in_pm4 = saved - 1;
+    cp_in_ring = true;
+}
+
+/* Called by the CP thread between two packets of an IB, BQL held. */
+static void ppc_mac_gpu_cp_park(PPCMacGPUState *s)
+{
+    int64_t now;
+    int nest;
+
+    if (++cp.pkts & 15) {
+        return;
+    }
+    if (!cp_park_us() || cp.waiters) {
+        return;                 /* someone wants the ring done: finish it */
+    }
+    now = g_get_monotonic_time();
+    if (now < cp.park_at) {
+        return;
+    }
+    cp.parked = true;
+    nest = g_in_pm4;
+    g_in_pm4 = 0;
+    cp_in_ring = false;
+    bql_unlock();
+    g_usleep(1);
+    bql_lock();
+    g_in_pm4 = nest;
+    cp_in_ring = true;
+    cp.park_at = g_get_monotonic_time() + cp_park_us();
+}
+
+/*
  * Called by the CP thread between two ring packets, BQL held.  Returns
  * true if the ring was taken over while the lock was released, in which
  * case the rest of this segment has been (or will be) run by someone else.
@@ -9351,6 +9463,7 @@ static bool ppc_mac_gpu_cp_yield(PPCMacGPUState *s, uint32_t pos_dw)
      * the ring space behind it. */
     s->regs.cp_rb_rptr = (cp.seg_rptr + pos_dw) & cp.ring_mask;
     ppc_mac_gpu_rptr_writeback(s);
+    ppc_mac_gpu_cp_unpark();            /* published: a catch-up may start here */
     epoch = cp.epoch;
     nest = g_in_pm4;
     g_in_pm4 = 0;
@@ -9436,6 +9549,10 @@ static bool ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
     }
     ppc_mac_gpu_process_pm4(s, rb_data, count);
     cp_in_ring = false;
+    if (on_thread) {
+        /* cp_run publishes the segment before the BQL is next released. */
+        ppc_mac_gpu_cp_unpark();
+    }
     g_free(rb_data);
     return !(on_thread && cp.aborted);
 }
@@ -9490,7 +9607,15 @@ static bool ppc_mac_gpu_cp_pending(PPCMacGPUState *s)
 /* Bring the ring up to date before the guest sees the card (BQL held). */
 static void ppc_mac_gpu_cp_sync(PPCMacGPUState *s, hwaddr why)
 {
-    if (!ppc_mac_gpu_cp_pending(s) || ppc_mac_gpu_cp_on_thread()) {
+    if (ppc_mac_gpu_cp_on_thread()) {
+        return;
+    }
+    while (cp.parked) {                 /* see ppc_mac_gpu_cp_park */
+        cp.waiters++;
+        qemu_cond_wait_bql(&cp.park_cond);
+        cp.waiters--;
+    }
+    if (!ppc_mac_gpu_cp_pending(s)) {
         return;
     }
     cp.syncs++;
@@ -9569,6 +9694,7 @@ static void ppc_mac_gpu_cp_start(PPCMacGPUState *s)
     }
     cp.s = s;
     qemu_event_init(&cp.kick, false);
+    qemu_cond_init(&cp.park_cond);
     cp.started = true;
     qemu_thread_create(&cp.thread, "ppc-gpu-cp", ppc_mac_gpu_cp_thread, s,
                        QEMU_THREAD_JOINABLE);
