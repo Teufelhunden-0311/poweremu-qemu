@@ -1257,64 +1257,76 @@ static void rqueue_drain(void);
  */
 static id<MTLBinaryArchive> g_bin_archive;
 static NSString *g_bin_archive_path;
-static int g_bin_archive_dirty;
+static bool g_bin_archive_dirty;
+/* MTLBinaryArchive is not thread-safe: adds come from whichever thread
+ * compiles a pipeline (setup can run on a draw caller while the render
+ * thread encodes), and serialization must not overlap them. */
+static pthread_mutex_t g_bin_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static id<MTLBinaryArchive> bin_archive(id<MTLDevice> dev)
 {
     static int tried;
 
-    if (tried) {
+    if (qatomic_read(&tried)) {
         return g_bin_archive;
     }
-    tried = 1;
+    pthread_mutex_lock(&g_bin_lock);
+    if (tried) {
+        pthread_mutex_unlock(&g_bin_lock);
+        return g_bin_archive;
+    }
     if (@available(macOS 11.0, *)) {
-    } else {
-        return nil;
-    }
-    @autoreleasepool {
-        NSFileManager *fm = [NSFileManager defaultManager];
-        NSString *dir = [NSSearchPathForDirectoriesInDomains(
-                            NSCachesDirectory, NSUserDomainMask, YES).firstObject
-                         stringByAppendingPathComponent:@"ppcosxkvm"];
-        NSOperatingSystemVersion osv =
-            [[NSProcessInfo processInfo] operatingSystemVersion];
-        NSString *name = [NSString stringWithFormat:@"metal-pso-%ld.%ld-%@.bin",
-                          (long)osv.majorVersion, (long)osv.minorVersion,
-                          [dev.name stringByReplacingOccurrencesOfString:@"/"
-                                                              withString:@"-"]];
-        [fm createDirectoryAtPath:dir
-      withIntermediateDirectories:YES attributes:nil error:NULL];
-        g_bin_archive_path = [[dir stringByAppendingPathComponent:name] copy];
-        MTLBinaryArchiveDescriptor *ad = [[MTLBinaryArchiveDescriptor alloc] init];
-        NSError *err = nil;
-        if ([fm fileExistsAtPath:g_bin_archive_path]) {
-            ad.url = [NSURL fileURLWithPath:g_bin_archive_path];
-        }
-        g_bin_archive = [dev newBinaryArchiveWithDescriptor:ad error:&err];
-        if (!g_bin_archive && ad.url) {
-            ad.url = nil;       /* a corrupt cache file: start a new one */
+        @autoreleasepool {
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSString *dir = [NSSearchPathForDirectoriesInDomains(
+                                NSCachesDirectory, NSUserDomainMask, YES).firstObject
+                             stringByAppendingPathComponent:@"ppcosxkvm"];
+            NSOperatingSystemVersion osv =
+                [[NSProcessInfo processInfo] operatingSystemVersion];
+            NSString *name = [NSString stringWithFormat:@"metal-pso-%ld.%ld-%@.bin",
+                              (long)osv.majorVersion, (long)osv.minorVersion,
+                              [dev.name stringByReplacingOccurrencesOfString:@"/"
+                                                                  withString:@"-"]];
+            [fm createDirectoryAtPath:dir
+          withIntermediateDirectories:YES attributes:nil error:NULL];
+            g_bin_archive_path = [[dir stringByAppendingPathComponent:name] copy];
+            MTLBinaryArchiveDescriptor *ad = [[MTLBinaryArchiveDescriptor alloc] init];
+            NSError *err = nil;
+            if ([fm fileExistsAtPath:g_bin_archive_path]) {
+                ad.url = [NSURL fileURLWithPath:g_bin_archive_path];
+            }
             g_bin_archive = [dev newBinaryArchiveWithDescriptor:ad error:&err];
-        }
-        [ad release];
-        if (!g_bin_archive) {
-            qemu_log("ppc-mac-gpu-metal: binary archive unavailable: %s\n",
-                     err ? [[err localizedDescription] UTF8String] : "?");
+            if (!g_bin_archive && ad.url) {
+                ad.url = nil;       /* a corrupt cache file: start a new one */
+                g_bin_archive = [dev newBinaryArchiveWithDescriptor:ad error:&err];
+            }
+            [ad release];
+            if (!g_bin_archive) {
+                qemu_log("ppc-mac-gpu-metal: binary archive unavailable: %s\n",
+                         err ? [[err localizedDescription] UTF8String] : "?");
+            }
         }
     }
+    qatomic_set(&tried, 1);     /* publishes g_bin_archive to the fast path */
+    pthread_mutex_unlock(&g_bin_lock);
     return g_bin_archive;
 }
 
+/* Only at teardown: serialization must not overlap function adds, and
+ * those can come from any thread that compiles a pipeline. */
 static void bin_archive_serialize(void)
 {
     if (@available(macOS 11.0, *)) {
     } else {
         return;
     }
+    pthread_mutex_lock(&g_bin_lock);
     if (g_bin_archive && g_bin_archive_dirty && g_bin_archive_path) {
         [g_bin_archive serializeToURL:[NSURL fileURLWithPath:g_bin_archive_path]
                                 error:NULL];
-        g_bin_archive_dirty = 0;
+        g_bin_archive_dirty = false;
     }
+    pthread_mutex_unlock(&g_bin_lock);
 }
 
 /* newRenderPipelineStateWithDescriptor through the archive, and into it. */
@@ -1332,11 +1344,11 @@ static id<MTLRenderPipelineState> bin_pso(id<MTLDevice> dev,
     }
     p = [dev newRenderPipelineStateWithDescriptor:pd error:err];
     if (a && p) {
+        pthread_mutex_lock(&g_bin_lock);
         if ([a addRenderPipelineFunctionsWithDescriptor:pd error:NULL]) {
-            if (++g_bin_archive_dirty >= 16) {
-                bin_archive_serialize();
-            }
+            g_bin_archive_dirty = true;
         }
+        pthread_mutex_unlock(&g_bin_lock);
     }
     return p;
 }
