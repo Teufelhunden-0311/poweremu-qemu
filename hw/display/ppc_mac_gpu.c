@@ -261,6 +261,10 @@ static struct {
  *                         instead of draining it on the UI thread
  *   PPCGPU_DIAG           per-frame diagnostic VRAM scans (default off)
  */
+static void ppc_mac_gpu_note_scanout(uint64_t lo, uint64_t hi);
+static bool ppc_mac_gpu_vram_gen(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
+                                 uint64_t *gen);
+
 static bool ppc_gpu_env_on(const char *name)
 {
     const char *v = getenv(name);
@@ -1973,6 +1977,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
 
     /* 32bpp path: shadow buffer with bswap32 */
     uint64_t frame_size = (uint64_t)stride * height;
+    ppc_mac_gpu_note_scanout(s->disp.offset, s->disp.offset + frame_size);
 
     /* (Re)allocate shadow buffer if needed */
     if (!s->shadow_buf || s->shadow_buf_size < frame_size) {
@@ -3281,6 +3286,18 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             sync_each = getenv("R300_SYNC") != NULL;   /* debug: no batching */
         }
         r200_rate.gpu_vs += pkt.vs_glsl != NULL;
+        static int tex_gen = -1;
+        if (tex_gen < 0) {
+            tex_gen = !s->renderer->set_dirty_source &&
+                      ppc_gpu_env_on("PPCGPU_TEX_DIRTY");
+        }
+        for (int t = 0; t < R300_NUM_TEX_UNITS && tex_gen; t++) {
+            R300TexDesc *td = &pkt.tex[t];
+            td->vram_gen_ok = td->bound && !td->host_data &&
+                ppc_mac_gpu_vram_gen(s, td->gpu_addr,
+                                     (uint64_t)td->gpu_addr + td->size_bytes,
+                                     &td->vram_gen);
+        }
         int rr = s->renderer->draw_r300(s->renderer_opaque, vram, s->vram_size, &pkt);
         if (s->r3_dump && g_r300_arm_rt && pkt.rt_gpu_addr == g_r300_arm_rt) {
             fprintf(s->r3_dump, "   renderer -> %d\n", rr);
@@ -12149,6 +12166,84 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
     s->vb_count = 0;
 
     timer_del(&s->vblank_timer);
+}
+
+/*
+ * For backends that cache converted copies of textures: how many times
+ * the pages under [lo, hi) have been written, so that an unchanged count
+ * says the bytes are unchanged and need not be read again (a hash of each
+ * texture on every draw was the Metal render thread's main cost, ahead of
+ * every fence).  False if it cannot say.
+ * Every writer marks the VGA dirty log: guest CPU stores through the BARs
+ * (TCG), the device's own writes (vram_mark, DMA) and 3D draws (their
+ * colour buffers, when the draw is queued).  With a renderer that does not
+ * consume the log itself, only the display refresh clears it, and only
+ * over the scanout; so outside every recent scanout this function can own
+ * the bits (a write to any page under the texture counts against all of
+ * them; then they are cleared), and inside one it declines.
+ */
+static uint64_t g_scanout_seen[8][2];  /* [lo, hi) of recent scanouts */
+static unsigned g_scanout_seen_n;
+
+static void ppc_mac_gpu_note_scanout(uint64_t lo, uint64_t hi)
+{
+    for (unsigned i = 0; i < ARRAY_SIZE(g_scanout_seen); i++) {
+        if (qatomic_read(&g_scanout_seen[i][0]) == lo &&
+            qatomic_read(&g_scanout_seen[i][1]) == hi) {
+            return;
+        }
+    }
+    unsigned i = g_scanout_seen_n++ % ARRAY_SIZE(g_scanout_seen);
+    /* Widen before narrowing, so a reader never sees a smaller range. */
+    qatomic_set(&g_scanout_seen[i][0], 0);
+    qatomic_set(&g_scanout_seen[i][1], UINT64_MAX);
+    qatomic_set(&g_scanout_seen[i][0], lo);
+    qatomic_set(&g_scanout_seen[i][1], hi);
+}
+
+static uint32_t *g_vram_page_gen;       /* writes seen, per dirty-log page */
+
+/*
+ * From exec/ram_addr.h, which this target-independent file cannot include
+ * (it pulls in cpu.h).  Unlike memory_region_snapshot_and_clear_dirty it
+ * walks no listeners and allocates nothing: atomic bitmap operations
+ * under RCU, plus a TLB reset when something was dirty.  At one call per
+ * texture per draw, the snapshot cost more than the hashing it saved.
+ */
+bool cpu_physical_memory_test_and_clear_dirty(ram_addr_t start,
+                                              ram_addr_t length,
+                                              unsigned client);
+
+static bool ppc_mac_gpu_vram_gen(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
+                                 uint64_t *gen)
+{
+    const uint64_t pg = PPC_MAC_GPU_DIRTY_PAGE;
+
+    if (hi <= lo || hi > s->vram_size) {
+        return false;
+    }
+    for (unsigned i = 0; i < ARRAY_SIZE(g_scanout_seen); i++) {
+        if (lo < qatomic_read(&g_scanout_seen[i][1]) &&
+            qatomic_read(&g_scanout_seen[i][0]) < hi) {
+            return false;           /* the display owns these bits */
+        }
+    }
+    if (!g_vram_page_gen) {
+        g_vram_page_gen = g_new0(uint32_t, s->vram_size / pg);
+    }
+    uint64_t p0 = lo / pg, p1 = (hi - 1) / pg, sum = 0;
+    if (cpu_physical_memory_test_and_clear_dirty(
+            memory_region_get_ram_addr(&s->vram) + p0 * pg, (p1 - p0 + 1) * pg,
+            DIRTY_MEMORY_VGA)) {
+        for (uint64_t p = p0; p <= p1; p++) {
+            g_vram_page_gen[p]++;
+        }
+    }
+    for (uint64_t p = p0; p <= p1; p++) {
+        sum += g_vram_page_gen[p];
+    }
+    *gen = sum;
+    return true;
 }
 
 /*
