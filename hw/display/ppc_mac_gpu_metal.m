@@ -7060,6 +7060,7 @@ static RQRanges g_rq_enc_ranges;
 static bool g_rq_enc_valid;
 static pthread_cond_t g_rq_space = PTHREAD_COND_INITIALIZER;   /* ring not full */
 static pthread_cond_t g_rq_work = PTHREAD_COND_INITIALIZER;    /* work arrived */
+static bool g_rq_sleeping;      /* the render thread waits on g_rq_work */
 static pthread_cond_t g_rq_idle = PTHREAD_COND_INITIALIZER;    /* all encoded */
 static pthread_t g_rq_thread;
 static bool g_rq_thread_started;
@@ -7148,10 +7149,22 @@ static void *rqueue_thread(void *unused)
     for (;;) {
         RQJob *job = rq_pop();
         if (!job) {
+            /*
+             * Say we are going to sleep, then look once more: a producer
+             * publishes its cell and then checks g_rq_sleeping, each side
+             * with a full barrier between its store and its load, so at
+             * least one of us sees the other (see rq_push).
+             */
             pthread_mutex_lock(&g_rq_mtx);
-            while (!g_rq_stop && !(job = rq_pop_locked())) {
+            for (;;) {
+                qatomic_set(&g_rq_sleeping, true);
+                smp_mb();
+                if (g_rq_stop || (job = rq_pop_locked())) {
+                    break;
+                }
                 pthread_cond_wait(&g_rq_work, &g_rq_mtx);
             }
+            qatomic_set(&g_rq_sleeping, false);
             pthread_mutex_unlock(&g_rq_mtx);
             if (!job) {
                 break;      /* stopped, and the ring is empty */
@@ -7203,8 +7216,19 @@ static void rq_push(RQJob *job)
     qatomic_set(&c->job, job);
     c->ranges = job->ranges;
     qatomic_store_release(&c->seq, pos + 1);    /* publishes job and ranges */
-    if (pos == qatomic_read(&g_rq_deq)) {
-        /* the ring was empty: the render thread may be asleep */
+    /*
+     * Wake the render thread if it is (about to be) asleep.  This used to
+     * test "the ring was empty" (pos == g_rq_deq) with a plain load after
+     * the seq store, which ARM may satisfy first: the producer read a stale
+     * g_rq_deq and skipped the wakeup while the render thread missed the
+     * new cell and slept, and with the ring no longer empty no later push
+     * woke it either.  The queue then never drained (a 2D blit waiting in
+     * rqueue_drain hung Doom 3).  The barrier pairs with the one in
+     * rqueue_thread; holding g_rq_mtx for the broadcast means it cannot
+     * fall between the render thread's last look and its wait.
+     */
+    smp_mb();
+    if (qatomic_read(&g_rq_sleeping)) {
         pthread_mutex_lock(&g_rq_mtx);
         pthread_cond_broadcast(&g_rq_work);
         pthread_mutex_unlock(&g_rq_mtx);
