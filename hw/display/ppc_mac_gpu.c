@@ -1667,12 +1667,12 @@ static void ppc_mac_gpu_bswap_line32(uint32_t *restrict dst,
         vst1q_u8((uint8_t *)(dst + i + 12), d);
     }
 #elif defined(__SSE2__)
-    const __m128i m = _mm_set1_epi32(0x00FF00FF);
+    /* swap the 16-bit halves, then the bytes within each half (the 16-bit
+     * shifts drop the bytes they move out, so no masks are needed) */
     for (; i + 4 <= width; i += 4) {
         __m128i v = _mm_loadu_si128((const __m128i *)(src + i));
         v = _mm_or_si128(_mm_srli_epi32(v, 16), _mm_slli_epi32(v, 16));
-        v = _mm_or_si128(_mm_slli_epi16(_mm_and_si128(v, m), 8),
-                         _mm_srli_epi16(_mm_and_si128(v, m), 8));
+        v = _mm_or_si128(_mm_slli_epi16(v, 8), _mm_srli_epi16(v, 8));
         _mm_storeu_si128((__m128i *)(dst + i), v);
     }
 #endif
