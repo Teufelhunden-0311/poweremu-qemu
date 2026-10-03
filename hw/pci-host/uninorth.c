@@ -221,15 +221,17 @@ static void pci_unin_main_init(Object *obj)
                           "unin-pci-isa-mmio", 0x00800000);
 
     /*
-     * 1 GB (0x80000000-0xbfffffff) rather than the 256 MB of the stock
-     * machine: a graphics card's VRAM BAR is aligned to its size, so 128 MB
-     * pushes the register BAR to 0x90000000 and 256 MB further still, where
-     * the CPU could not reach it through a 256 MB hole.  Nothing else lives
-     * at 0x9xxxxxxx-0xbxxxxxxx on mac99.
+     * 1.75 GB (0x80000000-0xefffffff) rather than the 256 MB of the stock
+     * machine: a graphics card's VRAM BAR is aligned to its size, and the
+     * R300's BAR holds two apertures (2 x VRAM).  With 128 MB of VRAM the
+     * 256 MB BAR lands at 0x90000000 and the register BAR at 0xa0000000;
+     * with 256 MB the 512 MB BAR lands at 0xa0000000 and the register BAR
+     * at 0xc0000000, where the CPU could not reach it through a 1 GB hole.
+     * Nothing else lives at 0x9xxxxxxx-0xexxxxxxx on mac99.
      */
     memory_region_init_alias(&s->pci_hole, OBJECT(s),
                              "unin-pci-hole", &s->pci_mmio,
-                             0x80000000ULL, 0x40000000ULL);
+                             0x80000000ULL, 0x70000000ULL);
 
     sysbus_init_mmio(sbd, &h->conf_mem);
     sysbus_init_mmio(sbd, &h->data_mem);
@@ -368,13 +370,13 @@ static void unin_main_pci_host_realize(PCIDevice *d, Error **errp)
     /*
      * Set kMacRISCPCIAddressSelect (0x48) register to indicate PCI
      * memory space for Apple's AppleMacRiscPCI/AGP driver: the upper 16
-     * bits select 256 MB regions, bit n for n * 256 MB.  Bits 8-11:
-     * 0x80000000-0xbfffffff, matching the 1 GB hole above.
+     * bits select 256 MB regions, bit n for n * 256 MB.  Bits 8-14:
+     * 0x80000000-0xefffffff, matching the hole above.
      */
     d->config[0x48] = 0x0;
     d->config[0x49] = 0x0;
     d->config[0x4a] = 0x0;
-    d->config[0x4b] = 0xf;
+    d->config[0x4b] = 0x7f;
 
     if (((UNINMainPCIHost *)d)->agp_capable) {
         unin_add_agp_capability(d, errp);
