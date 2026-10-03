@@ -2117,6 +2117,20 @@ void memory_region_clear_dirty_bitmap(MemoryRegion *mr, hwaddr start,
  * @size: the size of the range being queried.
  * @client: the user of the logging information; typically %DIRTY_MEMORY_VGA.
  */
+/**
+ * memory_region_any_dirty: is any page of a range dirty for a client?
+ *
+ * Unlike memory_region_snapshot_and_clear_dirty this neither clears the
+ * bitmap nor resets the TLBs' dirty tracking, so it is cheap to ask often.
+ *
+ * @mr: the memory region (RAM)
+ * @addr: start of the range, relative to @mr
+ * @size: size of the range
+ * @client: the dirty-log client, e.g. DIRTY_MEMORY_VGA
+ */
+bool memory_region_any_dirty(MemoryRegion *mr, hwaddr addr, hwaddr size,
+                             unsigned client);
+
 DirtyBitmapSnapshot *memory_region_snapshot_and_clear_dirty(MemoryRegion *mr,
                                                             hwaddr addr,
                                                             hwaddr size,

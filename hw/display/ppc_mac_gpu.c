@@ -12622,6 +12622,17 @@ static void ppc_mac_gpu_vram_dirty(void *arg, unsigned long *bitmap,
 {
     PPCMacGPUState *s = arg;
     const uint64_t pg = PPC_MAC_GPU_DIRTY_PAGE, chunk = 256 * pg;
+
+    /*
+     * The Vulkan renderer asks before every draw, and usually nothing was
+     * written since.  Snapshotting and clearing the whole log re-arms
+     * dirty tracking in every vCPU TLB entry (tlb_reset_dirty): 12% of
+     * the time in Quake III on x86 at thousands of draws a second.  A
+     * read-only look at the bitmap first is a scan of a few hundred words.
+     */
+    if (!memory_region_any_dirty(&s->vram, 0, s->vram_size, DIRTY_MEMORY_VGA)) {
+        return;
+    }
     DirtyBitmapSnapshot *snap =
         memory_region_snapshot_and_clear_dirty(&s->vram, 0, s->vram_size,
                                                DIRTY_MEMORY_VGA);
