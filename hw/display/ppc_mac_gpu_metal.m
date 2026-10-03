@@ -7040,6 +7040,7 @@ static RQRanges g_rq_enc_ranges;
 static bool g_rq_enc_valid;
 static pthread_cond_t g_rq_space = PTHREAD_COND_INITIALIZER;   /* ring not full */
 static pthread_cond_t g_rq_work = PTHREAD_COND_INITIALIZER;    /* work arrived */
+static bool g_rq_sleeping;      /* the render thread waits on g_rq_work */
 static pthread_cond_t g_rq_idle = PTHREAD_COND_INITIALIZER;    /* all encoded */
 static pthread_t g_rq_thread;
 static bool g_rq_thread_started;
@@ -7087,13 +7088,16 @@ static RQJob *rq_pop_locked(void)
     uintptr_t pos = qatomic_read(&g_rq_deq);
     RQCell *c = &g_rq_cells[pos & RQ_MASK];
 
-    if ((uintptr_t)qatomic_read(&c->seq) != pos + 1) {
+    /* Acquire pairs with rq_push's release: once seq says the cell is
+     * full, its job pointer and ranges are the ones just published (ARM
+     * reorders plain accesses; reading a stale pointer freed it twice). */
+    if ((uintptr_t)qatomic_load_acquire(&c->seq) != pos + 1) {
         return NULL;
     }
-    RQJob *job = c->job;
+    RQJob *job = qatomic_read(&c->job);
     g_rq_enc_ranges = c->ranges;
     g_rq_enc_valid = true;
-    qatomic_set(&c->seq, pos + RQ_SIZE);      /* the cell is free again */
+    qatomic_store_release(&c->seq, pos + RQ_SIZE);   /* the cell is free again */
     qatomic_set(&g_rq_deq, pos + 1);
     return job;
 }
@@ -7115,10 +7119,22 @@ static void *rqueue_thread(void *unused)
     for (;;) {
         RQJob *job = rq_pop();
         if (!job) {
+            /*
+             * Say we are going to sleep, then look once more: a producer
+             * publishes its cell and then checks g_rq_sleeping, each side
+             * with a full barrier between its store and its load, so at
+             * least one of us sees the other (see rq_push).
+             */
             pthread_mutex_lock(&g_rq_mtx);
-            while (!g_rq_stop && !(job = rq_pop_locked())) {
+            for (;;) {
+                qatomic_set(&g_rq_sleeping, true);
+                smp_mb();
+                if (g_rq_stop || (job = rq_pop_locked())) {
+                    break;
+                }
                 pthread_cond_wait(&g_rq_work, &g_rq_mtx);
             }
+            qatomic_set(&g_rq_sleeping, false);
             pthread_mutex_unlock(&g_rq_mtx);
             if (!job) {
                 break;      /* stopped, and the ring is empty */
@@ -7155,19 +7171,30 @@ static void rq_push(RQJob *job)
 
     /* Full: wait for the render thread to finish a job.  FIFO order
      * means this draw cannot be encoded here instead. */
-    while ((uintptr_t)qatomic_read(&c->seq) != pos) {
+    while ((uintptr_t)qatomic_load_acquire(&c->seq) != pos) {
         pthread_mutex_lock(&g_rq_mtx);
-        if ((uintptr_t)qatomic_read(&c->seq) != pos) {
+        if ((uintptr_t)qatomic_load_acquire(&c->seq) != pos) {
             g_rq_stat_full++;
             pthread_cond_wait(&g_rq_space, &g_rq_mtx);
         }
         pthread_mutex_unlock(&g_rq_mtx);
     }
     qatomic_set(&c->job, job);
-    c->ranges = job->ranges;      /* published by the seq store below */
-    qatomic_set(&c->seq, pos + 1);
-    if (pos == qatomic_read(&g_rq_deq)) {
-        /* the ring was empty: the render thread may be asleep */
+    c->ranges = job->ranges;
+    qatomic_store_release(&c->seq, pos + 1);    /* publishes job and ranges */
+    /*
+     * Wake the render thread if it is (about to be) asleep.  This used to
+     * test "the ring was empty" (pos == g_rq_deq) with a plain load after
+     * the seq store, which ARM may satisfy first: the producer read a stale
+     * g_rq_deq and skipped the wakeup while the render thread missed the
+     * new cell and slept, and with the ring no longer empty no later push
+     * woke it either.  The queue then never drained (a 2D blit waiting in
+     * rqueue_drain hung Doom 3).  The barrier pairs with the one in
+     * rqueue_thread; holding g_rq_mtx for the broadcast means it cannot
+     * fall between the render thread's last look and its wait.
+     */
+    smp_mb();
+    if (qatomic_read(&g_rq_sleeping)) {
         pthread_mutex_lock(&g_rq_mtx);
         pthread_cond_broadcast(&g_rq_work);
         pthread_mutex_unlock(&g_rq_mtx);
@@ -7387,7 +7414,7 @@ static bool metal_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi,
         uintptr_t enq = qatomic_read(&g_rq_enq);
         for (uintptr_t pos = deq; pos < enq && !busy; pos++) {
             RQCell *c = &g_rq_cells[pos & RQ_MASK];
-            if ((uintptr_t)qatomic_read(&c->seq) != pos + 1) {
+            if ((uintptr_t)qatomic_load_acquire(&c->seq) != pos + 1) {
                 busy = true;          /* being published right now */
                 break;
             }

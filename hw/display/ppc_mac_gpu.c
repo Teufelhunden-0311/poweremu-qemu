@@ -1157,6 +1157,7 @@ static const char *ppc_mac_gpu_reg_name(hwaddr addr)
     case R200_DP_MIX:              return "DP_MIX";
     case R200_CP_RB_BASE:          return "CP_RB_BASE";
     case R200_CP_RB_CNTL:          return "CP_RB_CNTL";
+    case R200_CP_RB_RPTR_WR:       return "CP_RB_RPTR_WR";
     case R200_CP_RB_RPTR:          return "CP_RB_RPTR";
     case R200_CP_RB_WPTR:          return "CP_RB_WPTR";
     case R200_CP_ME_CNTL:          return "CP_ME_CNTL";
@@ -2324,17 +2325,21 @@ static QEMUBH *r200_fence_bh;
 /* Perform queued scratch writebacks whose GPU batch has completed. */
 static void r200_fence_drain(PPCMacGPUState *s, uint32_t done)
 {
-    uint32_t n = 0;
-    while (n < s->regs.r200_fence_n &&
-           (int32_t)(done - s->regs.r200_fence_q[n].seq) >= 0) {
-        ppc_mac_gpu_scratch_writeback_val(s, s->regs.r200_fence_q[n].reg,
-                                          s->regs.r200_fence_q[n].val);
-        n++;
-    }
-    if (n) {
-        memmove(s->regs.r200_fence_q, s->regs.r200_fence_q + n,
-                (s->regs.r200_fence_n - n) * sizeof(s->regs.r200_fence_q[0]));
-        s->regs.r200_fence_n -= n;
+    /*
+     * Take each fence off the queue before writing it back: the write-back
+     * is a guest memory write that can land on the card again, run the ring
+     * and drain (or queue) fences re-entrantly.  Counting first and
+     * trimming afterwards then trimmed more than was left -- a memmove of
+     * ~50 GB and a crashed QEMU in Quake III.
+     */
+    while (s->regs.r200_fence_n &&
+           (int32_t)(done - s->regs.r200_fence_q[0].seq) >= 0) {
+        int reg = s->regs.r200_fence_q[0].reg;
+        uint32_t val = s->regs.r200_fence_q[0].val;
+        s->regs.r200_fence_n--;
+        memmove(s->regs.r200_fence_q, s->regs.r200_fence_q + 1,
+                s->regs.r200_fence_n * sizeof(s->regs.r200_fence_q[0]));
+        ppc_mac_gpu_scratch_writeback_val(s, reg, val);
     }
 }
 
@@ -11196,6 +11201,30 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         s->regs.cp_rb_rptr = val;
         ppc_mac_gpu_rptr_writeback(s);
         gpu_debug_log("CP_RING RPTR <- %u", val);
+        break;
+    case R200_CP_RB_RPTR_WR:
+        /*
+         * How the driver resets the ring: RB_CNTL with RB_RPTR_WR_ENA set,
+         * the new read pointer here (0), then WPTR = 0.  Mac OS X's ATI
+         * driver does it at start-up and again later (three times in a
+         * Quake III timedemo run, the last as the game starts).  Ignoring
+         * it left the read pointer where it was, so the WPTR = 0 that
+         * followed made the rest of the ring look new: the previous lap,
+         * replayed -- IBs whose buffers had since been refilled, run at
+         * their old sizes, until a draw's index data parsed as a packet
+         * that kicked an IB of garbage, which kicked itself forever.
+         * The CP thread may be part-way through a copy of the old ring;
+         * bump the epoch so it drops it.
+         */
+        if (s->regs.cp_rb_cntl & R200_RB_RPTR_WR_ENA) {
+            uint32_t rb_bufsz = s->regs.cp_rb_cntl & 0x3F;
+            uint32_t mask = rb_bufsz && rb_bufsz <= 25 ?
+                            (2U << rb_bufsz) - 1 : UINT32_MAX;
+            s->regs.cp_rb_rptr = val & mask;
+            cp.epoch++;
+            ppc_mac_gpu_rptr_writeback(s);
+            gpu_debug_log("CP_RING RPTR_WR <- %u", val);
+        }
         break;
     case R200_CP_RB_WPTR:
         /* Normally the lock-free region takes this; MM_DATA lands here. */
