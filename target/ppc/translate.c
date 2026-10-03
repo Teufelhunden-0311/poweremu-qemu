@@ -166,8 +166,18 @@ void ppc_translate_init(void)
 }
 
 /* internal defines */
+/* A deferred slow path of an inline FP op (fp-impl.c.inc) */
+typedef struct NativeFPSlow {
+    TCGLabel *slow;
+    target_ulong next;      /* address of the following instruction */
+    int op, frt, x, y, z;
+} NativeFPSlow;
+
 struct DisasContext {
     DisasContextBase base;
+    bool fp_fast;           /* HFLAGS_FP_FAST */
+    int n_nfp;
+    NativeFPSlow nfp[64];
     target_ulong cia;  /* current instruction address */
     uint32_t opcode;
     /* Routine used to access memory */
@@ -3675,6 +3685,23 @@ static void gen_lookup_and_goto_ptr(DisasContext *ctx)
     }
 }
 
+/*
+ * A branch to cpu_nip that changes nothing else: the next TB has this
+ * TB's hflags and cs_base, so the jump cache can be probed inline.
+ */
+static void gen_branch_lookup_and_goto_ptr(DisasContext *ctx)
+{
+    if (unlikely(ctx->singlestep_enabled) ||
+        (tb_cflags(ctx->base.tb) & CF_NO_GOTO_PTR)) {
+        gen_lookup_and_goto_ptr(ctx);
+    } else {
+        TCGv_i64 pc = tcg_temp_new_i64();
+
+        tcg_gen_extu_tl_i64(pc, cpu_nip);
+        translator_lookup_and_goto_ptr(&ctx->base, pc);
+    }
+}
+
 /***                                Branch                                 ***/
 static void gen_goto_tb(DisasContext *ctx, int n, target_ulong dest)
 {
@@ -3688,7 +3715,7 @@ static void gen_goto_tb(DisasContext *ctx, int n, target_ulong dest)
         tcg_gen_exit_tb(ctx->base.tb, n);
     } else {
         tcg_gen_movi_tl(cpu_nip, dest & ~3);
-        gen_lookup_and_goto_ptr(ctx);
+        gen_branch_lookup_and_goto_ptr(ctx);
     }
 }
 
@@ -3837,7 +3864,7 @@ static void gen_bcond(DisasContext *ctx, int type)
         } else {
             tcg_gen_andi_tl(cpu_nip, target, ~3);
         }
-        gen_lookup_and_goto_ptr(ctx);
+        gen_branch_lookup_and_goto_ptr(ctx);
     }
     if ((bo & 0x14) != 0x14) {
         /* fallthrough case */
@@ -6527,8 +6554,14 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     uint32_t hflags = ctx->base.tb->flags;
 
     ctx->spr_cb = env->spr_cb;
+    ctx->fp_fast = (hflags >> HFLAGS_FP_FAST) & 1;
+    ctx->n_nfp = 0;
     ctx->pr = (hflags >> HFLAGS_PR) & 1;
     ctx->mem_idx = (hflags >> HFLAGS_DMMU_IDX) & 7;
+    if (!(ctx->mem_idx & 2)) {
+        /* As ppc_env_mmu_index(): cs_base is the TLB slot. */
+        ctx->mem_idx |= ctx->base.tb->cs_base << 2;
+    }
     ctx->dr = (hflags >> HFLAGS_DR) & 1;
     ctx->hv = (hflags >> HFLAGS_HV) & 1;
     ctx->insns_flags = env->insns_flags;
@@ -6631,7 +6664,7 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     }
 }
 
-static void ppc_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
+static void ppc_tr_tb_exit(DisasContextBase *dcbase, CPUState *cs)
 {
     DisasContext *ctx = container_of(dcbase, DisasContext, base);
     DisasJumpType is_jmp = ctx->base.is_jmp;
@@ -6706,6 +6739,15 @@ static void ppc_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
     default:
         g_assert_not_reached();
     }
+}
+
+static void ppc_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
+{
+    DisasContext *ctx = container_of(dcbase, DisasContext, base);
+
+    ppc_tr_tb_exit(dcbase, cs);
+    /* out of line, after the TB's exit, so the fast paths never branch */
+    native_fp_emit_slow_paths(ctx);
 }
 
 static const TranslatorOps ppc_tr_ops = {
