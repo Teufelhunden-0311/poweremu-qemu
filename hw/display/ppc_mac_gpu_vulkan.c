@@ -242,6 +242,8 @@ static struct {
     VkFB fbs[VK_MAX_FB];
     unsigned fb_next;
     GHashTable *progs;          /* GLSL -> VkProg */
+    /* glsl_id -> VkProg, direct-mapped, so a draw needn't hash its source */
+    struct { uint32_t id; struct VkProg *pg; } prog_slot[256];
     GHashTable *samplers;       /* key -> VkSampler */
     VkImage dummy_img[3];
     VkDeviceMemory dummy_mem[3];
@@ -1606,9 +1608,21 @@ static VkShaderModule vk_module(VkProg *pg, const char *glsl, R300Stage stage)
     return pg->mod[stage];
 }
 
-static VkPipeline vk_pipeline(const char *glsl, const VkPipeKey *key)
+static VkPipeline vk_pipeline(const char *glsl, uint32_t glsl_id,
+                              const VkPipeKey *key)
 {
-    VkProg *pg = g_hash_table_lookup(V.progs, glsl);
+    /*
+     * glsl_id (r300_us_glsl_cached) names one source text for good, so a
+     * hit skips hashing and comparing the whole GLSL string -- several
+     * kilobytes, twice per draw, 6% of the time in Quake III on x86.
+     */
+    VkProg *pg = NULL;
+    if (glsl_id && V.prog_slot[glsl_id & 255].id == glsl_id) {
+        pg = V.prog_slot[glsl_id & 255].pg;
+    }
+    if (!pg) {
+        pg = g_hash_table_lookup(V.progs, glsl);
+    }
 
     if (!pg) {
         pg = g_new0(VkProg, 1);
@@ -1618,6 +1632,10 @@ static VkPipeline vk_pipeline(const char *glsl, const VkPipeKey *key)
             qemu_log("ppc-mac-gpu vulkan: %u fragment programs\n",
                      g_hash_table_size(V.progs));
         }
+    }
+    if (glsl_id) {
+        V.prog_slot[glsl_id & 255].id = glsl_id;
+        V.prog_slot[glsl_id & 255].pg = pg;
     }
     for (guint i = 0; i < pg->pipes->len; i++) {
         VkPipeVar *pv = &g_array_index(pg->pipes, VkPipeVar, i);
@@ -2130,7 +2148,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                                          : VK_FRONT_FACE_CLOCKWISE;
     VkPipeline pipe = VK_NULL_HANDLE, lpipe = VK_NULL_HANDLE;
     if (pkt->num_verts) {
-        pipe = vk_pipeline(pkt->glsl, &pk);
+        pipe = vk_pipeline(pkt->glsl, pkt->glsl_id, &pk);
         if (!pipe) {
             return -1;
         }
@@ -2139,7 +2157,7 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         VkPipeKey lk = pk;
         lk.topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
         lk.cull = VK_CULL_MODE_NONE;    /* polygon-mode edges: never culled */
-        lpipe = vk_pipeline(pkt->glsl, &lk);
+        lpipe = vk_pipeline(pkt->glsl, pkt->glsl_id, &lk);
         if (!lpipe) {
             return -1;
         }
