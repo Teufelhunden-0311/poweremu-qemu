@@ -13047,9 +13047,8 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
                 s->renderer = NULL;
             }
         }
-        if (!s->renderer)
 #endif
-        {
+        if (!s->renderer) {
             s->renderer = ppc_mac_gpu_renderer_sw();
             s->renderer_opaque = s->renderer->init(vram_ptr, s->vram_size);
             qemu_log("ppc-mac-gpu: using software renderer (3D textured quad)\n");
