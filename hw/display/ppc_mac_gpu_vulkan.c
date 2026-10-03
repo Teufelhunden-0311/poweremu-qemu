@@ -40,6 +40,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/error-report.h"
 #include "qemu/thread.h"
 #include "qemu/atomic.h"
 #include "qemu/bitmap.h"
@@ -254,6 +255,7 @@ static struct {
     GQueue *waitq;              /* VkWaitItem */
     bool thread_started;
 
+    bool lost;                  /* a fence wait failed: the device is gone */
     uint64_t stat_draws, stat_passes, stat_uploads, stat_writebacks, stat_flushes;
 } V;
 
@@ -741,6 +743,22 @@ static void vk_set_done(uint32_t seq)
     }
 }
 
+/*
+ * Wait for a batch's fence.  A failure (VK_ERROR_DEVICE_LOST: a GPU reset,
+ * a driver crash) means nothing more will render; say so once, loudly.
+ * Completion is still reported to the guest: holding it back would hang
+ * Mac OS X on the fence for good, which is worse than a frozen picture.
+ */
+static void vk_wait_fence(VkFence fence, const char *who)
+{
+    VkResult r = vkWaitForFences(V.dev, 1, &fence, VK_TRUE, UINT64_MAX);
+    if (r != VK_SUCCESS && !qatomic_xchg(&V.lost, true)) {
+        error_report("ppc-mac-gpu vulkan: %s: waiting for the GPU failed "
+                     "(VkResult %d%s); 3D rendering has stopped", who, (int)r,
+                     r == VK_ERROR_DEVICE_LOST ? ", device lost" : "");
+    }
+}
+
 static void *vk_waiter(void *opaque)
 {
     for (;;) {
@@ -751,7 +769,7 @@ static void *vk_waiter(void *opaque)
         VkWaitItem *it = g_queue_peek_head(V.waitq);
         qemu_mutex_unlock(&V.lock);
 
-        vkWaitForFences(V.dev, 1, &it->fence, VK_TRUE, UINT64_MAX);
+        vk_wait_fence(it->fence, "fence");
         vk_set_done(it->seq);
         if (it->done) {
             it->done(it->arg, it->seq);
@@ -1396,7 +1414,7 @@ static bool vk_flush_r200(void *opaque)
         return false;
     }
     /* A barrier opens every batch, so the newest finishing means all did. */
-    vkWaitForFences(V.dev, 1, &newest->fence, VK_TRUE, UINT64_MAX);
+    vk_wait_fence(newest->fence, "flush");
     vk_set_done(newest->seq);
     V.stat_flushes++;
     return true;
