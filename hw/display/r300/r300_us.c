@@ -70,6 +70,7 @@ static inline uint32_t us_reg(const R300State *st, uint32_t addr)
 #define TX_ENABLE           0x4104
 #define RB3D_CCTL           0x4E00
 #define RB3D_COLORPITCH0    0x4E38
+#define ZB_FORMAT           0x4F10
 #define VAP_CLIP_CNTL       0x221C
 
 uint32_t r300_tex_raw_bpp(uint32_t txformat)
@@ -344,7 +345,7 @@ static bool us_emit_tex(R300Sb *sb, const R300State *st, uint32_t inst,
     case 0:         /* NOP */
         return true;
     case 2:         /* KIL */
-        r300_sb_printf(sb, "    if (any(lessThan(t[%u], vec4(0.0)))) discard;\n", src);
+        r300_sb_printf(sb, "    if (any(lessThan(t[%u], vec4(0.0)))) R300_KILL;\n", src);
         return true;
     case 1:         /* LD */
         proj = "false"; bias = "0.0";
@@ -1132,8 +1133,35 @@ static const char us_prelude_z[] =
  * selects and swap from the uniforms; B-D have them folded into the text.
  * fbinK is the buffer as it was (a framebuffer-fetch input attachment).
  */
-static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k)
+/*
+ * Declare framebuffer input idx (colour buffer idx, or the depth buffer
+ * after them) as name, with mac##_LOAD reading the pixel.  Under
+ * R300_GLSL_FB_INTERLOCK it is a storage image of format fmt, read and
+ * written (mac##_STORE) in the ordered interlock: other GPUs than Apple's
+ * do not order a framebuffer fetch between overlapping primitives of one
+ * draw, and blending or depth testing particles then lost or garbled
+ * pixels.
+ */
+static void us_fb_decl(R300Sb *sb, uint32_t flags, unsigned idx, const char *name,
+                       const char *mac, bool u, const char *fmt, const char *load)
 {
+    if (flags & R300_GLSL_FB_INTERLOCK) {
+        r300_sb_printf(sb,
+            "layout(set = 0, binding = %u, %s) uniform coherent %simage2D %s;\n"
+            "#define %s_LOAD imageLoad(%s, ivec2(gl_FragCoord.xy))%s\n"
+            "#define %s_STORE(x) imageStore(%s, ivec2(gl_FragCoord.xy), x)\n",
+            R300_BIND_FB0 + idx, fmt, u ? "u" : "", name, mac, name, load, mac, name);
+    } else {
+        r300_sb_printf(sb,
+            "layout(input_attachment_index = %u, set = 0, binding = %u) uniform %ssubpassInput %s;\n"
+            "#define %s_LOAD subpassLoad(%s)%s\n",
+            idx, R300_BIND_FB0 + idx, u ? "u" : "", name, mac, name, load);
+    }
+}
+
+static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k, uint32_t flags)
+{
+    char name[8], mac[12];
     uint32_t pitch = r300_reg(st, RB3D_COLORPITCH0 + 4 * k);
     uint32_t cf = (pitch >> 21) & 0xF, e = (pitch >> 19) & 3;
     uint32_t ofr = r300_us_out_fmt(st, k), of = ofr & 0x1F;
@@ -1157,15 +1185,18 @@ static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k)
     for (int n = 0; n < 4; n++) {
         sg[n] = (ofr >> (16 + n)) & 1;
     }
+    snprintf(name, sizeof(name), "fbin%u", k);
+    snprintf(mac, sizeof(mac), "R300_FB%u", k);
     if (view == R300_RTV_RGBA8 || view == R300_RTV_NONE) {
         r300_sb_printf(sb,
             "#define r300_cb%u_t vec4\n#define r300_cb%u_o vec4\n#define R300_CB%u_OUT(x) (x)\n"
-            "#define R300_CB%u_CLAMP true\n#define R300_CB%u_BLEND true\n"
-            "layout(input_attachment_index = %u, set = 0, binding = %u) uniform subpassInput fbin%u;\n"
-            "#define R300_FB%u_LOAD subpassLoad(fbin%u)\n"
+            "#define R300_CB%u_CLAMP true\n#define R300_CB%u_BLEND true\n",
+            k, k, k, k, k);
+        us_fb_decl(sb, flags, k, name, mac, false, "rgba8", "");
+        r300_sb_printf(sb,
             "vec4 r300_cb%u_unpack(vec4 fb) { return r300_unpack(fb, %s, %s); }\n"
             "vec4 r300_cb%u_pack(vec4 c) { return r300_pack(c, %s, %s); }\n\n",
-            k, k, k, k, k, k, R300_BIND_FB0 + k, k, k, k, k, sel, swap, k, sel, swap);
+            k, sel, swap, k, sel, swap);
         return;
     }
     type = view == R300_RTV_RG32U ? "uvec2" : view == R300_RTV_RGBA32U ? "uvec4" : "uint";
@@ -1176,11 +1207,13 @@ static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k)
                                  : "uvec4(x, 0u, 0u, 0u)";
     r300_sb_printf(sb, "// colour buffer %u: format %u, US_OUT_FMT %08x, endian %u, %u bytes\n"
                    "#define r300_cb%u_t %s\n#define r300_cb%u_o uvec4\n#define R300_CB%u_OUT(x) %s\n"
-                   "#define R300_CB%u_CLAMP %s\n#define R300_CB%u_BLEND %s\n"
-                   "layout(input_attachment_index = %u, set = 0, binding = %u) uniform usubpassInput fbin%u;\n"
-                   "#define R300_FB%u_LOAD subpassLoad(fbin%u)%s\n",
+                   "#define R300_CB%u_CLAMP %s\n#define R300_CB%u_BLEND %s\n",
                    k, cf, ofr, e, bpp, k, type, k, k, pad, k, fp ? "false" : "true",
-                   k, blend ? "true" : "false", k, R300_BIND_FB0 + k, k, k, k, load);
+                   k, blend ? "true" : "false");
+    us_fb_decl(sb, flags, k, name, mac, true,
+               view == R300_RTV_R8U ? "r8ui" : view == R300_RTV_R16U ? "r16ui" :
+               view == R300_RTV_RG32U ? "rg32ui" : view == R300_RTV_RGBA32U ? "rgba32ui" : "r32ui",
+               load);
 
     /* The card's word(s): swaps are their own inverse. */
     char swb[200];
@@ -1346,6 +1379,7 @@ char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
     uint32_t units = 0;
     R300Sb body, sb;
     bool writes_w;
+    bool il = flags & R300_GLSL_FB_INTERLOCK;
     uint32_t written = us_targets_written(st, &writes_w);
     uint32_t nt = r300_us_num_targets(st);
     uint32_t mw = ((r300_reg(st, RB3D_CCTL) >> 5) & 3) + 1;
@@ -1379,6 +1413,18 @@ char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
 
     r300_sb_init(&sb);
     r300_sb_printf(&sb, "%s// flags %x\n", us_prelude_common, flags);
+    if (il) {
+        r300_sb_printf(&sb,
+            "#ifdef R300_FS\n"
+            "#extension GL_ARB_fragment_shader_interlock : require\n"
+            "#extension GL_EXT_demote_to_helper_invocation : require\n"
+            "#endif\n"
+            "/* A killed pixel goes on as a helper (its stores do nothing): it\n"
+            "   must still leave the interlock. */\n"
+            "#define R300_KILL demote\n");
+    } else {
+        r300_sb_printf(&sb, "#define R300_KILL discard\n");
+    }
 
     /* Vertex stage: post-transform vertices as they are (shifted by the
      * sample offset when multisampling), plus the user clip plane
@@ -1400,29 +1446,45 @@ char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
         ucp ? "out gl_PerVertex { vec4 gl_Position; float gl_ClipDistance[6]; };\n" : "",
         ucp ? "    for (int i = 0; i < 6; i++) gl_ClipDistance[i] = x.ucp[i];\n" : "");
 
-    r300_sb_printf(&sb, "%s%s%s", us_prelude,
-                   flags & R300_GLSL_VRAM_SSBO ? us_raw_ssbo : us_raw_tex,
+    r300_sb_printf(&sb, "%s%s%s%s", il ? "layout(pixel_interlock_ordered) in;\n" : "",
+                   us_prelude, flags & R300_GLSL_VRAM_SSBO ? us_raw_ssbo : us_raw_tex,
                    us_prelude2);
     for (unsigned k = 0; k < nt; k++) {
-        us_emit_cb(&sb, st, k);
+        us_emit_cb(&sb, st, k, flags);
     }
     r300_sb_printf(&sb, "%s", us_prelude_z);
 
     /* Fragment outputs: colour buffers 0..nt-1, then the depth buffer. */
-    R300Sb outs, fbp, fbarg, fbin, fbout, zsel;
+    R300Sb outs, fbp, fbarg, fbin, fbout, zsel, zdecl;
     r300_sb_init(&outs);
     r300_sb_init(&fbp);
     r300_sb_init(&fbarg);
     r300_sb_init(&fbin);
     r300_sb_init(&fbout);
     r300_sb_init(&zsel);
+    r300_sb_init(&zdecl);
+    if (il) {
+        r300_sb_printf(&fbin, "    beginInvocationInterlockARB();\n");
+    }
     for (unsigned k = 0; k < nt; k++) {
         r300_sb_printf(&outs, "r300_cb%u_t c%u; ", k, k);
         r300_sb_printf(&fbp, "%sr300_cb%u_t fb%u", k ? ", " : "", k, k);
         r300_sb_printf(&fbarg, ", fb%u", k);
         r300_sb_printf(&fbin, "    r300_cb%u_t fb%u = R300_FB%u_LOAD;\n", k, k, k);
-        r300_sb_printf(&fbout, "layout(location = %u) out r300_cb%u_o o_c%u;\n", k, k, k);
-        r300_sb_printf(&zsel, "    o_c%u = R300_CB%u_OUT(pass ? c.c%u : fb%u);\n", k, k, k, k);
+        if (il) {
+            r300_sb_printf(&zsel, "    R300_FB%u_STORE(R300_CB%u_OUT(pass ? c.c%u : fb%u));\n",
+                           k, k, k, k);
+        } else {
+            r300_sb_printf(&fbout, "layout(location = %u) out r300_cb%u_o o_c%u;\n", k, k, k);
+            r300_sb_printf(&zsel, "    o_c%u = R300_CB%u_OUT(pass ? c.c%u : fb%u);\n", k, k, k, k);
+        }
+    }
+    /* ZB_FORMAT as r300_draw sees it: 4-byte words but for Z16 / 13E3. */
+    us_fb_decl(&zdecl, flags, nt, "zin", "R300_Z", true,
+               (r300_reg(st, ZB_FORMAT) & 0xF) < 2 ? "r16ui" : "r32ui", ".x");
+    if (!il) {
+        r300_sb_printf(&zdecl, "layout(location = %u) out uvec4 o_z;\n"
+                       "#define R300_Z_STORE(x) o_z = (x)\n", nt);
     }
     r300_sb_printf(&sb, "struct R300FOut { %s};\n%s\n", outs.buf, fbout.buf);
 
@@ -1445,7 +1507,9 @@ char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
     }
     r300_sb_printf(&sb,
         "\n#define R300_WRITES_W %s\n"
-        "R300FOut r300_shade(%s, inout float ow)\n"
+        "/* The program, fog and alpha test: everything that does not read\n"
+        "   the framebuffer, so it runs before the interlock. */\n"
+        "void r300_shade(inout float ow, out vec4 oc[4])\n"
         "{\n"
         "    /* SC_CLIP_RULE: a 16-entry truth table over which of the four\n"
         "       clip rectangles contain the pixel. */\n"
@@ -1456,19 +1520,19 @@ char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
         "            ivec4 r = u.cliprect[i];\n"
         "            if (p.x >= r.x && p.y >= r.y && p.x <= r.z && p.y <= r.w) idx |= 1u << i;\n"
         "        }\n"
-        "        if (((u.clip_rule >> idx) & 1u) == 0u) discard;\n"
+        "        if (((u.clip_rule >> idx) & 1u) == 0u) R300_KILL;\n"
         "    }\n"
         "    vec4 t[32];\n"
         "    for (int i = 0; i < 32; i++) t[i] = vec4(0.0);\n"
         "    vec4 vin[10] = vec4[10](v0, v1, v2, v3, v4, v5, v6, v7, v8, v9);\n",
-        writes_w ? "true" : "false", fbp.buf);
+        writes_w ? "true" : "false");
     for (unsigned k = 0; k < R300_US_NUM_TEMPS; k++) {
         if (desc->route[k] >= 0) {
             r300_sb_printf(&sb, "    t[%u] = vin[%d];\n", k, desc->route[k]);
         }
     }
     r300_sb_printf(&sb,
-        "    vec4 oc[4] = vec4[4](vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0),\n"
+        "    oc = vec4[4](vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0),\n"
         "                         vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0));\n%s",
         body.buf ? body.buf : "");
     r300_sb_printf(&sb,
@@ -1477,9 +1541,14 @@ char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
         "        float f = r300_fogf(u.fog_blend, aux.x, u.fog_color.w);\n"
         "        for (int k = 0; k < 4; k++) oc[k].rgb = mix(u.fog_color.rgb, oc[k].rgb, f);\n"
         "    }\n"
-        "    if (!r300_alpha_pass(u.alpha_func, clamp(oc[0].a, 0.0, 1.0))) discard;\n"
+        "    if (!r300_alpha_pass(u.alpha_func, clamp(oc[0].a, 0.0, 1.0))) R300_KILL;\n"
+        "}\n"
+        "\n"
+        "/* Blend the program's colours into the framebuffer's. */\n"
+        "R300FOut r300_blend(vec4 oc[4], %s)\n"
+        "{\n"
         "    bool keep = r300_discard_src(u.cblend, clamp(oc[0], 0.0, 1.0));\n"
-        "    R300FOut o;\n");
+        "    R300FOut o;\n", fbp.buf);
     for (unsigned k = 0; k < nt; k++) {
         int src = mw > 1 && k < mw ? 0 : ((written >> k) & 1) || k == 0 ? (int)k : -1;
         us_emit_target(&sb, k, src);
@@ -1489,46 +1558,51 @@ char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
         "}\n"
         "\n"
         "#ifdef R300_FS_Z\n"
-        "layout(input_attachment_index = %u, set = 0, binding = %u) uniform usubpassInput zin;\n"
-        "layout(location = %u) out uvec4 o_z;\n"
+        "%s"
         "#endif\n"
         "\n"
         "void main()\n"
         "{\n"
-        "%s"
         "    float ow = gl_FragCoord.z;\n"
+        "    vec4 oc[4];\n"
+        "    r300_shade(ow, oc);\n"
+        "%s"
         "#ifndef R300_FS_Z\n"
-        "    R300FOut c = r300_shade(%s, ow);\n"
+        "    R300FOut c = r300_blend(oc, %s);\n"
         "    if (u.zpass_count != 0u) atomicAdd(zpass, 1u);\n",
-        nt, R300_BIND_FB0 + nt, nt, fbin.buf, fbarg.buf + 2);
+        zdecl.buf, fbin.buf, fbarg.buf + 2);
     for (unsigned k = 0; k < nt; k++) {
-        r300_sb_printf(&sb, "    o_c%u = R300_CB%u_OUT(c.c%u);\n", k, k, k);
+        r300_sb_printf(&sb, il ? "    R300_FB%u_STORE(R300_CB%u_OUT(c.c%u));\n"
+                               : "    o_c%u = R300_CB%u_OUT(c.c%u);\n", k, k, k);
     }
     r300_sb_printf(&sb,
+        "%s"
         "#else\n"
-        "    uint zb = subpassLoad(zin).x;\n"
+        "    uint zb = R300_Z_LOAD;\n"
         "    bool front = gl_FrontFacing;\n"
         "    /* SU_POLY_OFFSET_*: slope in depth per pixel */\n"
         "    float slope = max(abs(dFdx(gl_FragCoord.z)), abs(dFdy(gl_FragCoord.z)));\n"
-        "    R300FOut c = r300_shade(%s, ow);\n"
+        "    R300FOut c = r300_blend(oc, %s);\n"
         "    /* FG_DEPTH_SRC: the program's OMASK_W output replaces the depth */\n"
         "    float fz = (u.depth_src != 0u && R300_WRITES_W) ? ow : gl_FragCoord.z;\n"
         "    if (front ? (u.poly_en & 1u) != 0u : (u.poly_en & 2u) != 0u)\n"
         "        fz += front ? u.poly_offset.x * slope + u.poly_offset.y\n"
         "                    : u.poly_offset.z * slope + u.poly_offset.w;\n"
         "    bool pass;\n"
-        "    o_z = uvec4(r300_ztest(zb, fz, front, pass), 0u, 0u, 0u);\n"
-        "%s"
+        "    R300_Z_STORE(uvec4(r300_ztest(zb, fz, front, pass), 0u, 0u, 0u));\n"
+        "%s%s"
         "#endif\n"
         "}\n"
         "#endif\n",
-        fbarg.buf + 2, zsel.buf);
+        il ? "    endInvocationInterlockARB();\n" : "",
+        fbarg.buf + 2, zsel.buf, il ? "    endInvocationInterlockARB();\n" : "");
     r300_sb_free(&outs);
     r300_sb_free(&fbp);
     r300_sb_free(&fbarg);
     r300_sb_free(&fbin);
     r300_sb_free(&fbout);
     r300_sb_free(&zsel);
+    r300_sb_free(&zdecl);
     r300_sb_free(&body);
     return r300_sb_steal(&sb);
 }
