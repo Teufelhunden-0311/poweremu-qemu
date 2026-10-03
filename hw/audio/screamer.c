@@ -184,12 +184,42 @@ static int pmac_screamer_tx_transfer(ScreamerState *s, int max)
  */
 #define SCREAMER_PACE_NS (1 * SCALE_MS)
 
+/*
+ * The pacing rate, matched to the host's audio clock.  Paced by QEMU's
+ * clock at exactly the nominal rate, DMA fell behind the host device by
+ * about 0.5% (Doom 3, CoreAudio at 44.1 kHz: ~44,300 frames/s consumed,
+ * ~44,050 delivered), so the host queue drained to a period and then came
+ * up short about twice in three seconds, whatever its depth.  On real
+ * hardware the codec clock drives DMA; here the queued level -- Screamer's
+ * ring plus the host voice's buffer, both empty while the host is starved
+ * and filling once it is not -- steers the rate within 1% of nominal,
+ * toward the jitter-buffer level.  SCREAMER_RATE_MATCH=0 paces at nominal.
+ */
+static int64_t screamer_pace_rate(ScreamerState *s)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SCREAMER_RATE_MATCH");
+        on = !(e && e[0] == '0');
+    }
+    if (!on || !s->voice || !s->primed || !s->voice_free_max) {
+        return s->rate;
+    }
+    int64_t target = screamer_prime_frames(s);
+    /* The space the audio core offers is largest when it has nothing
+     * queued (its scale is its mix buffer's, not the voice's size). */
+    int64_t level = (int64_t)(s->wpos - s->rpos) +
+                    ((s->voice_free_max - s->voice_free) >> s->shift);
+    int64_t err = MAX(MIN(target - level, target), -target);
+    return s->rate + (int64_t)s->rate * err / (100 * target);
+}
+
 static void screamer_pace_cb(void *opaque)
 {
     ScreamerState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
-    s->pace_frac += (now - s->pace_last) * (int64_t)s->rate;
+    s->pace_frac += (now - s->pace_last) * screamer_pace_rate(s);
     s->pace_last = now;
     int64_t due = s->pace_frac / NANOSECONDS_PER_SECOND;
     s->pace_frac -= due * NANOSECONDS_PER_SECOND;
@@ -324,6 +354,8 @@ static void screamerspk_callback(void *opaque, int free_b)
     ScreamerState *s = opaque;
     int samples, generated;
 
+    s->voice_free = free_b;
+    s->voice_free_max = MAX(s->voice_free_max, free_b);
     if (free_b == 0) {
         return;
     }
@@ -393,6 +425,7 @@ static void screamer_update_settings(ScreamerState *s)
         AUD_log(s_spk, "Could not open voice\n");
         return;
     }
+    s->voice_free = s->voice_free_max = 0;
     AUD_set_active_out(s->voice, true);
 }
 
