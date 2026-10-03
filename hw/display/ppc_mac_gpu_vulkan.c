@@ -471,7 +471,21 @@ static bool vk_ctx_init(void)
     {
         const char *e = getenv("PPCGPU_VK_INTERLOCK");
         V.interlock = il_ext && !V.moltenvk && fil.fragmentShaderPixelInterlock &&
-                      fdem.shaderDemoteToHelperInvocation && !(e && *e == '0');
+                      fdem.shaderDemoteToHelperInvocation &&
+                      f2.features.shaderStorageImageExtendedFormats &&
+                      !(e && *e == '0');
+        /* every colour buffer format, and Z (R16/R32 uint), as a storage image */
+        static const VkFormat sf[] = {
+            VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8_UINT, VK_FORMAT_R16_UINT,
+            VK_FORMAT_R32_UINT, VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32B32A32_UINT,
+        };
+        for (unsigned i = 0; V.interlock && i < ARRAY_SIZE(sf); i++) {
+            VkFormatProperties fp;
+            vkGetPhysicalDeviceFormatProperties(V.pdev, sf[i], &fp);
+            V.interlock = fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+        }
+        /* r8ui, r16ui and rg32ui need the extended storage formats */
+        want.shaderStorageImageExtendedFormats = V.interlock;
     }
     VkPhysicalDeviceShaderDemoteToHelperInvocationFeaturesEXT wdem = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DEMOTE_TO_HELPER_INVOCATION_FEATURES_EXT,
