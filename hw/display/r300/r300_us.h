@@ -122,6 +122,10 @@ enum {
                                                buffer, not a uint texture view */
 #define R300_GLSL_GPU_VS        (1u << 1)   /* the renderer runs vertex programs
                                                (r300_draw.h vs_glsl) */
+#define R300_GLSL_FB_INTERLOCK  (1u << 2)   /* the colour and depth buffers are
+                                               storage images, read and written
+                                               in an ordered pixel interlock
+                                               (no colour outputs) */
 
 /*
  * Build the GLSL source for the current US program.  It compiles as three
