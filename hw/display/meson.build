@@ -63,14 +63,19 @@ system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_
 
 # The R300 fragment programs are generated as GLSL and compiled at run time
 # with shaderc (GLSL -> SPIR-V); SPIRV-Cross turns SPIR-V into MSL for the
-# Metal backend.  Homebrew ships SPIRV-Cross's C API only as static
-# libraries, which need its other parts and the C++ runtime.
+# Metal backend, so only macOS needs it (Fedora does not package it).
+# Homebrew ships SPIRV-Cross's C API only as static libraries, which need
+# its other parts and the C++ runtime.
 r300_shader_deps = []
 if config_all_devices.has_key('CONFIG_PPC_MAC_GPU')
   shaderc = dependency('shaderc', required: true, method: 'pkg-config')
+  r300_shader_deps = [shaderc]
+endif
+if config_all_devices.has_key('CONFIG_PPC_MAC_GPU') and host_os == 'darwin'
   spirv_cross = dependency('spirv-cross-c-shared', required: false, method: 'pkg-config')
+  r300_msl = declare_dependency(compile_args: ['-DR300_HAVE_SPIRV_CROSS'])
   if spirv_cross.found()
-    r300_shader_deps = [shaderc, spirv_cross]
+    r300_shader_deps += [spirv_cross, r300_msl]
   else
     spirv_cross = dependency('spirv-cross-c', required: true, method: 'pkg-config')
     spvc_libdir = spirv_cross.get_variable(pkgconfig: 'libdir')
@@ -78,8 +83,8 @@ if config_all_devices.has_key('CONFIG_PPC_MAC_GPU')
     foreach l : ['msl', 'hlsl', 'cpp', 'reflect', 'glsl', 'util', 'core']
       spvc_libs += cc.find_library('spirv-cross-' + l, dirs: [spvc_libdir], required: true)
     endforeach
-    spvc_libs += declare_dependency(link_args: host_os == 'darwin' ? ['-lc++'] : ['-lstdc++'])
-    r300_shader_deps = [shaderc] + spvc_libs
+    spvc_libs += declare_dependency(link_args: ['-lc++'])
+    r300_shader_deps += spvc_libs + [r300_msl]
   endif
 endif
 

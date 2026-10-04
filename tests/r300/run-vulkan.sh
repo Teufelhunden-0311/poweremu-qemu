@@ -35,8 +35,7 @@ for f in test_vkil:$T/test_vkil.c r300_state:$R/r300_state.c r300_pvs:$R/r300_pv
     eval "$CC $CFLAGS -Wno-missing-prototypes -c ${f#*:} -o $O/${f%%:*}.o"
 done
 # Linked like QEMU's unit tests: QOM and the event loop base, libqemuutil.
-LIBS=$(pkg-config --libs gio-2.0 gobject-2.0 gmodule-2.0 glib-2.0 vulkan shaderc \
-       spirv-cross-c-shared)
+LIBS=$(pkg-config --libs gio-2.0 gobject-2.0 gmodule-2.0 glib-2.0 vulkan shaderc)
 $CC -o "$O/test_vkil" "$O"/test_vkil.o "$O"/r300_*.o "$B"/libevent-loop-base.a.p/*.o \
     "$B"/libqom.a.p/*.o -Wl,--start-group "$B/libqemuutil.a" $LIBS -lrt -lm -pthread \
     -Wl,--end-group
