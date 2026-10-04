@@ -5944,8 +5944,8 @@ static NSString *const kR200ShaderSource = @
 "using namespace metal;\n"
 /* Specialization: how many combiner stages run and which texture units are
  * bound, per pipeline (the defaults keep the generic pipelines as before). */
-"constant uint FC_STAGES [[function_constant(0)]] = 8;\n"
-"constant uint FC_TEXMASK [[function_constant(1)]] = 0x3F;\n"
+"constant uint FC_STAGES [[function_constant(0)]];\n"
+"constant uint FC_TEXMASK [[function_constant(1)]];\n"
 "struct Vtx { float4 pos; float4 color; float4 spec; float4 tex[6]; };\n"
 "struct U {\n"
 "    float2 rt_size; uint pp_cntl; uint pp_misc;\n"
@@ -6428,6 +6428,25 @@ static id<MTLTexture> g_r200_dummy;
 
 static pthread_mutex_t g_r200_setup_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* The fragment functions are specialised by FC_STAGES/FC_TEXMASK; the generic
+ * pipelines get "all stages, all six texture units". */
+static id<MTLFunction> r200_generic_fs(id<MTLLibrary> lib, NSString *name)
+{
+    MTLFunctionConstantValues *fcv = [[MTLFunctionConstantValues alloc] init];
+    uint32_t stages = 8, mask = 0x3F;
+    NSError *e = nil;
+
+    [fcv setConstantValue:&stages type:MTLDataTypeUInt atIndex:0];
+    [fcv setConstantValue:&mask type:MTLDataTypeUInt atIndex:1];
+    id<MTLFunction> f = [lib newFunctionWithName:name constantValues:fcv error:&e];
+    [fcv release];
+    if (!f) {
+        qemu_log("ppc-mac-gpu r200: %s: %s\n", [name UTF8String],
+                 e ? [[e localizedDescription] UTF8String] : "?");
+    }
+    return f;
+}
+
 static bool r200_metal_setup_locked(id<MTLDevice> dev)
 {
     if (g_r200_pipeline) {
@@ -6443,14 +6462,14 @@ static bool r200_metal_setup_locked(id<MTLDevice> dev)
     }
     MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
     id<MTLFunction> vs = [lib newFunctionWithName:@"r200_vs"];
-    id<MTLFunction> fs = [lib newFunctionWithName:@"r200_fs"];
+    id<MTLFunction> fs = r200_generic_fs(lib, @"r200_fs");
     pd.vertexFunction = vs;
     pd.fragmentFunction = fs;
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     pd.colorAttachments[0].blendingEnabled = NO;
     g_r200_pipeline = bin_pso(dev, pd, &err);
     {
-        id<MTLFunction> zfs = [lib newFunctionWithName:@"r200_fs_z"];
+        id<MTLFunction> zfs = r200_generic_fs(lib, @"r200_fs_z");
         MTLRenderPipelineDescriptor *zd = [pd copy];
         zd.fragmentFunction = zfs;
         zd.colorAttachments[1].pixelFormat = MTLPixelFormatR32Uint;
@@ -6461,8 +6480,8 @@ static bool r200_metal_setup_locked(id<MTLDevice> dev)
         [zfs release];
     }
     {
-        id<MTLFunction> f16 = [lib newFunctionWithName:@"r200_fs16"];
-        id<MTLFunction> f16z = [lib newFunctionWithName:@"r200_fs16_z"];
+        id<MTLFunction> f16 = r200_generic_fs(lib, @"r200_fs16");
+        id<MTLFunction> f16z = r200_generic_fs(lib, @"r200_fs16_z");
         MTLRenderPipelineDescriptor *cd = [pd copy];
         cd.colorAttachments[0].pixelFormat = MTLPixelFormatR16Uint;
         cd.fragmentFunction = f16;

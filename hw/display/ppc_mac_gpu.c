@@ -10063,7 +10063,16 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         val = s->regs.crtc_v_sync_strt_wid;
         break;
     case R200_CRTC_OFFSET:
-        val = s->regs.crtc_offset;
+        /*
+         * Jaguar's ATIRadeon8500.kext reserves the scanout buffer from
+         * CRTC_OFFSET/CRTC_PITCH only when the offset differs from its
+         * (zero) initial value.  A framebuffer at VRAM 0 therefore looks
+         * "unchanged": nothing is reserved, and the first GL surface it
+         * allocates lands on the screen and corrupts the allocator.
+         * Report the offset 32 bytes in (the unreserved head is too small
+         * to ever be handed out); the scanout itself still starts at 0.
+         */
+        val = s->regs.crtc_offset | (s->rv250 ? R200_CRTC_OFFSET_BIAS : 0);
         break;
     case R200_CRTC_OFFSET_CNTL:
         val = s->regs.crtc_offset_cntl;
@@ -11001,6 +11010,9 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         s->regs.crtc_v_sync_strt_wid = val;
         break;
     case R200_CRTC_OFFSET:
+        if (s->rv250) {
+            val &= ~R200_CRTC_OFFSET_BIAS;
+        }
         if (val != s->regs.crtc_offset) {
             blit_path_log("CRTC", "OFFSET changed 0x%x -> 0x%x",
                           s->regs.crtc_offset, val);
@@ -12284,6 +12296,7 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
 
     s->regs_size = sizeof(PPCMacGPURegs);   /* saved with the machine */
     s->r300 = object_dynamic_cast(obj, TYPE_ATI_RADEON_9700) != NULL;
+    s->rv250 = object_dynamic_cast(obj, TYPE_ATI_RADEON_9000) != NULL;
     s->r300_src_swap = 2;       /* plain copy until the driver says otherwise */
     if (s->r300) {
         const char *dump = getenv("R300_DUMP");
@@ -13044,6 +13057,24 @@ static const TypeInfo ati_radeon_9700_type_info = {
     .class_init    = ati_radeon_9700_class_init,
 };
 
+/*
+ * ATI Radeon 9000 PRO (RV250) for Mac OS X 10.2 Jaguar: same R200 register
+ * model as the RV280 device, with the PCI ID Jaguar's ATIRadeon8500.kext
+ * (and its GL driver) match.
+ */
+static void ati_radeon_9000_class_init(ObjectClass *klass, void *data)
+{
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    k->device_id = PPC_MAC_GPU_RV250_DEVICE_ID;
+}
+
+static const TypeInfo ati_radeon_9000_type_info = {
+    .name          = TYPE_ATI_RADEON_9000,
+    .parent        = TYPE_PPC_MAC_GPU,
+    .class_init    = ati_radeon_9000_class_init,
+};
+
 static const TypeInfo ppc_mac_gpu_type_info = {
     .name          = TYPE_PPC_MAC_GPU,
     .parent        = TYPE_PCI_DEVICE,
@@ -13059,6 +13090,7 @@ static void ppc_mac_gpu_register_types(void)
 {
     type_register_static(&ppc_mac_gpu_type_info);
     type_register_static(&ati_radeon_9700_type_info);
+    type_register_static(&ati_radeon_9000_type_info);
 }
 
 type_init(ppc_mac_gpu_register_types)

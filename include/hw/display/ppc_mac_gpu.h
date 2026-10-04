@@ -32,6 +32,9 @@ struct R200Vertex;
 
 /* ATI Radeon 9700 PRO Mac Edition (R300 "ND", FCode ATY,GoldenEye). */
 #define PPC_MAC_GPU_R300_DEVICE_ID     0x4E44
+/* ATI Radeon 9000 PRO (RV250): an R200-class card Mac OS X 10.2 knows
+ * (ATIRadeon8500.kext IOPCIMatch lists 0x49661002; 10.2 has no R300 driver). */
+#define PPC_MAC_GPU_RV250_DEVICE_ID    0x4966
 #define PPC_MAC_GPU_PCI_CLASS          PCI_CLASS_DISPLAY_VGA  /* 0x0300 */
 
 /* ========================================================================
@@ -116,6 +119,7 @@ struct R200Vertex;
 #define R200_CRTC_V_SYNC_STRT_WID     0x020C
 #define R200_CRTC_OFFSET              0x0224
 #define R200_CRTC_OFFSET_CNTL         0x0228
+#define R200_CRTC_OFFSET_BIAS         0x20   /* see the CRTC_OFFSET read */
 #define R200_CRTC_PITCH               0x022C
 #define R200_CRTC_GUI_TRIG_VLINE      0x0218
 
@@ -624,6 +628,7 @@ typedef struct PPCMacGPUDisplayMode {
 
 #define TYPE_PPC_MAC_GPU "ppc-mac-gpu"
 #define TYPE_ATI_RADEON_9700 "ati-radeon-9700"
+#define TYPE_ATI_RADEON_9000 "ati-radeon-9000"
 OBJECT_DECLARE_SIMPLE_TYPE(PPCMacGPUState, PPC_MAC_GPU)
 
 struct PPCMacGPUState {
@@ -676,6 +681,7 @@ struct PPCMacGPUState {
 
     /* Device configuration */
     bool r300;                  /* ati-radeon-9700: R300 instead of RV280 */
+    bool rv250;                 /* ati-radeon-9000: the card Mac OS X 10.2 drives */
     struct R300State *r3;       /* R300 3D register file (r300 only) */
     struct R300Arrays r3_arrays;    /* last 3D_LOAD_VBPNTR */
     FILE *r3_dump;              /* $R300_DUMP: state dumps at draws */
