@@ -34,6 +34,8 @@
 #include "exec/translation-block.h"
 #include "tcg-internal.h"
 #include "host/cpuinfo.h"
+#include "exec/perf-counters.h"
+#include "qemu/log.h"
 
 
 /*
@@ -724,6 +726,40 @@ static int alloc_code_gen_buffer(size_t size, int splitwx, Error **errp)
 }
 #endif /* USE_STATIC_CODE_GEN_BUFFER, WIN32, POSIX */
 
+#if defined(CONFIG_DARWIN) && defined(__aarch64__) && !defined(CONFIG_TCG_INTERPRETER)
+/*
+ * On Apple Silicon, generated code placed far from QEMU's own code runs
+ * much slower: with the buffer at 0x70_0000_0000, where macOS puts a
+ * mapping that does not fit below its shared cache, a PowerPC guest's
+ * Cinebench 9.5 render took 241-246 s against 170-171 s with the same
+ * 256 MiB buffer at 0x1_0xxx_xxxx (M1 Max).  A 1 GiB buffer lands there in
+ * about half of all starts; 768 MiB and less did not in 16 tries each.
+ * So when the size is ours to choose, take the largest that lands within
+ * 4 GiB of QEMU's code.  A size the user asked for is left as it is.
+ */
+static bool code_gen_buffer_far(void)
+{
+    uintptr_t code = (uintptr_t)&tcg_region_init;
+    uintptr_t start = (uintptr_t)region.start_aligned;
+    uintptr_t end = start + region.total_size;
+
+    return start > code ? end - code > 4 * GiB : code - start > 4 * GiB;
+}
+
+static int alloc_code_gen_buffer_near(size_t *tb_size, int splitwx)
+{
+    int have_prot = alloc_code_gen_buffer(*tb_size, splitwx, &error_fatal);
+
+    while (code_gen_buffer_far() && !tcg_splitwx_diff &&
+           *tb_size > 256 * MiB) {
+        munmap(region.start_aligned, region.total_size);
+        *tb_size -= 256 * MiB;
+        have_prot = alloc_code_gen_buffer(*tb_size, splitwx, &error_fatal);
+    }
+    return have_prot;
+}
+#endif
+
 /*
  * Initializes region partitioning.
  *
@@ -757,6 +793,7 @@ void tcg_region_init(size_t tb_size, int splitwx, unsigned max_cpus)
     const size_t page_size = qemu_real_host_page_size();
     size_t region_size;
     int have_prot, need_prot;
+    G_GNUC_UNUSED bool auto_size = tb_size == 0;
 
     /* Size the buffer.  */
     if (tb_size == 0) {
@@ -775,8 +812,20 @@ void tcg_region_init(size_t tb_size, int splitwx, unsigned max_cpus)
         tb_size = MAX_CODE_GEN_BUFFER_SIZE;
     }
 
-    have_prot = alloc_code_gen_buffer(tb_size, splitwx, &error_fatal);
+#if defined(CONFIG_DARWIN) && defined(__aarch64__) && !defined(CONFIG_TCG_INTERPRETER)
+    if (auto_size) {
+        have_prot = alloc_code_gen_buffer_near(&tb_size, splitwx);
+    } else
+#endif
+    {
+        have_prot = alloc_code_gen_buffer(tb_size, splitwx, &error_fatal);
+    }
     assert(have_prot >= 0);
+    if (qemu_perf_on) {
+        qemu_log("tcg: code buffer %p, %zu MiB; QEMU code at %p\n",
+                 region.start_aligned, (size_t)(tb_size / MiB),
+                 (void *)&tcg_region_init);
+    }
 
     /* Request large pages for the buffer and the splitwx.  */
     qemu_madvise(region.start_aligned, region.total_size, QEMU_MADV_HUGEPAGE);
