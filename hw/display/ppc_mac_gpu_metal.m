@@ -6791,7 +6791,7 @@ static bool r200_split_enabled(void)
  * as before (the device then also keeps taking the BQL around draws).
  */
 
-enum { RQ_R200 = 0, RQ_R300 = 1 };
+enum { RQ_R200 = 0, RQ_R300 = 1, RQ_COMMIT = 2 };
 
 /* Defined at the bottom of the file; rqueue_start flags it. */
 static PPCMacGPURenderer metal_renderer;
@@ -6816,6 +6816,9 @@ typedef struct RQRanges {
 
 typedef struct RQJob {
     int kind;
+    void (*done)(void *, uint32_t);     /* RQ_COMMIT: the fence's completion */
+    void *done_arg;
+    uint32_t seq;
     R200DrawPacket r200;    /* copies of verts/indices; host_data taken over */
     R300DrawPacket r300;    /* the packet's owned buffers, taken over */
     RQRanges ranges;
@@ -7079,6 +7082,9 @@ static int r200_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                             uint64_t vram_size, const R200DrawPacket *pkt);
 static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                             uint64_t vram_size, const R300DrawPacket *pkt);
+static id<MTLCommandBuffer> r200_new_cb(PPCMacGPUMetalState *st);
+static uint32_t r200_commit_as(void (*done)(void *, uint32_t), void *arg,
+                               uint32_t forced_seq);
 
 /* Take the next job, or NULL when the ring is empty.  One consumer;
  * g_rq_mtx held, so a range scan never sees a job in neither the cell
@@ -7141,7 +7147,14 @@ static void *rqueue_thread(void *unused)
             }
         }
         pthread_mutex_lock(&g_render_lock);
-        if (job->kind == RQ_R200) {
+        if (job->kind == RQ_COMMIT) {
+            /* An empty batch still completes in queue order, which is all
+             * the fence needs when nothing was drawn since the last one. */
+            if (!g_r200_cb) {
+                g_r200_cb = r200_new_cb(st);
+            }
+            r200_commit_as(job->done, job->done_arg, job->seq);
+        } else if (job->kind == RQ_R200) {
             r200_draw_encode(st, st->vram_ptr, st->vram_size, &job->r200);
         } else {
             r300_draw_encode(st, st->vram_ptr, st->vram_size, &job->r300);
@@ -7155,7 +7168,9 @@ static void *rqueue_thread(void *unused)
         pthread_cond_broadcast(&g_rq_idle);
         pthread_cond_broadcast(&g_rq_space);
         pthread_mutex_unlock(&g_rq_mtx);
-        if (job->kind == RQ_R200) {
+        if (job->kind == RQ_COMMIT) {
+            rq_job_release(job);
+        } else if (job->kind == RQ_R200) {
             r200_job_free(job);
         } else {
             r300_job_free(job);
@@ -7591,6 +7606,18 @@ static id<MTLTexture> r200_view(PPCMacGPUMetalState *st, R200TexKey k,
 
 static uint32_t g_r200_seq;
 
+/* Sequence numbers come from the CP thread (async fences) and the render
+ * thread (internal commits): allocate them atomically. */
+static uint32_t r200_next_seq(void)
+{
+    uint32_t seq = qatomic_fetch_inc(&g_r200_seq) + 1;
+
+    if (seq == 0) {
+        seq = qatomic_fetch_inc(&g_r200_seq) + 1;
+    }
+    return seq;
+}
+
 /* r200_decode_tex_unit()'s AGP copy is pitch*height (DXT: block rows). */
 static uint64_t r200_tex_host_bytes(const R200TexUnit *t)
 {
@@ -7668,7 +7695,8 @@ static void aux_tex_sync_vram(PPCMacGPUMetalState *st, uint64_t lo, uint64_t hi)
 }
 
 /* Close the open batch and commit it; returns its sequence number or 0. */
-static uint32_t r200_commit(void (*done)(void *, uint32_t), void *arg)
+static uint32_t r200_commit_as(void (*done)(void *, uint32_t), void *arg,
+                               uint32_t forced_seq)
 {
     if (!g_r200_cb) {
         return 0;
@@ -7679,10 +7707,7 @@ static uint32_t r200_commit(void (*done)(void *, uint32_t), void *arg)
         g_r200_enc = nil;
     }
     g_r200_enc_depth_off = ~0u;
-    uint32_t seq = ++g_r200_seq;
-    if (seq == 0) {
-        seq = ++g_r200_seq;
-    }
+    uint32_t seq = forced_seq ? forced_seq : r200_next_seq();
     if (done) {
         [g_r200_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
             done(arg, seq);
@@ -7702,13 +7727,38 @@ static uint32_t r200_commit(void (*done)(void *, uint32_t), void *arg)
     return seq;
 }
 
+static uint32_t r200_commit(void (*done)(void *, uint32_t), void *arg)
+{
+    return r200_commit_as(done, arg, 0);
+}
+
 static uint32_t metal_submit_r200(void *opaque,
                                   void (*done)(void *, uint32_t), void *arg)
 {
     uint32_t seq;
 
-    if (rqueue_enabled()) {
-        rqueue_drain();
+    if (rqueue_enabled() &&
+        qatomic_read(&g_rq_done) != qatomic_read(&g_rq_enq)) {
+        /*
+         * Draws are still queued.  Waiting for the render thread to encode
+         * them (rqueue_drain) while the CP thread holds the BQL starved the
+         * vCPU: in Doom 3 the guest spent a third of its time waiting for
+         * the lock.  Queue the commit behind them and hand back its
+         * sequence number; the render thread commits in order and the fence
+         * fires from the batch's completion.  (Releasing the BQL around the
+         * wait instead is unsafe: the vCPU then changes register state
+         * under a half-processed packet.)
+         */
+        RQJob *job = rq_job_alloc();
+
+        memset(&job->ranges, 0, sizeof(job->ranges));   /* touches nothing */
+        job->kind = RQ_COMMIT;
+        job->done = done;
+        job->done_arg = arg;
+        job->seq = r200_next_seq();
+        seq = job->seq;
+        rq_push(job);
+        return seq;
     }
     pthread_mutex_lock(&g_render_lock);
     seq = r200_commit(done, arg);
