@@ -3231,6 +3231,73 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     }
     r300_note_formats(s, &pkt);
     r300_note_features(s, &pkt);
+    {
+        /* $R300_GLSLDUMP=prefix: each distinct fragment shader's GLSL */
+        static const char *gpre;
+        static int ginit, gn;
+        static GHashTable *gseen;
+
+        if (!ginit) {
+            ginit = 1;
+            gpre = getenv("R300_GLSLDUMP");
+        }
+        if (gpre && pkt.glsl && gn < 80) {
+            if (!gseen) {
+                gseen = g_hash_table_new(g_str_hash, g_str_equal);
+            }
+            if (!g_hash_table_contains(gseen, pkt.glsl)) {
+                g_hash_table_add(gseen, g_strdup(pkt.glsl));
+                char *fn = g_strdup_printf("%s.%02d.frag", gpre, gn++);
+                FILE *f = fopen(fn, "w");
+                if (f) {
+                    fprintf(f, "// draw %llu blend %08x/%08x/%08x alpha-test %08x\n%s",
+                            (unsigned long long)s->r3->draws,
+                            r300_reg(s->r3, 0x4E04), r300_reg(s->r3, 0x4E08),
+                            r300_reg(s->r3, 0x4E0C), r300_reg(s->r3, 0x4BD4),
+                            pkt.glsl);
+                    fclose(f);
+                }
+                g_free(fn);
+            }
+        }
+    }
+    {
+        /* $R300_DXTDUMP=prefix: raw bytes of each distinct DXT texture */
+        static const char *pre;
+        static int init, nfiles;
+        static GHashTable *done;
+
+        if (!init) {
+            init = 1;
+            pre = getenv("R300_DXTDUMP");
+        }
+        for (int t = 0; pre && nfiles < 60 && t < R300_NUM_TEX_UNITS; t++) {
+            const R300TexDesc *td = &pkt.tex[t];
+            if (!td->bound || td->kind < R300_TEXK_DXT1 || !td->size_bytes) {
+                continue;
+            }
+            const uint8_t *src = td->host_data ? td->host_data :
+                (uint8_t *)memory_region_get_ram_ptr(&s->vram) + td->gpu_addr;
+            if (!done) {
+                done = g_hash_table_new(g_direct_hash, g_direct_equal);
+            }
+            gpointer key = GUINT_TO_POINTER(td->gpu_addr ^ (td->width << 20) ^ td->height);
+            if (g_hash_table_contains(done, key)) {
+                continue;
+            }
+            g_hash_table_add(done, key);
+            char *fn = g_strdup_printf("%s.%02d_dxt%u_%ux%u_l%u_p%u%s.bin", pre,
+                                       nfiles++, td->kind - R300_TEXK_DXT1,
+                                       td->width, td->height, td->levels,
+                                       td->pitch_bytes, td->host_data ? "_gart" : "");
+            FILE *f = fopen(fn, "wb");
+            if (f) {
+                fwrite(src, 1, td->size_bytes, f);
+                fclose(f);
+            }
+            g_free(fn);
+        }
+    }
     if (s->r3_zconv && (pkt.depth.attach || (r300_reg(s->r3, 0x4F00) & 7))) {
         r300_zconv(s, false);           /* drawing again: back to linear */
         s->r3_zconv = false;

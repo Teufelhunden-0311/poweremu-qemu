@@ -441,14 +441,20 @@ void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
 
 /* Segment registers load and store */
 
-/* PPC_SR_SLOTS=0 flushes the whole TLB on every segment register change. */
+/*
+ * The per-segment-register TLB slots are opt-in (PPC_SR_SLOTS=1); by default
+ * a segment register change flushes the whole TLB, as before.  On Mac OS X
+ * 10.4 guests the slots made the Quartz Extreme desktop much slower: opening
+ * a folder took up to 7 s and Dashboard managed under 1 fps instead of ~7
+ * (measured: 4-6 vs 29-41 distinct frames in 12 s with them off).
+ */
 static bool ppc_mmu_slots_on(void)
 {
     static int on = -1;
 
     if (on < 0) {
         const char *s = getenv("PPC_SR_SLOTS");
-        on = !(s && !strcmp(s, "0"));
+        on = s && !strcmp(s, "1");
     }
     return on;
 }

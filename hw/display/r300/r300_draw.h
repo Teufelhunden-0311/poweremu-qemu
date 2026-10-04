@@ -59,6 +59,7 @@ typedef struct R300TexDesc {
     bool bound;
     uint32_t gpu_addr;          /* TX_OFFSET, low bits cleared */
     uint32_t width, height;
+    uint32_t endian;            /* TX_OFFSET[1:0]: the card's dword swap */
     uint32_t pitch_bytes;       /* level 0: bytes per row (per row of blocks for DXT) */
     uint32_t format;            /* TX_FORMAT1 & 0x1F */
     uint32_t kind;              /* R300_TEXK_* */
@@ -298,5 +299,6 @@ uint8_t *r300_tex_level_bytes(const R300TexDesc *td, const uint8_t *src,
 
 /* 64-bit content hash, for caches of textures copied out of guest memory. */
 uint64_t r300_hash_bytes(const uint8_t *p, size_t n);
+uint64_t r300_hash_tex(const uint8_t *p, size_t n);
 
 #endif

@@ -613,7 +613,7 @@ static const char us_prelude[] =
 "vec4 r300_tpost(vec4 raw, uint unit)\n"
 "{\n"
 "    uint k = u.tex_info[unit].y;\n"
-"    return r300_tfix(k == 1u ? raw.abgr : k == 2u ? raw.grba : raw, unit);\n"
+"    return r300_tfix(k == 1u ? raw.abgr : k == 2u ? raw.grba : k == 3u ? raw.bgra : raw, unit);\n"
 "}\n"
 "/* Share of a bilinear (or nearest) footprint inside [0, n) texels along\n"
 "   one axis; m 2 = mirror once first. */\n"
