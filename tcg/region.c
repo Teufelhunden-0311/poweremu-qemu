@@ -36,6 +36,7 @@
 #include "host/cpuinfo.h"
 #include "exec/perf-counters.h"
 #include "qemu/log.h"
+#include "qemu/error-report.h"
 
 
 /*
@@ -726,16 +727,19 @@ static int alloc_code_gen_buffer(size_t size, int splitwx, Error **errp)
 }
 #endif /* USE_STATIC_CODE_GEN_BUFFER, WIN32, POSIX */
 
-#if defined(CONFIG_DARWIN) && defined(__aarch64__) && !defined(CONFIG_TCG_INTERPRETER)
+#if defined(CONFIG_DARWIN) && defined(__aarch64__) && \
+    !defined(CONFIG_TCG_INTERPRETER) && !defined(CONFIG_TCG_THREADED_INTERPRETER)
 /*
  * On Apple Silicon, generated code placed far from QEMU's own code runs
  * much slower: with the buffer at 0x70_0000_0000, where macOS puts a
- * mapping that does not fit below its shared cache, a PowerPC guest's
- * Cinebench 9.5 render took 241-246 s against 170-171 s with the same
- * 256 MiB buffer at 0x1_0xxx_xxxx (M1 Max).  A 1 GiB buffer lands there in
- * about half of all starts; 768 MiB and less did not in 16 tries each.
+ * mapping that does not fit below its shared cache, a Mac OS X 10.4 guest
+ * scored 111-121 in Cinebench 9.5 instead of 156-171 (M1 Max), also with a
+ * 256 MiB buffer forced there.  Why is not known: a JIT call benchmark
+ * shows no such difference.  A 1 GiB buffer lands there in about half of
+ * all starts; 768 MiB and less did not in 16 tries each.
  * So when the size is ours to choose, take the largest that lands within
- * 4 GiB of QEMU's code.  A size the user asked for is left as it is.
+ * 4 GiB of QEMU's code (a heuristic: ADRP's reach, not a measured
+ * boundary).  A size the user asked for is left as it is.
  */
 static bool code_gen_buffer_far(void)
 {
@@ -752,9 +756,15 @@ static int alloc_code_gen_buffer_near(size_t *tb_size, int splitwx)
 
     while (code_gen_buffer_far() && !tcg_splitwx_diff &&
            *tb_size > 256 * MiB) {
-        munmap(region.start_aligned, region.total_size);
+        if (munmap(region.start_aligned, region.total_size) != 0) {
+            return have_prot;           /* keep the far buffer */
+        }
         *tb_size -= 256 * MiB;
         have_prot = alloc_code_gen_buffer(*tb_size, splitwx, &error_fatal);
+    }
+    if (code_gen_buffer_far()) {
+        warn_report("TCG code buffer at %p is far from QEMU's code; "
+                    "generated code may run slower", region.start_aligned);
     }
     return have_prot;
 }
@@ -812,7 +822,8 @@ void tcg_region_init(size_t tb_size, int splitwx, unsigned max_cpus)
         tb_size = MAX_CODE_GEN_BUFFER_SIZE;
     }
 
-#if defined(CONFIG_DARWIN) && defined(__aarch64__) && !defined(CONFIG_TCG_INTERPRETER)
+#if defined(CONFIG_DARWIN) && defined(__aarch64__) && \
+    !defined(CONFIG_TCG_INTERPRETER) && !defined(CONFIG_TCG_THREADED_INTERPRETER)
     if (auto_size) {
         have_prot = alloc_code_gen_buffer_near(&tb_size, splitwx);
     } else
