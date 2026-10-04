@@ -1532,7 +1532,12 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
     }
 
     /* Scanout offset */
-    m->offset = s->regs.crtc_offset;
+    /*
+     * The rv250 reports its CRTC_OFFSET R200_CRTC_OFFSET_BIAS bytes in (see
+     * the register read), and Mac OS X's accelerator then draws the screen
+     * from there (it starts at x = 8): scan out from the same place.
+     */
+    m->offset = s->regs.crtc_offset + (s->rv250 ? R200_CRTC_OFFSET_BIAS : 0);
 
     /* Validate offset + frame fits in VRAM */
     if (m->offset + (uint64_t)m->stride * m->height > s->vram_size) {
@@ -6909,6 +6914,18 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
                 } else {
                     for (uint32_t i = 0; i < n && i < 4; i++) {
                         dstc[i] = r200_f32(raw[i]);
+                    }
+                    /*
+                     * Floating-point colours arrive blue first: Mac OS X
+                     * 10.2's WindowServer fills the margin around its
+                     * windows with the Aqua blue (0.678, 0.420, 0.259) and
+                     * means 0x426BAD, which shows as brown unless the red
+                     * and blue slots are exchanged.
+                     */
+                    if (n >= 3) {
+                        float t = dstc[0];
+                        dstc[0] = dstc[2];
+                        dstc[2] = t;
                     }
                 }
                 break;

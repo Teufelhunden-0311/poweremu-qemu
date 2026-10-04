@@ -8609,6 +8609,32 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     PPCMacGPUMetalState *st = opaque;
     int r;
 
+    static int drawlog = -1;
+    if (drawlog < 0) {
+        drawlog = getenv("R200_DRAWLOG") != NULL;
+    }
+    if (drawlog) {
+        /* One line per draw: where it goes, how it blends, what it samples. */
+        qemu_log("R200DRAW t=%lld rt=%x/%u %ux%u sc=%u,%u-%u,%u rb3d=%x pp=%x "
+                 "cb=%x ab=%x mask=%x verts=%u idx=%u tex0=%u:%x/%u %ux%u f=%x "
+                 "alphain=%u swap=%u v0=(%.0f,%.0f) c0=(%.3f,%.3f,%.3f,%.3f) v2=(%.0f,%.0f)\n",
+                 (long long)(g_get_monotonic_time() / 1000), pkt->rt_offset,
+                 pkt->rt_pitch, pkt->rt_width, pkt->rt_height, pkt->scissor[0],
+                 pkt->scissor[1], pkt->scissor[2], pkt->scissor[3],
+                 pkt->rb3d_cntl, pkt->pp_cntl, pkt->cblend, pkt->ablend,
+                 pkt->plane_mask, pkt->num_verts, pkt->num_indices,
+                 pkt->tex[0].enabled, pkt->tex[0].offset, pkt->tex[0].pitch,
+                 pkt->tex[0].width, pkt->tex[0].height, pkt->tex[0].format,
+                 pkt->tex[0].alpha_in_map, pkt->tex[0].swap,
+                 pkt->verts ? pkt->verts[0].pos[0] : 0.f,
+                 pkt->verts ? pkt->verts[0].pos[1] : 0.f,
+                 pkt->verts ? pkt->verts[0].color[0] : 0.f,
+                 pkt->verts ? pkt->verts[0].color[1] : 0.f,
+                 pkt->verts ? pkt->verts[0].color[2] : 0.f,
+                 pkt->verts ? pkt->verts[0].color[3] : 0.f,
+                 pkt->num_verts > 2 ? pkt->verts[2].pos[0] : 0.f,
+                 pkt->num_verts > 2 ? pkt->verts[2].pos[1] : 0.f);
+    }
     if (!rqueue_enabled()) {
         pthread_mutex_lock(&g_render_lock);
         r = r200_draw_encode(st, vram_ptr, vram_size, pkt);
