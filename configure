@@ -1857,10 +1857,12 @@ if test "$skip_meson" = no; then
   echo "c_link_args = [$(meson_quote $CFLAGS $LDFLAGS $EXTRA_CFLAGS $EXTRA_LDFLAGS)]" >> $cross
   echo "cpp_link_args = [$(meson_quote $CXXFLAGS $LDFLAGS $EXTRA_CXXFLAGS $EXTRA_LDFLAGS)]" >> $cross
 
-  # Only enable by default for git builds and on select OSes
+  # Only enable by default for git builds and on select OSes, and not
+  # when --enable/--disable-werror chose: meson re-reads this file when it
+  # regenerates the build, and the file then wins over -Dwerror.
   echo "# environment defaults, can still be overridden on " >> $cross
   echo "# the command line" >> $cross
-  if test -e "$source_path/.git" && \
+  if test -e "$source_path/.git" && ! has_meson_option -Dwerror= && \
       { test "$host_os" = linux || test "$host_os" = "windows"; }; then
       echo 'werror = true' >> $cross
   fi
