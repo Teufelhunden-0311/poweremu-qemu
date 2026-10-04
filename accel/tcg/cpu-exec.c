@@ -45,6 +45,51 @@
 #include "tb-internal.h"
 #include "internal-common.h"
 #include "internal-target.h"
+#include "exec/perf-counters.h"
+#include "qemu/log.h"
+
+QemuPerfCounters qemu_perf;
+bool qemu_perf_on;
+
+static void __attribute__((constructor)) qemu_perf_init(void)
+{
+    const char *e = getenv("QEMU_PERF_COUNTERS");
+    qemu_perf_on = e && e[0] == '1';
+}
+
+void qemu_perf_maybe_report(void *cpu)
+{
+    static int64_t last;
+    int64_t now;
+
+    if (!qemu_perf_on) {
+        return;
+    }
+    now = get_clock_realtime();
+    if (!last) {
+        last = now;
+        return;
+    }
+    if (now - last < NANOSECONDS_PER_SECOND) {
+        return;
+    }
+    qemu_log("perf: lookup %" PRIu64 " (jc %" PRIu64 ", table %" PRIu64
+             ", miss %" PRIu64 "), gen %" PRIu64 " (%" PRIu64 " KB), code flush %"
+             PRIu64 ", inval %" PRIu64 ", code cache %zu/%zu MB, fill %"
+             PRIu64 ", flush %" PRIu64 ", resize +%" PRIu64 "/-%" PRIu64
+             ", slot sync %" PRIu64 " (hit %" PRIu64 ", evict %" PRIu64
+             "), tlb entries %zu, %.2f s\n",
+             qemu_perf.lookup, qemu_perf.jc_hit, qemu_perf.ht_hit,
+             qemu_perf.ht_miss, qemu_perf.tb_gen, qemu_perf.tb_bytes / 1024,
+             qemu_perf.code_flush, qemu_perf.tb_inval,
+             tcg_code_size() >> 20, tcg_code_capacity() >> 20,
+             qemu_perf.tlb_fill, qemu_perf.tlb_flush, qemu_perf.tlb_grow,
+             qemu_perf.tlb_shrink, qemu_perf.slot_sync, qemu_perf.slot_hit,
+             qemu_perf.slot_evict, tlb_dyn_entries_total(cpu),
+             (now - last) / 1e9);
+    memset(&qemu_perf, 0, sizeof(qemu_perf));
+    last = now;
+}
 
 /* -icount align implementation. */
 
@@ -245,6 +290,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
     hash = tb_jmp_cache_hash_func(pc);
     jc = cpu->tb_jmp_cache;
 
+    QEMU_PERF_INC(lookup);
     tb = qatomic_read(&jc->array[hash].tb);
     if (likely(tb &&
                jc->array[hash].gen == jc->gen &&
@@ -252,13 +298,16 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
                tb->cs_base == cs_base &&
                tb->flags == flags &&
                tb_cflags(tb) == cflags)) {
+        QEMU_PERF_INC(jc_hit);
         goto hit;
     }
 
     tb = tb_htable_lookup(cpu, pc, cs_base, flags, cflags);
     if (tb == NULL) {
+        QEMU_PERF_INC(ht_miss);
         return NULL;
     }
+    QEMU_PERF_INC(ht_hit);
 
     jc->array[hash].pc = pc;
     jc->array[hash].gen = jc->gen;

@@ -24,6 +24,7 @@
 #include "system/kvm.h"
 #include "system/tcg.h"
 #include "helper_regs.h"
+#include "exec/perf-counters.h"
 #include "power8-pmu.h"
 #include "cpu-models.h"
 #include "spr_common.h"
@@ -385,6 +386,7 @@ void check_tlb_flush(CPUPPCState *env, bool global)
         env->tlb_flush_npages = 0;
         tlb_flush_all_cpus_synced(cs);
         ppc_mmu_slots_reset(env);
+        QEMU_PERF_INC(tlb_flush);
         return;
     }
 
@@ -395,6 +397,7 @@ void check_tlb_flush(CPUPPCState *env, bool global)
         env->tlb_flush_npages = 0;
         tlb_flush(cs);
         ppc_mmu_slots_reset(env);
+        QEMU_PERF_INC(tlb_flush);
         return;
     }
 

@@ -38,6 +38,7 @@
 #include "qemu/atomic.h"
 #include "qemu/atomic128.h"
 #include "tb-internal.h"
+#include "exec/perf-counters.h"
 #include "trace.h"
 #include "tb-hash.h"
 #include "tb-internal.h"
@@ -242,6 +243,11 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
         return;
     }
 
+    if (new_size > old_size) {
+        QEMU_PERF_INC(tlb_grow);
+    } else {
+        QEMU_PERF_INC(tlb_shrink);
+    }
     g_free(fast->table);
     g_free(desc->fulltlb);
 
@@ -2971,4 +2977,15 @@ uint64_t cpu_ldq_code_mmu(CPUArchState *env, abi_ptr addr,
                           MemOpIdx oi, uintptr_t retaddr)
 {
     return do_ld8_mmu(env_cpu(env), addr, oi, retaddr, MMU_INST_FETCH);
+}
+
+size_t tlb_dyn_entries_total(void *opaque)
+{
+    CPUState *cpu = opaque;
+    size_t n = 0;
+
+    for (int i = 0; i < NB_MMU_MODES; i++) {
+        n += tlb_n_entries(&cpu->neg.tlb.f[i]);
+    }
+    return n;
 }

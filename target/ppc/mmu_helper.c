@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/perf-counters.h"
 #include "qemu/units.h"
 #include "cpu.h"
 #include "system/kvm.h"
@@ -317,6 +318,7 @@ void ppc_tlb_invalidate_all(CPUPPCState *env)
     case POWERPC_MMU_32B:
         env->tlb_need_flush = 0;
         tlb_flush(env_cpu(env));
+        QEMU_PERF_INC(tlb_flush);
         ppc_mmu_slots_reset(env);
         break;
     default:
@@ -353,10 +355,14 @@ void ppc_mmu_slot_sync(CPUPPCState *env)
             victim = i;
         }
     }
+    QEMU_PERF_INC(slot_sync);
     if (i == PPC_MMU_SLOTS) {
         i = victim;
         memcpy(env->mmu_slot_sr[i], env->sr, sizeof(env->mmu_slot_sr[i]));
         tlb_flush_by_mmuidx(env_cpu(env), 3 << (4 * i));
+        QEMU_PERF_INC(slot_evict);
+    } else {
+        QEMU_PERF_INC(slot_hit);
     }
     env->mmu_slot_used[i] = ++env->mmu_slot_clock;
     env->mmu_slot = i;
@@ -1497,6 +1503,9 @@ bool ppc_cpu_tlb_fill(CPUState *cs, vaddr eaddr, int size,
     PowerPCCPU *cpu = POWERPC_CPU(cs);
     hwaddr raddr;
     int page_size, prot;
+
+    QEMU_PERF_INC(tlb_fill);
+    qemu_perf_maybe_report(cs);
 
     if (cpu->env.mmu_model == POWERPC_MMU_32B && !(mmu_idx & 2) &&
         ((cpu->env.tlb_need_flush & TLB_NEED_SR_SWITCH) ||

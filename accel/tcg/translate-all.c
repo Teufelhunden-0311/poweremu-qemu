@@ -66,6 +66,7 @@
 #include "internal-common.h"
 #include "internal-target.h"
 #include "tcg/perf.h"
+#include "exec/perf-counters.h"
 #include "tcg/insn-start-words.h"
 
 TBContext tb_ctx;
@@ -431,6 +432,8 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
         goto buffer_overflow;
     }
     tb->tc.size = gen_code_size;
+    QEMU_PERF_INC(tb_gen);
+    QEMU_PERF_ADD(tb_bytes, gen_code_size);
 
     /*
      * For CF_PCREL, attribute all executions of the generated code

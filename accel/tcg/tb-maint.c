@@ -34,6 +34,7 @@
 #include "tb-internal.h"
 #include "internal-common.h"
 #include "internal-target.h"
+#include "exec/perf-counters.h"
 #ifdef CONFIG_USER_ONLY
 #include "user/page-protection.h"
 #endif
@@ -771,6 +772,7 @@ static void do_tb_flush(CPUState *cpu, run_on_cpu_data tb_flush_count)
         goto done;
     }
     did_flush = true;
+    QEMU_PERF_INC(code_flush);
 
     CPU_FOREACH(cpu) {
         tcg_flush_jmp_cache(cpu);
@@ -912,6 +914,8 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
     uint32_t h;
     tb_page_addr_t phys_pc;
     uint32_t orig_cflags = tb_cflags(tb);
+
+    QEMU_PERF_INC(tb_inval);
 
     assert_memory_lock();
 
