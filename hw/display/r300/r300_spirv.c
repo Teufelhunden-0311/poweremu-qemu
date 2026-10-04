@@ -12,7 +12,9 @@
 #include <string.h>
 
 #include <shaderc/shaderc.h>
+#ifdef R300_HAVE_SPIRV_CROSS
 #include <spirv_cross_c.h>
+#endif
 
 #include "r300_us.h"
 
@@ -73,6 +75,7 @@ uint32_t *r300_glsl_to_spirv(const char *glsl, R300Stage stage,
     return words;
 }
 
+#ifdef R300_HAVE_SPIRV_CROSS
 /* The pre-"_2" API: SPIRV-Cross in Linux distributions still lacks _2. */
 static void msl_bind(spvc_compiler c, SpvExecutionModel model, unsigned binding,
                      unsigned buffer, unsigned texture, unsigned sampler)
@@ -149,6 +152,16 @@ fail:
     spvc_context_destroy(ctx);
     return NULL;
 }
+#else
+/* Only the Metal backend (macOS) wants MSL; elsewhere SPIRV-Cross is not
+ * linked. */
+char *r300_spirv_to_msl(const uint32_t *spv, size_t nwords, R300Stage stage,
+                        char **err)
+{
+    *err = r300_strdup_err("SPIRV-Cross", "not built in (macOS only)");
+    return NULL;
+}
+#endif
 
 char *r300_glsl_to_msl(const char *glsl, R300Stage stage, char **err)
 {
