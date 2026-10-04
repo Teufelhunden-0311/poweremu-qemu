@@ -6083,7 +6083,16 @@ static void r200_decode_tex_unit(PPCMacGPUState *s, int n, R200TexUnit *t)
         }
     }
     offset &= ~0x1Fu;
-    if (offset < fb_base || offset - fb_base >= s->vram_size) {
+    /*
+     * The AGP aperture can start inside the VRAM the card has but does not
+     * report (the top megabytes are the command processor's): Jaguar's
+     * driver puts it at 124 MB, and texture offsets there are AGP.
+     */
+    uint32_t agp_loc = s->regs.mc_agp_location;
+    bool in_agp = agp_loc != 0 &&
+                  offset >= ((agp_loc & 0xFFFF) << 16) &&
+                  offset <= ((((agp_loc >> 16) & 0xFFFF) << 16) | 0xFFFF);
+    if (in_agp || offset < fb_base || offset - fb_base >= s->vram_size) {
         /*
          * AGP/GART texture (client storage / texture range): copy the texels
          * out of guest memory.  Level 0 only; the caller frees host_data.
@@ -10925,9 +10934,13 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         s->regs.config_cntl = val;
         break;
     case R200_MC_FB_LOCATION:
+        qemu_log("ppc-mac-gpu: MC_FB_LOCATION 0x%08x -> 0x%08x\n",
+                 s->regs.mc_fb_location, val);
         s->regs.mc_fb_location = val;
         break;
     case R200_MC_AGP_LOCATION:
+        qemu_log("ppc-mac-gpu: MC_AGP_LOCATION 0x%08x -> 0x%08x\n",
+                 s->regs.mc_agp_location, val);
         s->regs.mc_agp_location = val;
         break;
 
