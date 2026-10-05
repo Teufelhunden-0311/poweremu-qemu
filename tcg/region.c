@@ -731,18 +731,21 @@ static int alloc_code_gen_buffer(size_t size, int splitwx, Error **errp)
     !defined(CONFIG_TCG_INTERPRETER) && \
     !defined(CONFIG_TCG_THREADED_INTERPRETER)
 /*
- * On Apple Silicon (measured on an M1 Max), an indirect call (BLR) predicts
- * well only when the call site and its target share address bits 63:32,
- * i.e. lie in the same 4 GiB-aligned block.  With 64 call sites calling
- * one target: 0.94-2.2 ns per call within a block, even 3.6 GiB apart;
- * 5.3-7.1 ns across a block boundary, even only 0.25 GiB apart.  The
- * predictor keeps such cross-block targets for only 2-3 call sites; beyond
- * that every call mispredicts.  Generated code calls helpers in QEMU's own
- * code from thousands of sites, so a code buffer in another block than
- * QEMU's code turns most helper calls into mispredictions: with the buffer
- * at 0x70_0000_0000, a Mac OS X 10.4 guest's Cinebench 9.5 scored 98-115
- * instead of 153-171, with mispredicted indirect calls in generated code up
- * from 1.6k to 82k per 15 s sample (Instruments CPU Counters).
+ * On an M1 Max, indirect calls (BLR) whose call site and target lie in
+ * different 4 GiB-aligned blocks (differ in address bits 63:32) predict
+ * badly once more than a couple of call sites do it.  In a microbenchmark
+ * with the distance held fixed, 64 call sites to one target took 0.93 ns
+ * per call within a block and 5.3 ns across a block boundary only 0.25 GiB
+ * away; with 1-2 sites crossing, both were fast.  (Within a block, sites
+ * and targets that differ in bits 31:29 showed a milder slowdown, ~2 ns at
+ * 8-64 sites; we do not try to avoid that.)  This matches V8's "short
+ * builtin calls" findings on M1.  Generated code calls helpers in QEMU's
+ * own code from thousands of sites, so a code buffer in another block than
+ * QEMU's code makes helper calls slow: with the buffer at 0x70_0000_0000,
+ * a Mac OS X 10.4 guest's Cinebench 9.5 scored 98-115 instead of 153-171,
+ * and sampled indirect-call mispredictions in generated code rose from
+ * 1.6k to 82k per 15 s (Instruments CPU Counters).  Other Apple chips have
+ * not been measured.
  *
  * macOS places a 1 GiB buffer outside QEMU's block in about half of all
  * starts (the block is shared with the image, stacks and the shared cache;
