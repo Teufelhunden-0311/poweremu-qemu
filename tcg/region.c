@@ -728,29 +728,35 @@ static int alloc_code_gen_buffer(size_t size, int splitwx, Error **errp)
 #endif /* USE_STATIC_CODE_GEN_BUFFER, WIN32, POSIX */
 
 #if defined(CONFIG_DARWIN) && defined(__aarch64__) && \
-    !defined(CONFIG_TCG_INTERPRETER) && !defined(CONFIG_TCG_THREADED_INTERPRETER)
+    !defined(CONFIG_TCG_INTERPRETER) && \
+    !defined(CONFIG_TCG_THREADED_INTERPRETER)
 /*
- * On Apple Silicon, generated code placed far from QEMU's own code runs
- * much slower: with the buffer at 0x70_0000_0000, where macOS puts a
- * mapping that does not fit below its shared cache, a Mac OS X 10.4 guest
- * scored 111-121 in Cinebench 9.5 instead of 156-171 (M1 Max), also with a
- * 256 MiB buffer forced there, or to 0x71_, 0x80_ or 0x100_0000_0000
- * (98-112), whether guest RAM was low or high, and with all helper calls
- * made indirect (near 156-161, far 110-112).  Why is not known: a JIT call
- * benchmark shows no such difference.  A 1 GiB buffer lands at
- * 0x70_0000_0000 in about half of all starts; 768 MiB and less did not in
- * 16 tries each.
- * So when the size is ours to choose, take the largest that lands within
- * 4 GiB of QEMU's code (a heuristic: ADRP's reach, not a measured
- * boundary).  A size the user asked for is left as it is.
+ * On Apple Silicon (measured on an M1 Max), an indirect call (BLR) predicts
+ * well only when the call site and its target share address bits 63:32,
+ * i.e. lie in the same 4 GiB-aligned block.  With 64 call sites calling
+ * one target: 0.94-2.2 ns per call within a block, even 3.6 GiB apart;
+ * 5.3-7.1 ns across a block boundary, even only 0.25 GiB apart.  The
+ * predictor keeps such cross-block targets for only 2-3 call sites; beyond
+ * that every call mispredicts.  Generated code calls helpers in QEMU's own
+ * code from thousands of sites, so a code buffer in another block than
+ * QEMU's code turns most helper calls into mispredictions: with the buffer
+ * at 0x70_0000_0000, a Mac OS X 10.4 guest's Cinebench 9.5 scored 98-115
+ * instead of 153-171, with mispredicted indirect calls in generated code up
+ * from 1.6k to 82k per 15 s sample (Instruments CPU Counters).
+ *
+ * macOS places a 1 GiB buffer outside QEMU's block in about half of all
+ * starts (the block is shared with the image, stacks and the shared cache;
+ * the next free space is above the GPU carveout, at 0x70_0000_0000).  So
+ * when the size is ours to choose, take the largest that lands in the same
+ * 4 GiB block as QEMU's code.  A size the user asked for is left as it is.
  */
 static bool code_gen_buffer_far(void)
 {
     uintptr_t code = (uintptr_t)&tcg_region_init;
     uintptr_t start = (uintptr_t)region.start_aligned;
-    uintptr_t end = start + region.total_size;
+    uintptr_t last = start + region.total_size - 1;
 
-    return start > code ? end - code > 4 * GiB : code - start > 4 * GiB;
+    return (start >> 32) != (code >> 32) || (last >> 32) != (code >> 32);
 }
 
 static int alloc_code_gen_buffer_near(size_t *tb_size, int splitwx)
@@ -760,17 +766,18 @@ static int alloc_code_gen_buffer_near(size_t *tb_size, int splitwx)
     while (code_gen_buffer_far() && !tcg_splitwx_diff &&
            *tb_size > 256 * MiB) {
         if (munmap(region.start_aligned, region.total_size) != 0) {
-            warn_report("TCG code buffer at %p is far from QEMU's code and "
-                        "could not be unmapped to retry: %s",
-                        region.start_aligned, strerror(errno));
+            warn_report("TCG code buffer at %p is outside the 4 GiB block "
+                        "of QEMU's code and could not be unmapped to retry: "
+                        "%s", region.start_aligned, strerror(errno));
             return have_prot;
         }
         *tb_size -= 256 * MiB;
         have_prot = alloc_code_gen_buffer(*tb_size, splitwx, &error_fatal);
     }
     if (code_gen_buffer_far()) {
-        warn_report("TCG code buffer at %p is far from QEMU's code; "
-                    "generated code may run slower", region.start_aligned);
+        warn_report("TCG code buffer at %p is outside the 4 GiB block of "
+                    "QEMU's code; helper calls from generated code will "
+                    "often mispredict", region.start_aligned);
     }
     return have_prot;
 }
@@ -829,7 +836,8 @@ void tcg_region_init(size_t tb_size, int splitwx, unsigned max_cpus)
     }
 
 #if defined(CONFIG_DARWIN) && defined(__aarch64__) && \
-    !defined(CONFIG_TCG_INTERPRETER) && !defined(CONFIG_TCG_THREADED_INTERPRETER)
+    !defined(CONFIG_TCG_INTERPRETER) && \
+    !defined(CONFIG_TCG_THREADED_INTERPRETER)
     if (auto_size) {
         have_prot = alloc_code_gen_buffer_near(&tb_size, splitwx);
     } else
