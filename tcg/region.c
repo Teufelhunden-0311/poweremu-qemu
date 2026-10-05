@@ -734,9 +734,12 @@ static int alloc_code_gen_buffer(size_t size, int splitwx, Error **errp)
  * much slower: with the buffer at 0x70_0000_0000, where macOS puts a
  * mapping that does not fit below its shared cache, a Mac OS X 10.4 guest
  * scored 111-121 in Cinebench 9.5 instead of 156-171 (M1 Max), also with a
- * 256 MiB buffer forced there.  Why is not known: a JIT call benchmark
- * shows no such difference.  A 1 GiB buffer lands there in about half of
- * all starts; 768 MiB and less did not in 16 tries each.
+ * 256 MiB buffer forced there, or to 0x71_, 0x80_ or 0x100_0000_0000
+ * (98-112), whether guest RAM was low or high, and with all helper calls
+ * made indirect (near 156-161, far 110-112).  Why is not known: a JIT call
+ * benchmark shows no such difference.  A 1 GiB buffer lands at
+ * 0x70_0000_0000 in about half of all starts; 768 MiB and less did not in
+ * 16 tries each.
  * So when the size is ours to choose, take the largest that lands within
  * 4 GiB of QEMU's code (a heuristic: ADRP's reach, not a measured
  * boundary).  A size the user asked for is left as it is.
@@ -757,7 +760,10 @@ static int alloc_code_gen_buffer_near(size_t *tb_size, int splitwx)
     while (code_gen_buffer_far() && !tcg_splitwx_diff &&
            *tb_size > 256 * MiB) {
         if (munmap(region.start_aligned, region.total_size) != 0) {
-            return have_prot;           /* keep the far buffer */
+            warn_report("TCG code buffer at %p is far from QEMU's code and "
+                        "could not be unmapped to retry: %s",
+                        region.start_aligned, strerror(errno));
+            return have_prot;
         }
         *tb_size -= 256 * MiB;
         have_prot = alloc_code_gen_buffer(*tb_size, splitwx, &error_fatal);
