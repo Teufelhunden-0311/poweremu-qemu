@@ -741,17 +741,19 @@ static int alloc_code_gen_buffer(size_t size, int splitwx, Error **errp)
  * 8-64 sites; we do not try to avoid that.)  This matches V8's "short
  * builtin calls" findings on M1.  Generated code calls helpers in QEMU's
  * own code from thousands of sites, so a code buffer in another block than
- * QEMU's code makes helper calls slow: with the buffer at 0x70_0000_0000,
- * a Mac OS X 10.4 guest's Cinebench 9.5 scored 98-115 instead of 153-171,
- * and sampled indirect-call mispredictions in generated code rose from
- * 1.6k to 82k per 15 s (Instruments CPU Counters).  Other Apple chips have
- * not been measured.
+ * QEMU's code makes helper calls slow: with a 256 MiB buffer forced to
+ * 0x70_0000_0000, a Mac OS X 10.4 guest's Cinebench 9.5 scored 112/111
+ * instead of 153/155 (same build, alternating runs), and in another pair
+ * sampled indirect-call mispredictions in generated code rose from 1.6k
+ * to 82k per 15 s (Instruments CPU Counters).  Other Apple chips have not
+ * been measured.
  *
- * macOS places a 1 GiB buffer outside QEMU's block in about half of all
- * starts (the block is shared with the image, stacks and the shared cache;
- * the next free space is above the GPU carveout, at 0x70_0000_0000).  So
- * when the size is ours to choose, take the largest that lands in the same
- * 4 GiB block as QEMU's code.  A size the user asked for is left as it is.
+ * macOS sometimes places a 1 GiB buffer outside QEMU's block (4 of 16
+ * starts in one test, about half in another): the block is shared with
+ * the image, stacks and the shared cache, and the next free space is above
+ * the GPU carveout, at 0x70_0000_0000.  So when the size is ours to
+ * choose, take the largest that lands in the same 4 GiB block as QEMU's
+ * code.  A size the user asked for is left as it is.
  */
 static bool code_gen_buffer_far(void)
 {
