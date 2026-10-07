@@ -2704,35 +2704,6 @@ static void r300_surfwatch_update(PPCMacGPUState *s);
 static void r300_surface_changed(PPCMacGPUState *s);
 static void r300_zconv(PPCMacGPUState *s, bool to_card);
 
-static bool r300_in_fb(PPCMacGPUState *s, uint32_t a, uint64_t len);
-
-/* Raw guest GPU memory (VRAM or AGP), bytes as they lie. */
-static bool r300_read_raw(void *opaque, uint32_t gpu_addr, void *dst,
-                          uint32_t len)
-{
-    PPCMacGPUState *s = opaque;
-    uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
-    uint8_t *out = dst;
-
-    if (r300_in_fb(s, gpu_addr, len)) {
-        memcpy(dst, (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
-                    (gpu_addr - fb_base), len);
-        return true;
-    }
-    while (len) {
-        uint8_t *page = r200_agp_page(s, gpu_addr);
-        uint32_t n = MIN(len, 0x1000 - (gpu_addr & 0xFFF));
-        if (!page) {
-            return false;
-        }
-        memcpy(out, page + (gpu_addr & 0xFFF), n);
-        out += n;
-        gpu_addr += n;
-        len -= n;
-    }
-    return true;
-}
-
 static bool ppc_mac_gpu_gart_translate(PPCMacGPUState *s, uint32_t gpu_addr,
                                         hwaddr *phys_addr);
 static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s, uint32_t gpu_addr,
@@ -2745,51 +2716,138 @@ static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s, uint32_t gpu_addr,
  * The device has 4 MB more VRAM than it reports, and Apple's R300 driver
  * starts the PCI GART right there, so an address can be below vram_size
  * and still be system memory.
+ *
+ * r300_span(a, len, lo, last): the len bytes at a lie in [lo, last], with
+ * no arithmetic that can wrap.
  */
-static bool r300_in_fb(PPCMacGPUState *s, uint32_t a, uint64_t len)
+static bool r300_span(uint64_t a, uint64_t len, uint64_t lo, uint64_t last)
 {
-    uint32_t fb = s->regs.mc_fb_location;
-    uint64_t lo = (fb & 0xFFFF) << 16, end = ((uint64_t)(fb >> 16) + 1) << 16;
-
-    return a >= lo && a + len <= end && a - lo + len <= s->vram_size;
+    return len && lo <= last && a >= lo && a <= last && len - 1 <= last - a;
 }
 
-static bool r300_in_agp(PPCMacGPUState *s, uint32_t a)
+/* The VRAM MC_FB_LOCATION reports, as [*lo, *last]; false if none. */
+static bool r300_fb_range(PPCMacGPUState *s, uint64_t *lo, uint64_t *last)
+{
+    uint32_t fb = s->regs.mc_fb_location;
+    uint64_t top = ((uint64_t)(fb >> 16) << 16) | 0xFFFF;
+
+    *lo = (uint64_t)(fb & 0xFFFF) << 16;
+    if (top < *lo || !s->vram_size) {
+        return false;
+    }
+    *last = MIN(top, *lo + s->vram_size - 1);
+    return true;
+}
+
+static bool r300_in_fb(PPCMacGPUState *s, uint32_t a, uint64_t len)
+{
+    uint64_t lo, last;
+
+    return r300_fb_range(s, &lo, &last) && r300_span(a, len, lo, last);
+}
+
+static bool r300_in_agp(PPCMacGPUState *s, uint32_t a, uint64_t len)
 {
     uint32_t agp = s->regs.mc_agp_location;
 
-    return agp && a >= (agp & 0xFFFF) << 16 && a <= ((agp >> 16) << 16 | 0xFFFF);
+    return agp && r300_span(a, len, (uint64_t)(agp & 0xFFFF) << 16,
+                            ((uint64_t)(agp >> 16) << 16) | 0xFFFF);
 }
 
-static bool r300_in_aic(PPCMacGPUState *s, uint32_t a)
+static bool r300_in_aic(PPCMacGPUState *s, uint32_t a, uint64_t len)
 {
-    return (s->regs.aic_ctrl & 1) && a >= s->regs.aic_lo_addr &&
-           a <= s->regs.aic_hi_addr;
+    return (s->regs.aic_ctrl & 1) &&
+           r300_span(a, len, s->regs.aic_lo_addr, s->regs.aic_hi_addr);
+}
+
+/*
+ * The n bytes at a as system memory: none of them in VRAM, all of them in
+ * the aperture a is in (AGP before the PCI GART).  Ranges only.
+ */
+static bool r300_sys_span(PPCMacGPUState *s, uint32_t a, uint32_t n)
+{
+    uint64_t lo, last;
+
+    if (!n || (r300_fb_range(s, &lo, &last) && a <= last && a + (uint64_t)n - 1 >= lo)) {
+        return false;
+    }
+    return r300_in_agp(s, a, 1) ? r300_in_agp(s, a, n) : r300_in_aic(s, a, n);
+}
+
+/* The same, within one page, translated through that aperture alone. */
+static bool r300_sys_chunk(PPCMacGPUState *s, uint32_t a, uint32_t n,
+                           hwaddr *phys)
+{
+    if (!r300_sys_span(s, a, n)) {
+        return false;
+    }
+    return r300_in_agp(s, a, 1) ? ppc_mac_gpu_agp_translate(s, a, phys)
+                                : ppc_mac_gpu_gart_translate(s, a, phys);
+}
+
+/* Raw guest GPU memory (VRAM, else system memory as r300_sys_chunk takes
+ * it), bytes as they lie. */
+static bool r300_read_raw(void *opaque, uint32_t gpu_addr, void *dst,
+                          uint32_t len)
+{
+    PPCMacGPUState *s = opaque;
+    uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
+    uint8_t *out = dst;
+
+    if (r300_in_fb(s, gpu_addr, len)) {
+        memcpy(dst, (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
+                    (gpu_addr - fb_base), len);
+        return true;
+    }
+    if (!len || (uint64_t)gpu_addr + len > 0x100000000ull) {
+        return false;
+    }
+    while (len) {
+        uint32_t n = MIN(len, 0x1000 - (gpu_addr & 0xFFF));
+        hwaddr phys;
+        if (!r300_sys_span(s, gpu_addr, n)) {
+            return false;
+        }
+        /*
+         * Vertex fetch reads here a few dwords at a time, so the page comes
+         * from r200_agp_page's cache, not a page-table walk per read.  It
+         * tries AGP, then the PCI GART: the same choice as r300_sys_chunk
+         * unless the two apertures overlap, which takes the slow way.
+         */
+        uint8_t *page = r300_in_agp(s, gpu_addr, 1) && r300_in_aic(s, gpu_addr, 1)
+                        ? NULL : r200_agp_page(s, gpu_addr);
+        if (page) {
+            memcpy(out, page + (gpu_addr & 0xFFF), n);
+        } else if (!r300_sys_chunk(s, gpu_addr, n, &phys) ||
+                   address_space_read(&address_space_memory, phys,
+                                      MEMTXATTRS_UNSPECIFIED, out, n) != MEMTX_OK) {
+            return false;
+        }
+        out += n;
+        gpu_addr += n;
+        len -= n;
+    }
+    return true;
 }
 
 static bool r300_in_sysmem(PPCMacGPUState *s, uint32_t a)
 {
-    return !r300_in_fb(s, a, 1) && (r300_in_agp(s, a) || r300_in_aic(s, a));
+    return !r300_in_fb(s, a, 1) && (r300_in_agp(s, a, 1) || r300_in_aic(s, a, 1));
 }
 
 /* Copy len bytes between host memory and system memory at GPU address a,
- * page by page; every page must translate, in the aperture its address is
- * in. */
+ * page by page, every page as r300_sys_chunk takes it. */
 static bool r300_sysmem_rw(PPCMacGPUState *s, uint32_t a, uint8_t *buf,
                            uint64_t len, bool to_guest)
 {
-    if ((uint64_t)a + len > 0x100000000ull) {
+    if (!len || (uint64_t)a + len > 0x100000000ull) {
         return false;
     }
     while (len) {
         uint32_t n = MIN(len, 0x1000 - (a & 0xFFF));
         hwaddr phys;
-        if (r300_in_fb(s, a, 1) ||
-            !(r300_in_agp(s, a) ? ppc_mac_gpu_agp_translate(s, a, &phys) :
-              r300_in_aic(s, a) ? ppc_mac_gpu_gart_translate(s, a, &phys) : false)) {
-            return false;
-        }
-        if (address_space_rw(&address_space_memory, phys, MEMTXATTRS_UNSPECIFIED,
+        if (!r300_sys_chunk(s, a, n, &phys) ||
+            address_space_rw(&address_space_memory, phys, MEMTXATTRS_UNSPECIFIED,
                              buf, n, to_guest) != MEMTX_OK) {
             return false;
         }
@@ -2903,12 +2961,18 @@ static void r300_zmask_clear(PPCMacGPUState *s)
         rows = s->r3_zb_height;
     }
     rows *= r300_zb_samples(s, off);
-    if (off < fb_base || !bpr || !rows) {
+    uint64_t fb_lo, fb_last;
+    if (!bpr || !rows || !r300_in_fb(s, off, 1) ||
+        !r300_fb_range(s, &fb_lo, &fb_last)) {
         return;
     }
     off -= fb_base;
-    if (off + bpr * rows > s->vram_size) {
-        rows = (s->vram_size - off) / bpr;
+    /* Only the VRAM MC_FB_LOCATION reports (off is inside it). */
+    if (bpr * rows > fb_last - fb_lo + 1 - off) {
+        rows = (fb_last - fb_lo + 1 - off) / bpr;
+    }
+    if (!rows) {
+        return;
     }
     r200_vram_access(s, off, off + bpr * rows, true, 7);
     r200_pattern_fill(vram + off, bpr * rows, v, bpp);
@@ -2955,13 +3019,19 @@ static void r300_cmask_clear(PPCMacGPUState *s)
     }
     bpr = (uint64_t)(pitch & 0x3FFE) * bpp;
     rows = rows > 1440 ? rows - 1440 + 1 : 0;
-    if (off < fb_base || !bpr || !rows) {
+    uint64_t fb_lo, fb_last;
+    if (!bpr || !rows || !r300_in_fb(s, off, 1) ||
+        !r300_fb_range(s, &fb_lo, &fb_last)) {
         return;
     }
     off -= fb_base;
     rows *= r300_cb_samples(s, off);     /* every sample's rows */
-    if (off + bpr * rows > s->vram_size) {
-        rows = (s->vram_size - off) / bpr;
+    /* Only the VRAM MC_FB_LOCATION reports (off is inside it). */
+    if (bpr * rows > fb_last - fb_lo + 1 - off) {
+        rows = (fb_last - fb_lo + 1 - off) / bpr;
+    }
+    if (!rows) {
+        return;
     }
     r200_vram_access(s, off, off + bpr * rows, true, 8);
     if (bpp == 4) {
