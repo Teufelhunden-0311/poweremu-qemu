@@ -2704,6 +2704,8 @@ static void r300_surfwatch_update(PPCMacGPUState *s);
 static void r300_surface_changed(PPCMacGPUState *s);
 static void r300_zconv(PPCMacGPUState *s, bool to_card);
 
+static bool r300_in_fb(PPCMacGPUState *s, uint32_t a, uint64_t len);
+
 /* Raw guest GPU memory (VRAM or AGP), bytes as they lie. */
 static bool r300_read_raw(void *opaque, uint32_t gpu_addr, void *dst,
                           uint32_t len)
@@ -2712,7 +2714,7 @@ static bool r300_read_raw(void *opaque, uint32_t gpu_addr, void *dst,
     uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
     uint8_t *out = dst;
 
-    if (gpu_addr >= fb_base && (uint64_t)gpu_addr - fb_base + len <= s->vram_size) {
+    if (r300_in_fb(s, gpu_addr, len)) {
         memcpy(dst, (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
                     (gpu_addr - fb_base), len);
         return true;
@@ -2736,15 +2738,71 @@ static bool ppc_mac_gpu_gart_translate(PPCMacGPUState *s, uint32_t gpu_addr,
 static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s, uint32_t gpu_addr,
                                       hwaddr *phys_addr);
 
+/*
+ * Where an R300 address goes, as the card's memory controller decides it:
+ * the VRAM MC_FB_LOCATION reports, else the AGP aperture (MC_AGP_LOCATION),
+ * else the PCI GART (AIC_LO_ADDR..AIC_HI_ADDR, when AIC_CNTL enables it).
+ * The device has 4 MB more VRAM than it reports, and Apple's R300 driver
+ * starts the PCI GART right there, so an address can be below vram_size
+ * and still be system memory.
+ */
+static bool r300_in_fb(PPCMacGPUState *s, uint32_t a, uint64_t len)
+{
+    uint32_t fb = s->regs.mc_fb_location;
+    uint64_t lo = (fb & 0xFFFF) << 16, end = ((uint64_t)(fb >> 16) + 1) << 16;
+
+    return a >= lo && a + len <= end && a - lo + len <= s->vram_size;
+}
+
+static bool r300_in_agp(PPCMacGPUState *s, uint32_t a)
+{
+    uint32_t agp = s->regs.mc_agp_location;
+
+    return agp && a >= (agp & 0xFFFF) << 16 && a <= ((agp >> 16) << 16 | 0xFFFF);
+}
+
+static bool r300_in_aic(PPCMacGPUState *s, uint32_t a)
+{
+    return (s->regs.aic_ctrl & 1) && a >= s->regs.aic_lo_addr &&
+           a <= s->regs.aic_hi_addr;
+}
+
+/* Copy len bytes between host memory and system memory at GPU address a,
+ * page by page; every page must translate, in the aperture its address is
+ * in. */
+static bool r300_sysmem_rw(PPCMacGPUState *s, uint32_t a, uint8_t *buf,
+                           uint64_t len, bool to_guest)
+{
+    if ((uint64_t)a + len > 0x100000000ull) {
+        return false;
+    }
+    while (len) {
+        uint32_t n = MIN(len, 0x1000 - (a & 0xFFF));
+        hwaddr phys;
+        if (r300_in_fb(s, a, 1) ||
+            !(r300_in_agp(s, a) ? ppc_mac_gpu_agp_translate(s, a, &phys) :
+              r300_in_aic(s, a) ? ppc_mac_gpu_gart_translate(s, a, &phys) : false)) {
+            return false;
+        }
+        if (address_space_rw(&address_space_memory, phys, MEMTXATTRS_UNSPECIFIED,
+                             buf, n, to_guest) != MEMTX_OK) {
+            return false;
+        }
+        a += n;
+        buf += n;
+        len -= n;
+    }
+    return true;
+}
+
 /* A dword the card writes back to guest GPU memory (VRAM or AGP/GART),
  * bytes as given (lowest address first). */
 static bool r300_write_raw(PPCMacGPUState *s, uint32_t gpu_addr,
                            const uint8_t bytes[4])
 {
     uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
-    hwaddr phys;
 
-    if (gpu_addr >= fb_base && (uint64_t)gpu_addr - fb_base + 4 <= s->vram_size) {
+    if (r300_in_fb(s, gpu_addr, 4)) {
         uint64_t off = gpu_addr - fb_base;
         /* Only batched work that touches these four bytes has to finish
          * first; a write-back next to rendering keeps the GPU running. */
@@ -2753,12 +2811,7 @@ static bool r300_write_raw(PPCMacGPUState *s, uint32_t gpu_addr,
         vram_mark(s, off, 4);
         return true;
     }
-    if (ppc_mac_gpu_agp_translate(s, gpu_addr, &phys) ||
-        ppc_mac_gpu_gart_translate(s, gpu_addr, &phys)) {
-        cpu_physical_memory_write(phys, bytes, 4);
-        return true;
-    }
-    return false;
+    return r300_sysmem_rw(s, gpu_addr, (uint8_t *)bytes, 4, true);
 }
 
 /* The card's endian swap modes (VC_SWAP, DEPTHENDIAN, ...). */
@@ -2920,11 +2973,13 @@ static void r300_cmask_clear(PPCMacGPUState *s)
     }
 }
 
+/* An address and length inside the VRAM MC_FB_LOCATION reports, as an
+ * offset into VRAM (r300_in_fb). */
 static bool r300_to_vram(PPCMacGPUState *s, uint32_t *addr, uint64_t len)
 {
     uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
 
-    if (*addr < fb_base || (uint64_t)*addr - fb_base + len > s->vram_size) {
+    if (!r300_in_fb(s, *addr, len)) {
         return false;
     }
     *addr -= fb_base;
