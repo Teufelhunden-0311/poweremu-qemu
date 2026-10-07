@@ -2767,6 +2767,11 @@ static bool r300_in_aic(PPCMacGPUState *s, uint32_t a)
            a <= s->regs.aic_hi_addr;
 }
 
+static bool r300_in_sysmem(PPCMacGPUState *s, uint32_t a)
+{
+    return !r300_in_fb(s, a, 1) && (r300_in_agp(s, a) || r300_in_aic(s, a));
+}
+
 /* Copy len bytes between host memory and system memory at GPU address a,
  * page by page; every page must translate, in the aperture its address is
  * in. */
@@ -3430,8 +3435,43 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     if (pkt.warn & R300_WARN_FLOW)     r300_warn_once("vertex program flow control ran away", NULL);
 
     uint32_t ns = pkt.aa_samples;
-    if (!r300_to_vram(s, &pkt.rt_gpu_addr,
-                      (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height * ns)) {
+    /*
+     * A colour buffer in system memory.  Apple's GL driver reads pixels back
+     * (glReadPixels) by drawing the buffer as a texture into a colour buffer
+     * in PCI GART pages, which it then copies from.  The renderers draw only
+     * into VRAM, so the draw goes to the VRAM above what MC_FB_LOCATION
+     * reports -- which no R300 address reaches (r300_in_fb) -- and is copied
+     * in from the pages before it and out to them after it (below, around
+     * draw_r300).  Multiple render targets, and a buffer larger than that
+     * VRAM (4 MB: pitch x height x bytes x samples), are not handled: such a
+     * draw is dropped, as all of them were before.
+     */
+    uint32_t sys_rt = 0;
+    uint64_t sys_off = 0, sys_len = 0;
+    if (r300_in_sysmem(s, pkt.rt_gpu_addr)) {
+        uint32_t fb = s->regs.mc_fb_location;
+        uint64_t lo = (fb & 0xFFFF) << 16, end = ((uint64_t)(fb >> 16) + 1) << 16;
+        sys_len = (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height * ns;
+        if (pkt.num_cb > 1 || end < lo || end - lo + sys_len > s->vram_size ||
+            !sys_len) {
+            r300_warn_once("colour buffer in system memory: several targets, or "
+                           "too large for the VRAM above the reported size", NULL);
+            r300_draw_free(&pkt);
+            return;
+        }
+        static bool said;
+        if (!said) {
+            said = true;
+            qemu_log("ppc-mac-gpu r300: colour buffer in system memory at %08x "
+                     "(%ux%u), drawn in VRAM at %llx and copied out\n",
+                     pkt.rt_gpu_addr, pkt.rt_width, pkt.rt_height,
+                     (unsigned long long)(end - lo));
+        }
+        sys_rt = pkt.rt_gpu_addr;
+        sys_off = end - lo;
+        pkt.rt_gpu_addr = sys_off;      /* a VRAM offset, as r300_to_vram leaves it */
+    } else if (!r300_to_vram(s, &pkt.rt_gpu_addr,
+                             (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height * ns)) {
         r300_warn_once("colour buffer outside VRAM", NULL);
         r300_draw_free(&pkt);
         return;
@@ -3610,7 +3650,33 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                                      (uint64_t)td->gpu_addr + td->size_bytes,
                                      &td->vram_gen);
         }
-        int rr = s->renderer->draw_r300(s->renderer_opaque, vram, s->vram_size, &pkt);
+        /*
+         * A colour buffer in system memory (above): wait for earlier work on
+         * the staging VRAM, load it with the pages (what the draw leaves
+         * untouched -- masks, blending, uncovered pixels -- must come back
+         * unchanged), draw, wait for the draw to reach VRAM, copy it out.
+         * The copy-out is part of processing this packet, so it lands
+         * before any later fence the guest waits on.
+         */
+        bool sys_ok = true;
+        if (sys_rt) {
+            r200_vram_access(s, sys_off, sys_off + sys_len, true, 9);
+            sys_ok = r300_sysmem_rw(s, sys_rt, vram + sys_off, sys_len, false);
+            if (sys_ok) {
+                vram_mark(s, sys_off, sys_len);
+            } else {
+                r300_warn_once("colour buffer in system memory not mapped", NULL);
+            }
+        }
+        int rr = sys_ok ? s->renderer->draw_r300(s->renderer_opaque, vram,
+                                                 s->vram_size, &pkt) : 0;
+        if (sys_rt && sys_ok && rr >= 0) {
+            r200_vram_access(s, sys_off, sys_off + sys_len, false, 9);
+            if (!r300_sysmem_rw(s, sys_rt, vram + sys_off, sys_len, true)) {
+                r300_warn_once("colour buffer in system memory unmapped after the draw",
+                               NULL);
+            }
+        }
         if (s->r3_dump && g_r300_arm_rt && pkt.rt_gpu_addr == g_r300_arm_rt) {
             fprintf(s->r3_dump, "   renderer -> %d\n", rr);
         }
