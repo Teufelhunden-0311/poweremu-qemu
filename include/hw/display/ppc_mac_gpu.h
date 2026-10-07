@@ -859,6 +859,19 @@ struct PPCMacGPUState {
     void *metal_vram_ptr;
     void *metal_vram_opaque;
 
+    /*
+     * Private staging for R300 colour buffers in system memory: stage_size
+     * bytes the renderer allocates past vram_size, which the guest cannot
+     * reach (the VRAM memory region and every device path stop at
+     * vram_size).  0 when there is no renderer-owned VRAM.  Property
+     * "sysmem-staging-kb".  stage_dirty_lo/hi: staging bytes written from
+     * the CPU side since the renderer last asked (ppc_mac_gpu_vram_dirty).
+     */
+    uint32_t sysmem_stage_kb;
+    uint64_t stage_size;
+    uint64_t stage_dirty_lo, stage_dirty_hi;
+    uint32_t reset_count;           /* device resets, for transfers that wait */
+
     /* Renderer backend */
     PPCMacGPURenderer *renderer;
     void *renderer_opaque;          /* backend-specific state from init() */

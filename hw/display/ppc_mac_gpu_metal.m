@@ -6839,6 +6839,7 @@ typedef struct RQJob {
     int kind;
     R200DrawPacket r200;    /* copies of verts/indices; host_data taken over */
     R300DrawPacket r300;    /* the packet's owned buffers, taken over */
+    uint64_t vram_size;     /* R300: the VRAM it may use (draw_r300's) */
     RQRanges ranges;
     struct {                /* RQ_SUBMIT: commit, then done(arg, seq) */
         void (*done)(void *, uint32_t);
@@ -7031,12 +7032,13 @@ static void r200_job_free(RQJob *job)
 
 /* The R300 packet's owned fields (r300_draw_free's list) are taken over;
  * the device's r300_draw_free then frees only what was not queued. */
-static RQJob *r300_job_new(R300DrawPacket *pkt)
+static RQJob *r300_job_new(R300DrawPacket *pkt, uint64_t vram_size)
 {
     RQJob *job = rq_job_alloc();
     R300DrawPacket *p = &job->r300;
 
     job->kind = RQ_R300;
+    job->vram_size = vram_size;
     *p = *pkt;
     pkt->glsl = NULL;
     pkt->vs_glsl = NULL;
@@ -7195,7 +7197,7 @@ static void *rqueue_thread(void *unused)
         if (job->kind == RQ_R200) {
             r200_draw_encode(st, st->vram_ptr, st->vram_size, &job->r200);
         } else if (job->kind == RQ_R300) {
-            r300_draw_encode(st, st->vram_ptr, st->vram_size, &job->r300);
+            r300_draw_encode(st, st->vram_ptr, job->vram_size, &job->r300);
         } else {
             r200_commit_fence(st, job->sub.done, job->sub.arg, job->sub.seq);
         }
@@ -7681,6 +7683,7 @@ static id<MTLTexture> r200_view(PPCMacGPUMetalState *st, R200TexKey k,
 }
 
 static uint32_t g_r200_seq;
+static uint64_t g_metal_gpu_failures;   /* command buffers ended in error */
 
 /* r200_decode_tex_unit()'s AGP copy is pitch*height (DXT: block rows). */
 static uint64_t r200_tex_host_bytes(const R200TexUnit *t)
@@ -7776,6 +7779,11 @@ static uint32_t r200_commit_as(void (*done)(void *, uint32_t), void *arg,
     if (seq == 0) {
         seq = ++g_r200_seq;
     }
+    [g_r200_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        if (cb.status == MTLCommandBufferStatusError) {
+            qatomic_inc(&g_metal_gpu_failures);
+        }
+    }];
     if (done) {
         uint32_t report = fseq ? fseq : seq;
         [g_r200_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
@@ -7867,6 +7875,8 @@ static bool r200_flush_locked(PPCMacGPUMetalState *st)
     r200_commit(NULL, NULL);
     [g_r200_inflight waitUntilCompleted];
     if (g_r200_inflight.status == MTLCommandBufferStatusError) {
+        /* counted here too: completion handlers may not have run yet */
+        qatomic_inc(&g_metal_gpu_failures);
         r200_metal_warn(32, "command buffer failed", 0, 0);
     }
     [g_r200_inflight release];
@@ -9880,8 +9890,13 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     }
     /* The job takes the packet's heap buffers over (see r300_job_new);
      * the device's r300_draw_free frees what is left. */
-    rq_push(r300_job_new((R300DrawPacket *)(uintptr_t)pkt));
+    rq_push(r300_job_new((R300DrawPacket *)(uintptr_t)pkt, vram_size));
     return 0;
+}
+
+static uint64_t metal_gpu_failures(void *opaque)
+{
+    return qatomic_read(&g_metal_gpu_failures);
 }
 
 static PPCMacGPURenderer metal_renderer = {
@@ -9902,6 +9917,7 @@ static PPCMacGPURenderer metal_renderer = {
     .submit_r200       = metal_submit_r200,
     .fill_notify_r200  = metal_fill_notify_r200,
     .range_busy_r200   = metal_range_busy_r200,
+    .gpu_failures      = metal_gpu_failures,
     .get_caps          = metal_get_caps,
     .get_drag_state    = metal_get_drag_state,
     .get_drag_snap     = NULL,
