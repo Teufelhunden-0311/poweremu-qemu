@@ -266,6 +266,7 @@ static struct {
     bool thread_started;
 
     bool lost;                  /* a fence wait failed: the device is gone */
+    uint64_t failures;          /* failed submissions and fence waits (gpu_failures) */
     uint64_t stat_draws, stat_passes, stat_uploads, stat_writebacks, stat_flushes;
 } V;
 
@@ -818,6 +819,9 @@ static void vk_set_done(uint32_t seq)
 static void vk_wait_fence(VkFence fence, const char *who)
 {
     VkResult r = vkWaitForFences(V.dev, 1, &fence, VK_TRUE, UINT64_MAX);
+    if (r != VK_SUCCESS) {
+        qatomic_inc(&V.failures);
+    }
     if (r != VK_SUCCESS && !qatomic_xchg(&V.lost, true)) {
         error_report("ppc-mac-gpu vulkan: %s: waiting for the GPU failed "
                      "(VkResult %d%s); 3D rendering has stopped", who, (int)r,
@@ -1443,6 +1447,7 @@ static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
     };
     VkResult r = vkQueueSubmit(V.queue, 1, &si, b->fence);
     if (r != VK_SUCCESS) {
+        qatomic_inc(&V.failures);
         vk_fail("vkQueueSubmit failed (VkResult %d)", (int)r);
     }
     b->state = 2;
@@ -2497,6 +2502,11 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
 
 /* ---- the renderer ----------------------------------------------------- */
 
+static uint64_t vk_gpu_failures(void *opaque)
+{
+    return qatomic_read(&V.failures) + (qatomic_read(&V.lost) ? 1 : 0);
+}
+
 static void *vk_init(uint8_t *vram_ptr, uint64_t vram_size)
 {
     void *map;
@@ -2538,6 +2548,7 @@ static PPCMacGPURenderer vulkan_renderer = {
     .flush_r200       = vk_flush_r200,
     .submit_r200      = vk_submit_r200,
     .range_busy_r200  = vk_range_busy_r200,
+    .gpu_failures     = vk_gpu_failures,
     .set_dirty_source = vk_set_dirty_source,
     .get_caps         = vk_get_caps,
 };

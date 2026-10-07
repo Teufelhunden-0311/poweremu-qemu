@@ -3358,6 +3358,115 @@ static void r300_aa_resolve(PPCMacGPUState *s, const R300DrawPacket *pkt)
     }
 }
 
+/*
+ * A colour buffer in system memory, drawn in the private staging
+ * (stage_size bytes after vram_size, which only the renderer reaches) and
+ * copied between there and the guest's pages.  The pages are translated
+ * when the transfer starts.  The result is copied back only if, once the
+ * draw has been waited for, the device was not reset, no GPU work failed
+ * and every page still translates to the same place: a cancelled
+ * transfer leaves the pages as they were, which the guest sees as a
+ * readback that did not happen, never as a successful one.
+ */
+typedef struct R300SysXfer {
+    uint32_t gpu;               /* the colour buffer's GPU address */
+    uint64_t off, len;          /* where in the staging, and how much */
+    uint32_t resets;            /* reset_count when it started */
+    uint64_t failures;          /* gpu_failures when it started */
+    uint32_t n;                 /* entries in phys */
+    hwaddr *phys;               /* each page-bounded chunk's guest address */
+} R300SysXfer;
+
+static uint64_t r300_gpu_failures(PPCMacGPUState *s)
+{
+    return s->renderer && s->renderer->gpu_failures ?
+           s->renderer->gpu_failures(s->renderer_opaque) : 0;
+}
+
+/* Translate every chunk, or with check, translate again and compare. */
+static bool r300_xfer_map(PPCMacGPUState *s, R300SysXfer *x, bool check)
+{
+    uint32_t a = x->gpu;
+    uint64_t left = x->len;
+
+    for (uint32_t i = 0; left; i++) {
+        uint32_t n = MIN(left, 0x1000 - (a & 0xFFF));
+        hwaddr phys;
+        if (i >= x->n || !r300_sys_chunk(s, a, n, &phys) ||
+            (check && phys != x->phys[i])) {
+            return false;
+        }
+        x->phys[i] = phys;
+        a += n;
+        left -= n;
+    }
+    return true;
+}
+
+static bool r300_xfer_copy(R300SysXfer *x, uint8_t *stage, bool to_guest)
+{
+    uint32_t a = x->gpu;
+    uint64_t left = x->len, pos = 0;
+
+    for (uint32_t i = 0; left; i++) {
+        uint32_t n = MIN(left, 0x1000 - (a & 0xFFF));
+        if (address_space_rw(&address_space_memory, x->phys[i],
+                             MEMTXATTRS_UNSPECIFIED, stage + pos, n,
+                             to_guest) != MEMTX_OK) {
+            return false;
+        }
+        a += n;
+        pos += n;
+        left -= n;
+    }
+    return true;
+}
+
+/*
+ * Before the draw: wait for earlier work on the staging, then load it
+ * from the pages, so what the draw does not touch (masks, blending,
+ * uncovered pixels) comes back unchanged.
+ */
+static bool r300_xfer_begin(PPCMacGPUState *s, R300SysXfer *x, uint8_t *vram)
+{
+    if (!x->len || (uint64_t)x->gpu + x->len > 0x100000000ull) {
+        return false;
+    }
+    x->n = x->len / 0x1000 + 2;
+    x->phys = g_new(hwaddr, x->n);
+    r200_vram_access(s, x->off, x->off + x->len, true, 9);  /* may let go of the BQL */
+    x->resets = s->reset_count;
+    x->failures = r300_gpu_failures(s);
+    if (!r300_xfer_map(s, x, false) || !r300_xfer_copy(x, vram + x->off, false)) {
+        return false;
+    }
+    /* Tell a renderer that keeps copies (Vulkan) that the CPU wrote it. */
+    if (s->stage_dirty_hi > s->stage_dirty_lo) {
+        s->stage_dirty_lo = MIN(s->stage_dirty_lo, x->off);
+        s->stage_dirty_hi = MAX(s->stage_dirty_hi, x->off + x->len);
+    } else {
+        s->stage_dirty_lo = x->off;
+        s->stage_dirty_hi = x->off + x->len;
+    }
+    r300_rt_forget(x->off, x->off + x->len);
+    return true;
+}
+
+/* After the draw: wait for it to reach the staging, then copy it out. */
+static void r300_xfer_end(PPCMacGPUState *s, R300SysXfer *x, uint8_t *vram)
+{
+    r200_vram_access(s, x->off, x->off + x->len, false, 9); /* may let go of the BQL */
+    if (s->reset_count != x->resets) {
+        r300_warn_once("system-memory colour buffer not copied back: device reset", NULL);
+    } else if (r300_gpu_failures(s) != x->failures) {
+        r300_warn_once("system-memory colour buffer not copied back: GPU work failed", NULL);
+    } else if (!r300_xfer_map(s, x, true)) {
+        r300_warn_once("system-memory colour buffer not copied back: pages remapped", NULL);
+    } else if (!r300_xfer_copy(x, vram + x->off, true)) {
+        r300_warn_once("system-memory colour buffer not copied back: copy failed", NULL);
+    }
+}
+
 static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                         uint32_t body_dw, const R300Indices *idx)
 {
@@ -3507,25 +3616,30 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     uint32_t ns = pkt.aa_samples;
     /*
      * A colour buffer in system memory.  Apple's GL driver reads pixels back
-     * (glReadPixels) by drawing the buffer as a texture into a colour buffer
-     * in PCI GART pages, which it then copies from.  The renderers draw only
-     * into VRAM, so the draw goes to the VRAM above what MC_FB_LOCATION
-     * reports -- which no R300 address reaches (r300_in_fb) -- and is copied
-     * in from the pages before it and out to them after it (below, around
-     * draw_r300).  Multiple render targets, and a buffer larger than that
-     * VRAM (4 MB: pitch x height x bytes x samples), are not handled: such a
-     * draw is dropped, as all of them were before.
+     * (glReadPixels, colour or depth) by drawing the buffer as a texture into
+     * a colour buffer in PCI GART pages, which it then copies from.  The
+     * renderers draw only into memory they own, so such a draw goes to the
+     * private staging and is copied around draw_r300 below (R300SysXfer).
+     * Only what that path does is taken -- one linear, single-sample target,
+     * no AA resolve, that fits the staging; anything else is dropped, as all
+     * of them were before.
      */
-    uint32_t sys_rt = 0;
-    uint64_t sys_off = 0, sys_len = 0;
+    R300SysXfer sys = { 0 };
     if (r300_in_sysmem(s, pkt.rt_gpu_addr)) {
-        uint32_t fb = s->regs.mc_fb_location;
-        uint64_t lo = (fb & 0xFFFF) << 16, end = ((uint64_t)(fb >> 16) + 1) << 16;
-        sys_len = (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height * ns;
-        if (pkt.num_cb > 1 || end < lo || end - lo + sys_len > s->vram_size ||
-            !sys_len) {
-            r300_warn_once("colour buffer in system memory: several targets, or "
-                           "too large for the VRAM above the reported size", NULL);
+        uint64_t len = (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height;
+        const char *why =
+            !s->stage_size || !s->renderer || !s->renderer->draw_r300 ?
+                "system-memory colour buffer not drawn: no private staging" :
+            pkt.num_cb > 1 ? "system-memory colour buffer not drawn: several targets" :
+            ns > 1 ? "system-memory colour buffer not drawn: multisampled" :
+            (r300_reg(s->r3, 0x4E88) & 1) ?             /* RB3D_AARESOLVE_CTL */
+                "system-memory colour buffer not drawn: AA resolve" :
+            (r300_reg(s->r3, 0x4E38) >> 16) & 7 ?       /* COLORPITCH tiling */
+                "system-memory colour buffer not drawn: tiled" :
+            !len || len > s->stage_size ?
+                "system-memory colour buffer not drawn: larger than the staging" : NULL;
+        if (why) {
+            r300_warn_once(why, NULL);
             r300_draw_free(&pkt);
             return;
         }
@@ -3533,13 +3647,13 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         if (!said) {
             said = true;
             qemu_log("ppc-mac-gpu r300: colour buffer in system memory at %08x "
-                     "(%ux%u), drawn in VRAM at %llx and copied out\n",
-                     pkt.rt_gpu_addr, pkt.rt_width, pkt.rt_height,
-                     (unsigned long long)(end - lo));
+                     "(%ux%u), drawn in private staging and copied out\n",
+                     pkt.rt_gpu_addr, pkt.rt_width, pkt.rt_height);
         }
-        sys_rt = pkt.rt_gpu_addr;
-        sys_off = end - lo;
-        pkt.rt_gpu_addr = sys_off;      /* a VRAM offset, as r300_to_vram leaves it */
+        sys.gpu = pkt.rt_gpu_addr;
+        sys.off = s->vram_size;
+        sys.len = len;
+        pkt.rt_gpu_addr = sys.off;      /* a renderer VRAM offset, past the guest's */
     } else if (!r300_to_vram(s, &pkt.rt_gpu_addr,
                              (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height * ns)) {
         r300_warn_once("colour buffer outside VRAM", NULL);
@@ -3720,33 +3834,20 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                                      (uint64_t)td->gpu_addr + td->size_bytes,
                                      &td->vram_gen);
         }
-        /*
-         * A colour buffer in system memory (above): wait for earlier work on
-         * the staging VRAM, load it with the pages (what the draw leaves
-         * untouched -- masks, blending, uncovered pixels -- must come back
-         * unchanged), draw, wait for the draw to reach VRAM, copy it out.
-         * The copy-out is part of processing this packet, so it lands
-         * before any later fence the guest waits on.
-         */
-        bool sys_ok = true;
-        if (sys_rt) {
-            r200_vram_access(s, sys_off, sys_off + sys_len, true, 9);
-            sys_ok = r300_sysmem_rw(s, sys_rt, vram + sys_off, sys_len, false);
-            if (sys_ok) {
-                vram_mark(s, sys_off, sys_len);
-            } else {
-                r300_warn_once("colour buffer in system memory not mapped", NULL);
-            }
+        /* A colour buffer in system memory (above): load the staging, draw
+         * into it, copy it out -- all while this packet is processed, so
+         * before any later fence the guest waits on. */
+        bool sys_ok = !sys.len || r300_xfer_begin(s, &sys, vram);
+        if (!sys_ok) {
+            r300_warn_once("system-memory colour buffer not mapped", NULL);
         }
         int rr = sys_ok ? s->renderer->draw_r300(s->renderer_opaque, vram,
-                                                 s->vram_size, &pkt) : 0;
-        if (sys_rt && sys_ok && rr >= 0) {
-            r200_vram_access(s, sys_off, sys_off + sys_len, false, 9);
-            if (!r300_sysmem_rw(s, sys_rt, vram + sys_off, sys_len, true)) {
-                r300_warn_once("colour buffer in system memory unmapped after the draw",
-                               NULL);
-            }
+                                                 s->vram_size + (sys.len ? s->stage_size : 0),
+                                                 &pkt) : 0;
+        if (sys.len && sys_ok && rr >= 0) {
+            r300_xfer_end(s, &sys, vram);
         }
+        g_free(sys.phys);
         if (s->r3_dump && g_r300_arm_rt && pkt.rt_gpu_addr == g_r300_arm_rt) {
             fprintf(s->r3_dump, "   renderer -> %d\n", rr);
         }
@@ -3846,7 +3947,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
              * renderers that read the dirty log as CPU writes (Vulkan):
              * to them this would say the CPU overwrote what they drew. */
             uint64_t len = (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height;
-            if (!s->renderer->set_dirty_source) {
+            if (!s->renderer->set_dirty_source && !sys.len) {  /* staging is no VRAM page */
                 memory_region_set_dirty(&s->vram, pkt.rt_gpu_addr, len);
                 for (uint32_t k = 1; k < pkt.num_cb; k++) {
                     memory_region_set_dirty(&s->vram, pkt.cb[k].gpu_addr,
@@ -12740,6 +12841,7 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
     PPCMacGPUState *s = PPC_MAC_GPU(dev);
 
     cp.epoch++;                 /* a CP thread mid-ring drops what it has */
+    s->reset_count++;
     memset(&s->regs, 0, sizeof(s->regs));
     s->hwc_w = s->hwc_h = s->hwc_idx = 0;
     s->regs.regs_3d[R200_3D_IDX(0x3230)] = 0xFFFFFFFFu;  /* DEPTHCLEARVALUE */
@@ -12930,6 +13032,13 @@ static void ppc_mac_gpu_vram_dirty(void *arg, unsigned long *bitmap,
      * the time in Quake III on x86 at thousands of draws a second.  A
      * read-only look at the bitmap first is a scan of a few hundred words.
      */
+    if (s->stage_dirty_hi > s->stage_dirty_lo) {      /* private staging */
+        for (uint64_t p = s->stage_dirty_lo / pg;
+             p <= (s->stage_dirty_hi - 1) / pg && p < npages; p++) {
+            set_bit(p, bitmap);
+        }
+        s->stage_dirty_lo = s->stage_dirty_hi = 0;
+    }
     if (!memory_region_any_dirty(&s->vram, 0, s->vram_size, DIRTY_MEMORY_VGA)) {
         return;
     }
@@ -13029,10 +13138,16 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
      * memory the GPU copies to and from.  Falls back to normal QEMU RAM
      * on other hosts.
      */
+    /*
+     * The renderer's VRAM allocation also holds the R300's private staging
+     * (stage_size, after vram_size): the guest's VRAM region below stops
+     * at vram_size, so nothing but the renderer reaches it.
+     */
+    uint64_t stage = s->r300 ? (uint64_t)s->sysmem_stage_kb * KiB : 0;
 #ifdef CONFIG_PPC_MAC_GPU_VULKAN
     if (want_vulkan) {
         s->metal_vram_ptr = ppc_mac_gpu_vulkan_alloc_vram(
-            s->vram_size, &s->metal_vram_opaque);
+            s->vram_size + stage, &s->metal_vram_opaque);
         if (!s->metal_vram_ptr) {
             error_setg(errp, "%s: renderer=vulkan unavailable: %s",
                        object_get_typename(obj), ppc_mac_gpu_vulkan_error());
@@ -13043,7 +13158,7 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
 #ifdef CONFIG_DARWIN
     if (!want_vulkan) {
         s->metal_vram_ptr = ppc_mac_gpu_metal_alloc_vram(
-            s->vram_size, &s->metal_vram_opaque);
+            s->vram_size + stage, &s->metal_vram_opaque);
         if (!s->metal_vram_ptr && rname) {
             error_setg(errp, "%s: renderer=metal unavailable: it needs an "
                        "Apple GPU (on an Intel Mac, use renderer=vulkan)",
@@ -13052,6 +13167,7 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         }
     }
 #endif
+    s->stage_size = s->metal_vram_ptr ? stage : 0;
     if (s->metal_vram_ptr) {
         /* Zero-copy path: QEMU uses the MTLBuffer's memory directly */
         memory_region_init_ram_ptr(&s->vram, obj, "ppc-mac-gpu-vram",
@@ -13481,6 +13597,7 @@ static void ppc_mac_gpu_exit(PCIDevice *dev)
 
 static const Property ppc_mac_gpu_properties[] = {
     DEFINE_PROP_UINT32("vgamem_mb", PPCMacGPUState, vram_size_mb, 128),
+    DEFINE_PROP_UINT32("sysmem-staging-kb", PPCMacGPUState, sysmem_stage_kb, 8192),
     DEFINE_PROP_BOOL("host-aspect-modes", PPCMacGPUState, host_aspect_modes, false),
     DEFINE_PROP_STRING("biosrom", PPCMacGPUState, biosrom),
     DEFINE_PROP_STRING("renderer", PPCMacGPUState, renderer_name),

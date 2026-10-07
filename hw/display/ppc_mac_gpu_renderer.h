@@ -391,6 +391,14 @@ typedef struct PPCMacGPURenderer {
     bool (*range_busy_r200)(void *opaque, uint64_t lo, uint64_t hi,
                             bool write_access);
 
+    /*
+     * How many times GPU work has failed so far (a command buffer that
+     * ended in error, a failed submission, a lost device).  A transfer
+     * that must not report failed work as done compares it before and
+     * after.  Optional.
+     */
+    uint64_t (*gpu_failures)(void *opaque);
+
     void (*fill_notify_r200)(void *opaque, uint32_t offset, uint32_t pitch,
                              uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                              uint32_t bpp, uint32_t value);
