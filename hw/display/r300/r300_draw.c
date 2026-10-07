@@ -780,6 +780,7 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         }
         t->bound = true;
         t->gpu_addr = off & ~0x1Fu;
+        t->endian = off & 3;
         t->width = (f0 & 0x7FF) + 1;
         t->height = ((f0 >> 11) & 0x7FF) + 1;
         t->dim = (f1 >> 25) & 3;
@@ -2178,6 +2179,36 @@ uint64_t r300_hash_bytes(const uint8_t *p, size_t n)
     return h ^ (h >> 32);
 }
 
+/*
+ * Identity of a texture's texels for the renderers' caches.  Hashing every
+ * byte of a mip chain on every draw cost a third of the render thread in
+ * Doom 3 (megabytes of DXT per draw), so large chains are sampled: both
+ * ends plus a spread of words across the rest.  The driver uploads whole
+ * textures, which changes every sampled stretch; $R300_TEX_FULLHASH=1
+ * hashes everything.
+ */
+uint64_t r300_hash_tex(const uint8_t *p, size_t n)
+{
+    static int full = -1;
+    uint64_t h;
+
+    if (full < 0) {
+        full = getenv("R300_TEX_FULLHASH") != NULL;
+    }
+    if (full || n <= 32768) {
+        return r300_hash_bytes(p, n);
+    }
+    h = r300_hash_bytes(p, 8192) ^ (r300_hash_bytes(p + n - 8192, 8192) * 3);
+    size_t step = (n / 2048) & ~(size_t)7;      /* 2048 spots, 8-byte aligned */
+    for (size_t i = 8192; i + 8 <= n - 8192; i += step) {
+        uint64_t v;
+        memcpy(&v, p + i, 8);
+        h = (h ^ v) * 0x9E3779B97F4A7C15ull;
+        h ^= h >> 29;
+    }
+    return h ^ n;
+}
+
 uint8_t *r300_tex_level_bytes(const R300TexDesc *td, const uint8_t *src,
                                  uint32_t l, uint32_t w, uint32_t h,
                                  uint32_t *bpr)
@@ -2200,35 +2231,35 @@ uint8_t *r300_tex_level_bytes(const R300TexDesc *td, const uint8_t *src,
     case R300_TEXK_DXT1:
     case R300_TEXK_DXT3:
     case R300_TEXK_DXT5: {
-        /*
-         * VRAM holds the guest CPU's big-endian words, as for RGBA8 above:
-         * each 32-bit word of a block is byte-reversed.  A Doom 3 texture
-         * dumped from VRAM settles it: as they lie the blocks are noise,
-         * word-reversed they are the Mars map (DXT1) and its normal map
-         * (DXT5).  The r200 path's Halo textures come the other way; that
-         * is a different driver.  GART texels are left alone.
-         * R300_DXT_SWAP=0 copies VRAM blocks as they lie.
-         */
-        static int swap = -1;
-        if (swap < 0) {
-            const char *e = getenv("R300_DXT_SWAP");
-            swap = !(e && e[0] == '0');
-        }
         uint32_t bs = td->kind == R300_TEXK_DXT1 ? 8 : 16;
         uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4;
-        size_t row = (size_t)bw * bs;
         *bpr = bw * bs;
-        out = malloc(row * bh);
+        out = malloc((size_t)bw * bh * bs);
         for (uint32_t y = 0; y < bh; y++) {
-            memcpy(out + y * row, src + (uint64_t)y * pitch, row);
+            memcpy(out + (size_t)y * bw * bs, src + (uint64_t)y * pitch, (size_t)bw * bs);
         }
-        if (swap && !td->host_data) {
-            for (size_t i = 0; i < row * bh; i += 4) {
-                uint32_t v;
-                memcpy(&v, out + i, 4);
-                v = __builtin_bswap32(v);
-                memcpy(out + i, &v, 4);
+        /*
+         * Blocks are little-endian words to the card.  VRAM holds the
+         * big-endian CPU's view (GART copies the other side of the
+         * aperture), and the card's dword is the TX_OFFSET endian swap of
+         * that, as r300_texel does for shader-decoded formats: with no
+         * swap, every word is byte-reversed.  (Doom 3 on Tiger: untouched
+         * blocks decode to coloured speckle, reversed ones to the art.)
+         */
+        for (size_t i = 0; i < (size_t)bw * bh * bs; i += 4) {
+            uint32_t l, v;
+            memcpy(&l, out + i, 4);
+            if (td->host_data) {
+                l = __builtin_bswap32(l);
             }
+            v = __builtin_bswap32(l);                       /* the BE value */
+            switch (td->endian & 3) {
+            case 1: v = ((v & 0x00ff00ffu) << 8) | ((v >> 8) & 0x00ff00ffu); break;
+            case 2: v = __builtin_bswap32(v); break;
+            case 3: v = (v << 16) | (v >> 16); break;
+            default: break;
+            }
+            memcpy(out + i, &v, 4);
         }
         return out;
     }

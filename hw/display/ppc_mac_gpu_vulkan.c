@@ -1942,7 +1942,8 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
     VkFormat fmt = vk_tex_format(td->kind);
     VkTexKey key = { td->gpu_addr, td->format, td->kind, td->width, td->height,
                      td->depth, td->dim, td->levels, td->pitch_bytes,
-                     td->host_data != NULL, r300_hash_bytes(src, td->size_bytes) };
+                     td->host_data != NULL ? 1u + (td->endian << 1) : td->endian << 1,
+                     r300_hash_bytes(src, td->size_bytes) };
     int lru = 0;
 
     if (dxt && !V.bc) {

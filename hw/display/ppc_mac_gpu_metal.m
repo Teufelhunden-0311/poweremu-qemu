@@ -5946,8 +5946,8 @@ static NSString *const kR200ShaderSource = @
 "using namespace metal;\n"
 /* Specialization: how many combiner stages run and which texture units are
  * bound, per pipeline (the defaults keep the generic pipelines as before). */
-"constant uint FC_STAGES [[function_constant(0)]] = 8;\n"
-"constant uint FC_TEXMASK [[function_constant(1)]] = 0x3F;\n"
+"constant uint FC_STAGES [[function_constant(0)]];\n"
+"constant uint FC_TEXMASK [[function_constant(1)]];\n"
 "struct Vtx { float4 pos; float4 color; float4 spec; float4 tex[6]; };\n"
 "struct U {\n"
 "    float2 rt_size; uint pp_cntl; uint pp_misc;\n"
@@ -6430,6 +6430,25 @@ static id<MTLTexture> g_r200_dummy;
 
 static pthread_mutex_t g_r200_setup_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* The fragment functions are specialised by FC_STAGES/FC_TEXMASK; the generic
+ * pipelines get "all stages, all six texture units". */
+static id<MTLFunction> r200_generic_fs(id<MTLLibrary> lib, NSString *name)
+{
+    MTLFunctionConstantValues *fcv = [[MTLFunctionConstantValues alloc] init];
+    uint32_t stages = 8, mask = 0x3F;
+    NSError *e = nil;
+
+    [fcv setConstantValue:&stages type:MTLDataTypeUInt atIndex:0];
+    [fcv setConstantValue:&mask type:MTLDataTypeUInt atIndex:1];
+    id<MTLFunction> f = [lib newFunctionWithName:name constantValues:fcv error:&e];
+    [fcv release];
+    if (!f) {
+        qemu_log("ppc-mac-gpu r200: %s: %s\n", [name UTF8String],
+                 e ? [[e localizedDescription] UTF8String] : "?");
+    }
+    return f;
+}
+
 static bool r200_metal_setup_locked(id<MTLDevice> dev)
 {
     if (g_r200_pipeline) {
@@ -6445,14 +6464,14 @@ static bool r200_metal_setup_locked(id<MTLDevice> dev)
     }
     MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
     id<MTLFunction> vs = [lib newFunctionWithName:@"r200_vs"];
-    id<MTLFunction> fs = [lib newFunctionWithName:@"r200_fs"];
+    id<MTLFunction> fs = r200_generic_fs(lib, @"r200_fs");
     pd.vertexFunction = vs;
     pd.fragmentFunction = fs;
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     pd.colorAttachments[0].blendingEnabled = NO;
     g_r200_pipeline = bin_pso(dev, pd, &err);
     {
-        id<MTLFunction> zfs = [lib newFunctionWithName:@"r200_fs_z"];
+        id<MTLFunction> zfs = r200_generic_fs(lib, @"r200_fs_z");
         MTLRenderPipelineDescriptor *zd = [pd copy];
         zd.fragmentFunction = zfs;
         zd.colorAttachments[1].pixelFormat = MTLPixelFormatR32Uint;
@@ -6463,8 +6482,8 @@ static bool r200_metal_setup_locked(id<MTLDevice> dev)
         [zfs release];
     }
     {
-        id<MTLFunction> f16 = [lib newFunctionWithName:@"r200_fs16"];
-        id<MTLFunction> f16z = [lib newFunctionWithName:@"r200_fs16_z"];
+        id<MTLFunction> f16 = r200_generic_fs(lib, @"r200_fs16");
+        id<MTLFunction> f16z = r200_generic_fs(lib, @"r200_fs16_z");
         MTLRenderPipelineDescriptor *cd = [pd copy];
         cd.colorAttachments[0].pixelFormat = MTLPixelFormatR16Uint;
         cd.fragmentFunction = f16;
@@ -8662,6 +8681,32 @@ static int metal_draw_r200(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     PPCMacGPUMetalState *st = opaque;
     int r;
 
+    static int drawlog = -1;
+    if (drawlog < 0) {
+        drawlog = getenv("R200_DRAWLOG") != NULL;
+    }
+    if (drawlog) {
+        /* One line per draw: where it goes, how it blends, what it samples. */
+        qemu_log("R200DRAW t=%lld rt=%x/%u %ux%u sc=%u,%u-%u,%u rb3d=%x pp=%x "
+                 "cb=%x ab=%x mask=%x verts=%u idx=%u tex0=%u:%x/%u %ux%u f=%x "
+                 "alphain=%u swap=%u v0=(%.0f,%.0f) c0=(%.3f,%.3f,%.3f,%.3f) v2=(%.0f,%.0f)\n",
+                 (long long)(g_get_monotonic_time() / 1000), pkt->rt_offset,
+                 pkt->rt_pitch, pkt->rt_width, pkt->rt_height, pkt->scissor[0],
+                 pkt->scissor[1], pkt->scissor[2], pkt->scissor[3],
+                 pkt->rb3d_cntl, pkt->pp_cntl, pkt->cblend, pkt->ablend,
+                 pkt->plane_mask, pkt->num_verts, pkt->num_indices,
+                 pkt->tex[0].enabled, pkt->tex[0].offset, pkt->tex[0].pitch,
+                 pkt->tex[0].width, pkt->tex[0].height, pkt->tex[0].format,
+                 pkt->tex[0].alpha_in_map, pkt->tex[0].swap,
+                 pkt->verts ? pkt->verts[0].pos[0] : 0.f,
+                 pkt->verts ? pkt->verts[0].pos[1] : 0.f,
+                 pkt->verts ? pkt->verts[0].color[0] : 0.f,
+                 pkt->verts ? pkt->verts[0].color[1] : 0.f,
+                 pkt->verts ? pkt->verts[0].color[2] : 0.f,
+                 pkt->verts ? pkt->verts[0].color[3] : 0.f,
+                 pkt->num_verts > 2 ? pkt->verts[2].pos[0] : 0.f,
+                 pkt->num_verts > 2 ? pkt->verts[2].pos[1] : 0.f);
+    }
     if (!rqueue_enabled()) {
         pthread_mutex_lock(&g_render_lock);
         r = r200_draw_encode(st, vram_ptr, vram_size, pkt);
@@ -9210,7 +9255,7 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
     memset(&key, 0, sizeof(key));
     key = (R300TexCacheKey){ td->gpu_addr, td->format, td->kind, td->width, td->height,
                              td->depth, td->dim, td->levels, td->pitch_bytes,
-                             td->host_data != NULL };
+                             td->host_data != NULL ? 1u + (td->endian << 1) : td->endian << 1 };
     uint64_t gen = 0;
     bool gen_ok = !td->host_data && r300_tex_gen(td, &gen);
     int hit = r300_tcache_find(&key);

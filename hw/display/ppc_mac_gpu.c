@@ -1605,7 +1605,12 @@ static bool ppc_mac_gpu_update_display_mode(PPCMacGPUState *s)
     }
 
     /* Scanout offset */
-    m->offset = s->regs.crtc_offset;
+    /*
+     * The rv250 reports its CRTC_OFFSET R200_CRTC_OFFSET_BIAS bytes in (see
+     * the register read), and Mac OS X's accelerator then draws the screen
+     * from there (it starts at x = 8): scan out from the same place.
+     */
+    m->offset = s->regs.crtc_offset + (s->rv250 ? R200_CRTC_OFFSET_BIAS : 0);
 
     /* Validate offset + frame fits in VRAM */
     if (m->offset + (uint64_t)m->stride * m->height > s->vram_size) {
@@ -3416,6 +3421,73 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     }
     r300_note_formats(s, &pkt);
     r300_note_features(s, &pkt);
+    {
+        /* $R300_GLSLDUMP=prefix: each distinct fragment shader's GLSL */
+        static const char *gpre;
+        static int ginit, gn;
+        static GHashTable *gseen;
+
+        if (!ginit) {
+            ginit = 1;
+            gpre = getenv("R300_GLSLDUMP");
+        }
+        if (gpre && pkt.glsl && gn < 80) {
+            if (!gseen) {
+                gseen = g_hash_table_new(g_str_hash, g_str_equal);
+            }
+            if (!g_hash_table_contains(gseen, pkt.glsl)) {
+                g_hash_table_add(gseen, g_strdup(pkt.glsl));
+                char *fn = g_strdup_printf("%s.%02d.frag", gpre, gn++);
+                FILE *f = fopen(fn, "w");
+                if (f) {
+                    fprintf(f, "// draw %llu blend %08x/%08x/%08x alpha-test %08x\n%s",
+                            (unsigned long long)s->r3->draws,
+                            r300_reg(s->r3, 0x4E04), r300_reg(s->r3, 0x4E08),
+                            r300_reg(s->r3, 0x4E0C), r300_reg(s->r3, 0x4BD4),
+                            pkt.glsl);
+                    fclose(f);
+                }
+                g_free(fn);
+            }
+        }
+    }
+    {
+        /* $R300_DXTDUMP=prefix: raw bytes of each distinct DXT texture */
+        static const char *pre;
+        static int init, nfiles;
+        static GHashTable *done;
+
+        if (!init) {
+            init = 1;
+            pre = getenv("R300_DXTDUMP");
+        }
+        for (int t = 0; pre && nfiles < 60 && t < R300_NUM_TEX_UNITS; t++) {
+            const R300TexDesc *td = &pkt.tex[t];
+            if (!td->bound || td->kind < R300_TEXK_DXT1 || !td->size_bytes) {
+                continue;
+            }
+            const uint8_t *src = td->host_data ? td->host_data :
+                (uint8_t *)memory_region_get_ram_ptr(&s->vram) + td->gpu_addr;
+            if (!done) {
+                done = g_hash_table_new(g_direct_hash, g_direct_equal);
+            }
+            gpointer key = GUINT_TO_POINTER(td->gpu_addr ^ (td->width << 20) ^ td->height);
+            if (g_hash_table_contains(done, key)) {
+                continue;
+            }
+            g_hash_table_add(done, key);
+            char *fn = g_strdup_printf("%s.%02d_dxt%u_%ux%u_l%u_p%u%s.bin", pre,
+                                       nfiles++, td->kind - R300_TEXK_DXT1,
+                                       td->width, td->height, td->levels,
+                                       td->pitch_bytes, td->host_data ? "_gart" : "");
+            FILE *f = fopen(fn, "wb");
+            if (f) {
+                fwrite(src, 1, td->size_bytes, f);
+                fclose(f);
+            }
+            g_free(fn);
+        }
+    }
     if (s->r3_zconv && (pkt.depth.attach || (r300_reg(s->r3, 0x4F00) & 7))) {
         r300_zconv(s, false);           /* drawing again: back to linear */
         s->r3_zconv = false;
@@ -6251,7 +6323,16 @@ static void r200_decode_tex_unit(PPCMacGPUState *s, int n, R200TexUnit *t)
         }
     }
     offset &= ~0x1Fu;
-    if (offset < fb_base || offset - fb_base >= s->vram_size) {
+    /*
+     * The AGP aperture can start inside the VRAM the card has but does not
+     * report (the top megabytes are the command processor's): Jaguar's
+     * driver puts it at 124 MB, and texture offsets there are AGP.
+     */
+    uint32_t agp_loc = s->regs.mc_agp_location;
+    bool in_agp = agp_loc != 0 &&
+                  offset >= ((agp_loc & 0xFFFF) << 16) &&
+                  offset <= ((((agp_loc >> 16) & 0xFFFF) << 16) | 0xFFFF);
+    if (in_agp || offset < fb_base || offset - fb_base >= s->vram_size) {
         /*
          * AGP/GART texture (client storage / texture range): copy the texels
          * out of guest memory.  Level 0 only; the caller frees host_data.
@@ -7082,6 +7163,18 @@ static bool ppc_mac_gpu_r200_draw_now(PPCMacGPUState *s, const uint32_t *d,
                 } else {
                     for (uint32_t i = 0; i < n && i < 4; i++) {
                         dstc[i] = r200_f32(raw[i]);
+                    }
+                    /*
+                     * Floating-point colours arrive blue first: Mac OS X
+                     * 10.2's WindowServer fills the margin around its
+                     * windows with the Aqua blue (0.678, 0.420, 0.259) and
+                     * means 0x426BAD, which shows as brown unless the red
+                     * and blue slots are exchanged.
+                     */
+                    if (n >= 3) {
+                        float t = dstc[0];
+                        dstc[0] = dstc[2];
+                        dstc[2] = t;
                     }
                 }
                 break;
@@ -10349,7 +10442,16 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         val = s->regs.crtc_v_sync_strt_wid;
         break;
     case R200_CRTC_OFFSET:
-        val = s->regs.crtc_offset;
+        /*
+         * Jaguar's ATIRadeon8500.kext reserves the scanout buffer from
+         * CRTC_OFFSET/CRTC_PITCH only when the offset differs from its
+         * (zero) initial value.  A framebuffer at VRAM 0 therefore looks
+         * "unchanged": nothing is reserved, and the first GL surface it
+         * allocates lands on the screen and corrupts the allocator.
+         * Report the offset 32 bytes in (the unreserved head is too small
+         * to ever be handed out); the scanout itself still starts at 0.
+         */
+        val = s->regs.crtc_offset | (s->rv250 ? R200_CRTC_OFFSET_BIAS : 0);
         break;
     case R200_CRTC_OFFSET_CNTL:
         val = s->regs.crtc_offset_cntl;
@@ -11185,9 +11287,13 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         s->regs.config_cntl = val;
         break;
     case R200_MC_FB_LOCATION:
+        qemu_log("ppc-mac-gpu: MC_FB_LOCATION 0x%08x -> 0x%08x\n",
+                 s->regs.mc_fb_location, val);
         s->regs.mc_fb_location = val;
         break;
     case R200_MC_AGP_LOCATION:
+        qemu_log("ppc-mac-gpu: MC_AGP_LOCATION 0x%08x -> 0x%08x\n",
+                 s->regs.mc_agp_location, val);
         s->regs.mc_agp_location = val;
         break;
 
@@ -11287,6 +11393,9 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         s->regs.crtc_v_sync_strt_wid = val;
         break;
     case R200_CRTC_OFFSET:
+        if (s->rv250) {
+            val &= ~R200_CRTC_OFFSET_BIAS;
+        }
         if (val != s->regs.crtc_offset) {
             blit_path_log("CRTC", "OFFSET changed 0x%x -> 0x%x",
                           s->regs.crtc_offset, val);
@@ -12659,6 +12768,7 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
 
     s->regs_size = sizeof(PPCMacGPURegs);   /* saved with the machine */
     s->r300 = object_dynamic_cast(obj, TYPE_ATI_RADEON_9700) != NULL;
+    s->rv250 = object_dynamic_cast(obj, TYPE_ATI_RADEON_9000) != NULL;
     s->r300_src_swap = 2;       /* plain copy until the driver says otherwise */
     if (s->r300) {
         const char *dump = getenv("R300_DUMP");
@@ -13419,6 +13529,24 @@ static const TypeInfo ati_radeon_9700_type_info = {
     .class_init    = ati_radeon_9700_class_init,
 };
 
+/*
+ * ATI Radeon 9000 PRO (RV250) for Mac OS X 10.2 Jaguar: same R200 register
+ * model as the RV280 device, with the PCI ID Jaguar's ATIRadeon8500.kext
+ * (and its GL driver) match.
+ */
+static void ati_radeon_9000_class_init(ObjectClass *klass, void *data)
+{
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    k->device_id = PPC_MAC_GPU_RV250_DEVICE_ID;
+}
+
+static const TypeInfo ati_radeon_9000_type_info = {
+    .name          = TYPE_ATI_RADEON_9000,
+    .parent        = TYPE_PPC_MAC_GPU,
+    .class_init    = ati_radeon_9000_class_init,
+};
+
 static const TypeInfo ppc_mac_gpu_type_info = {
     .name          = TYPE_PPC_MAC_GPU,
     .parent        = TYPE_PCI_DEVICE,
@@ -13434,6 +13562,7 @@ static void ppc_mac_gpu_register_types(void)
 {
     type_register_static(&ppc_mac_gpu_type_info);
     type_register_static(&ati_radeon_9700_type_info);
+    type_register_static(&ati_radeon_9000_type_info);
 }
 
 type_init(ppc_mac_gpu_register_types)
