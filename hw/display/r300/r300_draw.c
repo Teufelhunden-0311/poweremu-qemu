@@ -754,9 +754,20 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
             /* VRAM holds the guest CPU's big-endian words (see r300_tex). */
             t->kind = R300_TEXK_RGBA8; bpp = 4; decode = (off & 3) == 0;
             break;
-        case 0xF:  t->kind = R300_TEXK_DXT1; bpp = 8;  dxt = true; break;   /* per block */
-        case 0x10: t->kind = R300_TEXK_DXT3; bpp = 16; dxt = true; break;
-        case 0x11: t->kind = R300_TEXK_DXT5; bpp = 16; dxt = true; break;
+        /*
+         * Measured on a Mobility Radeon 9700 (RV360) under Mac OS X's ATI
+         * driver, with known blocks: the sampler hands a decoded DXT texel
+         * to the TX_FORMAT1 swizzle in the lane order B,G,R,A for DXT1 and
+         * A,B,G,R for DXT3/DXT5, not R,G,B,A.  The driver programs DXT1 as
+         * (Z,Y,X,ONE) and DXT3/5 as (W,Z,Y,X) to match, so applying those
+         * swizzles to an RGBA texel swapped red and blue (DXT1) or
+         * reversed the texel (DXT3/5: Doom 3's font drawn as solid bars).
+         * Not a documented rule; other R3xx chips are untested.  decode 3
+         * and 1 make r300_tpost produce these lanes.
+         */
+        case 0xF:  t->kind = R300_TEXK_DXT1; bpp = 8;  dxt = true; decode = 3; break;
+        case 0x10: t->kind = R300_TEXK_DXT3; bpp = 16; dxt = true; decode = 1; break;
+        case 0x11: t->kind = R300_TEXK_DXT5; bpp = 16; dxt = true; decode = 1; break;
         default:
             bpp = r300_tex_raw_bpp(fmt);
             if (!bpp) {
@@ -812,6 +823,14 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         u->tex_info[k][3] = t->height;
 
         r300_border_color(fmt, r300_reg(st, TX_BORDER_COLOR_0 + 4 * k), u->tex_border[k]);
+        if (dxt) {                      /* the border mixes in before the swizzle: same lanes */
+            float *c = u->tex_border[k], r = c[0], g = c[1], b = c[2], a = c[3];
+            if (fmt == 0xF) {
+                c[0] = b; c[1] = g; c[2] = r; c[3] = a;
+            } else {
+                c[0] = a; c[1] = b; c[2] = g; c[3] = r;
+            }
+        }
         {
             int32_t bias = (int32_t)(((t->filter1 >> 3) & 0x3FF) << 22) >> 22;
             uint32_t minl = (t->filter0 >> 17) & 0xF;
@@ -825,7 +844,8 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         u->tex_dim[k][2] = t->pitch_bytes;
         u->tex_dim[k][3] = ((f1 >> 8) & 1) | ((f1 >> 6) & 2) | ((f1 >> 4) & 4) |
                            ((f1 >> 2) & 8) | ((f1 >> 21) & 1 ? R300_TEXF_GAMMA : 0) |
-                           (t->levels > 1 || t->dim != R300_TEXDIM_2D ? R300_TEXF_POT_ROWS : 0);
+                           (t->levels > 1 || t->dim != R300_TEXDIM_2D ? R300_TEXF_POT_ROWS : 0) |
+                           (t->kind == R300_TEXK_DXT1 ? R300_TEXF_DXT1_ALPHA : 0);
     }
 }
 
