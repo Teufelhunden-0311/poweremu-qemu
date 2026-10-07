@@ -737,6 +737,14 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         u->tex_info[k][3] = t->height;
 
         r300_border_color(fmt, r300_reg(st, TX_BORDER_COLOR_0 + 4 * k), u->tex_border[k]);
+        if (dxt) {                      /* the border mixes in before the swizzle: same lanes */
+            float *c = u->tex_border[k], r = c[0], g = c[1], b = c[2], a = c[3];
+            if (fmt == 0xF) {
+                c[0] = b; c[1] = g; c[2] = r; c[3] = a;
+            } else {
+                c[0] = a; c[1] = b; c[2] = g; c[3] = r;
+            }
+        }
         {
             int32_t bias = (int32_t)(((t->filter1 >> 3) & 0x3FF) << 22) >> 22;
             uint32_t minl = (t->filter0 >> 17) & 0xF;
@@ -750,7 +758,8 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         u->tex_dim[k][2] = t->pitch_bytes;
         u->tex_dim[k][3] = ((f1 >> 8) & 1) | ((f1 >> 6) & 2) | ((f1 >> 4) & 4) |
                            ((f1 >> 2) & 8) | ((f1 >> 21) & 1 ? R300_TEXF_GAMMA : 0) |
-                           (t->levels > 1 || t->dim != R300_TEXDIM_2D ? R300_TEXF_POT_ROWS : 0);
+                           (t->levels > 1 || t->dim != R300_TEXDIM_2D ? R300_TEXF_POT_ROWS : 0) |
+                           (t->kind == R300_TEXK_DXT1 ? R300_TEXF_DXT1_ALPHA : 0);
     }
 }
 
