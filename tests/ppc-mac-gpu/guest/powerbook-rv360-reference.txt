@@ -1,0 +1,39 @@
+rbprobe 2
+GL_RENDERER ATI Radeon 9600 XT OpenGL Engine
+GL_VERSION 1.5 ATI-1.4.18
+bits R8 G8 B8 A8 depth 16 stencil 0 samplebuffers 0
+CLR 4080c060; pat(x,y) = (4x+1, 4y+2, 7x+13y, 3x+5y+7) for x,y < 64
+BACK 1x1 finish: 1x1@10,20 err 0/0 9.63ms px 1 exact 1 near 1 zero 0 untouched 0 guards ok
+  first px 29524a89
+BACK 4x4 finish: 4x4@8,8 err 0/0 0.38ms px 16 exact 14 near 16 zero 0 untouched 0 guards ok
+  first px 2122a047 2522a74a  1st miss (10,11) got 292ed55b want 292ed55c
+BACK 64x64 finish: 64x64@0,0 err 0/0 5.04ms px 4096 exact 3612 near 4096 zero 0 untouched 0 guards ok
+  first px 01020007 0502070a  1st miss (8,0) got 2102381e want 2102381f
+BACK 64x64 again: 64x64@0,0 err 0/0 0.74ms px 4096 exact 3612 near 4096 zero 0 untouched 0 guards ok
+  first px 01020007 0502070a  1st miss (8,0) got 2102381e want 2102381f
+BACK 96x80 finish: 96x80@0,0 err 0/0 0.78ms px 7680 exact 7196 near 7680 zero 0 untouched 0 guards ok
+  first px 01020007 0502070a  1st miss (8,0) got 2102381e want 2102381f
+BACK 256x128 finish: 256x128@0,0 err 0/0 6.25ms px 32768 exact 32284 near 32768 zero 0 untouched 0 guards ok
+  first px 01020007 0502070a  1st miss (8,0) got 2102381e want 2102381f
+BACK 64x64 nofinish: 64x64@0,0 err 0/0 0.78ms px 4096 exact 3612 near 4096 zero 0 untouched 0 guards ok
+  first px 01020007 0502070a  1st miss (8,0) got 2102381e want 2102381f
+BACK 4x4 flush-only: 4x4@8,8 err 0/0 0.31ms px 16 exact 14 near 16 zero 0 untouched 0 guards ok
+  first px 2122a047 2522a74a  1st miss (10,11) got 292ed55b want 292ed55c
+BGRA/8888_REV words: 64x64 err 0/0 exact 3612 zero 0 guards ok swap_bytes 0 first 07010200 0a050207
+RGB 3x4 align 4: err 0/0 exact 12/12 pad bytes 12 still sentinel 12 guards ok
+RGB 3x4 align 1: err 0/0 exact 12/12 pad bytes 0 still sentinel 0 guards ok
+FRONT 64x64 after swap: 64x64@0,0 err 0/0 1.06ms px 4096 exact 3612 near 4096 zero 0 untouched 0 guards ok
+  first px 01020007 0502070a  1st miss (8,0) got 2102381e want 2102381f
+FRONT 96x80 after swap: 96x80@0,0 err 0/0 0.70ms px 7680 exact 7196 near 7680 zero 0 untouched 0 guards ok
+  first px 01020007 0502070a  1st miss (8,0) got 2102381e want 2102381f
+CopyTexImage(BACK)+GetTexImage: err 0/0/0 exact 3612/4096 zero 0 guards ok first 01020007
+Upload+GetTexImage control: err 0 exact 4096/4096 guards ok
+depth (16 bits): err 0/0 inside quad 0.5000 (want 0.5) outside 0.2500 (want 0.25)
+SEQ pattern2 64x64: 64x64@0,0 err 0/0 0.73ms px 4096 exact 3620 near 4096 zero 0 untouched 0 guards ok
+  first px 5b585a5c 5f585d50  1st miss (0,0) got 5b585a5c want 5b585a5d
+SEQ pattern1 37x45@5,3: 37x45@5,3 err 0/0 0.48ms px 1665 exact 1471 near 1665 zero 0 untouched 0 guards ok
+  first px 150e4a25 190e5128  1st miss (13,3) got 350e823c want 350e823d
+SEQ pattern1 100x70@3,1: 100x70@3,1 err 0/0 0.72ms px 7000 exact 6545 near 7000 zero 0 untouched 0 guards ok
+  first px 0d062215 11062918  1st miss (6,1) got 1906371d want 1906371e
+CLIENT texture (range 1, client storage 1): err 0/0 exact 4096/4096
+DONE
