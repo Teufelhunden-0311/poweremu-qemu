@@ -1532,9 +1532,10 @@ static VkImg *vk_img_get(int cls, uint32_t addr, uint32_t w, uint32_t h,
 }
 
 /*
- * A draw renders into rectangle [x0, x1) x [y0, y1) of im: the pages of
- * those rows get a new generation that im holds, and the rectangle is
- * written back with the batch.
+ * A draw renders into rectangle [x0, x1) x [y0, y1) of im.  The rectangle
+ * is written back with the batch, and the pages of what is written back
+ * get a new generation that im holds, and are the batch's until it has
+ * finished (page_wseq).
  */
 static void vk_img_written(VkImg *im, uint32_t x0, uint32_t y0,
                            uint32_t x1, uint32_t y1)
@@ -1567,6 +1568,19 @@ static void vk_img_written(VkImg *im, uint32_t x0, uint32_t y0,
         d[1] = MIN(d[1], y0);
         d[2] = MAX(d[2], x1);
         d[3] = MAX(d[3], y1);
+        if (grow) {
+            /*
+             * Merged with one it is not inside of: all of the result goes
+             * back to VRAM, the rows and columns between the two as well,
+             * which no draw touched.  Those pages are the batch's too, or
+             * the device, told that they are free, writes what the batch
+             * then writes over.
+             */
+            x0 = d[0];
+            y0 = d[1];
+            x1 = d[2];
+            y1 = d[3];
+        }
     } else {
         uint32_t *d = im->dr[im->ndr++];
         d[0] = x0;
@@ -1579,8 +1593,12 @@ static void vk_img_written(VkImg *im, uint32_t x0, uint32_t y0,
     if (grow == 0 && fresh) {
         return;                         /* those pages are already stamped */
     }
-    uint64_t lo = im->addr + (uint64_t)y0 * im->pitch + (uint64_t)x0 * im->bpp;
-    uint64_t hi = im->addr + (uint64_t)(y1 - 1) * im->pitch + (uint64_t)x1 * im->bpp;
+    /* The bytes the write-back writes for it: as vk_region places it,
+     * which may round outwards. */
+    VkBufferImageCopy r = vk_region(im, x0, y0, x1, y1);
+    uint64_t lo = r.bufferOffset;
+    uint64_t hi = lo + ((uint64_t)(r.imageExtent.height - 1) * r.bufferRowLength +
+                        r.imageExtent.width) * im->bpp;
     V.gen++;
     for (uint64_t p = vk_pg(lo); p <= vk_pg(hi - 1) && p < V.npages; p++) {
         V.page_gen[p] = V.gen;
