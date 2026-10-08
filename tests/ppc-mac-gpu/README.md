@@ -39,9 +39,12 @@ Radeon 9700, RV360, ATI-1.4.18).  The scripts drive a VM through ppcosxkvm's
 `tools/vmctl.py` (paths are the author's): `rbvm.sh TAG [ENV=..] [-- args]`,
 `rbreset.sh` (real system_reset during a transfer's first wait),
 `rbvklost.sh` (Vulkan device lost during a transfer, then guest shutdown),
-`rbvkdummy.sh` (Vulkan under the Khronos validation layer: the batch carrying
-the stand-in textures' initialization is not submitted, once and three times
-running; `VD-nofix` is the negative control).  `readstrip.py` exits non-zero
+`rbvkdummy.sh` (Vulkan under the Khronos validation layer with synchronization
+validation, ten runs, each checked, non-zero exit on any failure: the batch
+carrying the stand-in textures' initialization is not submitted, once and three
+times; creating the second or third image fails once, with the retry in a later
+batch and in the same open batch; `VD-nofix`, `VD-old1`, `VD-old2` are negative
+controls that must produce validation errors).  `readstrip.py` exits non-zero
 on a bad strip checksum and `rbvm.sh` then reports the run as failed.
 
 ## Test-only hooks (the commit after this one; never merge)
@@ -62,6 +65,12 @@ on a bad strip checksum and `rbvm.sh` then reports the run as failed.
                                 initializations is not submitted (returns code); after
                                 the next one the three images are copied out and logged
                                 (they get TRANSFER_SRC usage for that)
+    R300_VK_FAIL=dummyalloc:i   creating stand-in image i (1 or 2) fails once (vk_image is
+                                not called); after the retry the images are copied out
+    RBTEST_DUMMY_SAMEBATCH=1    with dummyalloc: a batch is opened first and the retry
+                                follows at once, in that same batch
+    RBTEST_DUMMY_INTERLEAVED=1  with dummyalloc: the order before the fix (create,
+                                record, create, record ...)
     RBTEST_NO_DUMMY_FIX=1       with the above: a cancelled batch does not clear
                                 dummy_ready (the code before the fix), and the images
                                 are copied out as they are

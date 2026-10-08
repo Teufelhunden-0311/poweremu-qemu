@@ -2013,7 +2013,29 @@ static VkSampler vk_sampler(uint32_t f0, uint32_t levels)
  * change and clear are recorded again after a cancelled batch
  * (vk_forget_images), since that batch may have been the one carrying them.
  * A transition from UNDEFINED is valid whatever layout the image is in.
+ *
+ * All three exist before anything is recorded: a failed creation must leave
+ * no initialization behind in the open batch, because the retry may come in
+ * that same batch and would then transition and clear an image again with
+ * nothing ordering the two.
  */
+/* RBTEST (never commit): copy the three stand-ins to the end of the VRAM buffer */
+static void rbtest_dummy_copyout(VkCommandBuffer cb)
+{
+    uint64_t off = V.vram_size - 16;
+    memset(V.vram + off, 0xA5, 12);
+    for (int i = 0; i < 3; i++) {
+        VkBufferImageCopy r = {
+            .bufferOffset = off + 4 * i,
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, i == 2 ? 5 : 0, 1 },
+            .imageExtent = { 1, 1, 1 },
+        };
+        vkCmdCopyImageToBuffer(cb, V.dummy_img[i], VK_IMAGE_LAYOUT_GENERAL, V.vram_buf, 1, &r);
+    }
+    vk_full_barrier(cb);
+    rbtest_dummy_chk = 1;
+}
+
 static bool vk_dummies(void)
 {
     static const VkImageType it[3] = { VK_IMAGE_TYPE_2D, VK_IMAGE_TYPE_3D, VK_IMAGE_TYPE_2D };
@@ -2028,50 +2050,91 @@ static bool vk_dummies(void)
         if (!rb_nc && rbtest_dummy_chk == 3 && getenv("RBTEST_NO_DUMMY_FIX")) {
             rb_nc = true;
             vk_end_pass();
-            VkCommandBuffer c2 = vk_batch()->cb;
-            uint64_t off = V.vram_size - 16;
-            memset(V.vram + off, 0xA5, 12);
-            for (int i = 0; i < 3; i++) {
-                VkBufferImageCopy r = {
-                    .bufferOffset = off + 4 * i,
-                    .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, i == 2 ? 5 : 0, 1 },
-                    .imageExtent = { 1, 1, 1 },
-                };
-                vkCmdCopyImageToBuffer(c2, V.dummy_img[i], VK_IMAGE_LAYOUT_GENERAL,
-                                       V.vram_buf, 1, &r);
-            }
-            vk_full_barrier(c2);
-            rbtest_dummy_chk = 1;
+            rbtest_dummy_copyout(vk_batch()->cb);
             qemu_log("RBTEST no fix: stand-ins not initialized again; contents copied out "
                      "in batch %u\n", V.cur->seq);
         }
         return true;
     }
-    vk_end_pass();
-    VkCommandBuffer cb = vk_batch()->cb;
-    /* RBTEST (never commit): $R300_VK_FAIL=dummy:code:reps does not submit the batch
-     * carrying each of the first reps stand-in initializations (returning code); after
-     * the next one the three images are copied to the end of the VRAM buffer and read
-     * at the following flush.  The images get TRANSFER_SRC usage for that. */
-    static int rb_k;
-    int rb_code = 0, rb_reps = 0, rb_made = 0;
+    /*
+     * RBTEST (never commit), all in $R300_VK_FAIL:
+     *  dummy:code:reps  the batch carrying each of the first reps initializations is
+     *                   not submitted (returns code); after the next one the images are
+     *                   copied out and read at the following flush
+     *  dummyalloc:i     creating image i (1 or 2) fails once: vk_image is not called,
+     *                   which leaves the state its own failure path leaves; after the
+     *                   retry the images are copied out
+     * $RBTEST_DUMMY_INTERLEAVED=1 restores the order before the fix (create, record,
+     * create, record ...) as the negative control for dummyalloc.
+     * $RBTEST_DUMMY_SAMEBATCH=1 with dummyalloc: a batch is opened first and the retry
+     * follows the failure at once, so both attempts are in one open batch.
+     * The images get TRANSFER_SRC usage for the copy-out.
+     */
+    static int rb_k, rb_tries;
+    static bool rb_failed;
+    int rb_code = 0, rb_reps = 0, rb_made = 0, rb_ai = 0, rb_rec = 0;
     const char *rb_e = getenv("R300_VK_FAIL");
     bool rb_on = rb_e && sscanf(rb_e, "dummy:%d:%d", &rb_code, &rb_reps) == 2;
+    bool rb_al = rb_e && sscanf(rb_e, "dummyalloc:%d", &rb_ai) == 1;
+    bool rb_il = rb_al && getenv("RBTEST_DUMMY_INTERLEAVED");
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+
+    bool rb_sb = rb_al && getenv("RBTEST_DUMMY_SAMEBATCH");
+    rb_tries++;
+    if (rb_sb) {
+        vk_batch();
+    }
+    if (rb_il) {
+        vk_end_pass();
+        cb = vk_batch()->cb;
+    }
     for (int i = 0; i < 3; i++) {
         uint32_t layers = i == 2 ? 6 : 1;
-        rb_made += !V.dummy_view[i];
-        if (!V.dummy_view[i] &&
-            !vk_image(it[i], vt[i], VK_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, 1, layers,
-                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                      (rb_on ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0),
-                      &V.dummy_img[i], &V.dummy_mem[i], &V.dummy_view[i])) {
-            return false;
+        if (!V.dummy_view[i]) {
+            if (rb_al && i == rb_ai && !rb_failed) {
+                rb_failed = true;
+                qemu_log("RBTEST stand-in attempt %d: creating image %d fails; %d created, "
+                         "%d initializations recorded, open batch %d (last seq %u)\n",
+                         rb_tries, i, rb_made, rb_rec, V.cur ? (int)V.cur->seq : -1, V.seq);
+                return rb_sb ? vk_dummies() : false;
+            }
+            if (!vk_image(it[i], vt[i], VK_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, 1, layers,
+                          VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                          (rb_on || rb_al ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0),
+                          &V.dummy_img[i], &V.dummy_mem[i], &V.dummy_view[i])) {
+                return false;
+            }
+            rb_made++;
         }
-        vk_layout_general(cb, V.dummy_img[i], 1, layers);
-        VkImageSubresourceRange sr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers };
-        vkCmdClearColorImage(cb, V.dummy_img[i], VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &sr);
+        if (rb_il) {
+            vk_layout_general(cb, V.dummy_img[i], 1, layers);
+            VkImageSubresourceRange sr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers };
+            vkCmdClearColorImage(cb, V.dummy_img[i], VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &sr);
+            rb_rec++;
+        }
+    }
+    if (!rb_il) {
+        int rb_open = V.cur ? (int)V.cur->seq : -1;
+        vk_end_pass();
+        cb = vk_batch()->cb;
+        for (int i = 0; i < 3; i++) {
+            uint32_t layers = i == 2 ? 6 : 1;
+            vk_layout_general(cb, V.dummy_img[i], 1, layers);
+            VkImageSubresourceRange sr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers };
+            vkCmdClearColorImage(cb, V.dummy_img[i], VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &sr);
+            rb_rec++;
+        }
+        if (rb_al) {
+            qemu_log("RBTEST stand-in attempt %d: batch open before recording %d\n",
+                     rb_tries, rb_open);
+        }
     }
     vk_full_barrier(cb);
+    if (rb_al) {
+        qemu_log("RBTEST stand-in attempt %d: %d created, %d initializations recorded in "
+                 "batch %u; contents copied out\n", rb_tries, rb_made, rb_rec, V.cur->seq);
+        rbtest_dummy_copyout(cb);
+    }
     if (rb_on) {
         rb_k++;
         if (rb_k <= rb_reps) {
@@ -2080,19 +2143,7 @@ static bool vk_dummies(void)
             qemu_log("RBTEST stand-in init %d recorded in batch %u (%d images created); "
                      "that batch will not be submitted\n", rb_k, V.cur->seq, rb_made);
         } else {
-            uint64_t off = V.vram_size - 16;
-            memset(V.vram + off, 0xA5, 12);
-            for (int i = 0; i < 3; i++) {
-                VkBufferImageCopy r = {
-                    .bufferOffset = off + 4 * i,
-                    .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, i == 2 ? 5 : 0, 1 },
-                    .imageExtent = { 1, 1, 1 },
-                };
-                vkCmdCopyImageToBuffer(cb, V.dummy_img[i], VK_IMAGE_LAYOUT_GENERAL,
-                                       V.vram_buf, 1, &r);
-            }
-            vk_full_barrier(cb);
-            rbtest_dummy_chk = 1;
+            rbtest_dummy_copyout(cb);
             qemu_log("RBTEST stand-in init %d recorded in batch %u (%d images created); "
                      "contents copied out\n", rb_k, V.cur->seq, rb_made);
         }
