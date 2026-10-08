@@ -288,6 +288,21 @@ typedef struct VkWaitItem {
         }                                                               \
     } while (0)
 
+/*
+ * The same for a call that creates the object `out`.  A call that fails
+ * leaves its output undefined (the specification promises a null handle
+ * only for command buffers, descriptor sets and pipelines), so `out` is
+ * cleared: what follows the failure sees no object, not a stray handle.
+ */
+#define VKCREATE(expr, out, what) do {                                  \
+        VkResult r_ = (expr);                                           \
+        if (r_ != VK_SUCCESS) {                                         \
+            (out) = VK_NULL_HANDLE;                                     \
+            vk_fail("%s failed (VkResult %d)", what, (int)r_);          \
+            goto fail;                                                  \
+        }                                                               \
+    } while (0)
+
 /* ---- context ---------------------------------------------------------- */
 
 static bool vk_has_ext(const VkExtensionProperties *e, uint32_t n, const char *name)
@@ -359,7 +374,7 @@ static bool vk_ctx_init(void)
         .enabledExtensionCount = niext,
         .ppEnabledExtensionNames = iext,
     };
-    VKCHECK(vkCreateInstance(&ici, NULL, &V.inst), "vkCreateInstance");
+    VKCREATE(vkCreateInstance(&ici, NULL, &V.inst), V.inst, "vkCreateInstance");
 
     n = 0;
     vkEnumeratePhysicalDevices(V.inst, &n, NULL);
@@ -539,7 +554,7 @@ static bool vk_ctx_init(void)
         .ppEnabledExtensionNames = dext,
         .pEnabledFeatures = &want,
     };
-    VKCHECK(vkCreateDevice(V.pdev, &dci, NULL, &V.dev), "vkCreateDevice");
+    VKCREATE(vkCreateDevice(V.pdev, &dci, NULL, &V.dev), V.dev, "vkCreateDevice");
     vkGetDeviceQueue(V.dev, V.qfam, 0, &V.queue);
 
     V.align = MAX(MAX(V.props.limits.minUniformBufferOffsetAlignment,
@@ -550,7 +565,8 @@ static bool vk_ctx_init(void)
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
         .queueFamilyIndex = V.qfam,
     };
-    VKCHECK(vkCreateCommandPool(V.dev, &cpi, NULL, &V.cmdpool), "vkCreateCommandPool");
+    VKCREATE(vkCreateCommandPool(V.dev, &cpi, NULL, &V.cmdpool), V.cmdpool,
+             "vkCreateCommandPool");
 
     /* One descriptor set layout for every R300 program (R300_BIND_*). */
     VkDescriptorSetLayoutBinding b[7 + VK_MAX_ATT + R300_NUM_TEX_UNITS];
@@ -584,13 +600,15 @@ static bool vk_ctx_init(void)
         .bindingCount = nb,
         .pBindings = b,
     };
-    VKCHECK(vkCreateDescriptorSetLayout(V.dev, &dli, NULL, &V.dsl), "vkCreateDescriptorSetLayout");
+    VKCREATE(vkCreateDescriptorSetLayout(V.dev, &dli, NULL, &V.dsl), V.dsl,
+             "vkCreateDescriptorSetLayout");
     VkPipelineLayoutCreateInfo pli = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1,
         .pSetLayouts = &V.dsl,
     };
-    VKCHECK(vkCreatePipelineLayout(V.dev, &pli, NULL, &V.layout), "vkCreatePipelineLayout");
+    VKCREATE(vkCreatePipelineLayout(V.dev, &pli, NULL, &V.layout), V.layout,
+             "vkCreatePipelineLayout");
 
     for (int i = 0; i < VK_NBATCH; i++) {
         VkBatch *bt = &V.batch[i];
@@ -602,7 +620,7 @@ static bool vk_ctx_init(void)
         };
         VKCHECK(vkAllocateCommandBuffers(V.dev, &cai, &bt->cb), "vkAllocateCommandBuffers");
         VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-        VKCHECK(vkCreateFence(V.dev, &fci, NULL, &bt->fence), "vkCreateFence");
+        VKCREATE(vkCreateFence(V.dev, &fci, NULL, &bt->fence), bt->fence, "vkCreateFence");
         bt->pools = g_array_new(FALSE, FALSE, sizeof(VkDescriptorPool));
         bt->chunks = g_ptr_array_new();
         bt->trash = g_array_new(FALSE, FALSE, sizeof(VkTrash));
@@ -637,6 +655,12 @@ fail:
 
 /* ---- buffers and images ----------------------------------------------- */
 
+/*
+ * vk_buffer and vk_image hand over what they created only if all of it was
+ * created: after a failure every output is null and nothing is left behind.
+ * Each object is kept in a local that is null unless its call succeeded
+ * (VKCREATE), so the clean-up never sees the output of a call that failed.
+ */
 static bool vk_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
                       VkMemoryPropertyFlags want, VkMemoryPropertyFlags prefer,
                       VkBuffer *buf, VkDeviceMemory *mem, void **map)
@@ -646,13 +670,19 @@ static bool vk_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
         .size = size,
         .usage = usage,
     };
+    VkBuffer b = VK_NULL_HANDLE;
+    VkDeviceMemory m = VK_NULL_HANDLE;
     VkMemoryRequirements req;
+    void *p = NULL;
     int mt;
 
     *buf = VK_NULL_HANDLE;
     *mem = VK_NULL_HANDLE;
-    VKCHECK(vkCreateBuffer(V.dev, &bci, NULL, buf), "vkCreateBuffer");
-    vkGetBufferMemoryRequirements(V.dev, *buf, &req);
+    if (map) {
+        *map = NULL;
+    }
+    VKCREATE(vkCreateBuffer(V.dev, &bci, NULL, &b), b, "vkCreateBuffer");
+    vkGetBufferMemoryRequirements(V.dev, b, &req);
     mt = vk_memtype(req.memoryTypeBits, want | prefer);
     if (mt < 0) {
         mt = vk_memtype(req.memoryTypeBits, want);
@@ -666,21 +696,22 @@ static bool vk_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
         .allocationSize = req.size,
         .memoryTypeIndex = mt,
     };
-    VKCHECK(vkAllocateMemory(V.dev, &mai, NULL, mem), "vkAllocateMemory");
-    VKCHECK(vkBindBufferMemory(V.dev, *buf, *mem, 0), "vkBindBufferMemory");
+    VKCREATE(vkAllocateMemory(V.dev, &mai, NULL, &m), m, "vkAllocateMemory");
+    VKCHECK(vkBindBufferMemory(V.dev, b, m, 0), "vkBindBufferMemory");
     if (map) {
-        VKCHECK(vkMapMemory(V.dev, *mem, 0, VK_WHOLE_SIZE, 0, map), "vkMapMemory");
+        VKCHECK(vkMapMemory(V.dev, m, 0, VK_WHOLE_SIZE, 0, &p), "vkMapMemory");
+        *map = p;
     }
+    *buf = b;
+    *mem = m;
     return true;
 fail:
-    if (*buf) {
-        vkDestroyBuffer(V.dev, *buf, NULL);
+    if (b) {
+        vkDestroyBuffer(V.dev, b, NULL);
     }
-    if (*mem) {
-        vkFreeMemory(V.dev, *mem, NULL);
+    if (m) {
+        vkFreeMemory(V.dev, m, NULL);
     }
-    *buf = VK_NULL_HANDLE;
-    *mem = VK_NULL_HANDLE;
     return false;
 }
 
@@ -702,43 +733,51 @@ static bool vk_image(VkImageType type, VkImageViewType vtype, VkFormat fmt,
         .usage = usage,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
+    VkImage i = VK_NULL_HANDLE;
+    VkDeviceMemory m = VK_NULL_HANDLE;
+    VkImageView v = VK_NULL_HANDLE;
     VkMemoryRequirements req;
     int mt;
 
     *img = VK_NULL_HANDLE;
     *mem = VK_NULL_HANDLE;
     *view = VK_NULL_HANDLE;
-    VKCHECK(vkCreateImage(V.dev, &ici, NULL, img), "vkCreateImage");
-    vkGetImageMemoryRequirements(V.dev, *img, &req);
+    VKCREATE(vkCreateImage(V.dev, &ici, NULL, &i), i, "vkCreateImage");
+    vkGetImageMemoryRequirements(V.dev, i, &req);
     mt = vk_memtype(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (mt < 0) {
         mt = vk_memtype(req.memoryTypeBits, 0);
+    }
+    if (mt < 0) {
+        vk_fail("no memory type for an image");
+        goto fail;
     }
     VkMemoryAllocateInfo mai = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .allocationSize = req.size,
         .memoryTypeIndex = mt,
     };
-    VKCHECK(vkAllocateMemory(V.dev, &mai, NULL, mem), "vkAllocateMemory (image)");
-    VKCHECK(vkBindImageMemory(V.dev, *img, *mem, 0), "vkBindImageMemory");
+    VKCREATE(vkAllocateMemory(V.dev, &mai, NULL, &m), m, "vkAllocateMemory (image)");
+    VKCHECK(vkBindImageMemory(V.dev, i, m, 0), "vkBindImageMemory");
     VkImageViewCreateInfo vci = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .image = *img,
+        .image = i,
         .viewType = vtype,
         .format = fmt,
         .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, layers },
     };
-    VKCHECK(vkCreateImageView(V.dev, &vci, NULL, view), "vkCreateImageView");
+    VKCREATE(vkCreateImageView(V.dev, &vci, NULL, &v), v, "vkCreateImageView");
+    *img = i;
+    *mem = m;
+    *view = v;
     return true;
 fail:
-    if (*img) {
-        vkDestroyImage(V.dev, *img, NULL);
+    if (i) {
+        vkDestroyImage(V.dev, i, NULL);
     }
-    if (*mem) {
-        vkFreeMemory(V.dev, *mem, NULL);
+    if (m) {
+        vkFreeMemory(V.dev, m, NULL);
     }
-    *img = VK_NULL_HANDLE;
-    *mem = VK_NULL_HANDLE;
     return false;
 }
 
