@@ -1969,6 +1969,11 @@ static VkSampler vk_sampler(uint32_t f0, uint32_t levels)
  * change and clear are recorded again after a cancelled batch
  * (vk_forget_images), since that batch may have been the one carrying them.
  * A transition from UNDEFINED is valid whatever layout the image is in.
+ *
+ * All three exist before anything is recorded: a failed creation must leave
+ * no initialization behind in the open batch, because the retry may come in
+ * that same batch and would then transition and clear an image again with
+ * nothing ordering the two.
  */
 static bool vk_dummies(void)
 {
@@ -1980,16 +1985,18 @@ static bool vk_dummies(void)
     if (V.dummy_ready) {
         return true;
     }
-    vk_end_pass();
-    VkCommandBuffer cb = vk_batch()->cb;
     for (int i = 0; i < 3; i++) {
-        uint32_t layers = i == 2 ? 6 : 1;
         if (!V.dummy_view[i] &&
-            !vk_image(it[i], vt[i], VK_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, 1, layers,
+            !vk_image(it[i], vt[i], VK_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, 1, i == 2 ? 6 : 1,
                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                       &V.dummy_img[i], &V.dummy_mem[i], &V.dummy_view[i])) {
             return false;
         }
+    }
+    vk_end_pass();
+    VkCommandBuffer cb = vk_batch()->cb;
+    for (int i = 0; i < 3; i++) {
+        uint32_t layers = i == 2 ? 6 : 1;
         vk_layout_general(cb, V.dummy_img[i], 1, layers);
         VkImageSubresourceRange sr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers };
         vkCmdClearColorImage(cb, V.dummy_img[i], VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &sr);
