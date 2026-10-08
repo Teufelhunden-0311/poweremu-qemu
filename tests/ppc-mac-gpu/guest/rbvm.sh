@@ -16,5 +16,5 @@ sleep 25; tools/vmctl.py shot $O/shot.ppm
 sed -n "$L0,\$p" vm/gpu-trace.log > $O/trace.txt
 [ -n "${KEEP:-}" ] && { echo KEPT; exit 0; }
 tools/vmctl.py cmd quit >/dev/null 2>&1; until ! pgrep -x qemu-system-ppc >/dev/null; do sleep 1; done
-python3 $W/readstrip.py $O/shot.ppm > $O/read.txt 2>&1
+python3 $W/readstrip.py $O/shot.ppm > $O/read.txt 2>&1 || { echo "RBVM-FAILED $TAG: strip rejected, see $O/read.txt"; exit 1; }
 echo RBVM-DONE $TAG

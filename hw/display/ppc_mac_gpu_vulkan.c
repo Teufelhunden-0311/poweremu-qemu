@@ -1442,6 +1442,8 @@ static void vk_img_written(VkImg *im, uint32_t x0, uint32_t y0,
  * code (-1 = OUT_OF_HOST_MEMORY, -2 = OUT_OF_DEVICE_MEMORY, -4 = DEVICE_LOST) WITHOUT
  * submitting; wait makes the first fence wait after /tmp/rbtest-wait-lost appears report
  * DEVICE_LOST, after really waiting. */
+static int rbtest_dummy_chk;  /* 1: stand-in contents were copied out, read them at the
+                                 next flush; 3: an initialization was cancelled */
 int rbtest_vk_fail_next;    /* set by the device's test hook: fail the next submission with this */
 static VkResult rbtest_submit(const VkSubmitInfo *si, VkFence fence)
 {
@@ -1487,7 +1489,9 @@ static void vk_forget_images(void)
      * are kept (earlier work may reference them) and initialized again by
      * the next batch that needs them, which is valid in either case.
      */
-    V.dummy_ready = false;
+    if (!getenv("RBTEST_NO_DUMMY_FIX")) {   /* RBTEST (never commit): negative control */
+        V.dummy_ready = false;
+    }
 }
 
 static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
@@ -1592,6 +1596,13 @@ static bool vk_flush_r200(void *opaque)
         vk_wait_fence(live->fence, "flush");
     }
     vk_set_done(newest->seq);
+    if (rbtest_dummy_chk == 1) {    /* RBTEST (never commit) */
+        const uint8_t *q = (const uint8_t *)V.vram + V.vram_size - 16;
+        rbtest_dummy_chk = 2;
+        qemu_log("RBTEST stand-in contents after flush (filled a5 before): 2D %02x%02x%02x%02x "
+                 "3D %02x%02x%02x%02x cube face 5 %02x%02x%02x%02x\n", q[0], q[1], q[2], q[3],
+                 q[4], q[5], q[6], q[7], q[8], q[9], q[10], q[11]);
+    }
     V.stat_flushes++;
     return true;
 }
@@ -2011,15 +2022,48 @@ static bool vk_dummies(void)
     VkClearColorValue zero = { { 0, 0, 0, 0 } };
 
     if (V.dummy_ready) {
+        /* RBTEST (never commit): negative control.  Without the fix the images stay
+         * "ready" after their batch was cancelled; copy them out as they are. */
+        static bool rb_nc;
+        if (!rb_nc && rbtest_dummy_chk == 3 && getenv("RBTEST_NO_DUMMY_FIX")) {
+            rb_nc = true;
+            vk_end_pass();
+            VkCommandBuffer c2 = vk_batch()->cb;
+            uint64_t off = V.vram_size - 16;
+            memset(V.vram + off, 0xA5, 12);
+            for (int i = 0; i < 3; i++) {
+                VkBufferImageCopy r = {
+                    .bufferOffset = off + 4 * i,
+                    .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, i == 2 ? 5 : 0, 1 },
+                    .imageExtent = { 1, 1, 1 },
+                };
+                vkCmdCopyImageToBuffer(c2, V.dummy_img[i], VK_IMAGE_LAYOUT_GENERAL,
+                                       V.vram_buf, 1, &r);
+            }
+            vk_full_barrier(c2);
+            rbtest_dummy_chk = 1;
+            qemu_log("RBTEST no fix: stand-ins not initialized again; contents copied out "
+                     "in batch %u\n", V.cur->seq);
+        }
         return true;
     }
     vk_end_pass();
     VkCommandBuffer cb = vk_batch()->cb;
+    /* RBTEST (never commit): $R300_VK_FAIL=dummy:code:reps does not submit the batch
+     * carrying each of the first reps stand-in initializations (returning code); after
+     * the next one the three images are copied to the end of the VRAM buffer and read
+     * at the following flush.  The images get TRANSFER_SRC usage for that. */
+    static int rb_k;
+    int rb_code = 0, rb_reps = 0, rb_made = 0;
+    const char *rb_e = getenv("R300_VK_FAIL");
+    bool rb_on = rb_e && sscanf(rb_e, "dummy:%d:%d", &rb_code, &rb_reps) == 2;
     for (int i = 0; i < 3; i++) {
         uint32_t layers = i == 2 ? 6 : 1;
+        rb_made += !V.dummy_view[i];
         if (!V.dummy_view[i] &&
             !vk_image(it[i], vt[i], VK_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, 1, layers,
-                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                      (rb_on ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0),
                       &V.dummy_img[i], &V.dummy_mem[i], &V.dummy_view[i])) {
             return false;
         }
@@ -2028,6 +2072,31 @@ static bool vk_dummies(void)
         vkCmdClearColorImage(cb, V.dummy_img[i], VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &sr);
     }
     vk_full_barrier(cb);
+    if (rb_on) {
+        rb_k++;
+        if (rb_k <= rb_reps) {
+            rbtest_vk_fail_next = rb_code;
+            rbtest_dummy_chk = 3;       /* for the negative control */
+            qemu_log("RBTEST stand-in init %d recorded in batch %u (%d images created); "
+                     "that batch will not be submitted\n", rb_k, V.cur->seq, rb_made);
+        } else {
+            uint64_t off = V.vram_size - 16;
+            memset(V.vram + off, 0xA5, 12);
+            for (int i = 0; i < 3; i++) {
+                VkBufferImageCopy r = {
+                    .bufferOffset = off + 4 * i,
+                    .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, i == 2 ? 5 : 0, 1 },
+                    .imageExtent = { 1, 1, 1 },
+                };
+                vkCmdCopyImageToBuffer(cb, V.dummy_img[i], VK_IMAGE_LAYOUT_GENERAL,
+                                       V.vram_buf, 1, &r);
+            }
+            vk_full_barrier(cb);
+            rbtest_dummy_chk = 1;
+            qemu_log("RBTEST stand-in init %d recorded in batch %u (%d images created); "
+                     "contents copied out\n", rb_k, V.cur->seq, rb_made);
+        }
+    }
     V.dummy_ready = true;
     return true;
 }

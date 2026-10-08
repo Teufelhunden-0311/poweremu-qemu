@@ -62,3 +62,6 @@ for (x, y) in [(0, 0), (1, 0), (0, 1), (10, 20), (63, 63), (32, 5)]:
     hits += got == pat(x, y)
     print('  copytex on screen (%d,%d): %s want %s' % (x, y, got, pat(x, y)))
 print('[copytex on screen: %d/6 exact]' % hits)
+# a strip that does not check out is not a result
+if not ok:
+    sys.exit('bad result: strip checksum')
