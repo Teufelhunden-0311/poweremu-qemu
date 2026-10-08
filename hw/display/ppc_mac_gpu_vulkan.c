@@ -303,6 +303,12 @@ typedef struct VkWaitItem {
         }                                                               \
     } while (0)
 
+/* Out of memory is the host's state, not a property of what was asked for. */
+static bool vk_oom(VkResult r)
+{
+    return r == VK_ERROR_OUT_OF_HOST_MEMORY || r == VK_ERROR_OUT_OF_DEVICE_MEMORY;
+}
+
 /* ---- context ---------------------------------------------------------- */
 
 static bool vk_has_ext(const VkExtensionProperties *e, uint32_t n, const char *name)
@@ -1673,6 +1679,11 @@ static VkRenderPass vk_render_pass(uint32_t n, const VkFormat *fmt)
             return V.rps[i].rp;
         }
     }
+    if (V.nrp == VK_MAX_RP) {
+        /* before creating one: it could not be kept, found again or freed */
+        vk_warn(1u << 11, "more attachment layouts than render passes are kept");
+        return VK_NULL_HANDLE;
+    }
     for (uint32_t k = 0; k < n; k++) {
         ad[k] = (VkAttachmentDescription){
             .format = fmt[k],
@@ -1730,7 +1741,7 @@ static VkRenderPass vk_render_pass(uint32_t n, const VkFormat *fmt)
         .pDependencies = dep,
     };
     VkRenderPass rp;
-    if (vkCreateRenderPass(V.dev, &rci, NULL, &rp) != VK_SUCCESS || V.nrp == VK_MAX_RP) {
+    if (vkCreateRenderPass(V.dev, &rci, NULL, &rp) != VK_SUCCESS) {
         vk_warn(1u << 0, "render pass creation failed");
         return VK_NULL_HANDLE;
     }
@@ -1801,9 +1812,12 @@ static VkShaderModule vk_module(VkProg *pg, const char *glsl, R300Stage stage)
         .codeSize = nw * 4,
         .pCode = spv,
     };
-    if (vkCreateShaderModule(V.dev, &mci, NULL, &pg->mod[stage]) != VK_SUCCESS) {
+    VkResult r = vkCreateShaderModule(V.dev, &mci, NULL, &pg->mod[stage]);
+    if (r != VK_SUCCESS) {
         pg->mod[stage] = VK_NULL_HANDLE;
-        pg->failed[stage] = true;
+        /* remembered, so as not to compile it for every draw -- unless
+         * memory ran out, which the next attempt may not find */
+        pg->failed[stage] = !vk_oom(r);
     }
     free(spv);
     return pg->mod[stage];
@@ -1829,10 +1843,14 @@ static VkShaderModule vk_vs_module(const char *vs_glsl, uint32_t vs_id)
             .codeSize = nw * 4,
             .pCode = spv,
         };
-        if (vkCreateShaderModule(V.dev, &mci, NULL, &mod) != VK_SUCCESS) {
-            mod = VK_NULL_HANDLE;
-        }
+        VkResult r = vkCreateShaderModule(V.dev, &mci, NULL, &mod);
         free(spv);
+        if (r != VK_SUCCESS) {
+            mod = VK_NULL_HANDLE;
+            if (vk_oom(r)) {
+                return mod;             /* not remembered (vk_module) */
+            }
+        }
     }
     g_hash_table_insert(V.vs_mods, GUINT_TO_POINTER(vs_id), (gpointer)mod);
     return mod;
@@ -2127,8 +2145,17 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
             VkDeviceSize so;
             void *dst = vk_arena(len, &sb, &so);
             if (!dst) {
+                /*
+                 * Without all of its levels it is not a texture to keep:
+                 * it would be found again by its key and sampled where
+                 * nothing was ever written.  (The copies already recorded
+                 * refer to it, so it goes with the batch.)
+                 */
                 free(bytes);
-                continue;
+                vk_trash(NULL, TRASH_VIEW, (uint64_t)(uintptr_t)t->view);
+                vk_trash(NULL, TRASH_IMAGE, (uint64_t)(uintptr_t)t->img);
+                vk_trash(NULL, TRASH_MEM, (uint64_t)(uintptr_t)t->mem);
+                return VK_NULL_HANDLE;
             }
             memcpy(dst, bytes, len);
             free(bytes);
@@ -2258,10 +2285,15 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         const R300TexDesc *td = &pkt->tex[t];
         bool raw = td->kind == R300_TEXK_RAW;
         VkImageView view = VK_NULL_HANDLE;
+        VkSampler smp = vk_sampler(td->filter0, td->levels);
 
+        if (!smp) {
+            /* every unit's descriptor needs one, bound or not */
+            vk_warn(1u << 10, "sampler creation failed");
+            return -1;
+        }
         tii[t] = (VkDescriptorImageInfo){
-            vk_sampler(td->filter0, td->levels),
-            V.dummy_view[raw ? 0 : MIN(td->dim, 2u)], VK_IMAGE_LAYOUT_GENERAL };
+            smp, V.dummy_view[raw ? 0 : MIN(td->dim, 2u)], VK_IMAGE_LAYOUT_GENERAL };
         u.tex_addr[t][0] = u.tex_addr[t][1] = 0;
         if (!td->bound) {
             u.tex_info[t][0] = 0;
