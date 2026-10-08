@@ -110,6 +110,7 @@ typedef struct VkTrash {
 
 typedef struct VkBatch {
     int state;                  /* 0 free, 1 open, 2 submitted */
+    bool cancelled;             /* state 2, but never submitted: its fence will not signal */
     uint32_t seq;
     VkCommandBuffer cb;
     VkFence fence;
@@ -272,6 +273,7 @@ static struct {
 
 typedef struct VkWaitItem {
     VkFence fence;
+    bool cancelled;             /* nothing was submitted: do not wait on fence */
     uint32_t seq;
     void (*done)(void *, uint32_t);
     void *arg;
@@ -839,7 +841,9 @@ static void *vk_waiter(void *opaque)
         VkWaitItem *it = g_queue_peek_head(V.waitq);
         qemu_mutex_unlock(&V.lock);
 
-        vk_wait_fence(it->fence, "fence");
+        if (!it->cancelled) {
+            vk_wait_fence(it->fence, "fence");
+        }
         vk_set_done(it->seq);
         if (it->done) {
             it->done(it->arg, it->seq);
@@ -887,6 +891,7 @@ static void vk_trash(VkBatch *b, int type, uint64_t h)
 /* Return a completed batch's resources. */
 static void vk_recycle(VkBatch *b)
 {
+    b->cancelled = false;
     vkResetFences(V.dev, 1, &b->fence);
     vkResetCommandBuffer(b->cb, 0);
     for (guint i = 0; i < b->pools->len; i++) {
@@ -1417,6 +1422,33 @@ static void vk_img_written(VkImg *im, uint32_t x0, uint32_t y0,
 
 /* ---- commit / flush --------------------------------------------------- */
 
+/*
+ * Nothing a cancelled batch recorded happened: not its image uploads and
+ * layout changes, not its rendering, not its write-backs.  VRAM is as the
+ * last completed batch left it, so every cached image is dropped and
+ * rebuilt from VRAM when next used.  What the batch drew is lost.
+ */
+static void vk_forget_images(void)
+{
+    for (int i = 0; i < VK_MAX_IMG; i++) {
+        VkImg *im = &V.img[i];
+        if (im->live) {
+            im->dirty = false;          /* no write-back: it never rendered */
+            im->ndr = 0;
+            vk_img_free(im);
+        }
+    }
+    for (int i = 0; i < VK_MAX_TEXFULL; i++) {
+        VkTexFull *t = &V.texfull[i];
+        if (t->live) {
+            vk_trash(NULL, TRASH_VIEW, (uint64_t)(uintptr_t)t->view);
+            vk_trash(NULL, TRASH_IMAGE, (uint64_t)(uintptr_t)t->img);
+            vk_trash(NULL, TRASH_MEM, (uint64_t)(uintptr_t)t->mem);
+            t->live = false;
+        }
+    }
+}
+
 static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
 {
     VkBatch *b = V.cur;
@@ -1445,17 +1477,39 @@ static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
         .commandBufferCount = 1,
         .pCommandBuffers = &b->cb,
     };
-    VkResult r = vkQueueSubmit(V.queue, 1, &si, b->fence);
-    if (r != VK_SUCCESS) {
-        qatomic_inc(&V.failures);
-        vk_fail("vkQueueSubmit failed (VkResult %d)", (int)r);
-    }
+    /*
+     * A batch that is not submitted is cancelled, not completed: its fence
+     * will never signal, so nothing may wait on it (the waiter, a flush).
+     * It still takes its place in the queue, so completions are reported
+     * in order -- as for a failed wait, holding one back would hang the
+     * guest on it.  gpu_failures tells a caller that must not take the
+     * batch's output as rendered.  After a lost device nothing is
+     * submitted any more: every later batch is cancelled the same way.
+     */
+    VkResult r = qatomic_read(&V.lost) ? VK_ERROR_DEVICE_LOST
+                                       : vkQueueSubmit(V.queue, 1, &si, b->fence);
+    b->cancelled = r != VK_SUCCESS;
     b->state = 2;
     V.cur = NULL;
     V.chunk = NULL;
+    if (b->cancelled) {
+        static unsigned said;
+        qatomic_inc(&V.failures);
+        if (r == VK_ERROR_DEVICE_LOST) {
+            if (!qatomic_xchg(&V.lost, true)) {
+                error_report("ppc-mac-gpu vulkan: submitting to the GPU failed (device "
+                             "lost); 3D rendering has stopped");
+            }
+        } else if (said++ < 8) {
+            error_report("ppc-mac-gpu vulkan: submitting to the GPU failed (VkResult "
+                         "%d); what this batch drew is lost", (int)r);
+        }
+        vk_forget_images();
+    }
 
     VkWaitItem *it = g_new0(VkWaitItem, 1);
     it->fence = b->fence;
+    it->cancelled = b->cancelled;
     it->seq = b->seq;
     it->done = done;
     it->arg = arg;
@@ -1473,21 +1527,29 @@ static uint32_t vk_submit_r200(void *opaque, void (*done)(void *, uint32_t), voi
 
 static bool vk_flush_r200(void *opaque)
 {
-    VkBatch *newest = NULL;
+    VkBatch *newest = NULL, *live = NULL;   /* live: the newest that was submitted */
 
     vk_commit(NULL, NULL);
     for (int i = 0; i < VK_NBATCH; i++) {
         VkBatch *b = &V.batch[i];
-        if (b->state == 2 && !vk_seq_done(b->seq) &&
-            (!newest || (int32_t)(b->seq - newest->seq) > 0)) {
+        if (b->state != 2 || vk_seq_done(b->seq)) {
+            continue;
+        }
+        if (!newest || (int32_t)(b->seq - newest->seq) > 0) {
             newest = b;
+        }
+        if (!b->cancelled && (!live || (int32_t)(b->seq - live->seq) > 0)) {
+            live = b;
         }
     }
     if (!newest) {
         return false;
     }
-    /* A barrier opens every batch, so the newest finishing means all did. */
-    vk_wait_fence(newest->fence, "flush");
+    /* A barrier opens every batch, so the newest submitted one finishing
+     * means all before it did; cancelled ones have nothing to wait for. */
+    if (live) {
+        vk_wait_fence(live->fence, "flush");
+    }
     vk_set_done(newest->seq);
     V.stat_flushes++;
     return true;
@@ -2053,6 +2115,9 @@ static bool vk_range_pending(uint64_t lo, uint64_t hi)
 static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                         const R300DrawPacket *pkt)
 {
+    if (qatomic_read(&V.lost)) {
+        return 0;                       /* nothing renders any more (vk_commit) */
+    }
     uint32_t ncb = MAX(pkt->num_cb, 1u);
     uint32_t sx0 = pkt->scissor[0], sy0 = pkt->scissor[1];
     uint32_t sx1 = MIN(pkt->scissor[2], pkt->rt_width);
