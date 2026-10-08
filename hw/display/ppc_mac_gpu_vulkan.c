@@ -116,6 +116,7 @@ typedef struct VkBatch {
     VkFence fence;
     GArray *pools;              /* VkDescriptorPool */
     unsigned pool_cur;
+    unsigned pool_sets;         /* sets taken from pools[pool_cur] */
     GPtrArray *chunks;          /* VkChunk * used by this batch */
     GArray *trash;              /* VkTrash, destroyed once complete */
 } VkBatch;
@@ -938,12 +939,23 @@ static void vk_trash(VkBatch *b, int type, uint64_t h)
 static void vk_recycle(VkBatch *b)
 {
     b->cancelled = false;
-    vkResetFences(V.dev, 1, &b->fence);
+    if (vkResetFences(V.dev, 1, &b->fence) != VK_SUCCESS && !qatomic_xchg(&V.lost, true)) {
+        /*
+         * Still signaled, the fence cannot go with another submission: a
+         * wait for it would return at once and the batch be taken for
+         * finished while the GPU works on it.  So nothing is submitted
+         * any more (vk_commit).
+         */
+        error_report("ppc-mac-gpu vulkan: a fence could not be reset; 3D rendering "
+                     "has stopped");
+    }
+    /* (should this fail, vkBeginCommandBuffer resets it, or fails itself) */
     vkResetCommandBuffer(b->cb, 0);
     for (guint i = 0; i < b->pools->len; i++) {
         vkResetDescriptorPool(V.dev, g_array_index(b->pools, VkDescriptorPool, i), 0);
     }
     b->pool_cur = 0;
+    b->pool_sets = 0;
     for (guint i = 0; i < b->chunks->len; i++) {
         VkChunk *c = g_ptr_array_index(b->chunks, i);
         if (c->size == VK_ARENA_CHUNK && V.free_chunks->len < 8) {
@@ -992,13 +1004,16 @@ static void vk_full_barrier(VkCommandBuffer cb)
                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 }
 
-/* The open batch, starting one if needed. */
-static VkBatch *vk_batch(void)
+/*
+ * Start a batch unless one is open.  False if its command buffer cannot be
+ * begun: nothing can be recorded then, and the batch stays free.
+ */
+static bool vk_batch_start(void)
 {
     VkBatch *b = NULL;
 
     if (V.cur) {
-        return V.cur;
+        return true;
     }
     vk_reap();
     for (;;) {
@@ -1019,21 +1034,38 @@ static VkBatch *vk_batch(void)
         qemu_mutex_unlock(&V.lock);
         vk_reap();
     }
+    VkCommandBufferBeginInfo bi = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    if (vkBeginCommandBuffer(b->cb, &bi) != VK_SUCCESS) {
+        vk_warn(1u << 12, "a command buffer could not be begun");
+        return false;
+    }
     b->state = 1;
     b->seq = ++V.seq;
     if (!b->seq) {
         b->seq = ++V.seq;
     }
-    VkCommandBufferBeginInfo bi = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-    };
-    vkBeginCommandBuffer(b->cb, &bi);
     /* ordered after everything submitted before (and host writes) */
     vk_full_barrier(b->cb);
     V.cur = b;
     V.chunk = NULL;
-    return b;
+    return true;
+}
+
+/*
+ * The open batch.  vk_draw_r300 starts it (and gives up if it cannot)
+ * before anything is recorded, and all that records is part of a draw or
+ * of committing the open batch.  Anything else would have one started
+ * here, and get NULL if that fails.
+ */
+static VkBatch *vk_batch(void)
+{
+    if (!V.cur) {
+        vk_batch_start();
+    }
+    return V.cur;
 }
 
 /* Bump allocation from the batch's host-visible arena. */
@@ -1524,7 +1556,6 @@ static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
     };
     vkCmdPipelineBarrier(b->cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                          VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-    vkEndCommandBuffer(b->cb);
     VkSubmitInfo si = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1,
@@ -1538,9 +1569,16 @@ static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
      * guest on it.  gpu_failures tells a caller that must not take the
      * batch's output as rendered.  After a lost device nothing is
      * submitted any more: every later batch is cancelled the same way.
+     * So is a batch whose recording failed, which vkEndCommandBuffer
+     * reports: its command buffer is not one that may be submitted.
      */
-    VkResult r = qatomic_read(&V.lost) ? VK_ERROR_DEVICE_LOST
-                                       : vkQueueSubmit(V.queue, 1, &si, b->fence);
+    const char *did = "recording its commands";
+    VkResult r = vkEndCommandBuffer(b->cb);
+    if (r == VK_SUCCESS) {
+        did = "submitting to the GPU";
+        r = qatomic_read(&V.lost) ? VK_ERROR_DEVICE_LOST
+                                  : vkQueueSubmit(V.queue, 1, &si, b->fence);
+    }
     b->cancelled = r != VK_SUCCESS;
     b->state = 2;
     V.cur = NULL;
@@ -1550,12 +1588,12 @@ static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
         qatomic_inc(&V.failures);
         if (r == VK_ERROR_DEVICE_LOST) {
             if (!qatomic_xchg(&V.lost, true)) {
-                error_report("ppc-mac-gpu vulkan: submitting to the GPU failed (device "
-                             "lost); 3D rendering has stopped");
+                error_report("ppc-mac-gpu vulkan: %s failed (device lost); 3D "
+                             "rendering has stopped", did);
             }
         } else if (said++ < 8) {
-            error_report("ppc-mac-gpu vulkan: submitting to the GPU failed (VkResult "
-                         "%d); what this batch drew is lost", (int)r);
+            error_report("ppc-mac-gpu vulkan: %s failed (VkResult %d); what this "
+                         "batch drew is lost", did, (int)r);
         }
         vk_forget_images();
     }
@@ -2275,6 +2313,10 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     if (need_flush) {
         vk_flush_r200(opaque);
     }
+    /* Everything from here on records into the open batch. */
+    if (!vk_batch_start()) {
+        return -1;
+    }
     if (!vk_dummies()) {
         return -1;
     }
@@ -2525,9 +2567,20 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             .pSetLayouts = &V.dsl,
         };
         if (vkAllocateDescriptorSets(V.dev, &dai, &set) == VK_SUCCESS) {
+            b->pool_sets++;
             break;
         }
+        if (!b->pool_sets) {
+            /*
+             * The pool is empty and still cannot supply a set: it is not
+             * that it ran out, and the next pool would do no better.  (A
+             * new one would be created for every failure, without end.)
+             */
+            vk_warn(1u << 13, "descriptor set allocation failed");
+            return -1;
+        }
         b->pool_cur++;
+        b->pool_sets = 0;
     }
     VkDescriptorBufferInfo bi[6] = {
         { ub, uo, sizeof(R300FSUniforms) },
