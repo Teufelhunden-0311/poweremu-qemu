@@ -116,6 +116,7 @@ typedef struct VkBatch {
     VkFence fence;
     GArray *pools;              /* VkDescriptorPool */
     unsigned pool_cur;
+    unsigned pool_sets;         /* sets taken from pools[pool_cur] */
     GPtrArray *chunks;          /* VkChunk * used by this batch */
     GArray *trash;              /* VkTrash, destroyed once complete */
 } VkBatch;
@@ -288,7 +289,36 @@ typedef struct VkWaitItem {
         }                                                               \
     } while (0)
 
+/*
+ * The same for a call that creates the object `out`.  A call that fails
+ * leaves its output undefined (the specification promises a null handle
+ * only for command buffers, descriptor sets and pipelines), so `out` is
+ * cleared: what follows the failure sees no object, not a stray handle.
+ */
+#define VKCREATE(expr, out, what) do {                                  \
+        VkResult r_ = (expr);                                           \
+        if (r_ != VK_SUCCESS) {                                         \
+            (out) = VK_NULL_HANDLE;                                     \
+            vk_fail("%s failed (VkResult %d)", what, (int)r_);          \
+            goto fail;                                                  \
+        }                                                               \
+    } while (0)
+
+/* Out of memory is the host's state, not a property of what was asked for. */
+static bool vk_oom(VkResult r)
+{
+    return r == VK_ERROR_OUT_OF_HOST_MEMORY || r == VK_ERROR_OUT_OF_DEVICE_MEMORY;
+}
+
 /* ---- context ---------------------------------------------------------- */
+
+/* The filling call of a count-then-fill pair: its count and array are good
+ * unless it failed (fewer entries than there now are, VK_INCOMPLETE, is not
+ * a failure). */
+static bool vk_listed(VkResult r)
+{
+    return r == VK_SUCCESS || r == VK_INCOMPLETE;
+}
 
 static bool vk_has_ext(const VkExtensionProperties *e, uint32_t n, const char *name)
 {
@@ -330,7 +360,10 @@ static bool vk_ctx_init(void)
         return false;
     }
     ie = g_new0(VkExtensionProperties, n);
-    vkEnumerateInstanceExtensionProperties(NULL, &n, ie);
+    if (!vk_listed(vkEnumerateInstanceExtensionProperties(NULL, &n, ie))) {
+        vk_fail("vkEnumerateInstanceExtensionProperties failed");
+        goto fail;
+    }
     if (vk_has_ext(ie, n, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
         iext[niext++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
         portability = true;
@@ -359,16 +392,18 @@ static bool vk_ctx_init(void)
         .enabledExtensionCount = niext,
         .ppEnabledExtensionNames = iext,
     };
-    VKCHECK(vkCreateInstance(&ici, NULL, &V.inst), "vkCreateInstance");
+    VKCREATE(vkCreateInstance(&ici, NULL, &V.inst), V.inst, "vkCreateInstance");
 
     n = 0;
-    vkEnumeratePhysicalDevices(V.inst, &n, NULL);
-    if (!n) {
+    if (vkEnumeratePhysicalDevices(V.inst, &n, NULL) != VK_SUCCESS || !n) {
         vk_fail("no Vulkan device");
         goto fail;
     }
     pd = g_new0(VkPhysicalDevice, n);
-    vkEnumeratePhysicalDevices(V.inst, &n, pd);
+    if (!vk_listed(vkEnumeratePhysicalDevices(V.inst, &n, pd))) {
+        vk_fail("vkEnumeratePhysicalDevices failed");
+        goto fail;
+    }
     {
         /* PPCGPU_VK_DEVICE=index picks one; else discrete, then integrated. */
         const char *e = getenv("PPCGPU_VK_DEVICE");
@@ -401,9 +436,15 @@ static bool vk_ctx_init(void)
     vkGetPhysicalDeviceMemoryProperties(V.pdev, &V.memprops);
 
     n = 0;
-    vkEnumerateDeviceExtensionProperties(V.pdev, NULL, &n, NULL);
+    if (vkEnumerateDeviceExtensionProperties(V.pdev, NULL, &n, NULL) != VK_SUCCESS) {
+        vk_fail("vkEnumerateDeviceExtensionProperties failed");
+        goto fail;
+    }
     de = g_new0(VkExtensionProperties, n);
-    vkEnumerateDeviceExtensionProperties(V.pdev, NULL, &n, de);
+    if (!vk_listed(vkEnumerateDeviceExtensionProperties(V.pdev, NULL, &n, de))) {
+        vk_fail("vkEnumerateDeviceExtensionProperties failed");
+        goto fail;
+    }
     if (vk_has_ext(de, n, "VK_KHR_portability_subset")) {
         dext[ndext++] = "VK_KHR_portability_subset";
     }
@@ -539,7 +580,7 @@ static bool vk_ctx_init(void)
         .ppEnabledExtensionNames = dext,
         .pEnabledFeatures = &want,
     };
-    VKCHECK(vkCreateDevice(V.pdev, &dci, NULL, &V.dev), "vkCreateDevice");
+    VKCREATE(vkCreateDevice(V.pdev, &dci, NULL, &V.dev), V.dev, "vkCreateDevice");
     vkGetDeviceQueue(V.dev, V.qfam, 0, &V.queue);
 
     V.align = MAX(MAX(V.props.limits.minUniformBufferOffsetAlignment,
@@ -550,7 +591,8 @@ static bool vk_ctx_init(void)
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
         .queueFamilyIndex = V.qfam,
     };
-    VKCHECK(vkCreateCommandPool(V.dev, &cpi, NULL, &V.cmdpool), "vkCreateCommandPool");
+    VKCREATE(vkCreateCommandPool(V.dev, &cpi, NULL, &V.cmdpool), V.cmdpool,
+             "vkCreateCommandPool");
 
     /* One descriptor set layout for every R300 program (R300_BIND_*). */
     VkDescriptorSetLayoutBinding b[7 + VK_MAX_ATT + R300_NUM_TEX_UNITS];
@@ -584,13 +626,15 @@ static bool vk_ctx_init(void)
         .bindingCount = nb,
         .pBindings = b,
     };
-    VKCHECK(vkCreateDescriptorSetLayout(V.dev, &dli, NULL, &V.dsl), "vkCreateDescriptorSetLayout");
+    VKCREATE(vkCreateDescriptorSetLayout(V.dev, &dli, NULL, &V.dsl), V.dsl,
+             "vkCreateDescriptorSetLayout");
     VkPipelineLayoutCreateInfo pli = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1,
         .pSetLayouts = &V.dsl,
     };
-    VKCHECK(vkCreatePipelineLayout(V.dev, &pli, NULL, &V.layout), "vkCreatePipelineLayout");
+    VKCREATE(vkCreatePipelineLayout(V.dev, &pli, NULL, &V.layout), V.layout,
+             "vkCreatePipelineLayout");
 
     for (int i = 0; i < VK_NBATCH; i++) {
         VkBatch *bt = &V.batch[i];
@@ -602,7 +646,7 @@ static bool vk_ctx_init(void)
         };
         VKCHECK(vkAllocateCommandBuffers(V.dev, &cai, &bt->cb), "vkAllocateCommandBuffers");
         VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-        VKCHECK(vkCreateFence(V.dev, &fci, NULL, &bt->fence), "vkCreateFence");
+        VKCREATE(vkCreateFence(V.dev, &fci, NULL, &bt->fence), bt->fence, "vkCreateFence");
         bt->pools = g_array_new(FALSE, FALSE, sizeof(VkDescriptorPool));
         bt->chunks = g_ptr_array_new();
         bt->trash = g_array_new(FALSE, FALSE, sizeof(VkTrash));
@@ -637,6 +681,12 @@ fail:
 
 /* ---- buffers and images ----------------------------------------------- */
 
+/*
+ * vk_buffer and vk_image hand over what they created only if all of it was
+ * created: after a failure every output is null and nothing is left behind.
+ * Each object is kept in a local that is null unless its call succeeded
+ * (VKCREATE), so the clean-up never sees the output of a call that failed.
+ */
 static bool vk_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
                       VkMemoryPropertyFlags want, VkMemoryPropertyFlags prefer,
                       VkBuffer *buf, VkDeviceMemory *mem, void **map)
@@ -646,13 +696,19 @@ static bool vk_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
         .size = size,
         .usage = usage,
     };
+    VkBuffer b = VK_NULL_HANDLE;
+    VkDeviceMemory m = VK_NULL_HANDLE;
     VkMemoryRequirements req;
+    void *p = NULL;
     int mt;
 
     *buf = VK_NULL_HANDLE;
     *mem = VK_NULL_HANDLE;
-    VKCHECK(vkCreateBuffer(V.dev, &bci, NULL, buf), "vkCreateBuffer");
-    vkGetBufferMemoryRequirements(V.dev, *buf, &req);
+    if (map) {
+        *map = NULL;
+    }
+    VKCREATE(vkCreateBuffer(V.dev, &bci, NULL, &b), b, "vkCreateBuffer");
+    vkGetBufferMemoryRequirements(V.dev, b, &req);
     mt = vk_memtype(req.memoryTypeBits, want | prefer);
     if (mt < 0) {
         mt = vk_memtype(req.memoryTypeBits, want);
@@ -666,21 +722,22 @@ static bool vk_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
         .allocationSize = req.size,
         .memoryTypeIndex = mt,
     };
-    VKCHECK(vkAllocateMemory(V.dev, &mai, NULL, mem), "vkAllocateMemory");
-    VKCHECK(vkBindBufferMemory(V.dev, *buf, *mem, 0), "vkBindBufferMemory");
+    VKCREATE(vkAllocateMemory(V.dev, &mai, NULL, &m), m, "vkAllocateMemory");
+    VKCHECK(vkBindBufferMemory(V.dev, b, m, 0), "vkBindBufferMemory");
     if (map) {
-        VKCHECK(vkMapMemory(V.dev, *mem, 0, VK_WHOLE_SIZE, 0, map), "vkMapMemory");
+        VKCHECK(vkMapMemory(V.dev, m, 0, VK_WHOLE_SIZE, 0, &p), "vkMapMemory");
+        *map = p;
     }
+    *buf = b;
+    *mem = m;
     return true;
 fail:
-    if (*buf) {
-        vkDestroyBuffer(V.dev, *buf, NULL);
+    if (b) {
+        vkDestroyBuffer(V.dev, b, NULL);
     }
-    if (*mem) {
-        vkFreeMemory(V.dev, *mem, NULL);
+    if (m) {
+        vkFreeMemory(V.dev, m, NULL);
     }
-    *buf = VK_NULL_HANDLE;
-    *mem = VK_NULL_HANDLE;
     return false;
 }
 
@@ -702,43 +759,51 @@ static bool vk_image(VkImageType type, VkImageViewType vtype, VkFormat fmt,
         .usage = usage,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
+    VkImage i = VK_NULL_HANDLE;
+    VkDeviceMemory m = VK_NULL_HANDLE;
+    VkImageView v = VK_NULL_HANDLE;
     VkMemoryRequirements req;
     int mt;
 
     *img = VK_NULL_HANDLE;
     *mem = VK_NULL_HANDLE;
     *view = VK_NULL_HANDLE;
-    VKCHECK(vkCreateImage(V.dev, &ici, NULL, img), "vkCreateImage");
-    vkGetImageMemoryRequirements(V.dev, *img, &req);
+    VKCREATE(vkCreateImage(V.dev, &ici, NULL, &i), i, "vkCreateImage");
+    vkGetImageMemoryRequirements(V.dev, i, &req);
     mt = vk_memtype(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (mt < 0) {
         mt = vk_memtype(req.memoryTypeBits, 0);
+    }
+    if (mt < 0) {
+        vk_fail("no memory type for an image");
+        goto fail;
     }
     VkMemoryAllocateInfo mai = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .allocationSize = req.size,
         .memoryTypeIndex = mt,
     };
-    VKCHECK(vkAllocateMemory(V.dev, &mai, NULL, mem), "vkAllocateMemory (image)");
-    VKCHECK(vkBindImageMemory(V.dev, *img, *mem, 0), "vkBindImageMemory");
+    VKCREATE(vkAllocateMemory(V.dev, &mai, NULL, &m), m, "vkAllocateMemory (image)");
+    VKCHECK(vkBindImageMemory(V.dev, i, m, 0), "vkBindImageMemory");
     VkImageViewCreateInfo vci = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .image = *img,
+        .image = i,
         .viewType = vtype,
         .format = fmt,
         .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, layers },
     };
-    VKCHECK(vkCreateImageView(V.dev, &vci, NULL, view), "vkCreateImageView");
+    VKCREATE(vkCreateImageView(V.dev, &vci, NULL, &v), v, "vkCreateImageView");
+    *img = i;
+    *mem = m;
+    *view = v;
     return true;
 fail:
-    if (*img) {
-        vkDestroyImage(V.dev, *img, NULL);
+    if (i) {
+        vkDestroyImage(V.dev, i, NULL);
     }
-    if (*mem) {
-        vkFreeMemory(V.dev, *mem, NULL);
+    if (m) {
+        vkFreeMemory(V.dev, m, NULL);
     }
-    *img = VK_NULL_HANDLE;
-    *mem = VK_NULL_HANDLE;
     return false;
 }
 
@@ -902,12 +967,23 @@ static void vk_trash(VkBatch *b, int type, uint64_t h)
 static void vk_recycle(VkBatch *b)
 {
     b->cancelled = false;
-    vkResetFences(V.dev, 1, &b->fence);
+    if (vkResetFences(V.dev, 1, &b->fence) != VK_SUCCESS && !qatomic_xchg(&V.lost, true)) {
+        /*
+         * Still signaled, the fence cannot go with another submission: a
+         * wait for it would return at once and the batch be taken for
+         * finished while the GPU works on it.  So nothing is submitted
+         * any more (vk_commit).
+         */
+        error_report("ppc-mac-gpu vulkan: a fence could not be reset; 3D rendering "
+                     "has stopped");
+    }
+    /* (should this fail, vkBeginCommandBuffer resets it, or fails itself) */
     vkResetCommandBuffer(b->cb, 0);
     for (guint i = 0; i < b->pools->len; i++) {
         vkResetDescriptorPool(V.dev, g_array_index(b->pools, VkDescriptorPool, i), 0);
     }
     b->pool_cur = 0;
+    b->pool_sets = 0;
     for (guint i = 0; i < b->chunks->len; i++) {
         VkChunk *c = g_ptr_array_index(b->chunks, i);
         if (c->size == VK_ARENA_CHUNK && V.free_chunks->len < 8) {
@@ -934,9 +1010,26 @@ static void vk_recycle(VkBatch *b)
     b->state = 0;
 }
 
+/*
+ * Once rendering has stopped (V.lost) nothing is recycled.  A wait that
+ * failed without the device being lost says nothing about its batch: the
+ * GPU may still be working on it, and it must keep its command buffer, its
+ * fence and everything it uses.  The waiter sets V.lost before it takes
+ * its lock to move worker_seq past such a batch, so read under that lock
+ * the two cannot disagree.
+ */
 static void vk_reap(void)
 {
-    uint32_t ws = qatomic_read(&V.worker_seq);
+    uint32_t ws;
+    bool lost;
+
+    qemu_mutex_lock(&V.lock);
+    ws = qatomic_read(&V.worker_seq);
+    lost = qatomic_read(&V.lost);
+    qemu_mutex_unlock(&V.lock);
+    if (lost) {
+        return;
+    }
     for (int i = 0; i < VK_NBATCH; i++) {
         VkBatch *b = &V.batch[i];
         if (b->state == 2 && (int32_t)(ws - b->seq) >= 0) {
@@ -956,13 +1049,16 @@ static void vk_full_barrier(VkCommandBuffer cb)
                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 }
 
-/* The open batch, starting one if needed. */
-static VkBatch *vk_batch(void)
+/*
+ * Start a batch unless one is open.  False if its command buffer cannot be
+ * begun: nothing can be recorded then, and the batch stays free.
+ */
+static bool vk_batch_start(void)
 {
     VkBatch *b = NULL;
 
     if (V.cur) {
-        return V.cur;
+        return true;
     }
     vk_reap();
     for (;;) {
@@ -974,6 +1070,9 @@ static VkBatch *vk_batch(void)
         if (b) {
             break;
         }
+        if (qatomic_read(&V.lost)) {
+            return false;               /* none will come free (vk_reap) */
+        }
         /* all in flight: wait for the waiter to finish the oldest */
         qemu_mutex_lock(&V.lock);
         uint32_t ws = qatomic_read(&V.worker_seq);
@@ -983,21 +1082,38 @@ static VkBatch *vk_batch(void)
         qemu_mutex_unlock(&V.lock);
         vk_reap();
     }
+    VkCommandBufferBeginInfo bi = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    if (vkBeginCommandBuffer(b->cb, &bi) != VK_SUCCESS) {
+        vk_warn(1u << 12, "a command buffer could not be begun");
+        return false;
+    }
     b->state = 1;
     b->seq = ++V.seq;
     if (!b->seq) {
         b->seq = ++V.seq;
     }
-    VkCommandBufferBeginInfo bi = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-    };
-    vkBeginCommandBuffer(b->cb, &bi);
     /* ordered after everything submitted before (and host writes) */
     vk_full_barrier(b->cb);
     V.cur = b;
     V.chunk = NULL;
-    return b;
+    return true;
+}
+
+/*
+ * The open batch.  vk_draw_r300 starts it (and gives up if it cannot)
+ * before anything is recorded, and all that records is part of a draw or
+ * of committing the open batch.  Anything else would have one started
+ * here, and get NULL if that fails.
+ */
+static VkBatch *vk_batch(void)
+{
+    if (!V.cur) {
+        vk_batch_start();
+    }
+    return V.cur;
 }
 
 /* Bump allocation from the batch's host-visible arena. */
@@ -1516,7 +1632,6 @@ static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
     };
     vkCmdPipelineBarrier(b->cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                          VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-    vkEndCommandBuffer(b->cb);
     VkSubmitInfo si = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1,
@@ -1530,9 +1645,16 @@ static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
      * guest on it.  gpu_failures tells a caller that must not take the
      * batch's output as rendered.  After a lost device nothing is
      * submitted any more: every later batch is cancelled the same way.
+     * So is a batch whose recording failed, which vkEndCommandBuffer
+     * reports: its command buffer is not one that may be submitted.
      */
-    VkResult r = qatomic_read(&V.lost) ? VK_ERROR_DEVICE_LOST
-                                       : rbtest_submit(&si, b->fence);
+    const char *did = "recording its commands";
+    VkResult r = vkEndCommandBuffer(b->cb);
+    if (r == VK_SUCCESS) {
+        did = "submitting to the GPU";
+        r = qatomic_read(&V.lost) ? VK_ERROR_DEVICE_LOST
+                                  : rbtest_submit(&si, b->fence);
+    }
     b->cancelled = r != VK_SUCCESS;
     b->state = 2;
     V.cur = NULL;
@@ -1542,12 +1664,12 @@ static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
         qatomic_inc(&V.failures);
         if (r == VK_ERROR_DEVICE_LOST) {
             if (!qatomic_xchg(&V.lost, true)) {
-                error_report("ppc-mac-gpu vulkan: submitting to the GPU failed (device "
-                             "lost); 3D rendering has stopped");
+                error_report("ppc-mac-gpu vulkan: %s failed (device lost); 3D "
+                             "rendering has stopped", did);
             }
         } else if (said++ < 8) {
-            error_report("ppc-mac-gpu vulkan: submitting to the GPU failed (VkResult "
-                         "%d); what this batch drew is lost", (int)r);
+            error_report("ppc-mac-gpu vulkan: %s failed (VkResult %d); what this "
+                         "batch drew is lost", did, (int)r);
         }
         vk_forget_images();
     }
@@ -1678,6 +1800,11 @@ static VkRenderPass vk_render_pass(uint32_t n, const VkFormat *fmt)
             return V.rps[i].rp;
         }
     }
+    if (V.nrp == VK_MAX_RP) {
+        /* before creating one: it could not be kept, found again or freed */
+        vk_warn(1u << 11, "more attachment layouts than render passes are kept");
+        return VK_NULL_HANDLE;
+    }
     for (uint32_t k = 0; k < n; k++) {
         ad[k] = (VkAttachmentDescription){
             .format = fmt[k],
@@ -1735,7 +1862,7 @@ static VkRenderPass vk_render_pass(uint32_t n, const VkFormat *fmt)
         .pDependencies = dep,
     };
     VkRenderPass rp;
-    if (vkCreateRenderPass(V.dev, &rci, NULL, &rp) != VK_SUCCESS || V.nrp == VK_MAX_RP) {
+    if (vkCreateRenderPass(V.dev, &rci, NULL, &rp) != VK_SUCCESS) {
         vk_warn(1u << 0, "render pass creation failed");
         return VK_NULL_HANDLE;
     }
@@ -1806,9 +1933,12 @@ static VkShaderModule vk_module(VkProg *pg, const char *glsl, R300Stage stage)
         .codeSize = nw * 4,
         .pCode = spv,
     };
-    if (vkCreateShaderModule(V.dev, &mci, NULL, &pg->mod[stage]) != VK_SUCCESS) {
+    VkResult r = vkCreateShaderModule(V.dev, &mci, NULL, &pg->mod[stage]);
+    if (r != VK_SUCCESS) {
         pg->mod[stage] = VK_NULL_HANDLE;
-        pg->failed[stage] = true;
+        /* remembered, so as not to compile it for every draw -- unless
+         * memory ran out, which the next attempt may not find */
+        pg->failed[stage] = !vk_oom(r);
     }
     free(spv);
     return pg->mod[stage];
@@ -1834,10 +1964,14 @@ static VkShaderModule vk_vs_module(const char *vs_glsl, uint32_t vs_id)
             .codeSize = nw * 4,
             .pCode = spv,
         };
-        if (vkCreateShaderModule(V.dev, &mci, NULL, &mod) != VK_SUCCESS) {
-            mod = VK_NULL_HANDLE;
-        }
+        VkResult r = vkCreateShaderModule(V.dev, &mci, NULL, &mod);
         free(spv);
+        if (r != VK_SUCCESS) {
+            mod = VK_NULL_HANDLE;
+            if (vk_oom(r)) {
+                return mod;             /* not remembered (vk_module) */
+            }
+        }
     }
     g_hash_table_insert(V.vs_mods, GUINT_TO_POINTER(vs_id), (gpointer)mod);
     return mod;
@@ -2234,8 +2368,17 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
             VkDeviceSize so;
             void *dst = vk_arena(len, &sb, &so);
             if (!dst) {
+                /*
+                 * Without all of its levels it is not a texture to keep:
+                 * it would be found again by its key and sampled where
+                 * nothing was ever written.  (The copies already recorded
+                 * refer to it, so it goes with the batch.)
+                 */
                 free(bytes);
-                continue;
+                vk_trash(NULL, TRASH_VIEW, (uint64_t)(uintptr_t)t->view);
+                vk_trash(NULL, TRASH_IMAGE, (uint64_t)(uintptr_t)t->img);
+                vk_trash(NULL, TRASH_MEM, (uint64_t)(uintptr_t)t->mem);
+                return VK_NULL_HANDLE;
             }
             memcpy(dst, bytes, len);
             free(bytes);
@@ -2355,6 +2498,10 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     if (need_flush) {
         vk_flush_r200(opaque);
     }
+    /* Everything from here on records into the open batch. */
+    if (!vk_batch_start()) {
+        return -1;
+    }
     if (!vk_dummies()) {
         return -1;
     }
@@ -2365,10 +2512,15 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
         const R300TexDesc *td = &pkt->tex[t];
         bool raw = td->kind == R300_TEXK_RAW;
         VkImageView view = VK_NULL_HANDLE;
+        VkSampler smp = vk_sampler(td->filter0, td->levels);
 
+        if (!smp) {
+            /* every unit's descriptor needs one, bound or not */
+            vk_warn(1u << 10, "sampler creation failed");
+            return -1;
+        }
         tii[t] = (VkDescriptorImageInfo){
-            vk_sampler(td->filter0, td->levels),
-            V.dummy_view[raw ? 0 : MIN(td->dim, 2u)], VK_IMAGE_LAYOUT_GENERAL };
+            smp, V.dummy_view[raw ? 0 : MIN(td->dim, 2u)], VK_IMAGE_LAYOUT_GENERAL };
         u.tex_addr[t][0] = u.tex_addr[t][1] = 0;
         if (!td->bound) {
             u.tex_info[t][0] = 0;
@@ -2600,9 +2752,20 @@ static int vk_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
             .pSetLayouts = &V.dsl,
         };
         if (vkAllocateDescriptorSets(V.dev, &dai, &set) == VK_SUCCESS) {
+            b->pool_sets++;
             break;
         }
+        if (!b->pool_sets) {
+            /*
+             * The pool is empty and still cannot supply a set: it is not
+             * that it ran out, and the next pool would do no better.  (A
+             * new one would be created for every failure, without end.)
+             */
+            vk_warn(1u << 13, "descriptor set allocation failed");
+            return -1;
+        }
         b->pool_cur++;
+        b->pool_sets = 0;
     }
     VkDescriptorBufferInfo bi[6] = {
         { ub, uo, sizeof(R300FSUniforms) },
