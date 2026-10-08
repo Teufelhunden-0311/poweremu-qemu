@@ -312,6 +312,14 @@ static bool vk_oom(VkResult r)
 
 /* ---- context ---------------------------------------------------------- */
 
+/* The filling call of a count-then-fill pair: its count and array are good
+ * unless it failed (fewer entries than there now are, VK_INCOMPLETE, is not
+ * a failure). */
+static bool vk_listed(VkResult r)
+{
+    return r == VK_SUCCESS || r == VK_INCOMPLETE;
+}
+
 static bool vk_has_ext(const VkExtensionProperties *e, uint32_t n, const char *name)
 {
     for (uint32_t i = 0; i < n; i++) {
@@ -352,7 +360,10 @@ static bool vk_ctx_init(void)
         return false;
     }
     ie = g_new0(VkExtensionProperties, n);
-    vkEnumerateInstanceExtensionProperties(NULL, &n, ie);
+    if (!vk_listed(vkEnumerateInstanceExtensionProperties(NULL, &n, ie))) {
+        vk_fail("vkEnumerateInstanceExtensionProperties failed");
+        goto fail;
+    }
     if (vk_has_ext(ie, n, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
         iext[niext++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
         portability = true;
@@ -384,13 +395,15 @@ static bool vk_ctx_init(void)
     VKCREATE(vkCreateInstance(&ici, NULL, &V.inst), V.inst, "vkCreateInstance");
 
     n = 0;
-    vkEnumeratePhysicalDevices(V.inst, &n, NULL);
-    if (!n) {
+    if (vkEnumeratePhysicalDevices(V.inst, &n, NULL) != VK_SUCCESS || !n) {
         vk_fail("no Vulkan device");
         goto fail;
     }
     pd = g_new0(VkPhysicalDevice, n);
-    vkEnumeratePhysicalDevices(V.inst, &n, pd);
+    if (!vk_listed(vkEnumeratePhysicalDevices(V.inst, &n, pd))) {
+        vk_fail("vkEnumeratePhysicalDevices failed");
+        goto fail;
+    }
     {
         /* PPCGPU_VK_DEVICE=index picks one; else discrete, then integrated. */
         const char *e = getenv("PPCGPU_VK_DEVICE");
@@ -423,9 +436,15 @@ static bool vk_ctx_init(void)
     vkGetPhysicalDeviceMemoryProperties(V.pdev, &V.memprops);
 
     n = 0;
-    vkEnumerateDeviceExtensionProperties(V.pdev, NULL, &n, NULL);
+    if (vkEnumerateDeviceExtensionProperties(V.pdev, NULL, &n, NULL) != VK_SUCCESS) {
+        vk_fail("vkEnumerateDeviceExtensionProperties failed");
+        goto fail;
+    }
     de = g_new0(VkExtensionProperties, n);
-    vkEnumerateDeviceExtensionProperties(V.pdev, NULL, &n, de);
+    if (!vk_listed(vkEnumerateDeviceExtensionProperties(V.pdev, NULL, &n, de))) {
+        vk_fail("vkEnumerateDeviceExtensionProperties failed");
+        goto fail;
+    }
     if (vk_has_ext(de, n, "VK_KHR_portability_subset")) {
         dext[ndext++] = "VK_KHR_portability_subset";
     }
