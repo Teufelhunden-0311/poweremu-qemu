@@ -268,8 +268,10 @@ static struct {
     GQueue *waitq;              /* VkWaitItem */
     bool thread_started;
 
-    bool lost;                  /* a fence wait failed: the device is gone */
-    uint64_t failures;          /* failed submissions and fence waits (gpu_failures) */
+    bool lost;                  /* nothing more is rendered: the device is lost,
+                                   or a fence could not be reset */
+    uint64_t failures;          /* batches cancelled, and waits that found the
+                                   device lost (gpu_failures) */
     uint64_t stat_draws, stat_passes, stat_uploads, stat_writebacks, stat_flushes;
 } V;
 
@@ -879,30 +881,116 @@ static void vk_set_done(uint32_t seq)
 }
 
 /*
- * Wait for a batch's fence.  A failure (VK_ERROR_DEVICE_LOST: a GPU reset,
- * a driver crash) means nothing more will render; say so once, loudly.
- * Completion is still reported to the guest: holding it back would hang
- * Mac OS X on the fence for good, which is worse than a frozen picture.
+ * RBTEST (never commit): one wait for a batch's fence.  In $R300_VK_FAIL:
+ *  wait               the first wait after /tmp/rbtest-wait-lost appears reports
+ *                     DEVICE_LOST, after really waiting
+ *  waitbusy:N:code:R  for every N-th batch waited for (the thread and flushes counted
+ *                     apart), the first R attempts return code (-1 host memory,
+ *                     -2 device memory, 2 VK_TIMEOUT) WITHOUT waiting: the GPU may
+ *                     really still be at work on the batch then
  */
-static void vk_wait_fence(VkFence fence, const char *who)
+static VkResult rbtest_wait(VkFence fence, unsigned tries, bool flush)
 {
-    VkResult r = vkWaitForFences(V.dev, 1, &fence, VK_TRUE, UINT64_MAX);
-    {   /* RBTEST (never commit): see rbtest_submit */
+    static unsigned k[2], said[2];
+    static unsigned injected;
+    const char *e = getenv("R300_VK_FAIL");
+    unsigned n = 0, reps = 0;
+    int code = 0;
+    VkResult r;
+
+    if (e && sscanf(e, "waitbusy:%u:%d:%u", &n, &code, &reps) == 3 && n) {
+        k[flush] += tries == 1;
+        if (k[flush] % n == 0 && tries <= reps) {
+            unsigned total = qatomic_fetch_inc(&injected) + 1;
+            if (said[flush]++ < 12 || !(total & (total - 1))) {
+                qemu_log("RBTEST %s wait %u, attempt %u: returns %d without waiting "
+                         "(%u such so far)\n", flush ? "flush" : "thread", k[flush], tries,
+                         code, total);
+            }
+            return (VkResult)code;
+        }
+    }
+    r = vkWaitForFences(V.dev, 1, &fence, VK_TRUE, UINT64_MAX);
+    {
         static bool once;
-        const char *e = getenv("R300_VK_FAIL");
         if (e && !strcmp(e, "wait") && !once && !access("/tmp/rbtest-wait-lost", F_OK)) {
             once = true;
             qemu_log("RBTEST a fence wait reported as DEVICE_LOST\n");
             r = VK_ERROR_DEVICE_LOST;
         }
     }
-    if (r != VK_SUCCESS) {
-        qatomic_inc(&V.failures);
-    }
-    if (r != VK_SUCCESS && !qatomic_xchg(&V.lost, true)) {
-        error_report("ppc-mac-gpu vulkan: %s: waiting for the GPU failed "
-                     "(VkResult %d%s); 3D rendering has stopped", who, (int)r,
-                     r == VK_ERROR_DEVICE_LOST ? ", device lost" : "");
+    return r;
+}
+
+/*
+ * Wait until batch seq, submitted with this fence, is the GPU's no longer.
+ * Two answers say that it is not.
+ *
+ * VK_SUCCESS: the fence has signaled.
+ *
+ * VK_ERROR_DEVICE_LOST (a GPU reset, a driver crash): for what is pending
+ * and in use that result counts as success, and memory mapped from a lost
+ * device may still be read and written, whatever it now holds.  Nothing
+ * more will render; say so once, loudly.  Completion is still reported to
+ * the guest: holding it back would hang Mac OS X on the fence for good,
+ * which is worse than a frozen picture.
+ *
+ * Anything else -- the wait failed for lack of memory, it came back early
+ * -- says nothing about the batch.  The GPU may still be reading and
+ * writing VRAM, the Z-pass counter and the batch's own buffers, so the
+ * batch is not reported complete, its pages stay busy and nothing of it is
+ * recycled: the question is put again, after a pause that grows to a tenth
+ * of a second, until it is answered.  If no answer ever comes, whoever
+ * waits here waits for good and the guest with it, as for a GPU that never
+ * finishes: nothing else tells when the memory may be touched.
+ *
+ * A flush may stop asking once the waiter thread has had the answer for
+ * this batch, which moves done_seq past it.  The thread asks until it is
+ * answered itself: after that the batch's fence and command buffer are
+ * used again (vk_reap), and for that the fence must have been seen
+ * signaled, not inferred from later work.
+ */
+static void vk_wait_fence(VkFence fence, uint32_t seq, bool flush)
+{
+    const char *who = flush ? "flush" : "fence";
+    static unsigned said;
+
+    for (unsigned tries = 1;; tries++) {
+        VkResult r = rbtest_wait(fence, tries, flush);  /* RBTEST (never commit) */
+        bool say;
+
+        if (r == VK_SUCCESS) {
+            if (tries > 64) {
+                error_report("ppc-mac-gpu vulkan: %s: the GPU answered at attempt %u",
+                             who, tries);
+            }
+            return;
+        }
+        if (r == VK_ERROR_DEVICE_LOST) {
+            qatomic_inc(&V.failures);
+            if (!qatomic_xchg(&V.lost, true)) {
+                error_report("ppc-mac-gpu vulkan: %s: waiting for the GPU failed "
+                             "(device lost); 3D rendering has stopped", who);
+            }
+            return;
+        }
+        if (flush && vk_seq_done(seq)) {
+            return;
+        }
+        if (getenv("RBTEST_WAIT_NO_RETRY")) {
+            /* RBTEST (never commit): negative control.  The unanswered wait is
+             * taken for the batch having finished, as it was before the fix
+             * (but without stopping rendering, so that what follows shows). */
+            return;
+        }
+        /* said the first few times it happens, and whenever it goes on and on */
+        say = tries == 1 ? qatomic_fetch_inc(&said) < 8
+                         : tries >= 64 && !(tries & (tries - 1));
+        if (say) {
+            error_report("ppc-mac-gpu vulkan: %s: no answer from the GPU (VkResult %d, "
+                         "attempt %u); asking again", who, (int)r, tries);
+        }
+        g_usleep(tries < 11 ? 50u << tries : 100000u);
     }
 }
 
@@ -917,7 +1005,7 @@ static void *vk_waiter(void *opaque)
         qemu_mutex_unlock(&V.lock);
 
         if (!it->cancelled) {
-            vk_wait_fence(it->fence, "fence");
+            vk_wait_fence(it->fence, it->seq, false);
         }
         vk_set_done(it->seq);
         if (it->done) {
@@ -1011,12 +1099,15 @@ static void vk_recycle(VkBatch *b)
 }
 
 /*
- * Once rendering has stopped (V.lost) nothing is recycled.  A wait that
- * failed without the device being lost says nothing about its batch: the
- * GPU may still be working on it, and it must keep its command buffer, its
- * fence and everything it uses.  The waiter sets V.lost before it takes
- * its lock to move worker_seq past such a batch, so read under that lock
- * the two cannot disagree.
+ * Recycle the batches the waiter is finished with: each was waited for
+ * until the GPU had done with it (vk_wait_fence), or was never submitted.
+ *
+ * Not once rendering has stopped (V.lost).  No batch is needed again then,
+ * and one that the lost device was given, or may have been -- a submission
+ * that returns VK_ERROR_DEVICE_LOST counts as made for what is pending --
+ * keeps its command buffer, its fence and everything it uses.  The waiter
+ * sets V.lost before it takes its lock to move worker_seq past a batch, so
+ * read under that lock the two cannot disagree.
  */
 static void vk_reap(void)
 {
@@ -1549,10 +1640,17 @@ static void vk_img_written(VkImg *im, uint32_t x0, uint32_t y0,
 /* ---- commit / flush --------------------------------------------------- */
 
 /*
- * Nothing a cancelled batch recorded happened: not its image uploads and
- * layout changes, not its rendering, not its write-backs.  VRAM is as the
+ * Nothing that a batch which was not submitted recorded has happened: not
+ * its image uploads and layout changes, not its rendering, not its
+ * write-backs.  (Its recording failed; or its submission did for lack of
+ * memory, which leaves everything it refers to as it was.)  VRAM is as the
  * last completed batch left it, so every cached image is dropped and
  * rebuilt from VRAM when next used.  What the batch drew is lost.
+ *
+ * A submission that reports the device lost promises nothing of the kind:
+ * the batch may have run, or part of it, and VRAM and the images hold
+ * whatever that left.  Nothing is rendered from them again (V.lost), so
+ * dropping them is all there is to do then, too.
  */
 /* RBTEST (never commit): $R300_VK_FAIL=submit:N:code makes every N-th submission return
  * code (-1 = OUT_OF_HOST_MEMORY, -2 = OUT_OF_DEVICE_MEMORY, -4 = DEVICE_LOST) WITHOUT
@@ -1641,12 +1739,13 @@ static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
      * A batch that is not submitted is cancelled, not completed: its fence
      * will never signal, so nothing may wait on it (the waiter, a flush).
      * It still takes its place in the queue, so completions are reported
-     * in order -- as for a failed wait, holding one back would hang the
-     * guest on it.  gpu_failures tells a caller that must not take the
-     * batch's output as rendered.  After a lost device nothing is
-     * submitted any more: every later batch is cancelled the same way.
-     * So is a batch whose recording failed, which vkEndCommandBuffer
-     * reports: its command buffer is not one that may be submitted.
+     * in order -- as for a lost device (vk_wait_fence), holding one back
+     * would hang the guest on it.  gpu_failures tells a caller that must
+     * not take the batch's output as rendered.  After a lost device
+     * nothing is submitted any more: every later batch is cancelled the
+     * same way.  So is a batch whose recording failed, which
+     * vkEndCommandBuffer reports: its command buffer is not one that may
+     * be submitted.
      */
     const char *did = "recording its commands";
     VkResult r = vkEndCommandBuffer(b->cb);
@@ -1713,9 +1812,10 @@ static bool vk_flush_r200(void *opaque)
         return false;
     }
     /* A barrier opens every batch, so the newest submitted one finishing
-     * means all before it did; cancelled ones have nothing to wait for. */
+     * means all before it did; cancelled ones have nothing to wait for.
+     * (No return from here without the answer: vk_wait_fence.) */
     if (live) {
-        vk_wait_fence(live->fence, "flush");
+        vk_wait_fence(live->fence, live->seq, true);
     }
     vk_set_done(newest->seq);
     if (rbtest_dummy_chk == 1) {    /* RBTEST (never commit) */
@@ -1756,6 +1856,7 @@ static uint32_t vk_zpass_r300(void *opaque, bool reset, uint32_t value)
     if (!V.zpass) {
         return 0;
     }
+    /* the counter is the GPU's while anything submitted is unfinished */
     vk_flush_r200(opaque);
     v = V.zpass[0];
     if (reset) {
