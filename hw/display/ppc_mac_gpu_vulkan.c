@@ -257,7 +257,8 @@ static struct {
     VkImage dummy_img[3];
     VkDeviceMemory dummy_mem[3];
     VkImageView dummy_view[3];
-    bool dummy_ready;
+    bool dummy_ready;           /* a batch that initializes them was recorded
+                                   and not cancelled since */
 
     /* completion waiter */
     QemuThread thread;
@@ -1447,6 +1448,13 @@ static void vk_forget_images(void)
             t->live = false;
         }
     }
+    /*
+     * The stand-in textures may have been initialized by this very batch,
+     * in which case they are still in no layout and hold nothing.  They
+     * are kept (earlier work may reference them) and initialized again by
+     * the next batch that needs them, which is valid in either case.
+     */
+    V.dummy_ready = false;
 }
 
 static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
@@ -1956,7 +1964,12 @@ static VkSampler vk_sampler(uint32_t f0, uint32_t levels)
     return s;
 }
 
-/* 1x1 stand-ins for unbound units: 2D, 3D, cube. */
+/*
+ * 1x1 stand-ins for unbound units: 2D, 3D, cube.  Created once; their layout
+ * change and clear are recorded again after a cancelled batch
+ * (vk_forget_images), since that batch may have been the one carrying them.
+ * A transition from UNDEFINED is valid whatever layout the image is in.
+ */
 static bool vk_dummies(void)
 {
     static const VkImageType it[3] = { VK_IMAGE_TYPE_2D, VK_IMAGE_TYPE_3D, VK_IMAGE_TYPE_2D };
@@ -1967,10 +1980,12 @@ static bool vk_dummies(void)
     if (V.dummy_ready) {
         return true;
     }
+    vk_end_pass();
     VkCommandBuffer cb = vk_batch()->cb;
     for (int i = 0; i < 3; i++) {
         uint32_t layers = i == 2 ? 6 : 1;
-        if (!vk_image(it[i], vt[i], VK_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, 1, layers,
+        if (!V.dummy_view[i] &&
+            !vk_image(it[i], vt[i], VK_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, 1, layers,
                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                       &V.dummy_img[i], &V.dummy_mem[i], &V.dummy_view[i])) {
             return false;
