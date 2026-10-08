@@ -13,7 +13,8 @@
 W=~/ppcosxkvm-work/rbprobe; VKL=${VKL:-$HOME/ppcosxkvm-work/vklayer}
 L="VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_LAYER_PATH=$VKL VK_LOADER_DEBUG=error,layer VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT"
 bad=0
-results() { grep -a -v 'ms px' $1/read.txt 2>/dev/null; }
+# what was read back: without the timings, and the strip's length, which varies with them
+results() { grep -a -v -e 'ms px' -e '^\[strip: ' $1/read.txt 2>/dev/null; }
 # run TAG WANT ENV...   WANT: base | same (as base, layer silent, waits unanswered) | control
 run() { tag=$1; want=$2; shift 2
   O=$W/vm-$tag; rm -rf $O; fail=()
@@ -30,7 +31,7 @@ run() { tag=$1; want=$2; shift 2
     [ $ne -eq 0 ] || fail+=("$ne validation errors, want 0")
     [ $ns -eq 0 ] || fail+=("rendering stopped")
   fi
-  same=no; [ $want = base ] || { results $O | diff -q - <(results $W/vm-WB-base) >/dev/null 2>&1 && same=yes; }
+  same=no; if [ $want = base ]; then same=-; else results $O | diff -q - <(results $W/vm-WB-base) >/dev/null 2>&1 && same=yes; fi
   case $want in
     base)    [ $nw -eq 0 ] || fail+=("waits were made to fail in the base run") ;;
     same)    [ $same = yes ] || fail+=("readbacks differ from the base run")

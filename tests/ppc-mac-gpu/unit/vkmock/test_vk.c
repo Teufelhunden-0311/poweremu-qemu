@@ -353,8 +353,34 @@ static void flush_now(void)
     }
 }
 
+/*
+ * With a batch in flight: is all the VRAM it uses reported busy?  The
+ * device's question for every page, and what it would do on the answer --
+ * write where it is told the page is free, read where it is told that the
+ * batch only reads it.
+ */
+static void probe_pages(void)
+{
+    for (uint64_t a = 0; a < VRAM_SIZE; a += 4096) {
+        if (!R->range_busy_r200(OPQ, a, a + 4096, true)) {
+            mock_host_access(VRAM + a, 4096, true, "the device writing VRAM");
+        } else if (!R->range_busy_r200(OPQ, a, a + 4096, false)) {
+            mock_host_access(VRAM + a, 4096, false, "the device reading VRAM");
+        }
+    }
+}
+
+static bool g_probe;            /* flush(): every batch is probed in flight first */
+static uint32_t submit(void);
+
 static void flush(void)
 {
+    if (g_probe && V.cur) {
+        mock_hold(true);                /* the GPU does not finish */
+        submit();
+        probe_pages();
+        mock_hold(false);
+    }
     flush_now();
     quiesce();
     check_done();
@@ -2598,6 +2624,91 @@ static void run_in_order(void *arg)
     test_completions_in_order();
 }
 
+/*
+ * What a batch writes back to VRAM can be more than its draws touched, and
+ * every page of it has to count as busy while the batch is in flight, or
+ * the device writes VRAM that the GPU is about to write, too.
+ *  - More scissor rectangles drawn into a buffer than the renderer keeps
+ *    apart (VK_MAX_DR): the ninth is merged with the nearest into one that
+ *    spans rows neither was drawn to.
+ *  - A buffer whose pitch is not a multiple of 4: buffer offsets of a copy
+ *    have to be, so its rows are written back from the first on.
+ */
+static void test_written_back(bool odd_pitch)
+{
+    const uint32_t base = 0x100000, w = odd_pitch ? 30 : 64, h = odd_pitch ? 600 : 256;
+    const uint32_t bpp = odd_pitch ? 1 : 4, pitch = w * bpp;
+    R300DrawPacket p;
+
+    printf("  %s\n", odd_pitch ? "a draw low in a buffer whose pitch is not a multiple of 4"
+                              : "nine scissor rectangles in one buffer, eight kept apart");
+    for (unsigned i = 0; i < (odd_pitch ? 2 : 10); i++) {
+        /* the first loads the buffer, in a batch that is over; then far-apart
+         * scissors: a page of its own each, the last one far off */
+        unsigned y = odd_pitch ? 500 : i < 9 ? (i - 1) * 16 : 240;
+        pkt_rt(&p, base, w, h);
+        p.rt_bpp = bpp;
+        p.rt_view = odd_pitch ? R300_RTV_R8U : R300_RTV_RGBA8;
+        if (i) {
+            p.scissor[0] = 0;
+            p.scissor[1] = y;
+            p.scissor[2] = 8;
+            p.scissor[3] = y + 2;
+        }
+        check(draw_one(&p) == 0, "draw %u is rejected", i);
+        if (!i) {
+            flush();
+        }
+    }
+    mock_hold(true);                    /* the GPU does not finish */
+    submit();
+    for (uint64_t pg = base / 4096; pg <= (base + (uint64_t)pitch * h - 1) / 4096; pg++) {
+        bool busy = R->range_busy_r200(OPQ, pg * 4096 + 2048, pg * 4096 + 2112, true);
+        /* what the device then does: write, if it is told the page is free */
+        bool clash = false;
+        for (uint64_t at = pg * 4096; !busy && !clash && at < (pg + 1) * 4096; at += 16) {
+            clash = !mock_host_access(VRAM + at, 16, true, "the device writing VRAM");
+        }
+        check(!clash, "VRAM %#llx-%#llx counts as free while the batch writes it back",
+              (unsigned long long)pg * 4096, (unsigned long long)(pg + 1) * 4096);
+    }
+    mock_hold(false);
+    quiesce();
+    check_done();
+    flush();
+    check(!new_violations(), "the driver was misused");
+}
+
+/*
+ * The whole scenario, nothing failing, with every batch it flushes held in
+ * flight first and every page of VRAM asked about.
+ */
+static void test_scenario_probed(void *arg)
+{
+    printf("  the scenario with every batch probed in flight\n");
+    g_probe = true;
+    scenario();
+    g_probe = false;
+    quiesce();
+    check_done();
+    check(ndone() == g_ncallback, "%u completions reported for %u batches", ndone(),
+          g_ncallback);
+    for (unsigned i = 0; i < g_nres[0]; i++) {
+        check(g_res[0][i] == 0, "draw %u is rejected", i);
+    }
+    check(!new_violations(), "the driver was misused");
+}
+
+static void run_merged_rectangles(void *arg)
+{
+    test_written_back(false);
+}
+
+static void run_odd_pitch(void *arg)
+{
+    test_written_back(true);
+}
+
 static void run_in_flight(void *arg)
 {
     test_all_in_flight(false);
@@ -2864,6 +2975,9 @@ static int helpers(void)
     helper_child(run_lost_thread, NULL, true);
     helper_child(run_lost_flush, NULL, true);
     helper_child(run_in_order, NULL, true);
+    helper_child(test_scenario_probed, NULL, true);
+    helper_child(run_merged_rectangles, NULL, true);
+    helper_child(run_odd_pitch, NULL, true);
     for (int same = 0; same < 2; same++) {
         for (unsigned which = 0; which < 3; which++) {
             for (unsigned k = 0; k < ARRAY_SIZE(per_image); k++) {

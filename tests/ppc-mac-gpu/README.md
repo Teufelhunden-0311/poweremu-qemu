@@ -164,6 +164,13 @@ VK_ERROR_VALIDATION_FAILED) are injected only where named above.
       submitted and nothing recycled afterwards;
     - five batches in flight and every wait unanswered three times:
       completions once each, in order, none early;
+
+  and which VRAM counts as busy: the whole scenario below with every batch
+  it flushes held in flight first, and the device asking about each page
+  and then writing or reading it as the answer allows; what a batch writes
+  back beyond what its draws touched -- nine scissor rectangles in a buffer
+  of which eight are kept apart, a buffer whose pitch is not a multiple of
+  4;
 - `sweep`: a scenario of some 500 draws (every texture path, lines, GPU vertex
   shading, several colour buffers, multisampling, a buffer rendered to and
   then sampled, batches in flight together, a descriptor pool running out,
