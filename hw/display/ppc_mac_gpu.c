@@ -3448,11 +3448,41 @@ static bool r300_xfer_begin(PPCMacGPUState *s, R300SysXfer *x, uint8_t *vram)
      * afterwards. */
     x->resets = s->reset_count;
     r200_vram_access(s, x->off, x->off + x->len, true, 9);  /* may let go of the BQL */
+    {   /* RBTEST (never commit): $R300_SYSRT_PREWAIT=N:ms holds transfer N in this
+         * wait, BQL released, so a real reset can be issued meanwhile */
+        static unsigned k;
+        const char *e = getenv("R300_SYSRT_PREWAIT");
+        unsigned n = 0, ms = 0;
+        if (e && sscanf(e, "%u:%u", &n, &ms) == 2 && ++k == n) {
+            qemu_log("RBTEST prewait transfer %u for %u ms (resets %u)\n", k, ms, x->resets);
+            int w = cp_wait_unlock();
+            g_usleep((gulong)ms * 1000);
+            cp_wait_relock(w);
+            qemu_log("RBTEST prewait over (resets now %u, unlocked %d)\n", s->reset_count, w);
+        }
+    }
     if (s->reset_count != x->resets) {
         r300_warn_once("system-memory colour buffer not drawn: device reset", NULL);
         return false;
     }
     x->failures = r300_gpu_failures(s);
+    {   /* RBTEST (never commit): $R300_SYSRT_VK=submit:code fails the submission of every 2nd
+         * transfer's batch; =wait makes transfer 5's fence wait report DEVICE_LOST */
+        extern int rbtest_vk_fail_next;
+        static unsigned k;
+        const char *e = getenv("R300_SYSRT_VK");
+        int code = 0;
+        ++k;
+        if (e && sscanf(e, "submit:%d", &code) == 1 && (k & 1) == 0) {
+            rbtest_vk_fail_next = code;
+            qemu_log("RBTEST transfer %u: its submission will fail\n", k);
+        }
+        if (e && !strcmp(e, "wait") && k == 5) {
+            FILE *f = fopen("/tmp/rbtest-wait-lost", "w");
+            if (f) fclose(f);
+            qemu_log("RBTEST transfer %u: next fence wait will report DEVICE_LOST\n", k);
+        }
+    }
     if (!r300_xfer_map(s, x, false) || !r300_xfer_copy(x, vram + x->off, false)) {
         r300_warn_once("system-memory colour buffer not mapped", NULL);
         return false;
@@ -3473,6 +3503,15 @@ static bool r300_xfer_begin(PPCMacGPUState *s, R300SysXfer *x, uint8_t *vram)
 static void r300_xfer_end(PPCMacGPUState *s, R300SysXfer *x, uint8_t *vram)
 {
     r200_vram_access(s, x->off, x->off + x->len, false, 9); /* may let go of the BQL */
+    {   /* RBTEST (never commit): $R300_SYSRT_FAULT=remap alters the saved translation of
+         * every 2nd transfer: exercises the comparison only, not a real remap */
+        static unsigned k;
+        const char *f = getenv("R300_SYSRT_FAULT");
+        if (f && !strcmp(f, "remap") && (++k & 1) == 0) {
+            x->phys[0] ^= 0x1000;
+            qemu_log("RBTEST altered saved translation of transfer %u\n", k);
+        }
+    }
     if (s->reset_count != x->resets) {
         r300_warn_once("system-memory colour buffer not copied back: device reset", NULL);
     } else if (r300_gpu_failures(s) != x->failures) {
@@ -3671,6 +3710,13 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         sys.off = s->vram_size;
         sys.len = len;
         pkt.rt_gpu_addr = sys.off;      /* a renderer VRAM offset, past the guest's */
+        {   /* RBTEST (never commit): $R300_SYSRT_TEST=mask: left half, R only */
+            const char *t = getenv("R300_SYSRT_TEST");
+            if (t && strstr(t, "mask")) {
+                pkt.scissor[2] = pkt.scissor[0] + (pkt.scissor[2] - pkt.scissor[0]) / 2;
+                pkt.uniforms.chanmask = 0x4;
+            }
+        }
     } else if (!r300_to_vram(s, &pkt.rt_gpu_addr,
                              (uint64_t)pkt.rt_pitch * pkt.rt_bpp * pkt.rt_height * ns)) {
         r300_warn_once("colour buffer outside VRAM", NULL);

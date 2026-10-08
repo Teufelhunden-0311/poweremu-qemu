@@ -821,6 +821,15 @@ static void vk_set_done(uint32_t seq)
 static void vk_wait_fence(VkFence fence, const char *who)
 {
     VkResult r = vkWaitForFences(V.dev, 1, &fence, VK_TRUE, UINT64_MAX);
+    {   /* RBTEST (never commit): see rbtest_submit */
+        static bool once;
+        const char *e = getenv("R300_VK_FAIL");
+        if (e && !strcmp(e, "wait") && !once && !access("/tmp/rbtest-wait-lost", F_OK)) {
+            once = true;
+            qemu_log("RBTEST a fence wait reported as DEVICE_LOST\n");
+            r = VK_ERROR_DEVICE_LOST;
+        }
+    }
     if (r != VK_SUCCESS) {
         qatomic_inc(&V.failures);
     }
@@ -1428,6 +1437,30 @@ static void vk_img_written(VkImg *im, uint32_t x0, uint32_t y0,
  * last completed batch left it, so every cached image is dropped and
  * rebuilt from VRAM when next used.  What the batch drew is lost.
  */
+/* RBTEST (never commit): $R300_VK_FAIL=submit:N:code makes every N-th submission return
+ * code (-1 = OUT_OF_HOST_MEMORY, -2 = OUT_OF_DEVICE_MEMORY, -4 = DEVICE_LOST) WITHOUT
+ * submitting; wait makes the first fence wait after /tmp/rbtest-wait-lost appears report
+ * DEVICE_LOST, after really waiting. */
+int rbtest_vk_fail_next;    /* set by the device's test hook: fail the next submission with this */
+static VkResult rbtest_submit(const VkSubmitInfo *si, VkFence fence)
+{
+    static unsigned k;
+    const char *e = getenv("R300_VK_FAIL");
+    unsigned n = 0;
+    int code = 0;
+    if (rbtest_vk_fail_next) {
+        code = rbtest_vk_fail_next;
+        rbtest_vk_fail_next = 0;
+        qemu_log("RBTEST the transfer's submission not made, returning %d\n", code);
+        return (VkResult)code;
+    }
+    if (e && sscanf(e, "submit:%u:%d", &n, &code) == 2 && n && (++k % n) == 0) {
+        qemu_log("RBTEST submission %u not made, returning %d\n", k, code);
+        return (VkResult)code;
+    }
+    return vkQueueSubmit(V.queue, 1, si, fence);
+}
+
 static void vk_forget_images(void)
 {
     for (int i = 0; i < VK_MAX_IMG; i++) {
@@ -1487,7 +1520,7 @@ static uint32_t vk_commit(void (*done)(void *, uint32_t), void *arg)
      * submitted any more: every later batch is cancelled the same way.
      */
     VkResult r = qatomic_read(&V.lost) ? VK_ERROR_DEVICE_LOST
-                                       : vkQueueSubmit(V.queue, 1, &si, b->fence);
+                                       : rbtest_submit(&si, b->fence);
     b->cancelled = r != VK_SUCCESS;
     b->state = 2;
     V.cur = NULL;

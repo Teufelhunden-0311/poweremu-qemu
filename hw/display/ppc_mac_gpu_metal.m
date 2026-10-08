@@ -7708,7 +7708,14 @@ static void r200_settle_unchecked(void)
 {
     for (int i = 0; i < g_r200_nunchecked; i++) {
         [g_r200_unchecked[i] waitUntilCompleted];
-        if (r200_cb_failed(g_r200_unchecked[i])) {
+        /* RBTEST (never commit): $R300_METAL_FAIL=k: every k-th earlier batch reads as failed */
+        static unsigned rbk;
+        const char *rbe = getenv("R300_METAL_FAIL");
+        bool rb_inj = rbe && atoi(rbe) > 0 && (++rbk % (unsigned)atoi(rbe)) == 0;
+        if (rb_inj) {
+            qemu_log("RBTEST earlier Metal batch %u read as failed\n", rbk);
+        }
+        if (rb_inj || r200_cb_failed(g_r200_unchecked[i])) {
             qatomic_inc(&g_metal_gpu_failures);
         }
         [g_r200_unchecked[i] release];
