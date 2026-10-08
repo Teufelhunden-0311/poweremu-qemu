@@ -7683,7 +7683,39 @@ static id<MTLTexture> r200_view(PPCMacGPUMetalState *st, R200TexKey k,
 }
 
 static uint32_t g_r200_seq;
-static uint64_t g_metal_gpu_failures;   /* command buffers ended in error */
+/*
+ * gpu_failures: bumped for every committed batch found to have ended in
+ * error.  A batch's status is read once it is known complete, on the
+ * thread that waits (r200_settle_unchecked) -- not from a completion
+ * handler, whose timing against a later batch's wait is unspecified.  It
+ * is a failure generation for "did anything fail between two points", not
+ * a count of distinct errors.
+ */
+static uint64_t g_metal_gpu_failures;
+#define R200_UNCHECKED 32
+static id<MTLCommandBuffer> g_r200_unchecked[R200_UNCHECKED];  /* committed, status unread */
+static int g_r200_nunchecked;
+
+static bool r200_cb_failed(id<MTLCommandBuffer> cb)
+{
+    return cb.status == MTLCommandBufferStatusError;
+}
+
+/* Read the status of every batch committed before the newest.  They run
+ * in commit order on one queue, so once the newest has completed (or when
+ * called to make room) each of these has, and its wait returns at once. */
+static void r200_settle_unchecked(void)
+{
+    for (int i = 0; i < g_r200_nunchecked; i++) {
+        [g_r200_unchecked[i] waitUntilCompleted];
+        if (r200_cb_failed(g_r200_unchecked[i])) {
+            qatomic_inc(&g_metal_gpu_failures);
+        }
+        [g_r200_unchecked[i] release];
+        g_r200_unchecked[i] = nil;
+    }
+    g_r200_nunchecked = 0;
+}
 
 /* r200_decode_tex_unit()'s AGP copy is pitch*height (DXT: block rows). */
 static uint64_t r200_tex_host_bytes(const R200TexUnit *t)
@@ -7779,11 +7811,6 @@ static uint32_t r200_commit_as(void (*done)(void *, uint32_t), void *arg,
     if (seq == 0) {
         seq = ++g_r200_seq;
     }
-    [g_r200_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-        if (cb.status == MTLCommandBufferStatusError) {
-            qatomic_inc(&g_metal_gpu_failures);
-        }
-    }];
     if (done) {
         uint32_t report = fseq ? fseq : seq;
         [g_r200_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
@@ -7795,7 +7822,12 @@ static uint32_t r200_commit_as(void (*done)(void *, uint32_t), void *arg,
     }
     r200_arena_recycle_on(g_r200_cb);
     [g_r200_cb commit];
-    [g_r200_inflight release];
+    if (g_r200_inflight) {                 /* its status is still to be read */
+        if (g_r200_nunchecked == R200_UNCHECKED) {
+            r200_settle_unchecked();
+        }
+        g_r200_unchecked[g_r200_nunchecked++] = g_r200_inflight;  /* reference moves */
+    }
     g_r200_inflight = g_r200_cb;           /* keeps the reference */
     g_r200_cb = nil;
     /* Committed work is ordered on the queue, but memory it writes may
@@ -7874,8 +7906,8 @@ static bool r200_flush_locked(PPCMacGPUMetalState *st)
     int64_t t0 = g_get_monotonic_time();
     r200_commit(NULL, NULL);
     [g_r200_inflight waitUntilCompleted];
-    if (g_r200_inflight.status == MTLCommandBufferStatusError) {
-        /* counted here too: completion handlers may not have run yet */
+    r200_settle_unchecked();               /* everything committed before it */
+    if (r200_cb_failed(g_r200_inflight)) {
         qatomic_inc(&g_metal_gpu_failures);
         r200_metal_warn(32, "command buffer failed", 0, 0);
     }

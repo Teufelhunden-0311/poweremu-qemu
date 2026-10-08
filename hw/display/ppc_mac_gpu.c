@@ -2754,9 +2754,16 @@ static bool r300_in_agp(PPCMacGPUState *s, uint32_t a, uint64_t len)
                             ((uint64_t)(agp >> 16) << 16) | 0xFFFF);
 }
 
+/*
+ * The PCI GART's table is indexed by page from AIC_LO_ADDR
+ * (ppc_mac_gpu_gart_translate), and transfers here are split at 4 KiB
+ * boundaries of the GPU address, so the two only agree for a page-aligned
+ * base (what the drivers program: 0x07c00000).  An unaligned base is not
+ * taken as system memory at all.
+ */
 static bool r300_in_aic(PPCMacGPUState *s, uint32_t a, uint64_t len)
 {
-    return (s->regs.aic_ctrl & 1) &&
+    return (s->regs.aic_ctrl & 1) && !(s->regs.aic_lo_addr & 0xFFF) &&
            r300_span(a, len, s->regs.aic_lo_addr, s->regs.aic_hi_addr);
 }
 
@@ -3362,11 +3369,13 @@ static void r300_aa_resolve(PPCMacGPUState *s, const R300DrawPacket *pkt)
  * A colour buffer in system memory, drawn in the private staging
  * (stage_size bytes after vram_size, which only the renderer reaches) and
  * copied between there and the guest's pages.  The pages are translated
- * when the transfer starts.  The result is copied back only if, once the
- * draw has been waited for, the device was not reset, no GPU work failed
- * and every page still translates to the same place: a cancelled
- * transfer leaves the pages as they were, which the guest sees as a
- * readback that did not happen, never as a successful one.
+ * when the transfer starts.  The result is copied back only if the device
+ * was not reset since before the transfer's first wait and, once the draw
+ * has been waited for, no GPU work failed and every page still translates
+ * to the same place.  Otherwise the copy back is suppressed and the pages
+ * keep what they held: invalid output is not delivered, but the guest gets
+ * no error either -- it cannot tell from the bytes.  The copy back itself
+ * is chunk by chunk and not undone if a later chunk fails.
  */
 typedef struct R300SysXfer {
     uint32_t gpu;               /* the colour buffer's GPU address */
@@ -3434,10 +3443,18 @@ static bool r300_xfer_begin(PPCMacGPUState *s, R300SysXfer *x, uint8_t *vram)
     }
     x->n = x->len / 0x1000 + 2;
     x->phys = g_new(hwaddr, x->n);
-    r200_vram_access(s, x->off, x->off + x->len, true, 9);  /* may let go of the BQL */
+    /* The packet was decoded before this wait: a reset during it makes the
+     * packet stale, and it must not be drawn with what the guest sets up
+     * afterwards. */
     x->resets = s->reset_count;
+    r200_vram_access(s, x->off, x->off + x->len, true, 9);  /* may let go of the BQL */
+    if (s->reset_count != x->resets) {
+        r300_warn_once("system-memory colour buffer not drawn: device reset", NULL);
+        return false;
+    }
     x->failures = r300_gpu_failures(s);
     if (!r300_xfer_map(s, x, false) || !r300_xfer_copy(x, vram + x->off, false)) {
+        r300_warn_once("system-memory colour buffer not mapped", NULL);
         return false;
     }
     /* Tell a renderer that keeps copies (Vulkan) that the CPU wrote it. */
@@ -3838,9 +3855,6 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
          * into it, copy it out -- all while this packet is processed, so
          * before any later fence the guest waits on. */
         bool sys_ok = !sys.len || r300_xfer_begin(s, &sys, vram);
-        if (!sys_ok) {
-            r300_warn_once("system-memory colour buffer not mapped", NULL);
-        }
         int rr = sys_ok ? s->renderer->draw_r300(s->renderer_opaque, vram,
                                                  s->vram_size + (sys.len ? s->stage_size : 0),
                                                  &pkt) : 0;
@@ -6395,18 +6409,34 @@ static inline float r200_f32(uint32_t bits)
  * every fence.
  */
 static struct { uint32_t tag; uint8_t *host; } r200_agp_tc[1024];
-static uint32_t r200_agp_tc_gen;
 
 static void r200_agp_tc_flush(void)
 {
     memset(r200_agp_tc, 0, sizeof(r200_agp_tc));
 }
 
+/*
+ * What a cached page was translated under: both apertures' ranges and
+ * table bases and the bridge's GART generation.  An entry is only good
+ * while all of it is unchanged, so the cache is dropped as soon as a
+ * lookup sees any of it differ -- whichever register write changed it.
+ * (Page table entries rewritten in place are covered as before: by the
+ * bridge generation, the table-base writes and every fence.)
+ */
+typedef struct R200AgpCfg {
+    uint32_t agp_loc, aic_ctrl, aic_lo, aic_hi, aic_pt, r300_pt, bridge_gen;
+} R200AgpCfg;
+static R200AgpCfg r200_agp_tc_cfg;
+
 static uint8_t *r200_agp_page(PPCMacGPUState *s, uint32_t gpu_addr)
 {
-    uint32_t g = uninorth_get_agp_gart_gen();
-    if (g != r200_agp_tc_gen) {
-        r200_agp_tc_gen = g;
+    R200AgpCfg cfg = {
+        s->regs.mc_agp_location, s->regs.aic_ctrl, s->regs.aic_lo_addr,
+        s->regs.aic_hi_addr, s->regs.aic_pt_base, s->r300_aic_pt_base,
+        uninorth_get_agp_gart_gen(),
+    };
+    if (memcmp(&cfg, &r200_agp_tc_cfg, sizeof(cfg))) {
+        r200_agp_tc_cfg = cfg;
         r200_agp_tc_flush();
     }
     uint32_t page = gpu_addr >> 12;
