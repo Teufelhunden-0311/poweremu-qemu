@@ -44,4 +44,9 @@ static inline uintptr_t qemu_real_host_page_size(void)
     return getpagesize();
 }
 
+/* The renderer's pauses (between attempts to get an answer from the GPU) go
+ * to the test, which counts them and need not sleep them out. */
+void vkmock_pause(unsigned long microseconds);
+#define g_usleep(us) vkmock_pause(us)
+
 #endif

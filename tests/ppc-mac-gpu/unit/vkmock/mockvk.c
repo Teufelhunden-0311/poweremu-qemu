@@ -19,29 +19,44 @@
  *    transition that names no source access is not preceded by an unordered
  *    write to the image;
  *  - descriptor sets are written with valid samplers, views and buffers and
- *    are not used after their pool was reset.
+ *    are not used after their pool was reset;
+ *  - the host does not touch mapped memory that submitted work not known to
+ *    have finished may write, nor write what it reads (mockvk.h).
  *
- * It does not model: shaders (every descriptor of a set counts as used),
- * image contents, queue families, formats, most valid-usage rules.
- * Submitted work "runs" inside vkQueueSubmit and counts as finished once
- * vkWaitForFences has seen its fence -- a wait that succeeded, or one that
- * reported the device lost; after a wait that failed otherwise the work is
- * still in flight.
+ * It does not model: shaders (every descriptor of a set counts as used, a
+ * storage buffer as written), image contents, queue families, most
+ * valid-usage rules; of formats only the size of a texel.
+ *
+ * Two clocks.  What a command buffer does to images (layouts, what has been
+ * written) is applied inside vkQueueSubmit, at once: those checks are about
+ * the order of commands, not about time.  Whether the work has finished is
+ * another matter, and there it is as slow as the specification allows: it
+ * is running until a vkWaitForFences has said that it is not -- one that
+ * succeeded for its fence, or for the fence of a later submission that a
+ * barrier over all commands orders after it, or one that reported the
+ * device lost.  After a wait that returned anything else it is still
+ * running, and what it uses is still in use.
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  */
+#include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include "mockvk.h"
 
 #define NOBJ    (1u << 17)
 #define MAXVIOL 256
+#define MAXRUN  64
+#define MAXMAP  4096
+#define MAXDECL 16
+#define PROT_RW (PROT_READ | PROT_WRITE)
 
 const char *const mock_fn_name[MF_COUNT] = {
     "vkCreateInstance", "vkCreateDevice", "vkCreateCommandPool",
@@ -73,6 +88,14 @@ typedef struct Ent {
     VkImageLayout layout;
 } Ent;
 
+/* Memory a command buffer's work uses: all of it (lo == hi == 0), or for a
+ * shared buffer the bytes [lo, hi) of it. */
+typedef struct Use {
+    Obj *mem;
+    uint64_t lo, hi;
+    bool write;
+} Use;
+
 enum { C_SYNC, C_TRANSITION, C_CLEAR, C_COPY_B2I, C_COPY_I2B, C_BEGIN_PASS,
        C_END_PASS, C_DRAW };
 typedef struct Cmd {
@@ -96,6 +119,7 @@ struct Obj {
     Obj *mem;                   /* image, buffer: the memory bound */
     /* image */
     bool is3d;
+    VkFormat fmt;
     uint32_t levels, layers, depth, slots;
     VkImageLayout layout;
     uint8_t *written;           /* per level, per layer or slice */
@@ -104,10 +128,15 @@ struct Obj {
     /* image view */
     Obj *image;
     /* memory */
-    void *map;
+    void *map;                  /* as the renderer was given it */
+    void *base;                 /* the pages: map, or 8 bytes before it */
+    size_t maplen;
     VkDeviceSize msize;
+    unsigned gpu_r, gpu_w;      /* running command buffers that read it, may write it */
+    int prot;                   /* what the pages allow now */
     /* buffer */
-    VkDeviceSize bsize;
+    VkDeviceSize bsize, boff;   /* its size, and where in mem it is */
+    bool shared;                /* mock_shared_buffer */
     /* render pass */
     uint32_t rp_natt;
     bool dep_in, dep_out;       /* external dependencies that order everything */
@@ -127,14 +156,22 @@ struct Obj {
     Cmd *cmd;
     unsigned ncmd, capcmd;
     bool in_pass;
-    Obj *cur_rp, *bound_set, *bound_pipe;
+    Obj *cur_rp, *bound_set, *bound_pipe, *bound_index;
     Obj **ref;
     unsigned nref, capref;
     uint64_t epoch;
+    unsigned nrec;              /* commands recorded, kept in cmd[] or not */
+    bool opens_sync;            /* the first of them is a barrier over all commands */
+    Use *use;
+    unsigned nuse, capuse;
+    unsigned ord;               /* which submission it is, while it is running */
+    Obj *fence;                 /* ... and the fence it was submitted with */
     /* fence */
     bool signaled;
+    bool unseen;                /* ... as far as later work tells: no wait has seen it */
     Obj *fence_cb[4];
     unsigned nfence_cb;
+    unsigned unanswered;        /* waits for it in a row that gave no answer */
 };
 
 static Obj g_obj[NOBJ];
@@ -142,7 +179,17 @@ static unsigned g_nobj;
 static unsigned g_serial[MT_COUNT], g_destroyed[MT_COUNT];
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_gate_cv = PTHREAD_COND_INITIALIZER;
-static bool g_gate;
+static bool g_gate, g_hold, g_lost;
+static __thread bool t_in;      /* this thread is inside the driver (holds g_mu) */
+static Obj *g_run[MAXRUN];      /* command buffers whose work is running */
+static unsigned g_nrun, g_nsub, g_patience;
+static Obj *g_mapped[MAXMAP];   /* memory objects that are mapped */
+static unsigned g_nmapped;
+static struct {
+    Obj *buf;
+    uint64_t lo, hi;
+} g_decl[MAXDECL];              /* mock_shader_reads */
+static unsigned g_ndecl;
 static char *g_viol[MAXVIOL];
 static unsigned g_nviol;
 static struct {
@@ -152,7 +199,7 @@ static struct {
     VkResult res;
     int thread;
 } g_plan = { -1, 0, false, VK_SUCCESS, -1 };
-static unsigned g_calls[MF_COUNT][3], g_fired, g_failable;
+static unsigned g_calls[MF_COUNT][3], g_nfail[MF_COUNT], g_fired, g_failable;
 static bool g_all_fail;
 static struct {
     unsigned permille;
@@ -203,14 +250,26 @@ static void viol(const char *fmt, ...)
     va_end(ap);
 }
 
-static void enter(void)
+static void lock(void)
 {
     pthread_mutex_lock(&g_mu);
+    t_in = true;
+}
+
+static void unlock(void)
+{
+    t_in = false;
+    pthread_mutex_unlock(&g_mu);
+}
+
+static void enter(void)
+{
+    lock();
     if (g_budget && ++g_total > g_budget) {
         void (*fn)(void) = g_budget_fn;
         viol("more than %lu Vulkan calls: the renderer does not stop", g_budget);
         g_budget = 0;
-        pthread_mutex_unlock(&g_mu);
+        unlock();
         if (fn) {
             fn();
         }
@@ -219,7 +278,7 @@ static void enter(void)
 }
 
 #define ENTER() enter()
-#define LEAVE() pthread_mutex_unlock(&g_mu)
+#define LEAVE() unlock()
 
 static void *garbage(void);
 
@@ -244,18 +303,25 @@ bool mock_is_garbage(const void *h)
     return ((uintptr_t)h >> 32) == 0xDEAD0000u;
 }
 
+/* More of something than any correct run makes: report it and end the run. */
+static void runaway(const char *what, unsigned limit)
+{
+    void (*fn)(void) = g_budget_fn;
+
+    viol("more than %u %s: the renderer does not stop", limit, what);
+    unlock();
+    if (fn) {
+        fn();
+    }
+    _exit(97);
+}
+
 static Obj *new_obj(int type)
 {
     Obj *o;
 
     if (g_nobj == NOBJ) {
-        void (*fn)(void) = g_budget_fn;
-        viol("more than %u objects created: the renderer does not stop", NOBJ);
-        pthread_mutex_unlock(&g_mu);
-        if (fn) {
-            fn();
-        }
-        _exit(97);
+        runaway("objects created", NOBJ);
     }
     o = &g_obj[g_nobj++];
     memset(o, 0, sizeof(*o));
@@ -295,6 +361,20 @@ static Obj *get(const void *h, int type, const char *fn, const char *what)
     return o;
 }
 
+VkResult mock_listed_error(int fn)
+{
+    return fn == MF_ResetFences || fn == MF_ResetCommandBuffer ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+                                                                : VK_ERROR_OUT_OF_HOST_MEMORY;
+}
+
+static bool fired(int fn, VkResult res, VkResult *out)
+{
+    g_fired++;
+    g_nfail[fn]++;
+    *out = res != VK_SUCCESS ? res : mock_listed_error(fn);
+    return true;
+}
+
 /* Count the call; should it fail? */
 static bool fail(int fn, VkResult *res)
 {
@@ -312,64 +392,68 @@ static bool fail(int fn, VkResult *res)
         x ^= x << 17;
         g_rand.state[t] = x;
         if (!((g_rand.except >> fn) & 1) && (x >> 11) % 1000 < g_rand.permille) {
-            g_fired++;
-            *res = VK_ERROR_OUT_OF_HOST_MEMORY;
-            return true;
+            return fired(fn, VK_SUCCESS, res);
         }
         return false;
     }
     if (g_plan.fn == MF_COUNT) {
         g_all_fail |= !t && g_failable >= g_plan.nth;
-        if (g_all_fail) {
-            g_fired++;
-            *res = g_plan.res;
-        }
-        return g_all_fail;
+        return g_all_fail && fired(fn, g_plan.res, res);
     }
     if (g_plan.fn != fn || (g_plan.thread >= 0 && g_plan.thread != t)) {
         return false;
     }
     if (n == g_plan.nth || (g_plan.persistent && n >= g_plan.nth)) {
-        g_fired++;
-        *res = g_plan.res;
-        return true;
+        return fired(fn, g_plan.res, res);
     }
     return false;
 }
 
 void mock_plan(int fn, unsigned nth, bool persistent, VkResult res, int thread)
 {
-    pthread_mutex_lock(&g_mu);
+    lock();
     g_plan.fn = fn;
     g_plan.nth = nth;
     g_plan.persistent = persistent;
     g_plan.res = res;
     g_plan.thread = thread;
-    pthread_mutex_unlock(&g_mu);
+    unlock();
 }
 
 void mock_plan_random(unsigned seed, unsigned permille, unsigned long except)
 {
-    pthread_mutex_lock(&g_mu);
+    lock();
     g_rand.permille = permille;
     g_rand.except = except;
     g_rand.state[0] = 0x9E3779B97F4A7C15ull * (seed + 1);
     g_rand.state[1] = 0xD1B54A32D192ED03ull * (seed + 1);
-    pthread_mutex_unlock(&g_mu);
+    unlock();
 }
 
 void mock_plan_clear(void)
 {
-    pthread_mutex_lock(&g_mu);
+    lock();
     g_plan.fn = -1;
     g_all_fail = false;
     g_rand.permille = 0;
-    pthread_mutex_unlock(&g_mu);
+    unlock();
+}
+
+void mock_wait_patience(unsigned n)
+{
+    lock();
+    g_patience = n;
+    unlock();
 }
 
 unsigned mock_fired(void)
 {
     return g_fired;
+}
+
+unsigned mock_failed(int fn)
+{
+    return g_nfail[fn];
 }
 
 unsigned mock_calls(int fn, int thread)
@@ -396,19 +480,19 @@ void mock_violation_add(const char *fmt, ...)
 {
     va_list ap;
 
-    pthread_mutex_lock(&g_mu);
+    lock();
     va_start(ap, fmt);
     violv(fmt, ap);
     va_end(ap);
-    pthread_mutex_unlock(&g_mu);
+    unlock();
 }
 
 void mock_set_budget(unsigned long n, void (*fn)(void))
 {
-    pthread_mutex_lock(&g_mu);
+    lock();
     g_budget = n ? g_total + n : 0;
     g_budget_fn = fn;
-    pthread_mutex_unlock(&g_mu);
+    unlock();
 }
 
 unsigned long mock_total_calls(void)
@@ -418,19 +502,19 @@ unsigned long mock_total_calls(void)
 
 void mock_gate(bool closed)
 {
-    pthread_mutex_lock(&g_mu);
+    lock();
     g_gate = closed;
     pthread_cond_broadcast(&g_gate_cv);
-    pthread_mutex_unlock(&g_mu);
+    unlock();
 }
 
 void mock_mark_begin(void)
 {
-    pthread_mutex_lock(&g_mu);
+    lock();
     for (unsigned i = 0; i < g_nobj; i++) {
         g_obj[i].marked = false;
     }
-    pthread_mutex_unlock(&g_mu);
+    unlock();
 }
 
 void mock_mark(void *h, int type, const char *what)
@@ -440,23 +524,23 @@ void mock_mark(void *h, int type, const char *what)
     if (!h) {
         return;
     }
-    pthread_mutex_lock(&g_mu);
+    lock();
     o = get(h, type, "the renderer still holds", what);
     if (o) {
         o->marked = true;
     }
-    pthread_mutex_unlock(&g_mu);
+    unlock();
 }
 
 unsigned mock_unmarked(int type)
 {
     unsigned n = 0;
 
-    pthread_mutex_lock(&g_mu);
+    lock();
     for (unsigned i = 0; i < g_nobj; i++) {
         n += g_obj[i].type == type && g_obj[i].alive && !g_obj[i].marked;
     }
-    pthread_mutex_unlock(&g_mu);
+    unlock();
     return n;
 }
 
@@ -464,11 +548,11 @@ unsigned mock_alive(int type)
 {
     unsigned n = 0;
 
-    pthread_mutex_lock(&g_mu);
+    lock();
     for (unsigned i = 0; i < g_nobj; i++) {
         n += g_obj[i].type == type && g_obj[i].alive;
     }
-    pthread_mutex_unlock(&g_mu);
+    unlock();
     return n;
 }
 
@@ -496,10 +580,205 @@ static void destroy(const void *h, int type, const char *fn)
     g_destroyed[type]++;
     free(o->written);
     o->written = NULL;
-    free(o->map);
+    if (o->base) {
+        munmap(o->base, o->maplen);
+        for (unsigned i = 0; i < g_nmapped; i++) {
+            if (g_mapped[i] == o) {
+                g_mapped[i] = g_mapped[--g_nmapped];
+                break;
+            }
+        }
+        o->base = NULL;
+    }
     o->map = NULL;
     free(o->ent);
     o->ent = NULL;
+}
+
+/* ---- submitted work and the memory it uses ---------------------------- */
+
+/*
+ * Make a mapped memory object's pages allow what the work that is running
+ * leaves the host: nothing where it may write, reading where it only reads.
+ * (What a fault on them then means: mock_trap.)  A lost device's memory
+ * may be touched whatever was using it.
+ */
+static void guard(Obj *m)
+{
+    int want = g_lost ? PROT_RW : m->gpu_w ? PROT_NONE : m->gpu_r ? PROT_READ : PROT_RW;
+
+    if (m->base && want != m->prot) {
+        if (mprotect(m->base, m->maplen, want)) {
+            perror("mockvk: mprotect");
+            abort();
+        }
+        m->prot = want;
+    }
+}
+
+/* A call reports the device lost.  It stays lost. */
+static void device_lost(void)
+{
+    g_lost = true;
+    for (unsigned i = 0; i < g_nmapped; i++) {
+        guard(g_mapped[i]);
+    }
+}
+
+static Obj *mapped_at(const void *p, bool pages)
+{
+    for (unsigned i = 0; i < g_nmapped; i++) {
+        Obj *m = g_mapped[i];
+        const char *lo = pages ? m->base : m->map;
+        size_t len = pages ? m->maplen : (size_t)m->msize;
+
+        if ((const char *)p >= lo && (const char *)p < lo + len) {
+            return m;
+        }
+    }
+    return NULL;
+}
+
+unsigned mock_running(void)
+{
+    unsigned n;
+
+    lock();
+    n = g_nrun;
+    unlock();
+    return n;
+}
+
+unsigned mock_submitted(void)
+{
+    unsigned n;
+
+    lock();
+    n = g_nsub;
+    unlock();
+    return n;
+}
+
+unsigned mock_finished_upto(void)
+{
+    unsigned upto;
+
+    lock();
+    upto = g_lost ? UINT_MAX : g_nsub;
+    for (unsigned i = 0; !g_lost && i < g_nrun; i++) {
+        if (g_run[i]->ord - 1 < upto) {
+            upto = g_run[i]->ord - 1;
+        }
+    }
+    unlock();
+    return upto;
+}
+
+bool mock_device_lost(void)
+{
+    bool lost;
+
+    lock();
+    lost = g_lost;
+    unlock();
+    return lost;
+}
+
+void mock_hold(bool held)
+{
+    lock();
+    g_hold = held;
+    pthread_cond_broadcast(&g_gate_cv);
+    unlock();
+}
+
+void mock_shader_reads_clear(void)
+{
+    lock();
+    g_ndecl = 0;
+    unlock();
+}
+
+void mock_shared_buffer(VkBuffer buf)
+{
+    Obj *b = (Obj *)buf;
+
+    lock();
+    if (b >= g_obj && b < g_obj + g_nobj && b->type == MT_BUFFER && b->alive) {
+        b->shared = true;
+    }
+    unlock();
+}
+
+void mock_shader_reads(VkBuffer buf, VkDeviceSize off, VkDeviceSize len)
+{
+    Obj *b = (Obj *)buf;
+
+    lock();
+    if (b >= g_obj && b < g_obj + g_nobj && b->type == MT_BUFFER && b->alive && len &&
+        g_ndecl < MAXDECL) {
+        g_decl[g_ndecl].buf = b;
+        g_decl[g_ndecl].lo = off;
+        g_decl[g_ndecl].hi = off + len;
+        g_ndecl++;
+    }
+    unlock();
+}
+
+bool mock_host_access(const void *p, size_t n, bool write, const char *who)
+{
+    const char *work = NULL;
+    uint64_t lo = 0, hi = 0;
+    Obj *m;
+
+    lock();
+    m = mapped_at(p, false);
+    if (m && n && !g_lost) {
+        lo = (const char *)p - (const char *)m->map;
+        hi = lo + n;
+        if (m->gpu_w) {
+            work = "may write";
+        } else if (write && m->gpu_r) {
+            work = "reads";
+        }
+        for (unsigned i = 0; !work && i < g_nrun; i++) {
+            const Obj *cb = g_run[i];
+            for (unsigned k = 0; k < cb->nuse; k++) {
+                const Use *u = &cb->use[k];
+                if (u->mem == m && u->hi && u->lo < hi && lo < u->hi && (u->write || write)) {
+                    work = u->write ? "writes" : "reads";
+                    break;
+                }
+            }
+        }
+        if (work) {
+            viol("%s: the host %s bytes 0x%llx-0x%llx of memory #%u, which submitted work "
+                 "not known to have finished %s", who, write ? "writes" : "reads",
+                 (unsigned long long)lo, (unsigned long long)hi, m->serial, work);
+        }
+    }
+    unlock();
+    return !work;
+}
+
+bool mock_trap(void *addr)
+{
+    Obj *m;
+
+    if (t_in) {
+        return false;                   /* a fault inside the driver is a crash */
+    }
+    lock();
+    m = mapped_at(addr, true);
+    if (m && m->prot != PROT_RW) {
+        viol("the host %s memory #%u (%llu bytes), which submitted work not known to have "
+             "finished %s", m->prot == PROT_NONE ? "touches" : "writes", m->serial,
+             (unsigned long long)m->msize, m->gpu_w ? "may write" : "reads");
+        m->prot = PROT_RW;              /* reported: let the access go on */
+        mprotect(m->base, m->maplen, PROT_RW);
+    }
+    unlock();
+    return m != NULL;
 }
 
 /* ---- instance and device --------------------------------------------- */
@@ -919,6 +1198,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkBindBufferMemory(VkDevice dev, VkBuffer buf,
     }
     if (b && m) {
         b->mem = m;
+        b->boff = off;
     }
     LEAVE();
     return VK_SUCCESS;
@@ -939,12 +1219,28 @@ VKAPI_ATTR VkResult VKAPI_CALL vkMapMemory(VkDevice dev, VkDeviceMemory mem,
         LEAVE();
         return r;
     }
-    if (m && !m->map &&
-        posix_memalign(&m->map, getpagesize(), (m->msize ? m->msize : 16) + 64)) {
-        fprintf(stderr, "mockvk: no memory for a mapping\n");
-        abort();
+    if (m && !m->map) {
+        /* pages of its own, so that they can be guarded */
+        size_t pg = getpagesize();
+        size_t len = ((size_t)(m->msize ? m->msize : 16) + 64 + pg - 1) & ~(pg - 1);
+        void *base;
+
+        if (g_nmapped == MAXMAP) {
+            runaway("memory objects mapped", MAXMAP);
+        }
+        base = mmap(NULL, len, PROT_RW, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (base == MAP_FAILED) {
+            fprintf(stderr, "mockvk: no memory for a mapping\n");
+            abort();
+        }
+        m->base = base;
+        m->maplen = len;
+        m->prot = PROT_RW;
+        m->map = g_misalign ? (char *)base + 8 : base;
+        g_mapped[g_nmapped++] = m;
+        guard(m);
     }
-    *out = !m ? NULL : g_misalign ? (char *)m->map + 8 : m->map;
+    *out = m ? m->map : NULL;
     LEAVE();
     return VK_SUCCESS;
 }
@@ -977,6 +1273,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(
         return r;
     }
     o = new_obj(MT_IMAGE);
+    o->fmt = ci->format;
     o->is3d = ci->imageType == VK_IMAGE_TYPE_3D;
     o->levels = ci->mipLevels ? ci->mipLevels : 1;
     o->layers = ci->arrayLayers ? ci->arrayLayers : 1;
@@ -1325,8 +1622,11 @@ static void cb_clear(Obj *cb)
 {
     cb->ncmd = 0;
     cb->nref = 0;
+    cb->nuse = 0;
+    cb->nrec = 0;
+    cb->opens_sync = false;
     cb->in_pass = false;
-    cb->cur_rp = cb->bound_set = cb->bound_pipe = NULL;
+    cb->cur_rp = cb->bound_set = cb->bound_pipe = cb->bound_index = NULL;
     cb->epoch = ++g_cb_epoch;
 }
 
@@ -1416,6 +1716,9 @@ static Obj *rec(VkCommandBuffer h, const char *fn)
              cb_state_name[cb->state]);
         return NULL;
     }
+    if (cb) {
+        cb->nrec++;
+    }
     return cb;
 }
 
@@ -1457,6 +1760,100 @@ static void add_ref_buffer(Obj *cb, Obj *b)
     }
 }
 
+/*
+ * The work recorded uses buf's memory: the bytes [lo, hi) of a shared
+ * buffer, otherwise all of it.
+ */
+static void add_use(Obj *cb, Obj *buf, uint64_t lo, uint64_t hi, bool write)
+{
+    Obj *mem = buf ? buf->mem : NULL;
+    Use *u;
+
+    if (!cb || !mem) {
+        return;
+    }
+    if (buf->shared) {
+        if (hi > buf->bsize) {
+            hi = buf->bsize;
+        }
+        if (lo >= hi) {
+            return;
+        }
+        lo += buf->boff;
+        hi += buf->boff;
+        u = cb->nuse ? &cb->use[cb->nuse - 1] : NULL;
+        if (u && u->mem == mem && u->lo == lo && u->hi == hi && u->write == write) {
+            return;                     /* as the draw before */
+        }
+    } else {
+        lo = hi = 0;
+        for (unsigned i = 0; i < cb->nuse; i++) {
+            if (cb->use[i].mem == mem && !cb->use[i].hi) {
+                cb->use[i].write |= write;
+                return;
+            }
+        }
+    }
+    if (cb->nuse == cb->capuse) {
+        cb->capuse = cb->capuse ? cb->capuse * 2 : 64;
+        cb->use = realloc(cb->use, cb->capuse * sizeof(Use));
+    }
+    cb->use[cb->nuse++] = (Use){ mem, lo, hi, write };
+}
+
+/* Bytes of a texel, or (negative) of a 4x4 block of a compressed format;
+ * 0 for a format this driver does not know. */
+static int fmt_bytes(VkFormat f)
+{
+    switch ((int)f) {
+    case VK_FORMAT_R8_UNORM:
+    case VK_FORMAT_R8_UINT:
+        return 1;
+    case VK_FORMAT_R8G8_UNORM:
+    case VK_FORMAT_R16_UINT:
+        return 2;
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_R32_UINT:
+        return 4;
+    case VK_FORMAT_R32G32_UINT:
+        return 8;
+    case VK_FORMAT_R32G32B32A32_UINT:
+        return 16;
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+        return -8;
+    case VK_FORMAT_BC2_UNORM_BLOCK:
+    case VK_FORMAT_BC3_UNORM_BLOCK:
+        return -16;
+    }
+    return 0;
+}
+
+/* The bytes of its buffer that a copy region covers; false if unknown. */
+static bool region_bytes(const Obj *img, const VkBufferImageCopy *r, uint64_t *lo, uint64_t *hi)
+{
+    int ts = fmt_bytes(img->fmt);
+    uint64_t w = r->imageExtent.width, h = r->imageExtent.height;
+    uint64_t row = r->bufferRowLength ? r->bufferRowLength : w;
+    uint64_t rows = r->bufferImageHeight ? r->bufferImageHeight : h;
+    uint64_t slices = (uint64_t)r->imageExtent.depth *
+                      (r->imageSubresource.layerCount ? r->imageSubresource.layerCount : 1);
+
+    if (!ts || !w || !h || !slices) {
+        return false;
+    }
+    if (ts < 0) {
+        ts = -ts;
+        w = (w + 3) / 4;
+        h = (h + 3) / 4;
+        row = (row + 3) / 4;
+        rows = (rows + 3) / 4;
+    }
+    *lo = r->bufferOffset;
+    *hi = *lo + (((slices - 1) * rows + (h - 1)) * row + w) * ts;
+    return true;
+}
+
 static Cmd *add_cmd(Obj *cb, int op, Obj *a, Obj *b)
 {
     Cmd *c;
@@ -1489,6 +1886,9 @@ VKAPI_ATTR void VKAPI_CALL vkCmdPipelineBarrier(
             (m[i].dstAccessMask & (VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT))) {
             if (cb->in_pass) {
                 viol("%s: a barrier over all commands inside a render pass", __func__);
+            }
+            if (cb->nrec == 1) {
+                cb->opens_sync = true;  /* all of it comes after what was submitted before */
             }
             add_cmd(cb, C_SYNC, NULL, NULL);
         }
@@ -1557,6 +1957,20 @@ static void rec_copy(Obj *cb, int op, Obj *img, Obj *buf, VkImageLayout layout,
         c->p[5] = r[i].imageExtent.depth;
         add_ref_image(cb, img);
         add_ref_buffer(cb, buf);
+        if (buf->shared) {
+            uint64_t lo, hi;
+            if (!region_bytes(img, &r[i], &lo, &hi)) {
+                viol("%s: region %u of an image of format %d cannot be placed in the "
+                     "shared buffer", fn, i, (int)img->fmt);
+            } else if (hi > buf->bsize) {
+                viol("%s: region %u ends at byte %llu of a buffer of %llu", fn, i,
+                     (unsigned long long)hi, (unsigned long long)buf->bsize);
+            } else {
+                add_use(cb, buf, lo, hi, op == C_COPY_I2B);
+            }
+        } else {
+            add_use(cb, buf, 0, 0, op == C_COPY_I2B);
+        }
     }
 }
 
@@ -1669,6 +2083,7 @@ VKAPI_ATTR void VKAPI_CALL vkCmdBindIndexBuffer(VkCommandBuffer h, VkBuffer buff
     b = get(buffer, MT_BUFFER, __func__, "buffer");
     if (cb) {
         add_ref_buffer(cb, b);
+        cb->bound_index = b;
     }
     LEAVE();
 }
@@ -1689,7 +2104,7 @@ VKAPI_ATTR void VKAPI_CALL vkCmdSetScissor(VkCommandBuffer h, uint32_t first, ui
     LEAVE();
 }
 
-static void rec_draw(VkCommandBuffer h, const char *fn)
+static void rec_draw(VkCommandBuffer h, bool indexed, const char *fn)
 {
     Obj *cb = rec(h, fn);
 
@@ -1708,9 +2123,32 @@ static void rec_draw(VkCommandBuffer h, const char *fn)
     add_ref(cb, cb->bound_set->pool);
     for (unsigned i = 0; i < cb->bound_set->nent; i++) {
         Ent *e = &cb->bound_set->ent[i];
+        bool uniform = e->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+                       e->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
         add_ref(cb, e->sampler);
         add_ref_view(cb, e->view);
         add_ref_buffer(cb, e->buffer);
+        if (!e->buffer) {
+            continue;
+        }
+        if (uniform) {
+            add_use(cb, e->buffer, 0, e->buffer->bsize, false);
+        } else if (!e->buffer->shared) {
+            add_use(cb, e->buffer, 0, 0, true);     /* a shader may store to it */
+        } else {
+            for (unsigned k = 0; k < g_ndecl; k++) {
+                if (g_decl[k].buf == e->buffer) {
+                    add_use(cb, e->buffer, g_decl[k].lo, g_decl[k].hi, false);
+                }
+            }
+        }
+    }
+    if (indexed) {
+        if (!cb->bound_index) {
+            viol("%s: no index buffer bound", fn);
+        } else {
+            add_use(cb, cb->bound_index, 0, cb->bound_index->bsize, false);
+        }
     }
 }
 
@@ -1718,7 +2156,7 @@ VKAPI_ATTR void VKAPI_CALL vkCmdDraw(VkCommandBuffer h, uint32_t nv, uint32_t ni
                                      uint32_t fv, uint32_t fi)
 {
     ENTER();
-    rec_draw(h, __func__);
+    rec_draw(h, false, __func__);
     LEAVE();
 }
 
@@ -1726,7 +2164,7 @@ VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexed(VkCommandBuffer h, uint32_t nidx, ui
                                             uint32_t fidx, int32_t voff, uint32_t fi)
 {
     ENTER();
-    rec_draw(h, __func__);
+    rec_draw(h, true, __func__);
     LEAVE();
 }
 
@@ -1922,14 +2360,67 @@ static void execute(Obj *cb)
     }
 }
 
-static void complete(Obj *cb)
+/*
+ * A command buffer's work is no longer running: a wait for its own fence
+ * was answered (seen), or one for later work that is ordered after it.
+ */
+static void complete(Obj *cb, bool seen)
 {
+    Obj *f = cb->fence;
+
     for (unsigned i = 0; i < cb->nref; i++) {
         if (cb->ref[i]->pending) {
             cb->ref[i]->pending--;
         }
     }
+    for (unsigned i = 0; i < cb->nuse; i++) {
+        Use *u = &cb->use[i];
+        if (!u->hi) {
+            unsigned *n = u->write ? &u->mem->gpu_w : &u->mem->gpu_r;
+            if (*n) {
+                --*n;
+            }
+            guard(u->mem);
+        }
+    }
+    for (unsigned i = 0; i < g_nrun; i++) {
+        if (g_run[i] == cb) {
+            g_run[i] = g_run[--g_nrun];
+            break;
+        }
+    }
     cb->state = CB_INVALID;             /* one-time submit */
+    cb->fence = NULL;
+    for (unsigned k = 0; f && k < f->nfence_cb; k++) {
+        if (f->fence_cb[k] == cb) {
+            f->fence_cb[k] = f->fence_cb[--f->nfence_cb];
+            if (!f->nfence_cb) {
+                f->signaled = true;
+                f->unseen = !seen;
+            }
+            break;
+        }
+    }
+}
+
+/*
+ * The driver has answered for cb's work: it is finished.  So is everything
+ * submitted before it, if cb opens with a barrier over all commands: its
+ * commands, every one, were ordered after all earlier ones.
+ */
+static void finish(Obj *cb)
+{
+    unsigned ord = cb->ord;
+    bool chain = cb->opens_sync;
+
+    complete(cb, true);
+    for (unsigned i = 0; chain && i < g_nrun;) {
+        if (g_run[i]->ord < ord) {
+            complete(g_run[i], false);  /* which puts another in its place */
+        } else {
+            i++;
+        }
+    }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue queue, uint32_t n,
@@ -1937,6 +2428,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue queue, uint32_t n,
 {
     VkResult r;
     Obj *f = NULL;
+    bool lost = false;
 
     ENTER();
     get(queue, MT_QUEUE, __func__, "queue");
@@ -1949,8 +2441,16 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue queue, uint32_t n,
         }
     }
     if (fail(MF_QueueSubmit, &r)) {
-        LEAVE();
-        return r;                       /* nothing was submitted */
+        if (r != VK_ERROR_DEVICE_LOST) {
+            LEAVE();
+            return r;                   /* nothing was submitted */
+        }
+        /*
+         * The device is lost.  Whether it took the work, or part of it, is
+         * not known, and for what is pending and in use the call counts as
+         * one that succeeded: the command buffers are pending.
+         */
+        lost = true;
     }
     if (f && f->signaled) {
         viol("%s: fence #%u is signaled", __func__, f->serial);
@@ -1970,57 +2470,108 @@ VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue queue, uint32_t n,
                      cb->serial, cb_state_name[cb->state]);
                 continue;
             }
-            execute(cb);
+            if (!lost) {
+                execute(cb);
+            }
             cb->state = CB_PENDING;
             for (unsigned j = 0; j < cb->nref; j++) {
                 cb->ref[j]->pending++;
             }
+            for (unsigned j = 0; j < cb->nuse; j++) {
+                Use *u = &cb->use[j];
+                if (!u->hi) {
+                    ++*(u->write ? &u->mem->gpu_w : &u->mem->gpu_r);
+                    guard(u->mem);
+                }
+            }
+            if (g_nrun == MAXRUN) {
+                runaway("submissions running at once", MAXRUN);
+            }
+            cb->ord = ++g_nsub;
+            g_run[g_nrun++] = cb;
             if (f && f->nfence_cb < 4) {
                 f->fence_cb[f->nfence_cb++] = cb;
-            } else {
-                complete(cb);
+                cb->fence = f;
             }
+            /* (without a fence only a later, ordered submission's can tell) */
         }
     }
+    if (lost) {
+        device_lost();
+    }
     LEAVE();
-    return VK_SUCCESS;
+    return lost ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice dev, uint32_t n, const VkFence *fences,
                                                VkBool32 all, uint64_t timeout)
 {
     VkResult r = VK_SUCCESS;
-    bool failed;
+    bool planned, lost, busy = false;
+    Obj *first = NULL;
 
     ENTER();
     while (mock_thread && g_gate) {
         pthread_cond_wait(&g_gate_cv, &g_mu);
     }
     get(dev, MT_DEVICE, __func__, "device");
-    failed = fail(MF_WaitForFences, &r);
+    planned = fail(MF_WaitForFences, &r);
     for (uint32_t i = 0; i < n; i++) {
         Obj *f = get(fences[i], MT_FENCE, __func__, "pFences[]");
-        if (!f) {
-            continue;
+        first = first ? first : f;
+        busy |= f && f->nfence_cb;
+    }
+    if (planned && r != VK_ERROR_DEVICE_LOST && g_patience && first &&
+        first->unanswered >= g_patience) {
+        planned = false;                /* failed often enough: this one is let through */
+        g_fired--;
+        g_nfail[MF_WaitForFences]--;
+    }
+    lost = planned && r == VK_ERROR_DEVICE_LOST;
+    if (!planned && busy && g_hold) {
+        /* the work is not finished, and will not be until it is let go */
+        if (timeout != UINT64_MAX) {
+            LEAVE();
+            return VK_TIMEOUT;
         }
-        if (f->nfence_cb) {
-            if (failed && r != VK_ERROR_DEVICE_LOST) {
-                /* The wait did not take place: the work goes on, and what it
-                 * uses stays in use.  (A lost device has dropped it.) */
-                continue;
-            }
-            for (unsigned k = 0; k < f->nfence_cb; k++) {
-                complete(f->fence_cb[k]);
-            }
-            f->nfence_cb = 0;
-            f->signaled = true;
-        } else if (!f->signaled && !failed) {
-            viol("%s: fence #%u is not signaled and nothing was submitted with it: "
-                 "this wait would never return", __func__, f->serial);
+        while (g_hold) {
+            pthread_cond_wait(&g_gate_cv, &g_mu);
         }
     }
+    for (uint32_t i = 0; i < n; i++) {
+        Obj *f = (Obj *)fences[i];
+        if (!f || mock_is_garbage(f) || f < g_obj || f >= g_obj + g_nobj ||
+            f->type != MT_FENCE || !f->alive) {
+            continue;                   /* reported above */
+        }
+        if (planned && !lost) {
+            /* No answer (an error, or VK_TIMEOUT): the work goes on, and
+             * what it uses stays in use. */
+            f->unanswered++;
+            continue;
+        }
+        f->unanswered = 0;
+        f->unseen = false;
+        if (f->nfence_cb) {
+            /* Finished -- or the device is lost, which counts the same for
+             * what is pending and in use. */
+            while (f->nfence_cb) {
+                finish(f->fence_cb[0]);
+            }
+        } else if (!f->signaled && !lost) {
+            if (g_lost) {
+                lost = true;            /* a lost device does answer, in finite time */
+            } else {
+                viol("%s: fence #%u is not signaled and nothing was submitted with it: "
+                     "this wait would never return", __func__, f->serial);
+            }
+        }
+    }
+    if (lost) {
+        device_lost();
+    }
     LEAVE();
-    return failed ? r : VK_SUCCESS;
+    return lost ? VK_ERROR_DEVICE_LOST : planned ? r : VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL vkResetFences(VkDevice dev, uint32_t n, const VkFence *fences)
@@ -2038,9 +2589,20 @@ VKAPI_ATTR VkResult VKAPI_CALL vkResetFences(VkDevice dev, uint32_t n, const VkF
         }
         if (f->nfence_cb) {
             viol("%s: fence #%u belongs to unfinished work", __func__, f->serial);
+        } else if (f->unseen) {
+            /*
+             * Its work has finished, as later work that was waited for
+             * tells; that the fence has been signaled for it is not known.
+             * Stricter than the letter of the specification, which asks
+             * only that the work have finished.
+             */
+            viol("%s: fence #%u is reset though no wait has seen it signaled", __func__,
+                 f->serial);
         }
         if (!failed) {
             f->signaled = false;
+            f->unseen = false;
+            f->unanswered = 0;
         }
     }
     LEAVE();

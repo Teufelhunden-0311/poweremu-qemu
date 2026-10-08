@@ -53,13 +53,13 @@ records a *violation* when
   VK_NULL_HANDLE where one is not allowed, the output of a failed call, an
   object already destroyed;
 - an object is destroyed, or a descriptor pool reset, while a submitted command
-  buffer that has not been waited for still uses it;
+  buffer that is still running uses it;
 - a command is recorded into a command buffer that is not recording, a command
   buffer is submitted that was not ended successfully, begun or reset while
   pending, or ended with its render pass open; a copy, clear or layout
   transition is recorded inside a render pass;
 - a fence is submitted while signaled or in use, reset while its work is
-  unfinished, or waited for when nothing can signal it;
+  running, or waited for when nothing can signal it;
 - a descriptor is written with a null or dead sampler, view or buffer, or a
   set is used after its pool was reset;
 - on submission, when the commands are "executed" in order: an image is not in
@@ -67,21 +67,78 @@ records a *violation* when
   attachment, copied from) has a level, layer or slice never written since it
   last left VK_IMAGE_LAYOUT_UNDEFINED; a layout transition that names no source
   access follows a write to the image with no ordering barrier between;
-- the renderer makes more than four million calls or 131072 objects in one run
-  (it does not stop).
+- the host touches mapped memory that running work may write, or writes
+  memory that it reads (below);
+- the renderer makes more than four million calls, 131072 objects, 4096
+  mappings or 64 submissions running at once in one run (it does not stop).
 
-It does not model shaders (every descriptor of a bound set counts as used),
-image contents, formats, queue families or most other valid-usage rules.
-Submitted work counts as finished when a `vkWaitForFences` has seen its fence
-and succeeded or reported the device lost; after a wait that failed otherwise
-it is still in flight.
-It is not a substitute for the validation layers on a real driver
-(`guest/rbvkdummy.sh`).
+*When work has finished.*  What a command buffer does to images is applied
+inside `vkQueueSubmit`, at once: those checks are about the order of commands.
+Whether the work has *finished* is kept apart, and there the driver is as slow
+as the specification allows.  A submission is running until a
+`vkWaitForFences` has said that it is not: one that returned VK_SUCCESS for
+its fence, or for the fence of a later submission whose command buffer opens
+with a barrier over all commands (which orders that one after everything
+submitted before); or one that returned VK_ERROR_DEVICE_LOST, which counts as
+success for what is pending and in use.  A wait that returned anything else --
+an error, VK_TIMEOUT -- leaves it running, and what it uses in use.  A
+submission that itself returned VK_ERROR_DEVICE_LOST counts as made.  The test
+can also hold the work (`mock_hold`): a wait then does not return at all.
+
+*Memory.*  From the commands recorded the driver knows what a submission
+uses: the buffer of a copy to or from an image, a draw's index buffer, the
+buffers of its descriptor set (read through a uniform descriptor; read and
+possibly written through a storage descriptor, shaders not being modelled).
+Mapped memory that running work uses is made inaccessible, or read-only where
+the work only reads it, so that the renderer's own accesses -- the Z-pass
+counter, a batch's vertex and texture data -- fault when they come too early;
+the fault is recorded and the access then let through.  That is exact for
+memory used as a whole.  VRAM, which the host and the GPU share piecemeal, is
+not guarded by pages: its uses are kept by the byte (a copy's region, and for
+the storage descriptor what the test says the draw's shader reads), and every
+access to it in the test is declared to the driver first -- the device's
+stand-in (`device_access`) and the two stand-in functions through which the
+renderer reads texture bytes.  On a lost device memory may be touched whatever
+was using it.
+
+It is not a substitute for a real driver under the validation layers
+(`guest/rbvkdummy.sh`), and there is much it cannot show:
+
+- It holds no image or buffer contents.  It cannot tell what is on the
+  screen, or that VRAM holds the right bytes after a failure -- only that
+  nothing was read that was never written, in the layout named, and that
+  memory was not touched while in use.
+- Shaders, formats beyond the size of a texel, queue families and most
+  valid-usage rules are not modelled.
+- An access to VRAM that the test does not declare is not seen.  The
+  renderer's are (they go through stand-in functions); a guest's own, in a
+  real machine, are the guest's to time by the completion it is told of --
+  which is why a completion must not be reported early, and that is checked.
+- "For good" cannot be run: that the renderer keeps waiting is shown for some
+  dozens of attempts and a tenth of a second, and otherwise read in its source.
+
+**Which failures.**  Every call the renderer makes that returns a `VkResult`
+can be made to fail (31; not `vkResetDescriptorPool`, for which the registry
+lists no error of its own).  Each fails with an error the specification lists
+for it (the registry's `errorcodes`, vk.xml 1.4.363): VK_ERROR_OUT_OF_HOST_MEMORY,
+or VK_ERROR_OUT_OF_DEVICE_MEMORY for `vkResetFences` and `vkResetCommandBuffer`,
+which list only that.  Where the renderer acts on which result it is, the
+others listed are run too: device memory and VK_ERROR_DEVICE_LOST for
+`vkQueueSubmit`; those two, VK_ERROR_UNKNOWN and VK_TIMEOUT for
+`vkWaitForFences`; device memory for `vkAllocateDescriptorSets`.  Injections
+*beyond* what a driver may do are run apart and labelled so in the output
+("error not listed"): host-memory errors from `vkResetFences` and
+`vkResetCommandBuffer`.  Two more liberties, both within the letter of the
+specification: a device reported lost by one call may answer later calls with
+success, and the same call may fail any number of times running.  The two
+generic errors any command may return (VK_ERROR_UNKNOWN,
+VK_ERROR_VALIDATION_FAILED) are injected only where named above.
 
 **The program** (`test_vk`, no arguments) runs
 
 - `selftest`: each kind of misuse above done to the driver directly, to see
-  that it is reported, and a correct batch, to see that it is not;
+  that it is reported, and its correct counterpart, to see that it is not;
+  what a wait does and does not say about earlier work;
 - `helpers`: `vk_image` and `vk_buffer` with each of their calls failing in
   turn (outputs all null, only what was created destroyed, nothing left) and
   with no memory type fitting; `vk_dummies` with each creation call of each
@@ -90,28 +147,59 @@ It is not a substitute for the validation layers on a real driver
   programs that do not compile (rejected, compiled once); draws refused for
   what they are (bad buffers, textures out of range ...); every batch in
   flight with a draw waiting for one, and a wait failing for lack of memory
-  meanwhile; VRAM mapped off a page boundary at start-up;
+  meanwhile; VRAM mapped off a page boundary at start-up; and the waits:
+    - *no answer*: a batch in flight, the GPU held, and every wait for it
+      returning an error that is not a lost device (host memory, device
+      memory, VK_ERROR_UNKNOWN) or VK_TIMEOUT.  While that lasts -- and after
+      the waits stop failing, for as long as the GPU has not finished -- the
+      pages the batch reads and writes stay busy, no completion is reported,
+      a flush does not return and the Z-pass counter is not read; VRAM the
+      batch does not use may be written.  Then the GPU finishes: the flush
+      returns, the completion is reported, the device writes the pages, and
+      rendering goes on;
+    - *one of two answered*: the renderer's thread and a flush wait for the
+      same batch and only one gets an answer, which settles it for both;
+    - *the device lost* with batches in flight, found out by the thread or by
+      a flush: completions reported in order, VRAM free to touch, nothing
+      submitted and nothing recycled afterwards;
+    - five batches in flight and every wait unanswered three times:
+      completions once each, in order, none early;
 - `sweep`: a scenario of some 500 draws (every texture path, lines, GPU vertex
   shading, several colour buffers, multisampling, a buffer rendered to and
   then sampled, batches in flight together, a descriptor pool running out,
   the image, framebuffer and texture caches overflowing, vertex data larger
-  than an arena chunk, a texture upload crossing one) run from start-up in a
-  fresh process for every case:
-    - each call that returns a `VkResult` (31 of them, start-up included; all
-      but `vkResetDescriptorPool`, which is specified to succeed) failing
-      once, for every time the scenario makes it, and failing from then on;
+  than an arena chunk, a texture upload crossing one; the device reading and
+  writing VRAM that batches open or in flight use, and VRAM they do not; the
+  Z-pass counter read and set) run from start-up in a fresh process for every
+  case:
+    - each failable call failing once, for every time the scenario makes it,
+      and failing from then on, with the results named above;
     - every failable call failing from some point on, as when memory is gone;
     - calls failing at random (0.5 %, 2 %, 10 %; 300 seeds each), with and
-      without the two failures after which the renderer stops rendering
-      (`vkWaitForFences`, `vkResetFences`).
+      without the one failure after which the renderer stops rendering
+      without the device being lost (`vkResetFences`).
+
+  A wait that is made to fail "from then on" fails three times running for a
+  fence and is then let through, or the run would not end: the renderer waits
+  it out.
 
   After the failing run the scenario is run again with nothing failing.  A
-  case passes if the driver recorded no violation; no object exists that the
-  renderer's state does not refer to, and it refers to no dead one; the
-  renderer did not crash, hang or run away; rendering stopped for good only
-  where a lost device or one of those two failures is the cause; a call that
-  failed once cost at most one draw; and every draw of the second run was
-  accepted.
+  case passes if the driver recorded no violation; no batch was reported
+  complete (the callback, or `flush_r200` returning) before the driver had
+  finished every submission made up to it; completions came once each and in
+  order; no object exists that the renderer's state does not refer to, and it
+  refers to no dead one; the renderer did not crash, hang or run away;
+  rendering stopped for good only where the device was lost or a fence could
+  not be reset, and did stop where a wait or a submission reported the device
+  lost; and every draw of the second run was accepted.
+
+  What a failure costs is two different things, and both are checked for a
+  call that failed once (rendering going on): at most one draw was *refused*
+  (`draw_r300` returned an error), and at most one batch was *cancelled* --
+  only when it was its recording or its submission that failed.  A cancelled
+  batch takes with it every draw already accepted into it, of which the
+  caller learns only through `gpu_failures`; the sweep prints how many that
+  was.
 
 `test_vk case …` / `test_vk random …` repeat one case, as the sweep's failure
 summary names it; `-v` prints the renderer's log and each violation.
@@ -141,8 +229,15 @@ validation, ten runs, each checked, non-zero exit on any failure: the batch
 carrying the stand-in textures' initialization is not submitted, once and three
 times; creating the second or third image fails once, with the retry in a later
 batch and in the same open batch; `VD-nofix`, `VD-old1`, `VD-old2` are negative
-controls that must produce validation errors).  `readstrip.py` exits non-zero
-on a bad strip checksum and `rbvm.sh` then reports the run as failed.
+controls that must produce validation errors), `rbvkwait.sh` (the same layer:
+waits for the GPU that give no answer -- the hook returns an error or
+VK_TIMEOUT without waiting, several times running, so the GPU may really still
+be at work; five runs, each checked: a clean one, three with device-memory,
+host-memory and VK_TIMEOUT results, whose readbacks must equal the clean
+run's with the layer silent, and `WB-old`, the negative control, in which an
+unanswered wait is taken for a finished batch and wrong readbacks or
+validation errors must follow).  `readstrip.py` exits non-zero on a bad strip
+checksum and `rbvm.sh` then reports the run as failed.
 
 ## Test-only hooks (the commit after this one; never merge)
 
@@ -171,3 +266,10 @@ on a bad strip checksum and `rbvm.sh` then reports the run as failed.
     RBTEST_NO_DUMMY_FIX=1       with the above: a cancelled batch does not clear
                                 dummy_ready (the code before the fix), and the images
                                 are copied out as they are
+    R300_VK_FAIL=waitbusy:N:code:R
+                                for every N-th batch waited for (the renderer's thread
+                                and flushes counted apart) the first R attempts return
+                                code (-1, -2; 2 is VK_TIMEOUT) without waiting
+    RBTEST_WAIT_NO_RETRY=1      with waitbusy: such a result is taken for the batch
+                                having finished, as before the fix -- but rendering
+                                goes on, so that what follows from it shows

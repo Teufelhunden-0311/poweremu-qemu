@@ -7,13 +7,17 @@
  * what the renderer does with handles, command buffers, fences and images.
  *
  *  - Helper contract: vk_image and vk_buffer with each of their calls
- *    failing, and vk_dummies around such a failure.
- *  - Sweep: a scenario of draws, flushes and submissions is run once per
- *    failable call it makes, with that one call failing (and again with
- *    every call from that one on failing), then once more with nothing
- *    failing.  A case passes if the driver saw no violation, the renderer
- *    lost no object and holds no dead handle, it did not stop rendering
- *    for good unless the failure was a lost device, and every draw of the
+ *    failing, and vk_dummies around such a failure; a wait for the GPU
+ *    that gives no answer, and one that reports the device lost.
+ *  - Sweep: a scenario of draws, flushes, submissions and accesses to VRAM
+ *    is run once per failable call it makes, with that one call failing
+ *    (and again with every call from that one on failing), then once more
+ *    with nothing failing.  A case passes if the driver saw no violation
+ *    -- which includes the host touching memory that submitted work not
+ *    known to have finished still uses -- no batch was reported complete
+ *    before the driver had finished it, the renderer lost no object and
+ *    holds no dead handle, it did not stop rendering for good unless the
+ *    device was lost or a fence could not be reset, and every draw of the
  *    second, undisturbed run was accepted.
  *
  * Usage: test_vk [-v] [-i] [selftest | helpers | sweep |
@@ -22,7 +26,8 @@
  *   -i   the device offers the ordered pixel interlock (storage images)
  *   -v   print the renderer's log and each violation
  * With no command: selftest, helpers and sweep.  "case" and "random" repeat
- * one case of the sweep, as its failure summary names them.
+ * one case of the sweep, as its failure summary names them (RESULT 0, or
+ * none: the error the specification lists for the call).
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  */
@@ -31,6 +36,7 @@
 #include "qemu/error-report.h"
 #include "qemu/thread.h"
 
+#include <sched.h>
 #include <signal.h>
 #include <sys/wait.h>
 
@@ -66,6 +72,24 @@ void error_report(const char *fmt, ...)
         vfprintf(stderr, fmt, ap);
         va_end(ap);
         fputc('\n', stderr);
+    }
+}
+
+/*
+ * The renderer's pauses between attempts to get an answer from the GPU
+ * (g_usleep, shim/qemu/osdep.h): counted, and slept only in tests that keep
+ * it waiting for a while.
+ */
+static unsigned g_pauses;
+static bool g_pause_sleeps;
+
+void vkmock_pause(unsigned long us)
+{
+    __atomic_fetch_add(&g_pauses, 1, __ATOMIC_SEQ_CST);
+    if (g_pause_sleeps) {
+        usleep(us < 2000 ? us : 2000);
+    } else {
+        sched_yield();
     }
 }
 
@@ -121,10 +145,15 @@ uint32_t *r300_glsl_to_spirv(const char *glsl, R300Stage stage, size_t *nwords, 
     return calloc(8, 4);
 }
 
+/* The two that read a texture's bytes, which may be VRAM, say so to the
+ * driver: the GPU must have finished writing them. */
 uint64_t r300_hash_bytes(const uint8_t *p, size_t n)
 {
     uint64_t h = 0xcbf29ce484222325ull;
 
+    if (!mock_host_access(p, n, false, "hashing a texture")) {
+        return 0;
+    }
     for (size_t i = 0; i < n; i++) {
         h = (h ^ p[i]) * 0x100000001b3ull;
     }
@@ -153,6 +182,9 @@ static uint32_t kind_bytes(uint32_t kind)
 uint8_t *r300_tex_level_bytes(const R300TexDesc *td, const uint8_t *src, uint32_t l,
                               uint32_t w, uint32_t h, uint32_t *bpr)
 {
+    /* what the real one reads: a face or slice of the level */
+    mock_host_access(src, (size_t)td->lvl_pitch[l] * td->lvl_rows[l], false,
+                     "rebuilding a texture");
     if (td->kind >= R300_TEXK_DXT1) {
         uint32_t bs = td->kind == R300_TEXK_DXT1 ? 8 : 16;
         *bpr = (w + 3) / 4 * bs;
@@ -169,20 +201,110 @@ uint8_t *r300_tex_level_bytes(const R300TexDesc *td, const uint8_t *src, uint32_
 static PPCMacGPURenderer *R;
 static void *OPQ;
 static uint8_t *VRAM;
-static bool g_dirty_tex;        /* the next dirty-log read reports the texture page */
-static unsigned g_done_calls;
+static uint64_t g_dirty[16];    /* VRAM the CPU wrote: the next dirty-log read reports it */
+static unsigned g_ndirty;
+static int g_pass;              /* which run of the scenario */
 
 static void dirty_fn(void *arg, unsigned long *bitmap, uint64_t npages)
 {
-    if (g_dirty_tex) {
-        g_dirty_tex = false;
-        bitmap[(0x030000 / 4096) / BITS_PER_LONG] |= 1ul << ((0x030000 / 4096) % BITS_PER_LONG);
+    for (unsigned i = 0; i < g_ndirty; i++) {
+        uint64_t pg = g_dirty[i] / 4096;
+        bitmap[pg / BITS_PER_LONG] |= 1ul << (pg % BITS_PER_LONG);
+    }
+    g_ndirty = 0;
+}
+
+static void cpu_wrote(uint64_t addr)
+{
+    if (g_ndirty < ARRAY_SIZE(g_dirty)) {
+        g_dirty[g_ndirty++] = addr;
     }
 }
 
+/*
+ * Completions.  A batch committed with a callback (submit) is reported
+ * complete by the renderer's thread, once, in the order of the commits,
+ * and not before the driver has finished everything submitted up to it:
+ * the callback notes how far the driver had got, and check_done() compares
+ * that with the submissions made by the time of the commit.
+ */
+#define MAX_SEQ 4096
+static unsigned g_seq_sub[MAX_SEQ];     /* by batch number */
+static struct {
+    uint32_t seq;
+    unsigned upto;
+} g_done[1024];
+static unsigned g_ndone, g_ncallback;   /* completions reported, and asked for */
+
 static void done_fn(void *arg, uint32_t seq)
 {
-    __atomic_fetch_add(&g_done_calls, 1, __ATOMIC_SEQ_CST);
+    unsigned i = g_ndone;               /* (only the renderer's thread writes it) */
+
+    if (i < ARRAY_SIZE(g_done)) {
+        g_done[i].upto = mock_finished_upto();
+        g_done[i].seq = seq;
+    }
+    __atomic_store_n(&g_ndone, i + 1, __ATOMIC_SEQ_CST);
+}
+
+static unsigned ndone(void)
+{
+    return __atomic_load_n(&g_ndone, __ATOMIC_SEQ_CST);
+}
+
+static void check_done(void)
+{
+    static unsigned seen;
+    unsigned n = ndone();
+
+    for (unsigned i = seen; i < n && i < ARRAY_SIZE(g_done); i++) {
+        unsigned need = g_seq_sub[g_done[i].seq % MAX_SEQ];
+
+        if (g_done[i].upto < need) {
+            mock_violation_add("batch %u was reported complete when the driver had finished "
+                               "%u of the %u submissions made by its commit", g_done[i].seq,
+                               g_done[i].upto, need);
+        }
+        if (i && (int32_t)(g_done[i].seq - g_done[i - 1].seq) <= 0) {
+            mock_violation_add("completions out of order: batch %u reported after batch %u",
+                               g_done[i].seq, g_done[i - 1].seq);
+        }
+    }
+    seen = n;
+}
+
+/*
+ * What becomes of the draws the renderer accepts.  A batch whose recording
+ * or submission fails is cancelled, and every draw already accepted into
+ * it is lost with it: that is counted apart from the draws refused.
+ * before() and after() go around each call that may commit the open batch.
+ */
+static unsigned g_open_draws, g_marks;
+static uint32_t g_open_seq;
+static bool g_was_stopped;
+static unsigned g_cancelled[2], g_lost_draws[2];
+
+static unsigned cancel_marks(void)
+{
+    return mock_failed(MF_EndCommandBuffer) + mock_failed(MF_QueueSubmit);
+}
+
+static void before(void)
+{
+    g_open_seq = V.cur ? V.cur->seq : 0;
+    g_marks = cancel_marks();
+    g_was_stopped = qatomic_read(&V.lost);
+}
+
+static void after(void)
+{
+    if (g_open_seq && (!V.cur || V.cur->seq != g_open_seq)) {
+        if (cancel_marks() != g_marks || g_was_stopped) {
+            g_cancelled[g_pass]++;
+            g_lost_draws[g_pass] += g_open_draws;
+        }
+        g_open_draws = 0;
+    }
 }
 
 static bool renderer_start(void)
@@ -191,6 +313,8 @@ static bool renderer_start(void)
     if (!VRAM) {
         return false;
     }
+    /* the host and the GPU share it piecemeal (mockvk.h) */
+    mock_shared_buffer(V.vram_buf);
     R = ppc_mac_gpu_renderer_vulkan();
     if (!R->init(VRAM, VRAM_SIZE)) {
         return false;
@@ -214,10 +338,74 @@ static void quiesce(void)
     }
 }
 
+/* flush_r200: when it returns the device takes all work for finished. */
+static void flush_now(void)
+{
+    unsigned n;
+
+    before();
+    R->flush_r200(OPQ);
+    after();
+    n = mock_running();
+    if (n && !mock_device_lost()) {
+        mock_violation_add("flush_r200 returned with %u submissions not known to have "
+                           "finished", n);
+    }
+}
+
 static void flush(void)
 {
-    R->flush_r200(OPQ);
+    flush_now();
     quiesce();
+    check_done();
+}
+
+/* Commit the open batch and have its completion reported. */
+static uint32_t submit(void)
+{
+    uint32_t seq;
+
+    before();
+    seq = R->submit_r200(OPQ, done_fn, NULL);
+    after();
+    if (seq) {
+        g_seq_sub[seq % MAX_SEQ] = mock_submitted();
+        g_ncallback++;
+    }
+    return seq;
+}
+
+/*
+ * The device itself reads or writes VRAM [lo, hi), the way it goes about
+ * it (r200_vram_access): if work batched or in flight uses the range, that
+ * is finished first.
+ */
+static void device_access(uint64_t lo, uint64_t hi, bool write)
+{
+    if (R->range_busy_r200(OPQ, lo, hi, write)) {
+        flush_now();
+    }
+    if (!mock_host_access(VRAM + lo, hi - lo, write,
+                          write ? "the device writing VRAM" : "the device reading VRAM")) {
+        return;
+    }
+    if (write) {
+        VRAM[lo]++;
+        cpu_wrote(lo);
+    } else {
+        volatile uint8_t v = VRAM[lo];
+        (void)v;
+    }
+}
+
+static uint32_t zpass(bool reset)
+{
+    uint32_t v;
+
+    before();
+    v = R->zpass_r300(OPQ, reset, 0);
+    after();
+    return v;
 }
 
 /* ---- packets ----------------------------------------------------------- */
@@ -314,11 +502,31 @@ static void tex_raw(R300TexDesc *t, uint32_t addr)
 #define MAX_STEPS 2048
 static int g_res[2][MAX_STEPS];
 static unsigned g_nres[2];
-static int g_pass;
+
+static int draw_one(const R300DrawPacket *p)
+{
+    int r;
+
+    /* what its shader reads of VRAM through the storage buffer */
+    for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
+        const R300TexDesc *td = &p->tex[t];
+        if (td->bound && td->kind == R300_TEXK_RAW && !td->host_data) {
+            mock_shader_reads(V.vram_buf, td->gpu_addr, td->size_bytes);
+        }
+    }
+    before();
+    r = R->draw_r300(OPQ, VRAM, VRAM_SIZE, p);
+    after();
+    mock_shader_reads_clear();
+    if (r == 0 && V.cur && !qatomic_read(&V.lost)) {
+        g_open_draws++;
+    }
+    return r;
+}
 
 static void draw(const R300DrawPacket *p)
 {
-    int r = R->draw_r300(OPQ, VRAM, VRAM_SIZE, p);
+    int r = draw_one(p);
 
     if (g_nres[g_pass] < MAX_STEPS) {
         g_res[g_pass][g_nres[g_pass]++] = r;
@@ -336,6 +544,8 @@ static void scenario(void)
     draw(&p);
     pkt_rt(&p, 0x000000, 64, 64);
     draw(&p);
+    /* the device reads what they drew (a scanout, a 2D copy) */
+    device_access(0x000000, 0x004000, false);
 
     /* every way a texture reaches the GPU */
     pkt_rt(&p, 0x000000, 64, 64);
@@ -356,8 +566,9 @@ static void scenario(void)
     tex(&p.tex[11], 0x078000, 16, 16, R300_TEXK_DXT5, R300_TEXDIM_2D, 1, 2);
     p.tex[11].filter0 = 0x1200 | 6 | 1 << 3 | 3 << 9 | 4 << 21;   /* border, mirror, anisotropic */
     draw(&p);
-    /* the CPU writes the first texture: it is loaded again */
-    g_dirty_tex = true;
+    /* the device writes the first texture, which the batch still has to
+     * load: it is loaded again */
+    device_access(0x030000, 0x030400, true);
     draw(&p);
     flush();
 
@@ -446,21 +657,30 @@ static void scenario(void)
     p.aa_samples = 2;
     draw(&p);
 
-    /* completion reported through the callback */
-    R->submit_r200(OPQ, done_fn, NULL);
-    quiesce();
+    /* the Z-pass counter read with a batch open */
+    zpass(false);
 
-    /* several batches in flight at once */
+    /* completion reported through the callback */
+    pkt_rt(&p, 0x000000, 64, 64);
+    draw(&p);
+    submit();
+    quiesce();
+    check_done();
+
+    /* several batches in flight at once; the device writes VRAM that none
+     * of them uses, then VRAM that they render to */
     mock_gate(true);
     for (int i = 0; i < 4; i++) {
         pkt_rt(&p, 0x000000, 64, 64);
         pkt_z(&p, 0x010000, 4);
         draw(&p);
-        R->submit_r200(OPQ, done_fn, NULL);
+        submit();
     }
-    R->range_busy_r200(OPQ, 0, 4096, true);
+    device_access(0x3f0000, 0x3f1000, true);
+    device_access(0x000000, 0x001000, true);
     mock_gate(false);
     quiesce();
+    check_done();
 
     /* more draws in a batch than one descriptor pool holds */
     for (int i = 0; i < VK_SETS_PER_POOL + 40; i++) {
@@ -489,7 +709,7 @@ static void scenario(void)
             flush();
         }
     }
-    R->zpass_r300(OPQ, true, 0);
+    zpass(true);
     R->gpu_failures(OPQ);
     R->get_caps(OPQ);
     flush();
@@ -628,6 +848,8 @@ typedef struct Result {
     int done, init_ok, lost;
     int crashed;                        /* the signal that ended the run, if one did */
     unsigned fired, nviol, leaks, rejected[2], ndraw[2];
+    unsigned cancelled[2], lost_draws[2];   /* batches cancelled, accepted draws in them */
+    unsigned pauses;                    /* the renderer's, waiting for an answer */
     unsigned calls[MF_COUNT][3];        /* in the first run of the scenario */
     unsigned failable;                  /* ... failable calls on the main thread */
     char leak_desc[160];
@@ -666,12 +888,30 @@ static void crashed(int sig)
     _exit(0);
 }
 
-static void catch_crashes(void)
+/*
+ * A fault may be the host touching memory the driver has guarded: it has
+ * reported that, and the access goes on.  Anything else is a crash, which
+ * `crash` reports.
+ */
+static void (*g_crash)(int);
+
+static void on_signal(int sig, siginfo_t *si, void *uc)
+{
+    if ((sig == SIGSEGV || sig == SIGBUS) && mock_trap(si->si_addr)) {
+        return;
+    }
+    g_crash(sig);
+}
+
+static void catch_signals(void (*crash)(int))
 {
     static const int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGALRM };
+    struct sigaction sa = { .sa_sigaction = on_signal, .sa_flags = SA_SIGINFO };
 
+    g_crash = crash;
+    sigemptyset(&sa.sa_mask);
     for (unsigned i = 0; i < ARRAY_SIZE(sigs); i++) {
-        signal(sigs[i], crashed);
+        sigaction(sigs[i], &sa, NULL);
     }
 }
 
@@ -686,11 +926,15 @@ typedef struct Case {
     bool gentle;                /* ... but not the ones that end rendering for good */
 } Case;
 
-#define ENDS_RENDERING ((1ul << MF_WaitForFences) | (1ul << MF_ResetFences))
+/* The one failure that ends rendering without the device being lost. */
+#define ENDS_RENDERING (1ul << MF_ResetFences)
 
 static void case_body(const Case *c)
 {
     mock_set_budget(4000000, budget_exceeded);
+    /* a wait that keeps failing is let through the fourth time, or a run
+     * in which every wait fails would not end: the renderer waits it out */
+    mock_wait_patience(3);
     if (c->fn >= 0) {
         mock_plan(c->fn, c->nth, c->persistent, c->res, c->thread);
     }
@@ -712,6 +956,13 @@ static void case_body(const Case *c)
         mock_plan_clear();
         g_pass = 1;
         scenario();
+        quiesce();
+        check_done();
+        if (ndone() != g_ncallback) {
+            mock_violation_add("%u completions reported for %u batches committed with a "
+                               "callback", ndone(), g_ncallback);
+        }
+        g_result.pauses = g_pauses;
         g_result.lost = qatomic_read(&V.lost);
         if (!g_result.lost) {
             /* what the last batches left to destroy (the renderer does this
@@ -721,6 +972,8 @@ static void case_body(const Case *c)
         g_result.leaks = count_leaks(g_result.leak_desc, sizeof(g_result.leak_desc));
         for (int p = 0; p < 2; p++) {
             g_result.ndraw[p] = g_nres[p];
+            g_result.cancelled[p] = g_cancelled[p];
+            g_result.lost_draws[p] = g_lost_draws[p];
             for (unsigned i = 0; i < g_nres[p]; i++) {
                 g_result.rejected[p] += g_res[p][i] != 0;
             }
@@ -750,7 +1003,7 @@ static int run_case(const Case *c, Result *r)
     if (pid == 0) {
         close(fd[0]);
         g_result_fd = fd[1];
-        catch_crashes();
+        catch_signals(crashed);
         alarm(60);
         case_body(c);
         _exit(0);
@@ -768,13 +1021,16 @@ static int run_case(const Case *c, Result *r)
     return WIFSIGNALED(status) ? WTERMSIG(status) : r->crashed;
 }
 
+/* May the run end with rendering stopped for good?  Only for a lost device,
+ * or a fence that could not be reset: not for a wait that gave no answer. */
 static bool lost_expected(const Case *c)
 {
     if (c->permille) {
         return !c->gentle;
     }
-    return c->fn == MF_COUNT || c->fn == MF_WaitForFences || c->fn == MF_ResetFences ||
-           (c->fn == MF_QueueSubmit && c->res == VK_ERROR_DEVICE_LOST);
+    return c->fn == MF_COUNT || c->fn == MF_ResetFences ||
+           ((c->fn == MF_QueueSubmit || c->fn == MF_WaitForFences) &&
+            c->res == VK_ERROR_DEVICE_LOST);
 }
 
 /* Why a run fails, or NULL. */
@@ -805,14 +1061,32 @@ static const char *judge(const Case *c, const Result *r, int sig, char *buf, siz
     if (r->lost && !lost_expected(c)) {
         return "rendering stopped for good, though the device was not lost";
     }
-    if (c->fn >= 0 && c->fn < MF_COUNT && !c->persistent && !r->lost && r->rejected[0] > 1) {
-        snprintf(buf, n, "%u draws rejected after one call failed once", r->rejected[0]);
-        return buf;
+    if (!r->lost && r->fired && c->res == VK_ERROR_DEVICE_LOST &&
+        (c->fn == MF_QueueSubmit || c->fn == MF_WaitForFences)) {
+        return "the device was reported lost and rendering goes on";
+    }
+    if (c->fn >= 0 && c->fn < MF_COUNT && !c->persistent && !r->lost) {
+        /* one call failed once: at most one draw is refused for it, or (its
+         * recording or its submission failing) one batch cancelled */
+        if (r->rejected[0] > 1) {
+            snprintf(buf, n, "%u draws rejected after one call failed once", r->rejected[0]);
+            return buf;
+        }
+        if (r->cancelled[0] > 1) {
+            snprintf(buf, n, "%u batches cancelled after one call failed once", r->cancelled[0]);
+            return buf;
+        }
+        if (r->cancelled[0] && c->fn != MF_EndCommandBuffer && c->fn != MF_QueueSubmit) {
+            return "a batch was cancelled, though neither its recording nor its submission failed";
+        }
     }
     if (!r->lost && r->rejected[1]) {
         snprintf(buf, n, "%u of %u draws rejected in the run with nothing failing",
                  r->rejected[1], r->ndraw[1]);
         return buf;
+    }
+    if (!r->lost && r->cancelled[1]) {
+        return "a batch cancelled in the run with nothing failing";
     }
     if (c->fn < 0 && !c->permille && r->rejected[0]) {
         return "draws rejected with nothing failing";
@@ -842,6 +1116,16 @@ static struct {
 } g_why[96];
 static unsigned g_nwhy;
 
+/*
+ * What one call failing once costs, over the cases in which it did and
+ * rendering went on: draws refused (the draw call says so), and draws that
+ * were accepted into a batch which was then cancelled (it does not).
+ */
+static struct {
+    unsigned cases, refused_max, cancel_cases, lost_max;
+    unsigned long lost_total;
+} g_cost;
+
 /* Run one case; false, with the reason noted under `label`, if it fails. */
 static bool sweep_case(const char *label, const Case *c, unsigned *unreached)
 {
@@ -853,6 +1137,15 @@ static bool sweep_case(const char *label, const Case *c, unsigned *unreached)
 
     if (!bad) {
         *unreached += !sig && !r.fired;
+        if (c->fn >= 0 && c->fn < MF_COUNT && !c->persistent && r.fired && !r.lost) {
+            g_cost.cases++;
+            g_cost.refused_max = MAX(g_cost.refused_max, r.rejected[0]);
+            if (r.cancelled[0]) {
+                g_cost.cancel_cases++;
+                g_cost.lost_total += r.lost_draws[0];
+                g_cost.lost_max = MAX(g_cost.lost_max, r.lost_draws[0]);
+            }
+        }
         return true;
     }
     snprintf(m, sizeof(m), "%s: %s", label, bad);
@@ -886,10 +1179,42 @@ static void sweep_row(const char *label, unsigned ncase, unsigned nfail, unsigne
     *failed += nfail;
 }
 
+/* One call failing, once and from then on, for each time the scenario makes it. */
+static void sweep_call(const char *label, int fn, VkResult res, const Result *base,
+                       unsigned *ncase, unsigned *nfail, unsigned *unreached)
+{
+    for (int t = 0; t < 2; t++) {
+        for (unsigned k = 1; k <= base->calls[fn][t]; k++) {
+            for (int persistent = 0; persistent < 2; persistent++) {
+                Case c = { fn, k, persistent, t, res };
+                ++*ncase;
+                *nfail += !sweep_case(label, &c, unreached);
+            }
+        }
+    }
+}
+
 static int sweep(void)
 {
-    static const VkResult codes[] = { VK_ERROR_OUT_OF_HOST_MEMORY,
-                                      VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_ERROR_DEVICE_LOST };
+    /*
+     * Results the specification lists for a call beyond the one every case
+     * of it gets (mock_listed_error), where the renderer acts on which it
+     * is.  VK_TIMEOUT is no error: a wait that came back early.
+     */
+    static const struct { int fn; VkResult res; } more[] = {
+        { MF_QueueSubmit, VK_ERROR_OUT_OF_DEVICE_MEMORY },
+        { MF_QueueSubmit, VK_ERROR_DEVICE_LOST },
+        { MF_WaitForFences, VK_ERROR_OUT_OF_DEVICE_MEMORY },
+        { MF_WaitForFences, VK_ERROR_DEVICE_LOST },
+        { MF_WaitForFences, VK_ERROR_UNKNOWN },
+        { MF_WaitForFences, VK_TIMEOUT },
+        { MF_AllocateDescriptorSets, VK_ERROR_OUT_OF_DEVICE_MEMORY },
+    };
+    /* And errors it does not list for the call: beyond what a driver may do. */
+    static const struct { int fn; VkResult res; } unlisted[] = {
+        { MF_ResetFences, VK_ERROR_OUT_OF_HOST_MEMORY },
+        { MF_ResetCommandBuffer, VK_ERROR_OUT_OF_HOST_MEMORY },
+    };
     Case none = { -1 };
     Result base;
     char buf[320];
@@ -904,44 +1229,42 @@ static int sweep(void)
     }
     printf("%-40s %6s %6s %6s\n", "what fails", "cases", "passed", "failed");
 
-    /* One call, once; and that call from then on. */
+    /* One call, once; and that call from then on: with results the
+     * specification lists for it. */
     for (int fn = 0; fn < MF_COUNT; fn++) {
         ncase = nfail = 0;
-        for (int t = 0; t < 2; t++) {
-            for (unsigned k = 1; k <= base.calls[fn][t]; k++) {
-                for (int persistent = 0; persistent < 2; persistent++) {
-                    for (unsigned ci = 0; ci < ARRAY_SIZE(codes); ci++) {
-                        Case c = { fn, k, persistent, t, codes[ci] };
-                        /* one error code each, but all of them where the
-                         * code decides what the renderer does */
-                        if (ci && fn != MF_QueueSubmit && fn != MF_WaitForFences &&
-                            fn != MF_AllocateDescriptorSets) {
-                            continue;
-                        }
-                        if (codes[ci] == VK_ERROR_DEVICE_LOST && fn == MF_AllocateDescriptorSets) {
-                            continue;
-                        }
-                        ncase++;
-                        nfail += !sweep_case(mock_fn_name[fn], &c, &unreached);
-                    }
-                }
+        sweep_call(mock_fn_name[fn], fn, mock_listed_error(fn), &base, &ncase, &nfail,
+                   &unreached);
+        for (unsigned i = 0; i < ARRAY_SIZE(more); i++) {
+            if (more[i].fn == fn) {
+                sweep_call(mock_fn_name[fn], fn, more[i].res, &base, &ncase, &nfail,
+                           &unreached);
             }
         }
         sweep_row(mock_fn_name[fn], ncase, nfail, &total, &failed);
     }
+    for (unsigned i = 0; i < ARRAY_SIZE(unlisted); i++) {
+        char label[64];
+        snprintf(label, sizeof(label), "%s, error not listed", mock_fn_name[unlisted[i].fn]);
+        ncase = nfail = 0;
+        sweep_call(label, unlisted[i].fn, unlisted[i].res, &base, &ncase, &nfail, &unreached);
+        sweep_row(label, ncase, nfail, &total, &failed);
+    }
 
     /* Every call from some point on, as when memory runs out: from each of
-     * the first 300 failable calls, then from every 7th. */
+     * the first 300 failable calls, then from every 7th.  Each fails with
+     * the error listed for it. */
     ncase = nfail = 0;
     for (unsigned k = 1; k <= base.failable; k += k < 300 ? 1 : 7) {
-        Case c = { MF_COUNT, k, true, 0, VK_ERROR_OUT_OF_HOST_MEMORY };
+        Case c = { MF_COUNT, k, true, 0, VK_SUCCESS };
         ncase++;
         nfail += !sweep_case("every call from some point on", &c, &unreached);
     }
     sweep_row("every call from some point on", ncase, nfail, &total, &failed);
 
     /* Calls failing at random: 0.5%, 2% and 10% of them, 300 seeds each,
-     * with and without the failures that end rendering for good. */
+     * with and without the failure that ends rendering for good (a fence
+     * that cannot be reset). */
     for (int gentle = 1; gentle >= 0; gentle--) {
         static const unsigned permille[] = { 5, 20, 100 };
         ncase = nfail = 0;
@@ -961,6 +1284,10 @@ static int sweep(void)
     if (unreached) {
         printf("%u cases in which no call was made to fail\n", unreached);
     }
+    printf("one call failing once, rendering going on (%u cases): at most %u draw refused;\n"
+           "  in %u of them the batch being recorded or submitted was cancelled, and with it\n"
+           "  draws already accepted: up to %u, %lu in all\n", g_cost.cases,
+           g_cost.refused_max, g_cost.cancel_cases, g_cost.lost_max, g_cost.lost_total);
     for (unsigned w = 0; w < g_nwhy; w++) {
         printf("  %5u x %s\n          (first: %s)\n", g_why[w].n, g_why[w].msg, g_why[w].first);
     }
@@ -998,6 +1325,7 @@ static StImage st_image(void)
 {
     VkImageCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
                               .imageType = VK_IMAGE_TYPE_2D, .extent = { 4, 4, 1 },
+                              .format = VK_FORMAT_R8G8B8A8_UNORM,
                               .mipLevels = 1, .arrayLayers = 1 };
     VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
                                  .allocationSize = 4096 };
@@ -1024,6 +1352,29 @@ static VkBuffer st_buffer(void)
     vkAllocateMemory(S.dev, &mai, NULL, &mem);
     vkBindBufferMemory(S.dev, buf, mem, 0);
     return buf;
+}
+
+/* A buffer of 4096 bytes in mapped memory. */
+typedef struct StMapped {
+    VkBuffer buf;
+    uint8_t *map;
+} StMapped;
+
+static StMapped st_mapped(void)
+{
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 4096 };
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .allocationSize = 4096 };
+    VkDeviceMemory mem;
+    StMapped m;
+    void *map;
+
+    vkCreateBuffer(S.dev, &bci, NULL, &m.buf);
+    vkAllocateMemory(S.dev, &mai, NULL, &mem);
+    vkBindBufferMemory(S.dev, m.buf, mem, 0);
+    vkMapMemory(S.dev, mem, 0, VK_WHOLE_SIZE, 0, &map);
+    m.map = map;
+    return m;
 }
 
 static VkCommandBuffer st_cb(void)
@@ -1127,6 +1478,25 @@ static VkDescriptorSet st_set(VkDescriptorPool pool, VkImageView view, VkSampler
     return set;
 }
 
+/* The same, with a uniform buffer and a storage buffer besides. */
+static VkDescriptorSet st_set_buffers(VkDescriptorPool pool, VkImageView view, VkBuffer uniform,
+                                      VkBuffer storage)
+{
+    VkDescriptorSet set = st_set(pool, view, S.sampler);
+    VkDescriptorBufferInfo bu = { uniform, 0, 64 }, bs = { storage, 0, VK_WHOLE_SIZE };
+    VkWriteDescriptorSet w[2] = {
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 1,
+          .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+          .pBufferInfo = &bu },
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 2,
+          .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          .pBufferInfo = &bs },
+    };
+
+    vkUpdateDescriptorSets(S.dev, 2, w, 0, NULL);
+    return set;
+}
+
 static VkFramebuffer st_fb(VkImageView view)
 {
     VkFramebufferCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
@@ -1216,6 +1586,22 @@ static void st_setup(void)
 }
 
 static unsigned g_st_from, g_st_fails;
+
+/* What was just done is correct: nothing must have been reported. */
+static void st_accept(const char *what)
+{
+    bool quiet = mock_violations() == g_st_from;
+
+    printf("  %-64s %s\n", what, quiet ? "accepted" : "REPORTED AS WRONG");
+    g_st_fails += !quiet;
+    g_st_from = mock_violations();
+}
+
+static void st_true(const char *what, bool ok)
+{
+    printf("  %-64s %s\n", what, ok ? "yes" : "NO");
+    g_st_fails += !ok;
+}
 
 /* The misuse just committed must have been reported, in words containing `needle`. */
 static void st_expect(const char *what, const char *needle)
@@ -1420,6 +1806,170 @@ static int selftest(void)
         mock_mark(a.view, MT_IMAGE, "a view held as an image");
         st_expect("a held handle that is not what it is held as", "not a image");
     }
+    {   /* memory that running work uses */
+        VkCommandBuffer c = st_cb(), last = st_cb();
+        VkDescriptorPool p = st_pool();
+        VkFence g = st_fence(), glast = st_fence();
+        StImage t = st_image(), r = st_image();
+        VkFramebuffer fb2 = st_fb(r.view);
+        StMapped u = st_mapped(), st = st_mapped();
+        volatile uint8_t sink;
+
+        /* what the misuse above left running is finished first: by a wait
+         * for work that a barrier orders after it (which is tested below) */
+        st_begin(last);
+        st_sync(last);
+        vkEndCommandBuffer(last);
+        st_submit(last, glast);
+        st_wait(glast);
+        st_true("nothing is left running", mock_running() == 0);
+        g_st_from = mock_violations();
+        st_begin(c);
+        st_ready(c, t.img);
+        st_ready(c, r.img);
+        st_draw(c, fb2, st_set_buffers(p, t.view, u.buf, st.buf));
+        vkEndCommandBuffer(c);
+        u.map[0] = 1;
+        st.map[0] = 1;
+        st_accept("the host writes buffers of a batch not yet submitted");
+        st_submit(c, g);
+        sink = u.map[0];
+        st_accept("the host reads memory that running work reads");
+        u.map[1] = 1;
+        st_expect("the host writes memory that running work reads", "the host writes memory");
+        sink = st.map[0];
+        st_expect("the host reads memory that running work may write", "the host touches memory");
+        mock_plan(MF_WaitForFences, mock_calls(MF_WaitForFences, 0) + 1, false,
+                  VK_ERROR_OUT_OF_DEVICE_MEMORY, 0);
+        st_wait(g);
+        mock_plan_clear();
+        st_true("a wait that fails leaves the work running", mock_running() == 1);
+        mock_host_access(st.map, 16, false, "selftest");
+        st_expect("... and its memory in use", "not known to have finished may write");
+        mock_plan(MF_WaitForFences, mock_calls(MF_WaitForFences, 0) + 1, false, VK_TIMEOUT, 0);
+        st_true("a wait that comes back early (VK_TIMEOUT) leaves it running",
+                vkWaitForFences(S.dev, 1, &g, VK_TRUE, UINT64_MAX) == VK_TIMEOUT &&
+                mock_running() == 1);
+        mock_plan_clear();
+        mock_hold(true);
+        st_true("while the work is held, a wait with a time limit times out",
+                vkWaitForFences(S.dev, 1, &g, VK_TRUE, 1000) == VK_TIMEOUT &&
+                mock_running() == 1);
+        mock_hold(false);
+        st_wait(g);
+        st_true("a wait that succeeds finishes it", mock_running() == 0);
+        st.map[1] = 2;
+        u.map[2] = 2;
+        sink = st.map[1];
+        st_accept("the host touches the memory once the work has finished");
+        (void)sink;
+    }
+    {   /* memory shared piecemeal: uses by the byte, accesses declared */
+        VkCommandBuffer c = st_cb();
+        VkFence g = st_fence();
+        StImage t = st_image();
+        StMapped sh = st_mapped();
+        VkBufferImageCopy in = { .bufferOffset = 1024,
+                                 .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                                 .imageExtent = { 4, 4, 1 } };
+        VkBufferImageCopy out = in;
+
+        out.bufferOffset = 256;
+        out.bufferRowLength = 8;        /* rows 32 bytes apart: 3 * 32 + 16 = 112 bytes */
+        mock_shared_buffer(sh.buf);
+        g_st_from = mock_violations();
+        st_begin(c);
+        st_general(c, t.img);
+        vkCmdCopyBufferToImage(c, sh.buf, t.img, VK_IMAGE_LAYOUT_GENERAL, 1, &in);
+        st_sync(c);
+        vkCmdCopyImageToBuffer(c, t.img, VK_IMAGE_LAYOUT_GENERAL, sh.buf, 1, &out);
+        vkEndCommandBuffer(c);
+        st_submit(c, g);
+        mock_host_access(sh.map, 256, true, "selftest");
+        mock_host_access(sh.map + 368, 656, true, "selftest");
+        mock_host_access(sh.map + 1088, 3008, true, "selftest");
+        mock_host_access(sh.map + 1024, 64, false, "selftest");
+        st_accept("shared memory: the host writes around the regions, reads what is read");
+        mock_host_access(sh.map + 367, 1, false, "selftest");
+        st_expect("shared memory: the host reads a byte that a copy writes", "work not known "
+                  "to have finished writes");
+        mock_host_access(sh.map + 1087, 2, true, "selftest");
+        st_expect("shared memory: the host writes a byte that a copy reads", "work not known "
+                  "to have finished reads");
+        st_wait(g);
+        mock_host_access(sh.map, 4096, true, "selftest");
+        st_accept("shared memory: the host writes all of it once the work has finished");
+    }
+    {   /* what a wait says about earlier work */
+        VkCommandBuffer a = st_cb(), b = st_cb(), c = st_cb(), d = st_cb();
+        VkFence fa = st_fence(), fb = st_fence(), fc = st_fence(), fd = st_fence();
+
+        g_st_from = mock_violations();
+        st_begin(a);
+        vkEndCommandBuffer(a);
+        st_submit(a, fa);
+        st_begin(b);                    /* no barrier: not ordered after a */
+        vkEndCommandBuffer(b);
+        st_submit(b, fb);
+        st_wait(fb);
+        st_true("work is not finished by a wait for later, unordered work",
+                mock_running() == 1 && mock_finished_upto() == mock_submitted() - 2);
+        st_begin(c);
+        st_sync(c);                     /* a barrier first: after everything before */
+        vkEndCommandBuffer(c);
+        st_submit(c, fc);
+        st_wait(fc);
+        st_true("... and is by a wait for later work that a barrier orders after it",
+                mock_running() == 0 && mock_finished_upto() == mock_submitted());
+        vkResetFences(S.dev, 1, &fa);
+        st_expect("its fence reset, which no wait has seen signaled", "no wait has seen it");
+        st_begin(a);
+        st_sync(a);
+        vkEndCommandBuffer(a);
+        st_submit(a, fa);
+        st_begin(c);
+        st_sync(c);
+        vkEndCommandBuffer(c);
+        vkResetFences(S.dev, 1, &fc);
+        st_submit(c, fc);
+        st_wait(fc);
+        st_wait(fa);
+        vkResetFences(S.dev, 1, &fa);
+        st_accept("... and reset after a wait for it");
+
+        /* last: the device stays lost */
+        st_begin(d);
+        vkEndCommandBuffer(d);
+        mock_plan(MF_QueueSubmit, mock_calls(MF_QueueSubmit, 0) + 1, false,
+                  VK_ERROR_DEVICE_LOST, 0);
+        st_submit(d, fd);
+        mock_plan_clear();
+        st_true("a submission that reports the device lost counts as made",
+                mock_device_lost() && mock_running() == 1);
+        st_begin(d);
+        st_expect("... its command buffer begun again", "is pending");
+        st_true("a lost device: everything counts as finished",
+                mock_finished_upto() == UINT_MAX);
+    }
+    {
+        VkCommandBuffer c = st_cb();
+        VkDescriptorPool p = st_pool();
+        VkFence g = st_fence();
+        StImage t = st_image(), r = st_image();
+        VkFramebuffer fb2 = st_fb(r.view);
+        StMapped u = st_mapped(), st = st_mapped();
+
+        g_st_from = mock_violations();
+        st_begin(c);
+        st_ready(c, t.img);
+        st_ready(c, r.img);
+        st_draw(c, fb2, st_set_buffers(p, t.view, u.buf, st.buf));
+        vkEndCommandBuffer(c);
+        st_submit(c, g);
+        st.map[0] = 3;
+        mock_host_access(st.map, 16, true, "selftest");
+        st_accept("a lost device: the host may touch memory its work was using");
+    }
     printf("stand-in driver: %u of its checks failed\n", g_st_fails);
     return g_st_fails != 0;
 }
@@ -1620,7 +2170,7 @@ static void test_vk_dummies(unsigned which, int fn, bool same_batch)
     /* use them: a draw binds a stand-in at every unit, and the driver checks
      * their layout and contents when the batch runs */
     pkt_rt(&p, 0x000000, 64, 64);
-    check(R->draw_r300(OPQ, VRAM, VRAM_SIZE, &p) == 0, "a draw after it is rejected");
+    check(draw_one(&p) == 0, "a draw after it is rejected");
     flush();
     check(!new_violations(), "the driver was misused");
 }
@@ -1687,7 +2237,8 @@ static void run_render_passes(void *arg)
  * Every batch is in flight and a draw has to wait for one to come free.
  * Then again with a wait failing meanwhile, and not because the device is
  * lost: the batch whose wait failed may still be running and must keep its
- * fence, its command buffer and what it uses.
+ * fence, its command buffer and what it uses until the wait is answered.
+ * Rendering goes on.
  */
 static void *open_gate_later(void *arg)
 {
@@ -1707,8 +2258,8 @@ static void test_all_in_flight(bool wait_fails)
     mock_gate(true);                    /* the renderer's thread stops in its first wait */
     for (int i = 0; i < VK_NBATCH; i++) {
         pkt_rt(&p, 0x000000, 64, 64);
-        check(R->draw_r300(OPQ, VRAM, VRAM_SIZE, &p) == 0, "draw %d is rejected", i);
-        R->submit_r200(OPQ, done_fn, NULL);
+        check(draw_one(&p) == 0, "draw %d is rejected", i);
+        submit();
     }
     if (wait_fails) {
         mock_plan(MF_WaitForFences, mock_calls(MF_WaitForFences, 1) + 1, false,
@@ -1716,24 +2267,335 @@ static void test_all_in_flight(bool wait_fails)
     }
     pthread_create(&th, NULL, open_gate_later, NULL);
     pkt_rt(&p, 0x000000, 64, 64);
-    r = R->draw_r300(OPQ, VRAM, VRAM_SIZE, &p);     /* no batch is free: it waits */
+    r = draw_one(&p);                   /* no batch is free: it waits */
     pthread_join(th, NULL);
     mock_plan_clear();
     quiesce();
+    check_done();
     if (wait_fails) {
         check(mock_fired() == 1, "the wait was not made to fail");
-        check(qatomic_read(&V.lost), "rendering goes on after the failed wait");
-        check(r == -1, "the draw that found no batch free returns %d", r);
-        check(V.batch[0].state == 2, "the batch whose wait failed was recycled (state %d)",
-              V.batch[0].state);
-    } else {
-        check(!qatomic_read(&V.lost), "rendering has stopped");
-        check(r == 0, "the draw that waited for a batch returns %d", r);
+        check(g_pauses >= 1, "the renderer did not pause before it asked again");
     }
+    check(!qatomic_read(&V.lost), "rendering has stopped");
+    check(r == 0, "the draw that waited for a batch returns %d", r);
+    check(ndone() == VK_NBATCH, "%u completions reported for %u batches", ndone(), VK_NBATCH);
     pkt_rt(&p, 0x000000, 64, 64);
-    check(R->draw_r300(OPQ, VRAM, VRAM_SIZE, &p) == 0, "a later draw is rejected");
+    check(draw_one(&p) == 0, "a later draw is rejected");
     flush();
     check(!new_violations(), "the driver was misused");
+}
+
+/* ---- the GPU gives no answer -------------------------------------------- */
+
+/* Wait, not for ever, for something another thread brings about. */
+#define WAIT_FOR(cond)                                          \
+    ({                                                          \
+        int left_ = 8000;       /* 4 s */                       \
+        while (!(cond) && --left_) {                            \
+            usleep(500);                                        \
+        }                                                       \
+        left_ != 0;                                             \
+    })
+
+/* The renderer is entered by one thread at a time (the device holds a lock
+ * around it): a call that is to be seen waiting is made on a thread of its
+ * own, and nothing else calls the renderer until it is back. */
+typedef struct Blocked {
+    pthread_t th;
+    int which;                  /* 0: flush_r200, 1: zpass_r300 */
+    int back;
+} Blocked;
+
+static void *blocked_fn(void *arg)
+{
+    Blocked *b = arg;
+
+    if (b->which) {
+        zpass(false);
+    } else {
+        flush_now();
+    }
+    __atomic_store_n(&b->back, 1, __ATOMIC_SEQ_CST);
+    return NULL;
+}
+
+static bool is_back(Blocked *b)
+{
+    return __atomic_load_n(&b->back, __ATOMIC_SEQ_CST);
+}
+
+/*
+ * A batch is in flight and no wait for it is answered: each returns `res`,
+ * an error other than a lost device, or VK_TIMEOUT.  The GPU may still be
+ * working, so the batch is not complete: its pages stay busy, no completion
+ * is reported, and a flush (or a read of the Z-pass counter, `which`) does
+ * not return.  That holds while the waits fail, and after they stop failing
+ * for as long as the GPU has not finished.  Then all of it goes ahead, and
+ * rendering with it.
+ */
+static void test_no_answer(VkResult res, int which)
+{
+    Blocked bl = { .which = which };
+    R300DrawPacket p;
+    uint32_t seq;
+    unsigned w0;
+
+    printf("  no answer about a batch (the wait returns %d); %s meanwhile\n", (int)res,
+           which ? "the Z-pass counter is read" : "a flush");
+    g_pause_sleeps = true;
+    mock_hold(true);                    /* the GPU does not finish */
+    mock_plan(MF_WaitForFences, mock_calls(MF_WaitForFences, 2) + 1, true, res, -1);
+    pkt_rt(&p, 0x000000, 64, 64);
+    pkt_z(&p, 0x010000, 4);
+    tex(&p.tex[0], 0x030000, 32, 32, R300_TEXK_RGBA8, R300_TEXDIM_2D, 1, 1);
+    check(draw_one(&p) == 0, "the draw is rejected");
+    seq = submit();
+    check(seq != 0, "nothing was committed");
+
+    /* the renderer's thread asks, and asks again */
+    check(WAIT_FOR(mock_calls(MF_WaitForFences, 1) >= 20), "its thread does not ask again");
+    check(ndone() == 0, "the batch was reported complete");
+    check(mock_running() == 1, "%u submissions are running, not 1", mock_running());
+    check(R->range_busy_r200(OPQ, 0x000000, 0x004000, false),
+          "the colour buffer it renders to counts as free to read");
+    check(R->range_busy_r200(OPQ, 0x010000, 0x014000, true),
+          "the depth buffer it renders to counts as free to write");
+    check(R->range_busy_r200(OPQ, 0x030000, 0x031000, true),
+          "the texture it loads counts as free to write");
+    check(!R->range_busy_r200(OPQ, 0x030000, 0x031000, false),
+          "the texture it loads counts as busy to read");
+    check(!R->range_busy_r200(OPQ, 0x3f0000, 0x3f1000, true),
+          "VRAM it does not use counts as busy");
+    device_access(0x3f0000, 0x3f1000, true);        /* ... and may be written */
+    check(!qatomic_read(&V.lost), "rendering has stopped");
+    check(g_pauses > 0, "the renderer does not pause between its attempts");
+
+    /* a flush cannot return, nor the Z-pass counter be read */
+    w0 = mock_calls(MF_WaitForFences, 0);
+    pthread_create(&bl.th, NULL, blocked_fn, &bl);
+    check(WAIT_FOR(mock_calls(MF_WaitForFences, 0) >= w0 + 20), "it does not ask again");
+    check(!is_back(&bl), "it returned while no wait was answered");
+    check(ndone() == 0, "the batch was reported complete");
+
+    /* the waits no longer fail, but the GPU has not finished */
+    mock_plan_clear();
+    usleep(100000);
+    check(!is_back(&bl), "it returned before the GPU had finished");
+    check(ndone() == 0, "the batch was reported complete before the GPU had finished");
+    check(mock_running() == 1, "%u submissions are running, not 1", mock_running());
+
+    /* it finishes */
+    mock_hold(false);
+    check(WAIT_FOR(is_back(&bl)), "it does not return once the GPU has finished");
+    pthread_join(bl.th, NULL);
+    quiesce();
+    check_done();
+    check(ndone() == 1 && g_done[0].seq == seq, "%u completions reported, the first for "
+          "batch %u (committed: one, batch %u)", ndone(), g_done[0].seq, seq);
+    check(mock_running() == 0, "%u submissions are still running", mock_running());
+    check(!R->range_busy_r200(OPQ, 0x000000, 0x004000, true), "the colour buffer stays busy");
+    device_access(0x000000, 0x001000, true);
+    device_access(0x030000, 0x030400, true);
+    check(!qatomic_read(&V.lost), "rendering has stopped");
+    pkt_rt(&p, 0x000000, 64, 64);
+    check(draw_one(&p) == 0, "a later draw is rejected");
+    flush();
+    vk_reap();
+    {
+        char desc[160];
+        check(!count_leaks(desc, sizeof(desc)), "objects nothing refers to: %s", desc);
+    }
+    check(!new_violations(), "the driver was misused");
+}
+
+struct no_answer_arg {
+    VkResult res;
+    int which;
+};
+
+static void run_no_answer(void *arg)
+{
+    struct no_answer_arg *a = arg;
+
+    test_no_answer(a->res, a->which);
+}
+
+/*
+ * Two wait for a batch -- the renderer's thread and a flush -- and only one
+ * of them is answered.  The thread's answer settles it for the flush too,
+ * which stops asking.  The flush's answer frees the memory, and the flush
+ * returns; the thread goes on asking, for it is on its own answer that the
+ * batch's fence is used again and the completion reported.
+ */
+static void test_one_answered(bool thread_answered)
+{
+    Blocked bl = { .which = 0 };
+    R300DrawPacket p;
+    uint32_t seq;
+    unsigned w0;
+
+    printf("  two wait for a batch; only %s is answered\n",
+           thread_answered ? "the renderer's thread" : "the flush");
+    g_pause_sleeps = true;
+    pkt_rt(&p, 0x000000, 64, 64);
+    check(draw_one(&p) == 0, "the draw is rejected");
+    if (thread_answered) {
+        /* the thread is kept from asking until the flush has asked in vain */
+        mock_gate(true);
+        mock_plan(MF_WaitForFences, mock_calls(MF_WaitForFences, 0) + 1, true,
+                  VK_ERROR_OUT_OF_DEVICE_MEMORY, 0);
+        seq = submit();
+        w0 = mock_calls(MF_WaitForFences, 0);
+        pthread_create(&bl.th, NULL, blocked_fn, &bl);
+        check(WAIT_FOR(mock_calls(MF_WaitForFences, 0) >= w0 + 20), "the flush does not ask again");
+        check(!is_back(&bl), "the flush returned unanswered");
+        check(ndone() == 0, "the batch was reported complete");
+        mock_gate(false);
+        check(WAIT_FOR(ndone() == 1), "the thread's answer is not reported");
+        check(WAIT_FOR(is_back(&bl)), "the flush goes on asking though the batch is complete");
+        pthread_join(bl.th, NULL);
+        check(mock_failed(MF_WaitForFences) >= 20, "the flush's waits were not made to fail");
+    } else {
+        unsigned resets = mock_calls(MF_ResetFences, 2);
+
+        mock_plan(MF_WaitForFences, mock_calls(MF_WaitForFences, 1) + 1, true,
+                  VK_ERROR_OUT_OF_DEVICE_MEMORY, 1);
+        seq = submit();
+        check(WAIT_FOR(mock_calls(MF_WaitForFences, 1) >= 20), "the thread does not ask again");
+        check(ndone() == 0, "the batch was reported complete");
+        check(R->range_busy_r200(OPQ, 0x000000, 0x004000, false), "its colour buffer is free");
+        flush_now();                    /* answered: the batch has finished */
+        check(mock_running() == 0, "%u submissions are still running", mock_running());
+        check(!R->range_busy_r200(OPQ, 0x000000, 0x004000, true), "its colour buffer stays busy");
+        device_access(0x000000, 0x001000, true);
+        /* the thread has no answer of its own: the batch is not its to use
+         * again, and it is the thread that reports completions */
+        pkt_rt(&p, 0x000000, 64, 64);
+        check(draw_one(&p) == 0, "a draw meanwhile is rejected");
+        check(mock_calls(MF_ResetFences, 2) == resets, "the batch was recycled on the "
+              "flush's answer, its own fence not seen signaled");
+        check(ndone() == 0, "the completion was reported without the thread's own answer");
+    }
+    mock_plan_clear();
+    quiesce();
+    check_done();
+    check(ndone() == 1 && g_done[0].seq == seq, "%u completions reported, the first for "
+          "batch %u (committed: one, batch %u)", ndone(), g_done[0].seq, seq);
+    check(!qatomic_read(&V.lost), "rendering has stopped");
+    pkt_rt(&p, 0x000000, 64, 64);
+    check(draw_one(&p) == 0, "a later draw is rejected");
+    flush();
+    check(!new_violations(), "the driver was misused");
+}
+
+static void run_thread_answered(void *arg)
+{
+    test_one_answered(true);
+}
+
+static void run_flush_answered(void *arg)
+{
+    test_one_answered(false);
+}
+
+/*
+ * The device is lost while batches are in flight: the wait of the
+ * renderer's thread says so, or a flush's.  That is an answer.  Completion
+ * is reported for each batch, in order, VRAM may be touched (what it holds
+ * is undefined), nothing more is submitted and nothing is recycled.
+ */
+static void test_device_lost(bool in_flush)
+{
+    R300DrawPacket p;
+    unsigned subs, resets;
+
+    printf("  the device is lost with batches in flight: %s finds out\n",
+           in_flush ? "a flush" : "the renderer's thread");
+    mock_gate(true);
+    for (int i = 0; i < 3; i++) {
+        pkt_rt(&p, 0x000000, 64, 64);
+        pkt_z(&p, 0x010000, 4);
+        check(draw_one(&p) == 0, "draw %d is rejected", i);
+        submit();
+    }
+    resets = mock_calls(MF_ResetFences, 2);
+    mock_plan(MF_WaitForFences, mock_calls(MF_WaitForFences, in_flush ? 0 : 1) + 1, false,
+              VK_ERROR_DEVICE_LOST, in_flush ? 0 : 1);
+    if (in_flush) {
+        flush_now();
+        check(qatomic_read(&V.lost), "rendering goes on after the flush was told");
+        check(!R->range_busy_r200(OPQ, 0x000000, 0x004000, true), "the colour buffer stays busy");
+        device_access(0x000000, 0x001000, true);
+    }
+    mock_gate(false);
+    quiesce();
+    check_done();
+    mock_plan_clear();
+    check(mock_fired() == 1, "no wait was made to report the device lost");
+    check(mock_device_lost(), "the driver does not count the device as lost");
+    check(qatomic_read(&V.lost), "rendering goes on");
+    check(ndone() == 3, "%u completions reported for 3 batches", ndone());
+    check(!R->range_busy_r200(OPQ, 0x000000, 0x004000, true), "the colour buffer stays busy");
+    device_access(0x000000, 0x001000, true);
+    check(R->gpu_failures(OPQ) != 0, "gpu_failures does not tell");
+    subs = mock_submitted();
+    pkt_rt(&p, 0x000000, 64, 64);
+    check(draw_one(&p) == 0, "a draw after the loss returns an error");
+    flush();
+    check(mock_submitted() == subs, "work was submitted after the loss");
+    check(mock_calls(MF_ResetFences, 2) == resets, "a batch was recycled after the loss");
+    check(!new_violations(), "the driver was misused");
+}
+
+static void run_lost_thread(void *arg)
+{
+    test_device_lost(false);
+}
+
+static void run_lost_flush(void *arg)
+{
+    test_device_lost(true);
+}
+
+/*
+ * Several batches in flight, and each wait fails three times before it is
+ * answered, on both threads: every completion is reported, once, in the
+ * order of the commits, and none before its batch has finished.
+ */
+static void test_completions_in_order(void)
+{
+    R300DrawPacket p;
+    uint32_t seq[5];
+
+    printf("  five batches in flight, every wait unanswered three times\n");
+    mock_wait_patience(3);
+    mock_plan(MF_WaitForFences, mock_calls(MF_WaitForFences, 2) + 1, true,
+              VK_ERROR_OUT_OF_HOST_MEMORY, -1);
+    for (int i = 0; i < 5; i++) {
+        pkt_rt(&p, 0x000000, 64, 64);
+        check(draw_one(&p) == 0, "draw %d is rejected", i);
+        seq[i] = submit();
+        if (i == 2) {
+            device_access(0x000000, 0x001000, false);   /* a flush in between */
+        }
+    }
+    quiesce();
+    check_done();
+    mock_plan_clear();
+    check(ndone() == 5, "%u completions reported for 5 batches", ndone());
+    for (unsigned i = 0; i < 5 && i < ndone(); i++) {
+        check(g_done[i].seq == seq[i], "completion %u is for batch %u, not %u", i,
+              g_done[i].seq, seq[i]);
+    }
+    check(mock_fired() >= 9, "only %u waits were made to fail", mock_fired());
+    check(!qatomic_read(&V.lost), "rendering has stopped");
+    flush();
+    check(!new_violations(), "the driver was misused");
+}
+
+static void run_in_order(void *arg)
+{
+    test_completions_in_order();
 }
 
 static void run_in_flight(void *arg)
@@ -1912,7 +2774,6 @@ static void helper_crashed(int sig)
 
 static int helper_child(void (*fn)(void *), void *arg, bool start)
 {
-    static const int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGALRM };
     int status = 0, fd[2];
     unsigned res[2] = { 0, 1 };
     pid_t pid;
@@ -1925,9 +2786,7 @@ static int helper_child(void (*fn)(void *), void *arg, bool start)
     if (pid == 0) {
         close(fd[0]);
         g_helper_fd = fd[1];
-        for (unsigned i = 0; i < ARRAY_SIZE(sigs); i++) {
-            signal(sigs[i], helper_crashed);
-        }
+        catch_signals(helper_crashed);
         alarm(60);
         g_checks = g_check_fails = 0;
         if (start && !renderer_start()) {
@@ -1991,6 +2850,20 @@ static int helpers(void)
     helper_child(run_refused_draws, NULL, true);
     helper_child(run_in_flight, NULL, true);
     helper_child(run_wait_fails, NULL, true);
+    for (int which = 0; which < 2; which++) {
+        static const VkResult res[] = { VK_ERROR_OUT_OF_HOST_MEMORY,
+                                        VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_ERROR_UNKNOWN,
+                                        VK_TIMEOUT };
+        for (unsigned i = 0; i < ARRAY_SIZE(res); i++) {
+            struct no_answer_arg a = { res[i], which };
+            helper_child(run_no_answer, &a, true);
+        }
+    }
+    helper_child(run_thread_answered, NULL, true);
+    helper_child(run_flush_answered, NULL, true);
+    helper_child(run_lost_thread, NULL, true);
+    helper_child(run_lost_flush, NULL, true);
+    helper_child(run_in_order, NULL, true);
     for (int same = 0; same < 2; same++) {
         for (unsigned which = 0; which < 3; which++) {
             for (unsigned k = 0; k < ARRAY_SIZE(per_image); k++) {
@@ -2001,6 +2874,13 @@ static int helpers(void)
     }
     printf("helper contract: %u checks, %u failed\n", g_checks, g_check_fails);
     return g_check_fails != 0;
+}
+
+static void selftest_crashed(int sig)
+{
+    printf("stand-in driver: its test ended by signal %d\n", sig);
+    fflush(NULL);
+    _exit(1);
 }
 
 int main(int argc, char **argv)
@@ -2017,8 +2897,7 @@ int main(int argc, char **argv)
     if (i < argc && ((!strcmp(argv[i], "case") && i + 4 < argc) ||
                      (!strcmp(argv[i], "random") && i + 3 < argc))) {
         Case c = { atoi(argv[i + 1]), atoi(argv[i + 2]), atoi(argv[i + 3]),
-                   i + 4 < argc ? atoi(argv[i + 4]) : 0,
-                   i + 5 < argc ? atoi(argv[i + 5]) : VK_ERROR_OUT_OF_HOST_MEMORY };
+                   i + 4 < argc ? atoi(argv[i + 4]) : 0, i + 5 < argc ? atoi(argv[i + 5]) : 0 };
         Result r;
         char buf[320];
         int sig;
@@ -2027,6 +2906,8 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "random")) {
             c = (Case){ -1, .seed = atoi(argv[i + 1]), .permille = atoi(argv[i + 2]),
                         .gentle = atoi(argv[i + 3]) };
+        } else if (!c.res && c.fn >= 0 && c.fn < MF_COUNT) {
+            c.res = mock_listed_error(c.fn);
         }
         sig = run_case(&c, &r);
         bad = judge(&c, &r, sig, buf, sizeof(buf));
@@ -2042,6 +2923,9 @@ int main(int argc, char **argv)
         printf("  started %d, fired %u, violations %u, lost %d, rejected %u/%u then %u/%u, "
                "leaks %u (%s)\n", r.init_ok, r.fired, r.nviol, r.lost, r.rejected[0],
                r.ndraw[0], r.rejected[1], r.ndraw[1], r.leaks, r.leak_desc);
+        printf("  batches cancelled %u then %u, accepted draws lost with them %u then %u; "
+               "%u pauses for an answer\n", r.cancelled[0], r.cancelled[1], r.lost_draws[0],
+               r.lost_draws[1], r.pauses);
         for (unsigned k = 0; k < 3 && k < r.nviol; k++) {
             printf("  %s\n", r.viol[k]);
         }
@@ -2061,7 +2945,9 @@ int main(int argc, char **argv)
         fflush(NULL);
         pid = fork();
         if (pid == 0) {
-            int st = selftest();
+            int st;
+            catch_signals(selftest_crashed);
+            st = selftest();
             fflush(NULL);
             _exit(st);
         }
