@@ -1001,9 +1001,26 @@ static void vk_recycle(VkBatch *b)
     b->state = 0;
 }
 
+/*
+ * Once rendering has stopped (V.lost) nothing is recycled.  A wait that
+ * failed without the device being lost says nothing about its batch: the
+ * GPU may still be working on it, and it must keep its command buffer, its
+ * fence and everything it uses.  The waiter sets V.lost before it takes
+ * its lock to move worker_seq past such a batch, so read under that lock
+ * the two cannot disagree.
+ */
 static void vk_reap(void)
 {
-    uint32_t ws = qatomic_read(&V.worker_seq);
+    uint32_t ws;
+    bool lost;
+
+    qemu_mutex_lock(&V.lock);
+    ws = qatomic_read(&V.worker_seq);
+    lost = qatomic_read(&V.lost);
+    qemu_mutex_unlock(&V.lock);
+    if (lost) {
+        return;
+    }
     for (int i = 0; i < VK_NBATCH; i++) {
         VkBatch *b = &V.batch[i];
         if (b->state == 2 && (int32_t)(ws - b->seq) >= 0) {
@@ -1043,6 +1060,9 @@ static bool vk_batch_start(void)
         }
         if (b) {
             break;
+        }
+        if (qatomic_read(&V.lost)) {
+            return false;               /* none will come free (vk_reap) */
         }
         /* all in flight: wait for the waiter to finish the oldest */
         qemu_mutex_lock(&V.lock);
