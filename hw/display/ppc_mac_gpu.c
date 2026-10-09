@@ -654,9 +654,11 @@ static void r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
      * GPU with the lock held was the longest BQL hold left in Doom 3, up
      * to 53 ms, and the main loop and its audio timers waited behind it);
      * the statistics and fence write-backs need the lock and come after.
-     * A synchronous renderer relies on the BQL to order draws: keep it.
+     * A synchronous renderer relies on the BQL for everything it is asked,
+     * this question included (the display refresh may be committing its
+     * batch under the lock meanwhile): for it the lock is kept throughout.
      */
-    int w = cp_wait_unlock();
+    int w = s->renderer->draw_queue_async ? cp_wait_unlock() : 0;
     bool busy = s->renderer->range_busy_r200(s->renderer_opaque, lo, hi,
                                              write_access);
     bool flushed = false, did = false;
