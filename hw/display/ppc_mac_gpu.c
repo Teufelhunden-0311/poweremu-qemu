@@ -10204,6 +10204,8 @@ static const MemoryRegionOps ppc_mac_gpu_cp_wptr_ops = {
     },
 };
 
+static Notifier ppc_mac_gpu_cp_exit_notifier;
+
 static void ppc_mac_gpu_cp_start(PPCMacGPUState *s)
 {
     const char *e = getenv("PPCGPU_CP_SYNC");
@@ -10217,6 +10219,7 @@ static void ppc_mac_gpu_cp_start(PPCMacGPUState *s)
     cp.started = true;
     qemu_thread_create(&cp.thread, "ppc-gpu-cp", ppc_mac_gpu_cp_thread, s,
                        QEMU_THREAD_JOINABLE);
+    qemu_add_exit_notifier(&ppc_mac_gpu_cp_exit_notifier);
     memory_region_init_io(&s->cp_wptr_mr, OBJECT(s), &ppc_mac_gpu_cp_wptr_ops,
                           s, "ppc-mac-gpu-cp-wptr", 4);
     memory_region_enable_lockless_io(&s->cp_wptr_mr);
@@ -10224,18 +10227,52 @@ static void ppc_mac_gpu_cp_start(PPCMacGPUState *s)
                                         &s->cp_wptr_mr, 1);
 }
 
+/* With or without the BQL; the thread needs it to finish its slice. */
 static void ppc_mac_gpu_cp_stop(void)
 {
+    bool locked = bql_locked();
+
     if (!cp.started) {
         return;
     }
     qatomic_set(&cp.stop, true);
     qemu_event_set(&cp.kick);
-    bql_unlock();
+    if (locked) {
+        bql_unlock();
+    }
     qemu_thread_join(&cp.thread);
-    bql_lock();
+    if (locked) {
+        bql_lock();
+    }
     cp.started = false;
 }
+
+/*
+ * exit() runs the host libraries' destructors while every other thread
+ * goes on: a CP thread still drawing then calls into a renderer that is
+ * being taken apart (seen as an abort in the Vulkan validation layer).  So
+ * stop it first, and let the renderer finish what it was given.  QEMU does
+ * not unrealize devices when it quits, hence the notifier.
+ */
+static void ppc_mac_gpu_cp_exit_notify(Notifier *n, void *data)
+{
+    bool locked = bql_locked();
+
+    if (!cp.started || ppc_mac_gpu_cp_on_thread()) {
+        return;                         /* exit() from the thread itself */
+    }
+    ppc_mac_gpu_cp_stop();
+    if (!locked) {
+        bql_lock();
+    }
+    r200_flush(cp.s);
+    if (!locked) {
+        bql_unlock();
+    }
+}
+static Notifier ppc_mac_gpu_cp_exit_notifier = {
+    .notify = ppc_mac_gpu_cp_exit_notify,
+};
 
 /* The last command packets pushed in by hand, for the stall report. */
 static struct { uint32_t hdr, type, opcode, count; } pm4_recent[32];
@@ -13610,6 +13647,9 @@ static void ppc_mac_gpu_exit(PCIDevice *dev)
 {
     PPCMacGPUState *s = PPC_MAC_GPU(dev);
 
+    if (cp.started) {
+        qemu_remove_exit_notifier(&ppc_mac_gpu_cp_exit_notifier);
+    }
     ppc_mac_gpu_cp_stop();
     timer_del(&s->vblank_timer);
     g_free(s->shadow_buf);
