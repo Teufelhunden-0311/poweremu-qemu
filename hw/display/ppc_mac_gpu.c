@@ -3595,7 +3595,8 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                 r300_reg(s->r3, 0x4480), r300_reg(s->r3, 0x44C0),
                 r300_reg(s->r3, 0x4500), pkt.scissor[0], pkt.scissor[1],
                 pkt.scissor[2], pkt.scissor[3], build_ok ? pkt.num_verts : 0);
-        for (uint32_t v = 0; build_ok && v < pkt.num_verts && v < 48; v++) {
+        /* (no vertex array when the GPU runs the vertex program) */
+        for (uint32_t v = 0; build_ok && pkt.verts && v < pkt.num_verts && v < 48; v++) {
             const R300Vertex *x = &pkt.verts[v];
             fprintf(s->r3_dump, "   v%u ndc %.3f %.3f w %.3f  t %.4f %.4f %.4f %.4f"
                     " | %.4f %.4f %.4f %.4f\n", v, x->pos[0] / x->pos[3],
