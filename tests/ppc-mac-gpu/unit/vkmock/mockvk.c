@@ -32,9 +32,8 @@
  * the order of commands, not about time.  Whether the work has finished is
  * another matter, and there it is as slow as the specification allows: it
  * is running until a vkWaitForFences has said that it is not -- one that
- * succeeded for its fence, or for the fence of a later submission that a
- * barrier over all commands orders after it, or one that reported the
- * device lost.  After a wait that returned anything else it is still
+ * succeeded for its fence, or for the fence of a later submission to the
+ * queue, or one that reported the device lost.  After a wait that returned anything else it is still
  * running, and what it uses is still in use.
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
@@ -161,7 +160,6 @@ struct Obj {
     unsigned nref, capref;
     uint64_t epoch;
     unsigned nrec;              /* commands recorded, kept in cmd[] or not */
-    bool opens_sync;            /* the first of them is a barrier over all commands */
     Use *use;
     unsigned nuse, capuse;
     unsigned ord;               /* which submission it is, while it is running */
@@ -1624,7 +1622,6 @@ static void cb_clear(Obj *cb)
     cb->nref = 0;
     cb->nuse = 0;
     cb->nrec = 0;
-    cb->opens_sync = false;
     cb->in_pass = false;
     cb->cur_rp = cb->bound_set = cb->bound_pipe = cb->bound_index = NULL;
     cb->epoch = ++g_cb_epoch;
@@ -1886,9 +1883,6 @@ VKAPI_ATTR void VKAPI_CALL vkCmdPipelineBarrier(
             (m[i].dstAccessMask & (VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT))) {
             if (cb->in_pass) {
                 viol("%s: a barrier over all commands inside a render pass", __func__);
-            }
-            if (cb->nrec == 1) {
-                cb->opens_sync = true;  /* all of it comes after what was submitted before */
             }
             add_cmd(cb, C_SYNC, NULL, NULL);
         }
@@ -2405,16 +2399,16 @@ static void complete(Obj *cb, bool seen)
 
 /*
  * The driver has answered for cb's work: it is finished.  So is everything
- * submitted before it, if cb opens with a barrier over all commands: its
- * commands, every one, were ordered after all earlier ones.
+ * submitted to the queue before it: the signal of a fence given to
+ * vkQueueSubmit comes after all commands earlier in submission order, with
+ * or without a barrier in the command buffer.
  */
 static void finish(Obj *cb)
 {
     unsigned ord = cb->ord;
-    bool chain = cb->opens_sync;
 
     complete(cb, true);
-    for (unsigned i = 0; chain && i < g_nrun;) {
+    for (unsigned i = 0; i < g_nrun;) {
         if (g_run[i]->ord < ord) {
             complete(g_run[i], false);  /* which puts another in its place */
         } else {
@@ -2592,9 +2586,10 @@ VKAPI_ATTR VkResult VKAPI_CALL vkResetFences(VkDevice dev, uint32_t n, const VkF
         } else if (f->unseen) {
             /*
              * Its work has finished, as later work that was waited for
-             * tells; that the fence has been signaled for it is not known.
-             * Stricter than the letter of the specification, which asks
-             * only that the work have finished.
+             * tells; this fence itself no wait has seen signaled.  Not a
+             * rule of Vulkan's, which asks only that the work have
+             * finished: the rule of the renderer under test, whose thread
+             * recycles a batch on the answer for the batch's own fence.
              */
             viol("%s: fence #%u is reset though no wait has seen it signaled", __func__,
                  f->serial);

@@ -110,9 +110,9 @@ void mock_gate(bool closed);
  *
  * A submission is "running" until the driver has said that it is not: until
  * a vkWaitForFences that returned VK_SUCCESS for its fence -- or for the
- * fence of a later submission whose command buffer opens with a barrier
- * over all commands, which orders that one after everything submitted
- * before -- or one that returned VK_ERROR_DEVICE_LOST, which counts as
+ * fence of a later submission to the same queue, whose signal comes after
+ * all commands earlier in submission order -- or one that returned
+ * VK_ERROR_DEVICE_LOST, which counts as
  * success for what is pending and in use.  A wait that returned anything
  * else (an error, VK_TIMEOUT) leaves it running.  So work finishes as late
  * as the specification allows: nothing may rely on it having finished
@@ -121,8 +121,9 @@ void mock_gate(bool closed);
  *
  * Work found finished through later work has freed what it used, but its
  * own fence has not been seen signaled: resetting that fence before a wait
- * for it has been answered is a violation.  (The specification's wording
- * asks only that the work have finished; a driver may signal late.)
+ * for it has been answered is reported.  That is no requirement of
+ * Vulkan's, which asks only that the work have finished; it is the rule
+ * the renderer under test keeps, and the check holds it to it.
  */
 unsigned mock_running(void);                /* submissions still running */
 unsigned mock_submitted(void);              /* submissions made so far; they are numbered 1 ... */

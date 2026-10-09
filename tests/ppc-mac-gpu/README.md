@@ -77,10 +77,12 @@ inside `vkQueueSubmit`, at once: those checks are about the order of commands.
 Whether the work has *finished* is kept apart, and there the driver is as slow
 as the specification allows.  A submission is running until a
 `vkWaitForFences` has said that it is not: one that returned VK_SUCCESS for
-its fence, or for the fence of a later submission whose command buffer opens
-with a barrier over all commands (which orders that one after everything
-submitted before); or one that returned VK_ERROR_DEVICE_LOST, which counts as
-success for what is pending and in use.  A wait that returned anything else --
+its fence, or for the fence of a later submission to the queue (a fence's
+signal comes after all commands earlier in submission order); or one that
+returned VK_ERROR_DEVICE_LOST, which counts as success for what is pending
+and in use.  Resetting a fence that no wait has itself seen signaled is
+reported too: not a rule of Vulkan's but the renderer's own, to which the
+check holds it.  A wait that returned anything else --
 an error, VK_TIMEOUT -- leaves it running, and what it uses in use.  A
 submission that itself returned VK_ERROR_DEVICE_LOST counts as made.  The test
 can also hold the work (`mock_hold`): a wait then does not return at all.

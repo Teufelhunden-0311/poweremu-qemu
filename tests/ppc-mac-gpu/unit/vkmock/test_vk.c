@@ -1842,9 +1842,8 @@ static int selftest(void)
         volatile uint8_t sink;
 
         /* what the misuse above left running is finished first: by a wait
-         * for work that a barrier orders after it (which is tested below) */
+         * for later work (which is tested below) */
         st_begin(last);
-        st_sync(last);
         vkEndCommandBuffer(last);
         st_submit(last, glast);
         st_wait(glast);
@@ -1934,21 +1933,17 @@ static int selftest(void)
         st_begin(a);
         vkEndCommandBuffer(a);
         st_submit(a, fa);
-        st_begin(b);                    /* no barrier: not ordered after a */
+        st_true("work submitted and not waited for is running",
+                mock_running() == 1 && mock_finished_upto() == mock_submitted() - 1);
+        st_begin(b);                    /* no barrier in it */
         vkEndCommandBuffer(b);
         st_submit(b, fb);
         st_wait(fb);
-        st_true("work is not finished by a wait for later, unordered work",
-                mock_running() == 1 && mock_finished_upto() == mock_submitted() - 2);
-        st_begin(c);
-        st_sync(c);                     /* a barrier first: after everything before */
-        vkEndCommandBuffer(c);
-        st_submit(c, fc);
-        st_wait(fc);
-        st_true("... and is by a wait for later work that a barrier orders after it",
+        st_true("... and finished by a wait for later work, no barrier needed",
                 mock_running() == 0 && mock_finished_upto() == mock_submitted());
         vkResetFences(S.dev, 1, &fa);
-        st_expect("its fence reset, which no wait has seen signaled", "no wait has seen it");
+        st_expect("its fence reset, no wait having seen it (the renderer's rule)",
+                  "no wait has seen it");
         st_begin(a);
         st_sync(a);
         vkEndCommandBuffer(a);
