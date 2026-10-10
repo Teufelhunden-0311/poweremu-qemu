@@ -1811,6 +1811,14 @@ static void ppc_mac_gpu_present_done(void *arg, uint32_t seq)
     dpy_refresh_soon(s->con);
 }
 
+/*
+ * The colour table of the "256 colours" display mode, as Mac OS X's driver
+ * loads it: index and R, G, B bytes through the VGA DAC ports (0x3C8/0x3C9,
+ * at MMIO 0x408/0x409).  Kept at full width beside the 6-bit VGA copy.
+ */
+static uint8_t r200_clut[256][3];
+static uint8_t r200_clut_max;
+
 static void ppc_mac_gpu_display_update(void *opaque)
 {
     PPCMacGPUState *s = opaque;
@@ -1990,7 +1998,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
      * Cocoa front end only understands 32bpp little-endian surfaces, so
      * expand the big-endian ARGB1555 / RGB565 scanout into the shadow buffer.
      */
-    if (bpp_bytes == 2) {
+    if (bpp_bytes == 2 || s->disp.bpp == 8) {
         uint64_t need = (uint64_t)width * 4 * height;
         if (!s->shadow_buf || s->shadow_buf_size < need) {
             g_free(s->shadow_buf);
@@ -2005,7 +2013,27 @@ static void ppc_mac_gpu_display_update(void *opaque)
             dpy_gfx_replace_surface(s->con, ds);
         }
         bool is565 = s->disp.bpp == 16;
-        if ((uint64_t)s->disp.offset + (uint64_t)stride * height <= s->vram_size) {
+        if (s->disp.bpp == 8 && stride >= width &&
+            (uint64_t)s->disp.offset + (uint64_t)stride * height <= s->vram_size) {
+            /* "256 colours": one index per pixel, looked up in the DAC's table */
+            uint32_t lut[256];
+            bool six = r200_clut_max < 0x40;    /* a 6-bit DAC's values */
+            for (int i = 0; i < 256; i++) {
+                uint32_t r = r200_clut[i][0], g = r200_clut[i][1], b = r200_clut[i][2];
+                if (six) {
+                    r = (r << 2) | (r >> 4); g = (g << 2) | (g >> 4); b = (b << 2) | (b >> 4);
+                }
+                lut[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
+            }
+            for (uint32_t y = 0; y < height; y++) {
+                const uint8_t *sp = vram_ptr + s->disp.offset + (uint64_t)y * stride;
+                uint32_t *dp = (uint32_t *)s->shadow_buf + (uint64_t)y * width;
+                for (uint32_t x = 0; x < width; x++) {
+                    dp[x] = lut[sp[x]];
+                }
+            }
+        } else if (bpp_bytes == 2 &&
+            (uint64_t)s->disp.offset + (uint64_t)stride * height <= s->vram_size) {
             for (uint32_t y = 0; y < height; y++) {
                 const uint8_t *sp = vram_ptr + s->disp.offset + (uint64_t)y * stride;
                 uint32_t *dp = (uint32_t *)s->shadow_buf + (uint64_t)y * width;
@@ -11819,6 +11847,13 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
             s->regs.palette_index = (s->regs.palette_index + 1) & 0xFF;
         }
         break;
+    case 0x00B8:                    /* PALETTE_30_DATA: 10 bits a channel */
+        if (s->regs.palette_index < 256) {
+            s->regs.palette[s->regs.palette_index] =
+                ((val >> 6) & 0xFF0000) | ((val >> 4) & 0xFF00) | ((val >> 2) & 0xFF);
+            s->regs.palette_index = (s->regs.palette_index + 1) & 0xFF;
+        }
+        break;
 
     /* Cursor */
     case R200_CUR_OFFSET:
@@ -12385,6 +12420,8 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
                 uint8_t idx = s->regs.vga_dac_write_index;
                 s->regs.vga_dac_palette[idx][s->regs.vga_dac_sub_index] =
                     val & 0x3F;
+                r200_clut[idx][s->regs.vga_dac_sub_index] = val;
+                r200_clut_max = MAX(r200_clut_max, (uint8_t)val);
                 s->regs.vga_dac_sub_index++;
                 if (s->regs.vga_dac_sub_index >= 3) {
                     s->regs.vga_dac_sub_index = 0;
