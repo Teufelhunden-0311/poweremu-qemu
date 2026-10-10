@@ -508,6 +508,20 @@ static void *r200_async_worker(void *opaque)
     return NULL;
 }
 
+/* Whether a queued draw has yet to finish. */
+static bool r200_async_busy(void)
+{
+    bool busy;
+
+    if (!r200_async.started) {
+        return false;
+    }
+    qemu_mutex_lock(&r200_async.lock);
+    busy = r200_async.inflight != 0;
+    qemu_mutex_unlock(&r200_async.lock);
+    return busy;
+}
+
 /* Wait until every queued draw has finished. */
 static void r200_async_drain(void)
 {
@@ -10316,7 +10330,7 @@ static void ppc_mac_gpu_exit_notify(Notifier *n, void *data)
      * Whatever could add to it meanwhile needs the lock to do so: empty
      * with the lock held is empty for good.
      */
-    while (r200_async.started && qatomic_read(&r200_async.inflight)) {
+    while (r200_async_busy()) {
         bql_unlock();
         r200_async_drain();
         bql_lock();
@@ -12981,8 +12995,9 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
     s->regs.rbbm_status = 64;  /* FIFO entries free */
     s->regs.gui_stat = 64;
     /*
-     * As a Mac's firmware leaves it: Mac OS X's driver loads eight-bit
-     * values through the DAC ports and never writes this register.
+     * Mac compatibility default: the Tiger driver was observed to write
+     * eight-bit DAC values without programming DAC_CNTL.  What a physical
+     * Mac's firmware leaves here has not been verified.
      */
     s->regs.dac_cntl = DAC_8BIT_EN;
     s->regs.dp_write_msk = 0xFFFFFFFF;
@@ -13862,8 +13877,13 @@ static int ppc_mac_gpu_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_ppc_mac_gpu = {
     .name = "ppc-mac-gpu",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    /*
+     * 2: the DAC ports' table moved from regs.vga_dac_palette to
+     * regs.palette.  The two could disagree in an older state, so those
+     * are refused rather than converted by guesswork.
+     */
+    .version_id = 2,
+    .minimum_version_id = 2,
     .pre_save = ppc_mac_gpu_pre_save,
     .post_load = ppc_mac_gpu_post_load,
     .fields = (const VMStateField[]) {
