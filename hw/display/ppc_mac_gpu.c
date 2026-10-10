@@ -1812,12 +1812,36 @@ static void ppc_mac_gpu_present_done(void *arg, uint32_t seq)
 }
 
 /*
- * The colour table of the "256 colours" display mode, as Mac OS X's driver
- * loads it: index and R, G, B bytes through the VGA DAC ports (0x3C8/0x3C9,
- * at MMIO 0x408/0x409).  Kept at full width beside the 6-bit VGA copy.
+ * The DAC's colour table is regs.palette, 0x00RRGGBB at eight bits a
+ * channel, whichever way it is loaded: PALETTE_INDEX/PALETTE_DATA, or the
+ * VGA DAC ports (0x3C8/0x3C9, at MMIO 0x408/0x409), which is how Mac OS X's
+ * driver loads the "256 colours" table.  The ports are six bits wide unless
+ * DAC_CNTL has DAC_8BIT_EN.
  */
-static uint8_t r200_clut[256][3];
-static uint8_t r200_clut_max;
+static bool r200_dac_8bit(PPCMacGPUState *s)
+{
+    return s->regs.dac_cntl & DAC_8BIT_EN;
+}
+
+static void r200_dac_port_write(PPCMacGPUState *s, uint8_t idx, unsigned sub,
+                                uint8_t val)
+{
+    unsigned shift = 16 - 8 * sub;
+
+    if (!r200_dac_8bit(s)) {
+        val &= 0x3F;
+        val = (val << 2) | (val >> 4);
+    }
+    s->regs.palette[idx] = (s->regs.palette[idx] & ~(0xFFu << shift)) |
+                           ((uint32_t)val << shift);
+}
+
+static uint8_t r200_dac_port_read(PPCMacGPUState *s, uint8_t idx, unsigned sub)
+{
+    uint8_t val = s->regs.palette[idx] >> (16 - 8 * sub);
+
+    return r200_dac_8bit(s) ? val : val >> 2;
+}
 
 static void ppc_mac_gpu_display_update(void *opaque)
 {
@@ -2017,13 +2041,8 @@ static void ppc_mac_gpu_display_update(void *opaque)
             (uint64_t)s->disp.offset + (uint64_t)stride * height <= s->vram_size) {
             /* "256 colours": one index per pixel, looked up in the DAC's table */
             uint32_t lut[256];
-            bool six = r200_clut_max < 0x40;    /* a 6-bit DAC's values */
             for (int i = 0; i < 256; i++) {
-                uint32_t r = r200_clut[i][0], g = r200_clut[i][1], b = r200_clut[i][2];
-                if (six) {
-                    r = (r << 2) | (r >> 4); g = (g << 2) | (g >> 4); b = (b << 2) | (b >> 4);
-                }
-                lut[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
+                lut[i] = 0xFF000000u | (s->regs.palette[i] & 0xFFFFFF);
             }
             for (uint32_t y = 0; y < height; y++) {
                 const uint8_t *sp = vram_ptr + s->disp.offset + (uint64_t)y * stride;
@@ -10233,8 +10252,6 @@ static const MemoryRegionOps ppc_mac_gpu_cp_wptr_ops = {
     },
 };
 
-static Notifier ppc_mac_gpu_cp_exit_notifier;
-
 static void ppc_mac_gpu_cp_start(PPCMacGPUState *s)
 {
     const char *e = getenv("PPCGPU_CP_SYNC");
@@ -10248,7 +10265,6 @@ static void ppc_mac_gpu_cp_start(PPCMacGPUState *s)
     cp.started = true;
     qemu_thread_create(&cp.thread, "ppc-gpu-cp", ppc_mac_gpu_cp_thread, s,
                        QEMU_THREAD_JOINABLE);
-    qemu_add_exit_notifier(&ppc_mac_gpu_cp_exit_notifier);
     memory_region_init_io(&s->cp_wptr_mr, OBJECT(s), &ppc_mac_gpu_cp_wptr_ops,
                           s, "ppc-mac-gpu-cp-wptr", 4);
     memory_region_enable_lockless_io(&s->cp_wptr_mr);
@@ -10278,30 +10294,35 @@ static void ppc_mac_gpu_cp_stop(void)
 
 /*
  * exit() runs the host libraries' destructors while every other thread
- * goes on: a CP thread still drawing then calls into a renderer that is
- * being taken apart (seen as an abort in the Vulkan validation layer).  So
- * stop it first, and let the renderer finish what it was given.  QEMU does
- * not unrealize devices when it quits, hence the notifier.
+ * goes on: a CP thread still drawing would call into a renderer that is
+ * being taken apart (an abort in the Vulkan validation layer at quit looked
+ * like that, though it was not reproduced).  So stop the producers first
+ * and let the renderer finish what it was given.  QEMU does not unrealize
+ * devices when it quits, hence the notifier; it is called with the BQL.
+ * Only exit() from another thread comes through here: not abort(), _exit()
+ * or a kill, and not exit() from the CP thread itself.
  */
-static void ppc_mac_gpu_cp_exit_notify(Notifier *n, void *data)
+static void ppc_mac_gpu_exit_notify(Notifier *n, void *data)
 {
-    bool locked = bql_locked();
+    PPCMacGPUState *s = container_of(n, PPCMacGPUState, exit_notifier);
 
-    if (!cp.started || ppc_mac_gpu_cp_on_thread()) {
-        return;                         /* exit() from the thread itself */
+    if (ppc_mac_gpu_cp_on_thread()) {
+        return;
     }
     ppc_mac_gpu_cp_stop();
-    if (!locked) {
+    /*
+     * A draw worker job may be waiting for the BQL (a synchronous
+     * renderer is called under it), so the queue is waited for without.
+     * Whatever could add to it meanwhile needs the lock to do so: empty
+     * with the lock held is empty for good.
+     */
+    while (r200_async.started && qatomic_read(&r200_async.inflight)) {
+        bql_unlock();
+        r200_async_drain();
         bql_lock();
     }
-    r200_flush(cp.s);
-    if (!locked) {
-        bql_unlock();
-    }
+    r200_flush(s);
 }
-static Notifier ppc_mac_gpu_cp_exit_notifier = {
-    .notify = ppc_mac_gpu_cp_exit_notify,
-};
 
 /* The last command packets pushed in by hand, for the stall report. */
 static struct { uint32_t hdr, type, opcode, count; } pm4_recent[32];
@@ -11297,7 +11318,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
                 break;
             case 0x3C9: {  /* DAC Data (read) */
                 uint8_t idx = s->regs.vga_dac_read_index;
-                val = s->regs.vga_dac_palette[idx][s->regs.vga_dac_sub_index];
+                val = r200_dac_port_read(s, idx, s->regs.vga_dac_sub_index);
                 s->regs.vga_dac_sub_index++;
                 if (s->regs.vga_dac_sub_index >= 3) {
                     s->regs.vga_dac_sub_index = 0;
@@ -11843,14 +11864,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
     case R200_PALETTE_DATA:
         if (s->regs.palette_index < 256) {
-            s->regs.palette[s->regs.palette_index] = val;
-            s->regs.palette_index = (s->regs.palette_index + 1) & 0xFF;
-        }
-        break;
-    case 0x00B8:                    /* PALETTE_30_DATA: 10 bits a channel */
-        if (s->regs.palette_index < 256) {
-            s->regs.palette[s->regs.palette_index] =
-                ((val >> 6) & 0xFF0000) | ((val >> 4) & 0xFF00) | ((val >> 2) & 0xFF);
+            s->regs.palette[s->regs.palette_index] = val & 0xFFFFFF;
             s->regs.palette_index = (s->regs.palette_index + 1) & 0xFF;
         }
         break;
@@ -12418,10 +12432,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
                 break;
             case 0x3C9: { /* DAC Data (write) */
                 uint8_t idx = s->regs.vga_dac_write_index;
-                s->regs.vga_dac_palette[idx][s->regs.vga_dac_sub_index] =
-                    val & 0x3F;
-                r200_clut[idx][s->regs.vga_dac_sub_index] = val;
-                r200_clut_max = MAX(r200_clut_max, (uint8_t)val);
+                r200_dac_port_write(s, idx, s->regs.vga_dac_sub_index, val);
                 s->regs.vga_dac_sub_index++;
                 if (s->regs.vga_dac_sub_index >= 3) {
                     s->regs.vga_dac_sub_index = 0;
@@ -12969,7 +12980,11 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
     s->regs.mc_fb_location = 0x00000000 | ((reported_memsize - 1) >> 16) << 16;
     s->regs.rbbm_status = 64;  /* FIFO entries free */
     s->regs.gui_stat = 64;
-    s->regs.dac_cntl = 0x00000000;
+    /*
+     * As a Mac's firmware leaves it: Mac OS X's driver loads eight-bit
+     * values through the DAC ports and never writes this register.
+     */
+    s->regs.dac_cntl = DAC_8BIT_EN;
     s->regs.dp_write_msk = 0xFFFFFFFF;
     s->regs.default_sc_bottom_right = 0x1FFF1FFF;
     s->regs.host_path_cntl = (1 << 23);
@@ -13312,6 +13327,8 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
     pci_register_bar(dev, PPC_MAC_GPU_MMIO_BAR,
                      PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
     ppc_mac_gpu_cp_start(s);
+    s->exit_notifier.notify = ppc_mac_gpu_exit_notify;
+    qemu_add_exit_notifier(&s->exit_notifier);
 
     /* BAR1: I/O space alias to first 256 bytes of MMIO */
     memory_region_init_alias(&s->io, obj, "ppc-mac-gpu-io",
@@ -13685,9 +13702,7 @@ static void ppc_mac_gpu_exit(PCIDevice *dev)
 {
     PPCMacGPUState *s = PPC_MAC_GPU(dev);
 
-    if (cp.started) {
-        qemu_remove_exit_notifier(&ppc_mac_gpu_cp_exit_notifier);
-    }
+    qemu_remove_exit_notifier(&s->exit_notifier);
     ppc_mac_gpu_cp_stop();
     timer_del(&s->vblank_timer);
     g_free(s->shadow_buf);

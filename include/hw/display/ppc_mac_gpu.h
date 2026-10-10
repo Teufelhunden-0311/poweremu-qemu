@@ -18,6 +18,7 @@
 #include "hw/display/i2c-ddc.h"
 #include "ui/console.h"
 #include "qom/object.h"
+#include "qemu/notify.h"
 
 /* Defined in hw/display/ppc_mac_gpu_renderer.h, private to the device. */
 struct R200Vertex;
@@ -125,6 +126,7 @@ struct R200Vertex;
 
 /* DAC */
 #define R200_DAC_CNTL                  0x0058
+#define DAC_8BIT_EN                    0x00000100  /* VGA DAC ports eight bits wide */
 #define R200_DAC_CNTL2                 0x007C
 #define R200_DAC_RANGE_CNTL           0x0484
 
@@ -571,7 +573,7 @@ typedef struct PPCMacGPURegs {
     uint8_t vga_dac_read_index;
     uint8_t vga_dac_write_index;
     uint8_t vga_dac_sub_index;  /* 0=R, 1=G, 2=B cycle */
-    uint8_t vga_dac_palette[256][3];  /* 6-bit RGB per entry */
+    uint8_t vga_dac_palette[256][3];  /* unused (palette[] is the table); kept for the migration layout */
     uint8_t vga_ar_index;       /* Attribute controller index */
     uint8_t vga_ar_flip_flop;   /* AR index/data flip flop */
 
@@ -710,6 +712,7 @@ struct PPCMacGPUState {
     uint32_t regs_size;
     PPCMacGPUDisplayMode disp;  /* Current display mode */
     QEMUTimer vblank_timer;     /* VBlank interrupt timer */
+    Notifier exit_notifier;     /* finish drawing before exit() */
     bool display_invalid;       /* Display needs full redraw */
 
     /* PM4 PIO FIFO for CP command processing */
