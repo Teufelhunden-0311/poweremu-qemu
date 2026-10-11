@@ -543,6 +543,22 @@ static bool r200_async_submit(PPCMacGPUState *s, const uint32_t *d,
     if (!r200_async_enabled()) {
         return false;
     }
+    /*
+     * Only for a renderer that queues its draws: a synchronous one is
+     * called under the BQL, which every flush holds while it waits for
+     * this worker.  Asked now and not at startup, because the answer is
+     * the renderer's once it has come up (its queue may have failed to).
+     */
+    if (!s->renderer || !s->renderer->draw_queue_async) {
+        static bool warned;
+
+        if (!warned) {
+            warned = true;
+            warn_report("ppc-mac-gpu: PPCGPU_ASYNC_DRAW ignored: the "
+                        "renderer draws synchronously");
+        }
+        return false;
+    }
     if (!r200_async.started) {
         qemu_mutex_init(&r200_async.lock);
         qemu_cond_init(&r200_async.wake);
