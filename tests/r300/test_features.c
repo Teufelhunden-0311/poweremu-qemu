@@ -119,6 +119,62 @@ static void rendering_completeness(void)
     CHECK(t.lvl_pitch[0] == 32 && t.lvl_rows[0] == 4 && t.lvl_off[1] == 128 &&
           t.lvl_off[2] == 192 && t.size_bytes == 224, "dxt1 %u %u %u", t.lvl_off[1],
           t.lvl_off[2], t.size_bytes);
+    /* Micro-tiled (TX_OFFSET bits 4:3 = 1), as Apple's driver uploads
+     * everything: offsets read from VRAM as it filled it for Halo. */
+    memset(&t, 0, sizeof(t));
+    t.width = t.height = 4; t.levels = 3; t.depth = 1; t.tiling = 3;
+    r300_tex_layout(&t, 4, false, false);           /* ARGB8888 */
+    CHECK(t.lvl_pitch[0] == 16 && t.lvl_off[1] == 0x40 && t.lvl_off[2] == 0x60 &&
+          t.size_bytes == 0x80, "4x4 8888 %x %x %x", t.lvl_off[1], t.lvl_off[2], t.size_bytes);
+    t.dim = R300_TEXDIM_CUBE;
+    r300_tex_layout(&t, 4, false, false);
+    CHECK(t.lvl_off[1] == 0x180 && t.lvl_face[1] == 32 && t.lvl_off[2] == 0x240 &&
+          t.lvl_face[2] == 32 && t.size_bytes == 0x300, "4x4 8888 cube %x %x %x",
+          t.lvl_off[1], t.lvl_off[2], t.size_bytes);
+    memset(&t, 0, sizeof(t));
+    t.width = t.height = 256; t.levels = 9; t.depth = 1; t.tiling = 3;
+    r300_tex_layout(&t, 2, false, false);           /* ARGB1555 */
+    CHECK(t.lvl_off[4] == 0x2a800 && t.lvl_pitch[4] == 32 && t.lvl_off[5] == 0x2aa00 &&
+          t.lvl_pitch[5] == 16 && t.lvl_off[6] == 0x2aa80 && t.lvl_off[7] == 0x2aac0 &&
+          t.lvl_off[8] == 0x2aae0 && t.size_bytes == 0x2ab00, "256 1555 %x %x %x %x %x",
+          t.lvl_off[5], t.lvl_off[6], t.lvl_off[7], t.lvl_off[8], t.size_bytes);
+    memset(&t, 0, sizeof(t));
+    t.width = t.height = 64; t.levels = 7; t.depth = 1; t.dim = R300_TEXDIM_CUBE; t.tiling = 3;
+    r300_tex_layout(&t, 8, true, false);            /* DXT1 cube */
+    CHECK(t.lvl_face[2] == 128 && t.lvl_face[3] == 32 && t.lvl_face[4] == 32 &&
+          t.lvl_face[6] == 32 && t.lvl_off[4] == t.lvl_off[3] + 6 * 32, "dxt1 cube %u %u",
+          t.lvl_face[3], t.lvl_off[4] - t.lvl_off[3]);
+    memset(&t, 0, sizeof(t));
+    t.width = 1024; t.height = 256; t.levels = 11; t.depth = 1; t.tiling = 3;
+    r300_tex_layout(&t, 8, true, false);            /* DXT1: one-row levels take two */
+    CHECK(t.lvl_off[6] == 0x2aa80 && t.lvl_face[6] == 64 && t.lvl_off[7] == 0x2aac0 &&
+          t.lvl_off[8] == 0x2aae0 && t.lvl_off[10] == 0x2ab20 && t.size_bytes == 0x2ab40,
+          "1024x256 dxt1 %x %x %x", t.lvl_off[7], t.lvl_off[10], t.size_bytes);
+    r300_tex_layout(&t, 4, false, false);           /* ARGB8888 */
+    CHECK(t.lvl_off[8] == 0x155540 && t.lvl_off[9] == 0x155560 && t.lvl_off[10] == 0x155580 &&
+          t.size_bytes == 0x1555a0, "1024x256 8888 %x %x", t.lvl_off[9], t.size_bytes);
+    memset(&t, 0, sizeof(t));
+    t.width = 512; t.height = 256; t.levels = 10; t.depth = 1; t.tiling = 3;
+    r300_tex_layout(&t, 16, true, false);           /* DXT3: no microtile */
+    CHECK(t.lvl_off[6] == 0x2aa80 && t.lvl_off[7] == 0x2aaa0 && t.lvl_off[9] == 0x2aae0 &&
+          t.size_bytes == 0x2ab00, "512x256 dxt3 %x %x", t.lvl_off[7], t.size_bytes);
+    /* Not measured, so on the untiled rule though micro-tiled: 8-bit
+     * texels, square microtiles; and macro tiling alone. */
+    memset(&t, 0, sizeof(t));
+    t.width = t.height = 4; t.levels = 3; t.depth = 1; t.tiling = 3;
+    r300_tex_layout(&t, 1, false, false);
+    CHECK(t.lvl_pitch[0] == 32 && t.lvl_off[1] == 128 && t.size_bytes == 224, "4x4 X8 %u %u",
+          t.lvl_off[1], t.size_bytes);
+    memset(&t, 0, sizeof(t));
+    t.width = 4; t.height = 16; t.levels = 1; t.depth = 1; t.tiling = 3;
+    r300_tex_layout(&t, 16, true, false);
+    CHECK(t.lvl_pitch[0] == 32 && t.size_bytes == 128, "4x16 dxt5 %u", t.size_bytes);
+    for (uint32_t tl = 1; tl <= 5; tl += 4) {       /* macro only; macro + square */
+        memset(&t, 0, sizeof(t));
+        t.width = t.height = 4; t.levels = 3; t.depth = 1; t.tiling = tl;
+        r300_tex_layout(&t, 2, false, false);
+        CHECK(t.lvl_pitch[0] == 32 && t.size_bytes == 224, "tiling %u: %u", tl, t.size_bytes);
+    }
     memset(&t, 0, sizeof(t));
     t.width = 100; t.height = 10; t.levels = 1; t.depth = 1; t.pitch_bytes = 512;
     r300_tex_layout(&t, 4, false, true);            /* TX_PITCH_EN keeps its pitch */
@@ -152,6 +208,14 @@ static void rendering_completeness(void)
     CHECK(p.uniforms.tex_dim[0][3] == (R300_TEXF_SIGNED_X | R300_TEXF_GAMMA | R300_TEXF_POT_ROWS),
           "tex flags %x", p.uniforms.tex_dim[0][3]);
     r300_draw_free(&p);
+    r300_state_write(&st, 0x4540, 0x00100000 | (1u << 3) | (1u << 2));     /* micro + macro tiled */
+    r300_draw_build(&st, &none, 0x35, d, n, rd, NULL, &p, &err);
+    CHECK(p.tex[0].gpu_addr == 0x00100000 && p.tex[0].tiling == 3 &&
+          p.tex[0].size_bytes == 16384 + 4096 + 1024 + 256 + 64 + 32 + 32 &&
+          (p.uniforms.tex_dim[0][3] & R300_TEXF_MICROTILED), "micro-tiled: size %u flags %x",
+          p.tex[0].size_bytes, p.uniforms.tex_dim[0][3]);
+    r300_draw_free(&p);
+    r300_state_write(&st, 0x4540, 0x00100000);
     r300_state_write(&st, 0x4480, 7 | (7u << 11) | (2u << 22));            /* 8x8x4 */
     r300_state_write(&st, 0x44C0, 0x0C | (1u << 25));                      /* 3D */
     r300_draw_build(&st, &none, 0x35, d, n, rd, NULL, &p, &err);

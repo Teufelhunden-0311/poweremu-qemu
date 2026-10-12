@@ -60,6 +60,7 @@ typedef struct R300TexDesc {
     uint32_t gpu_addr;          /* TX_OFFSET, low bits cleared */
     uint32_t width, height;
     uint32_t endian;            /* TX_OFFSET[1:0]: the card's dword swap */
+    uint32_t tiling;            /* TX_OFFSET[4:2]: macro tiling, micro tiling (2 bits) */
     uint32_t pitch_bytes;       /* level 0: bytes per row (per row of blocks for DXT) */
     uint32_t format;            /* TX_FORMAT1 & 0x1F */
     uint32_t kind;              /* R300_TEXK_* */
@@ -72,8 +73,10 @@ typedef struct R300TexDesc {
      * The whole image as the sampler addresses it (r300_tex_layout): mip
      * levels one after another, each holding its cube faces or 3D slices
      * back to back.  Rows are 32-byte aligned below level 0 (and at level
-     * 0 without TX_PITCH_EN), and heights round up to a power of two when
-     * the texture has mip levels or is 3D or a cube.
+     * 0 without TX_PITCH_EN), or, in a micro-tiled texture of 16-bit
+     * or 32-bit texels or DXT1, 16-byte aligned with an even number of
+     * rows to a face or slice.  Heights round up to a power of two when the
+     * texture has mip levels or is 3D or a cube.
      */
     uint32_t dim;               /* R300_TEXDIM_* */
     uint32_t depth;             /* 3D: slices at level 0, else 1 */
@@ -99,6 +102,7 @@ void r300_tex_level_dims(const R300TexDesc *td, uint32_t l, uint32_t *w,
 
 /* Fill the layout fields of td from its size, format, dim and levels;
  * bpp is bytes per texel (per 4x4 block for DXT, flagged by dxt). */
+bool r300_tex_microtiled(uint32_t tiling, uint32_t bpp, bool dxt);
 void r300_tex_layout(R300TexDesc *td, uint32_t bpp, bool dxt, bool pitch_en);
 
 /* A TX_BORDER_COLOR dword as the unit's XYZW before the swizzle: packed

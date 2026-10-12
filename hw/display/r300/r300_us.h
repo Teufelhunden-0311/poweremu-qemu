@@ -79,6 +79,7 @@ typedef struct R300FSUniforms {
 #define R300_TEXF_GAMMA         (1u << 4)
 #define R300_TEXF_POT_ROWS      (1u << 5)     /* heights round up to a power of two */
 #define R300_TEXF_DXT1_ALPHA    (1u << 6)     /* DXT1: transparent texels stay transparent */
+#define R300_TEXF_MICROTILED    (1u << 7)     /* 16-byte rows, even heights (r300_tex_layout) */
 
 #define R300_ZFMT_ENDIAN_MASK   3u            /* ZB_DEPTHPITCH.DEPTHENDIAN */
 #define R300_ZFMT_Z16           (1u << 2)     /* 16-bit Z, no stencil */

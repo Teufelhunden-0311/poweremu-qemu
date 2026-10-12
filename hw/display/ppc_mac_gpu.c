@@ -3264,9 +3264,9 @@ static void r300_framecap(PPCMacGPUState *s, const R300DrawPacket *pkt,
         const R300TexDesc *td = &pkt->tex[t];
         if (td->bound) {
             fprintf(log, " | t%d %06x fmt %02x %ux%ux%u dim %u lv %u kind %u "
-                    "f0 %08x f1 %08x lod %.2f/%.0f/%.0f/%.0f", t, td->gpu_addr,
+                    "tile %u f0 %08x f1 %08x lod %.2f/%.0f/%.0f/%.0f", t, td->gpu_addr,
                     td->format & 0x1F, td->width, td->height, td->depth,
-                    td->dim, td->levels, td->kind, td->filter0, td->filter1,
+                    td->dim, td->levels, td->kind, td->tiling, td->filter0, td->filter1,
                     pkt->uniforms.tex_lod[t][0], pkt->uniforms.tex_lod[t][1],
                     pkt->uniforms.tex_lod[t][2], pkt->uniforms.tex_lod[t][3]);
         }
@@ -3281,16 +3281,18 @@ static void r300_framecap(PPCMacGPUState *s, const R300DrawPacket *pkt,
             (uint64_t)td->gpu_addr + td->size_bytes > s->vram_size || g_hash_table_contains(txdone, key)) {
             continue;
         }
-        if (td->width * td->height != 128 * 128 && td->levels > 1 &&
+        if (td->width == td->height && td->width != 128 && td->levels > 1 &&
             td->dim == 0 && (td->format & 0x1F) >= 0xF) {
-            continue;                   /* ordinary DXT art */
+            continue;                   /* ordinary square DXT art */
         }
         g_hash_table_add(txdone, key);
         snprintf(path, sizeof(path), "%s.t%06x_d%04d_f%02x_%ux%u_p%u.bin", pre,
                  td->gpu_addr, n, td->format & 0x1F, td->width, td->height,
                  td->pitch_bytes);
         if ((f = fopen(path, "wb"))) {
-            fwrite(vram + td->gpu_addr, 1, td->size_bytes, f);
+            /* and what follows, in case the layout is the thing in doubt */
+            fwrite(vram + td->gpu_addr, 1, MIN((uint64_t)td->size_bytes + 256,
+                                               s->vram_size - td->gpu_addr), f);
             fclose(f);
         }
     }

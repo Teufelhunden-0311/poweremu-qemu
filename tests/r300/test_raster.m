@@ -299,7 +299,7 @@ int main(void)
             for (uint32_t z = 0; z < 2; z++)
                 for (uint32_t y = 0; y < 2; y++)
                     for (uint32_t x = 0; x < 2; x++)
-                        put_be(mem + z * td.lvl_pitch[0] * td.lvl_rows[0] + y * td.lvl_pitch[0] + x * 4,
+                        put_be(mem + z * td.lvl_face[0] + y * td.lvl_pitch[0] + x * 4,
                                fb32(10 * z + 2 * y + x));
             R300FSUniforms u = base_uniforms();
             u.tex_info[0][0] = 1; u.tex_info[0][1] = td.lvl_pitch[0] / 4;
@@ -311,27 +311,33 @@ int main(void)
             CHECK(r == 11, "3D texel %g (want slice 1, x 1, y 0)", r);
         }
 
-        /* ---- 32F 2x2 cube map: face from the major axis ---- */
-        {
+        /* ---- 32F cube maps: face from the major axis.  2x2 untiled, then
+         *      1x1 micro-tiled with two levels: a face is one 16-byte row
+         *      and the next face 32 bytes on, at both levels. ---- */
+        for (uint32_t n = 2; n >= 1; n--) {
             R300TexDesc td;
             memset(&td, 0, sizeof(td));
-            td.width = td.height = 2; td.depth = 1; td.levels = 1; td.dim = R300_TEXDIM_CUBE;
+            td.width = td.height = n; td.depth = 1; td.levels = 1; td.dim = R300_TEXDIM_CUBE;
+            td.tiling = n == 1 ? 3 : 0;
             r300_tex_layout(&td, 4, false, false);
             static uint8_t mem[1024];
+            memset(mem, 0, sizeof(mem));
+            CHECK(td.lvl_pitch[0] == (n == 1 ? 16 : 32) && td.lvl_face[0] == (n == 1 ? 32 : 64),
+                  "cube %u pitch %u face %u", n, td.lvl_pitch[0], td.lvl_face[0]);
             for (uint32_t f = 0; f < 6; f++)
                 for (uint32_t b = 0; b < td.lvl_pitch[0] * td.lvl_rows[0]; b += 4)
-                    put_be(mem + f * td.lvl_pitch[0] * td.lvl_rows[0] + b, fb32(f));
+                    put_be(mem + f * td.lvl_face[0] + b, fb32(f));
             R300FSUniforms u = base_uniforms();
             u.tex_info[0][0] = 1; u.tex_info[0][1] = td.lvl_pitch[0] / 4;
-            u.tex_info[0][2] = 2; u.tex_info[0][3] = 2;
+            u.tex_info[0][2] = n; u.tex_info[0][3] = n;
             u.tex_dim[0][0] = 2; u.tex_dim[0][1] = 1; u.tex_dim[0][2] = td.lvl_pitch[0];
-            u.tex_dim[0][3] = R300_TEXF_POT_ROWS;
+            u.tex_dim[0][3] = R300_TEXF_POT_ROWS | (n == 1 ? R300_TEXF_MICROTILED : 0);
             const float px_[4] = { 1, 0.1f, 0.2f, 1 }, ny[4] = { 0.1f, -1, 0.2f, 1 },
                         nz[4] = { 0.2f, 0.1f, -1, 1 };
             float a = raw_sample(0x1B, 2, mem, td.size_bytes, &u, 64, px_);
             float b = raw_sample(0x1B, 2, mem, td.size_bytes, &u, 64, ny);
             float cz = raw_sample(0x1B, 2, mem, td.size_bytes, &u, 64, nz);
-            CHECK(a == 0 && b == 3 && cz == 5, "cube faces %g %g %g", a, b, cz);
+            CHECK(a == 0 && b == 3 && cz == 5, "cube %u faces %g %g %g", n, a, b, cz);
         }
 
         /* ---- border colour through a float texture ---- */
