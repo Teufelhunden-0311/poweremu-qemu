@@ -561,12 +561,14 @@ bool r300_tex_microtiled(uint32_t tiling, uint32_t bpp, bool dxt)
  * levels one after another, each holding its faces or slices in turn.
  *
  * Untiled, a row is a multiple of 32 bytes.  Micro-tiled (TX_OFFSET bits
- * 4:3 = 1), as everything Apple's driver uploads is, a row is a whole
- * number of microtiles and a level's height a multiple of the microtile's:
- * 8 texels by 2 rows at 16 bpp, 4 by 2 at 32 bpp, 2 by 2 DXT1 blocks, 16
- * bytes by 2 rows each.  Mesa's table has no microtile for 16-byte
- * DXT3/DXT5 blocks, which stay on the untiled rule.  All of that agrees
- * with VRAM as the driver filled it (Tiger, ATI-1.4.18, Halo):
+ * 4:3 = 1), a row is a whole number of microtiles and a level's height a
+ * multiple of the microtile's: in Mesa's table 8 texels by 2 rows at 16
+ * bpp and 4 by 2 at 32 bpp, 16 bytes by 2 rows either way.  Mesa itself
+ * micro-tiles no compressed format; that DXT1 is laid out the same way,
+ * two 8-byte blocks by two rows, and that DXT3 is not, comes only from
+ * the measurements.  Apple's driver set macro and micro tiling on every
+ * texture it uploaded in the stretch of Halo looked at (Tiger,
+ * ATI-1.4.18), and VRAM as it filled it reads:
  *   ARGB8888 4x4, three levels: rows at 0x00..0x30, 2x2 at 0x40 and
  *   0x50, 1x1 at 0x60, the next texture at 0x80;
  *   ARGB1555 256x256, nine levels: the 8x8, 4x4 and 2x2 levels in rows
@@ -576,12 +578,19 @@ bool r300_tex_microtiled(uint32_t tiling, uint32_t bpp, bool dxt)
  *   DXT1 1024x256: the 16x4 level (one row of four blocks, 32 bytes)
  *   takes 64 bytes, the levels after it 32 each;
  *   DXT3 512x256: the 8x4 level (one row of two blocks) takes 32 bytes.
- * Not modelled: the order of texels inside a tiled level, here or where
- * the guest's writes land, so levels read back in row order; macro
- * tiling; the microtiles of 8-bit texels (8 by 4) and the square ones of
- * 16-bit texels (4 by 4), which nothing measured has used and which stay
- * on the untiled rule.  Rows that are not a multiple of 32 bytes but more
- * than 16 follow Mesa (multiples of 16) without having been measured. */
+ * (The driver also leaves a copy of each one-row level where it would
+ * sit without the height rule; which copy the card samples is taken from
+ * the textures' extents, not from a probe on hardware.)
+ *
+ * This is a compatibility model for those layouts, applied to every
+ * 2-byte and 4-byte texel format, DXT1, and 3D slices alike, not a model
+ * of tiling.  The order of texels inside a tiled level is not modelled,
+ * here or where the guest's writes land; for the upload paths seen the
+ * levels read back in row order.  Macro tiling is not modelled at all.
+ * The microtiles of 8-bit texels (8 by 4) and the square ones of 16-bit
+ * texels (4 by 4) stay on the untiled rule, unmeasured.  Rows that are
+ * not a multiple of 32 bytes but more than 16 follow Mesa (multiples of
+ * 16) without having been measured. */
 void r300_tex_layout(R300TexDesc *td, uint32_t bpp, bool dxt, bool pitch_en)
 {
     bool pot_rows = td->levels > 1 || td->dim != R300_TEXDIM_2D;

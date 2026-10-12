@@ -9132,7 +9132,7 @@ static MTLPixelFormat r300_raw_pf(uint32_t view_bpp)
 #define R300_TCACHE_BYTES (512ull << 20)
 typedef struct R300TexCacheKey {
     uint32_t addr, format, kind, width, height, depth, dim, levels, pitch;
-    uint32_t host;
+    uint32_t host;              /* GART copy, TX_OFFSET swap and tiling (the layout) */
 } R300TexCacheKey;
 static struct {
     R300TexCacheKey key;
@@ -9297,7 +9297,7 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
     memset(&key, 0, sizeof(key));
     key = (R300TexCacheKey){ td->gpu_addr, td->format, td->kind, td->width, td->height,
                              td->depth, td->dim, td->levels, td->pitch_bytes,
-                             td->host_data != NULL ? 1u + (td->endian << 1) : td->endian << 1 };
+                             (td->host_data != NULL) | td->endian << 1 | td->tiling << 3 };
     uint64_t gen = 0;
     bool gen_ok = !td->host_data && r300_tex_gen(td, &gen);
     int hit = r300_tcache_find(&key);

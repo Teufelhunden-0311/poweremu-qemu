@@ -143,7 +143,7 @@ typedef struct VkImg {
 /* Textures rebuilt on the CPU (mips, 3D, cube, 16bpp, DXT, GART copies). */
 typedef struct VkTexKey {
     uint32_t addr, format, kind, width, height, depth, dim, levels, pitch;
-    uint32_t host;
+    uint32_t host;              /* GART copy, TX_OFFSET swap and tiling (the layout) */
     uint64_t hash;
 } VkTexKey;
 typedef struct VkTexFull {
@@ -2245,7 +2245,7 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
     VkFormat fmt = vk_tex_format(td->kind);
     VkTexKey key = { td->gpu_addr, td->format, td->kind, td->width, td->height,
                      td->depth, td->dim, td->levels, td->pitch_bytes,
-                     td->host_data != NULL ? 1u + (td->endian << 1) : td->endian << 1,
+                     (td->host_data != NULL) | td->endian << 1 | td->tiling << 3,
                      r300_hash_bytes(src, td->size_bytes) };
     int lru = 0;
 
