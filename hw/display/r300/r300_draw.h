@@ -81,6 +81,7 @@ typedef struct R300TexDesc {
     uint32_t lvl_off[R300_TEX_MAX_LEVELS];      /* bytes from gpu_addr */
     uint32_t lvl_pitch[R300_TEX_MAX_LEVELS];    /* bytes per row (of blocks) */
     uint32_t lvl_rows[R300_TEX_MAX_LEVELS];     /* rows (of blocks) per face/slice */
+    uint32_t lvl_face[R300_TEX_MAX_LEVELS];     /* bytes from one face/slice to the next */
     uint32_t size_bytes;        /* the whole chain */
 
     /*

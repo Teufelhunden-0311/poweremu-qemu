@@ -551,33 +551,43 @@ void r300_tex_level_dims(const R300TexDesc *td, uint32_t l, uint32_t *w,
 
 /* The hardware's addressing, as Mesa's r300_texture_desc.c lays out
  * linear (untiled) textures: 32-byte rows, power-of-two heights for
- * mipmapped, 3D and cube textures, levels one after another. */
+ * mipmapped, 3D and cube textures, levels one after another.
+ *
+ * Except for rows of 16 bytes or less (levels up to 4 texels wide at
+ * 32 bpp, up to 8 at DXT1): those take 16 bytes, and each face of a level
+ * is rounded up to 32.  Read from the chains Apple's driver uploads for
+ * Halo (4x4 ARGB8888 with three levels: rows at 0x00..0x30, 2x2 at 0x40
+ * and 0x50, 1x1 at 0x60; 64x64 DXT1 cube: the 8x8 faces 32 bytes apart).
+ * Not established for 8-bit texels, which keep 32-byte rows. */
 void r300_tex_layout(R300TexDesc *td, uint32_t bpp, bool dxt, bool pitch_en)
 {
     bool pot_rows = td->levels > 1 || td->dim != R300_TEXDIM_2D;
     uint32_t off = 0;
 
     for (uint32_t l = 0; l < td->levels; l++) {
-        uint32_t w, h, d, pitch, rows;
+        uint32_t w, h, d, pitch, rows, face;
 
         r300_tex_level_dims(td, l, &w, &h, &d);
         if (pot_rows) {
             h = pot_ceil(h);
         }
         if (dxt) {
-            pitch = (((w + 3) / 4) * bpp + 31) & ~31u;
+            pitch = ((w + 3) / 4) * bpp;
             rows = (h + 3) / 4;
         } else {
-            pitch = (w * bpp + 31) & ~31u;
+            pitch = w * bpp;
             rows = h;
         }
+        pitch = pitch <= 16 && bpp > 1 ? 16 : (pitch + 31) & ~31u;
         if (l == 0 && pitch_en) {
             pitch = td->pitch_bytes;
         }
+        face = (pitch * rows + 31) & ~31u;
         td->lvl_off[l] = off;
         td->lvl_pitch[l] = pitch;
         td->lvl_rows[l] = rows;
-        off += pitch * rows * d;
+        td->lvl_face[l] = face;
+        off += face * d;
     }
     td->size_bytes = off;
 }
@@ -816,7 +826,6 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         }
         t->format = fmt;
         t->filter0 = r300_reg(st, TX_FILTER0_0 + 4 * k);
-        t->filter1 = r300_reg(st, TX_FILTER1_0 + 4 * k);
         u->tex_info[k][0] = 1;
         /* RAW: the uint view's elements per row, as the renderer binds it */
         u->tex_info[k][1] = t->kind == R300_TEXK_RAW ? t->pitch_bytes / t->view_bpp : decode;

@@ -2293,7 +2293,7 @@ static VkImageView vk_texture_full(const R300TexDesc *td)
         r300_tex_level_dims(td, l, &lw, &lh, &n);
         uint32_t mw = MAX(w >> l, 1u), mh = MAX(h >> l, 1u);
         uint32_t cw = dxt ? mw : lw, ch = dxt ? mh : lh;
-        size_t face = (size_t)td->lvl_pitch[l] * td->lvl_rows[l];
+        size_t face = td->lvl_face[l];
         for (uint32_t f = 0; f < n; f++) {
             uint8_t *bytes = r300_tex_level_bytes(td, src + td->lvl_off[l] + f * face,
                                                   l, cw, ch, &bpr);

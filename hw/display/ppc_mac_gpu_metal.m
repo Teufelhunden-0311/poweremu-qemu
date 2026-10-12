@@ -9340,7 +9340,7 @@ static id<MTLTexture> r300_texture_full(PPCMacGPUMetalState *st, id<MTLDevice> d
         r300_tex_level_dims(td, l, &w, &h, &n);
         /* Metal's level size (BC: from the rounded-up base) */
         uint32_t mw = MAX((uint32_t)t.width >> l, 1u), mh = MAX((uint32_t)t.height >> l, 1u);
-        size_t face = (size_t)td->lvl_pitch[l] * td->lvl_rows[l];
+        size_t face = td->lvl_face[l];
         for (uint32_t f = 0; f < n; f++) {
             const uint8_t *fs = src + td->lvl_off[l] + f * face;
             uint8_t *bytes = r300_tex_level_bytes(td, fs, l, dxt ? mw : w, dxt ? mh : h, &bpr);

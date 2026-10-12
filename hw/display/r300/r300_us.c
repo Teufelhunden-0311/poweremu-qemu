@@ -772,9 +772,10 @@ static const char us_prelude[] =
 "        uint w = max(u.tex_info[unit].z >> i, 1u), h = max(u.tex_info[unit].w >> i, 1u);\n"
 "        uint d = dm.x == 2u ? 6u : dm.x == 1u ? max(dm.y >> i, 1u) : 1u;\n"
 "        if ((dm.w & 32u) != 0u && h > 1u) h = 1u << uint(findMSB(h - 1u) + 1);\n"
-"        uint p = i == 0u ? dm.z : (w * bpp + 31u) & ~31u;\n"
-"        if (i == l) { pitch = p; fbytes = p * h; break; }\n"
-"        off += p * h * d;\n"
+"        uint p = i == 0u ? dm.z : w * bpp <= 16u && bpp > 1u ? 16u : (w * bpp + 31u) & ~31u;\n"
+"        uint fb = (p * h + 31u) & ~31u;\n"
+"        if (i == l) { pitch = p; fbytes = fb; break; }\n"
+"        off += fb * d;\n"
 "    }\n"
 "    return off;\n"
 "}\n";
