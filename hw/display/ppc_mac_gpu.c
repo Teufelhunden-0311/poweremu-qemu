@@ -3161,6 +3161,143 @@ static void r300_warn_once(const char *what, const char *detail)
     }
 }
 
+/* The shader's number for r300_framecap(), taken before the renderer
+ * consumes the packet. */
+static int r300_cap_fs = -1;
+
+static void r300_framecap_fs(const R300DrawPacket *pkt)
+{
+    static const char *pre;
+    static int init, nfs;
+    static GHashTable *fs;
+    gpointer v;
+
+    if (!init) {
+        init = 1;
+        pre = getenv("R300_CAP");
+    }
+    r300_cap_fs = -1;
+    if (!pre || !pkt->glsl) {
+        return;
+    }
+    if (!fs) {
+        fs = g_hash_table_new(g_str_hash, g_str_equal);
+    }
+    if (g_hash_table_lookup_extended(fs, pkt->glsl, NULL, &v)) {
+        r300_cap_fs = GPOINTER_TO_INT(v);
+    } else {
+        char *fn = g_strdup_printf("%s.fs%03d.frag", pre, nfs);
+        FILE *f = fopen(fn, "w");
+        if (f) {
+            fputs(pkt->glsl, f);
+            fclose(f);
+        }
+        g_free(fn);
+        r300_cap_fs = nfs++;
+        g_hash_table_insert(fs, g_strdup(pkt->glsl), GINT_TO_POINTER(r300_cap_fs));
+    }
+}
+
+/*
+ * Debug ($R300_CAP=prefix): when the file "prefix.go" appears, save the
+ * colour buffer after each of the next draws (a count in that file, 400
+ * if empty) with the draw's shader and textures, to find the draw that
+ * paints something wrong.
+ */
+static void r300_framecap(PPCMacGPUState *s, const R300DrawPacket *pkt,
+                          const uint8_t *vram)
+{
+    static const char *pre;
+    static int init, left, n;
+    static unsigned poll;
+    static GHashTable *txdone;
+    static FILE *log;
+    char path[512];
+    FILE *f;
+    int id = -1;
+
+    if (!init) {
+        init = 1;
+        pre = getenv("R300_CAP");
+    }
+    if (!pre || !s->renderer->flush_r200) {
+        return;
+    }
+    if (!left) {
+        if (++poll % 64) {
+            return;
+        }
+        snprintf(path, sizeof(path), "%s.go", pre);
+        if (!(f = fopen(path, "r"))) {
+            return;
+        }
+        if (fscanf(f, "%d", &left) != 1 || left <= 0) {
+            left = 400;
+        }
+        fclose(f);
+        unlink(path);
+        if (!log) {
+            snprintf(path, sizeof(path), "%s.log", pre);
+            log = fopen(path, "w");
+            txdone = g_hash_table_new(g_direct_hash, g_direct_equal);
+        }
+        if (!log) {
+            left = 0;
+            return;
+        }
+    }
+    id = r300_cap_fs;
+    s->renderer->flush_r200(s->renderer_opaque);
+    snprintf(path, sizeof(path), "%s.d%04d_%06x_p%u_h%u.bin", pre, n,
+             pkt->rt_gpu_addr, pkt->rt_pitch * pkt->rt_bpp, pkt->rt_height);
+    if ((uint64_t)pkt->rt_gpu_addr + (uint64_t)pkt->rt_pitch * pkt->rt_bpp *
+        pkt->rt_height <= s->vram_size && (f = fopen(path, "wb"))) {
+        fwrite(vram + pkt->rt_gpu_addr, 1,
+               (size_t)pkt->rt_pitch * pkt->rt_bpp * pkt->rt_height, f);
+        fclose(f);
+    }
+    fprintf(log, "D%04d draw %llu rt %06x fs %d verts %u cls %u cblend %08x "
+            "ablend %08x", n, (unsigned long long)s->r3->draws,
+            pkt->rt_gpu_addr, id, pkt->num_verts, pkt->prim_class,
+            pkt->uniforms.cblend, pkt->uniforms.ablend);
+    for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
+        const R300TexDesc *td = &pkt->tex[t];
+        if (td->bound) {
+            fprintf(log, " | t%d %06x fmt %02x %ux%ux%u dim %u lv %u kind %u "
+                    "f0 %08x f1 %08x lod %.2f/%.0f/%.0f/%.0f", t, td->gpu_addr,
+                    td->format & 0x1F, td->width, td->height, td->depth,
+                    td->dim, td->levels, td->kind, td->filter0, td->filter1,
+                    pkt->uniforms.tex_lod[t][0], pkt->uniforms.tex_lod[t][1],
+                    pkt->uniforms.tex_lod[t][2], pkt->uniforms.tex_lod[t][3]);
+        }
+    }
+    fprintf(log, "\n");
+    fflush(log);
+    for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
+        const R300TexDesc *td = &pkt->tex[t];
+        gpointer key = GUINT_TO_POINTER(td->gpu_addr);
+        if (!td->bound || td->host_data || !td->size_bytes ||
+            td->size_bytes > (4u << 20) ||
+            (uint64_t)td->gpu_addr + td->size_bytes > s->vram_size || g_hash_table_contains(txdone, key)) {
+            continue;
+        }
+        if (td->width * td->height != 128 * 128 && td->levels > 1 &&
+            td->dim == 0 && (td->format & 0x1F) >= 0xF) {
+            continue;                   /* ordinary DXT art */
+        }
+        g_hash_table_add(txdone, key);
+        snprintf(path, sizeof(path), "%s.t%06x_d%04d_f%02x_%ux%u_p%u.bin", pre,
+                 td->gpu_addr, n, td->format & 0x1F, td->width, td->height,
+                 td->pitch_bytes);
+        if ((f = fopen(path, "wb"))) {
+            fwrite(vram + td->gpu_addr, 1, td->size_bytes, f);
+            fclose(f);
+        }
+    }
+    n++;
+    left--;
+}
+
 /* $R300_DRAWLOG: one line per draw (and per other type-3 packet) with the
  * state that decides depth, culling, tiling and texturing; capped. */
 static FILE *r300_drawlog(void)
@@ -3795,6 +3932,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                      "(%ux%u), read through the GART\n", ga, td->width, td->height);
         }
     }
+    r300_framecap_fs(&pkt);
     r300_note_formats(s, &pkt);
     r300_note_features(s, &pkt);
     {
@@ -4004,6 +4142,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                     }
                 }
             }
+            r300_framecap(s, &pkt, vram);
             /* Debug: snapshot a drag frame (scratch texture + screen). */
             {
                 static int reads;
