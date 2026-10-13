@@ -1,0 +1,41 @@
+texprobe: a guest program for comparing texturing on a real Radeon and in
+the emulator, texel by texel.
+
+texprobe.c   Mac OS X 10.4 (PowerPC), GLUT.  Uploads mip-mapped textures in
+             which every texel names its level, face and place, draws each
+             level at one texel per pixel (GL_NEAREST_MIPMAP_NEAREST, so
+             the card picks the level) and reads the pixels back.  One line
+             per level in /tmp/texprobe.txt, PASS or FAIL with the first
+             wrong texels.  Then replaces part of two levels with
+             glTexSubImage2D and checks again ("sub").
+               gcc -std=gnu99 -O2 -o texprobe texprobe.c \
+                   -framework GLUT -framework OpenGL
+               ./texprobe [stage=1|2] [only=ID] [hold=SECONDS] [wait=SECONDS]
+             stage 1: 32-bit, 16-bit and DXT textures, among them chains
+             with one-row levels many microtiles wide (1024x4), levels
+             wider than a macrotile but not as tall (2048x8), and cubes.
+             stage 2: 8-bit textures and two-byte luminance-alpha.
+tags.py      Finds texprobe's levels in a capture of the emulator's VRAM
+             (R300_CAP=prefix R300_CAP_TEX=1, then "echo 9000 > prefix.go"
+             before texprobe starts) and compares where the driver put
+             each level with the layout the emulator's sampler uses.
+
+What the two say, and what they do not:
+- texprobe.txt is a test of what comes out: on hardware it shows the
+  driver, the card and the probe agree; in the emulator a FAIL is an
+  emulator bug.  It says nothing about the order of texels inside a level
+  in the card's memory: an upload and a sampler that both go through the
+  same address translation give the same picture as none at all.
+- tags.py reads the emulator's memory, which holds what the driver's
+  upload commands put there as the emulator executes them (untiled).  It
+  shows where the driver places each level and with what row pitch.  It
+  is not a view of a real card's memory.
+
+Results, 2026-10-12 (Tiger 10.4.11, ATI-1.4.18):
+- PowerBook G4 (ATY,RV360M11): stage 1 486 of 486 levels PASS, stage 2
+  161 of 161, no LOD bias needed.
+- Emulator (Radeon 9700, gpu-work 5cc1c53): stage 1 every first upload
+  PASS and every level where the layout expects it; 22 levels FAIL after
+  glTexSubImage2D (32-bit: the whole texture's components change places;
+  16-bit: the replaced texels are byte-swapped).  Stage 2: 93 of 161 FAIL,
+  the 8-bit textures with rows under 32 bytes.

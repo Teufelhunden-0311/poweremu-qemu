@@ -3203,12 +3203,17 @@ static void r300_framecap_fs(const R300DrawPacket *pkt)
  * colour buffer after each of the next draws (a count in that file, 400
  * if empty) with the draw's shader and textures, to find the draw that
  * paints something wrong.
+ *
+ * With $R300_CAP_TEX set the textures are the subject (tests/r300's
+ * texprobe): no colour buffers; every texture in VRAM, again whenever its
+ * bytes have changed, with as much again and 64 KB after it in case the
+ * layout is too short; and a line with the layout the sampler will use.
  */
 static void r300_framecap(PPCMacGPUState *s, const R300DrawPacket *pkt,
                           const uint8_t *vram)
 {
     static const char *pre;
-    static int init, left, n;
+    static int init, left, n, texmode;
     static unsigned poll;
     static GHashTable *txdone;
     static FILE *log;
@@ -3219,12 +3224,13 @@ static void r300_framecap(PPCMacGPUState *s, const R300DrawPacket *pkt,
     if (!init) {
         init = 1;
         pre = getenv("R300_CAP");
+        texmode = getenv("R300_CAP_TEX") != NULL;
     }
     if (!pre || !s->renderer->flush_r200) {
         return;
     }
     if (!left) {
-        if (++poll % 64) {
+        if (!texmode && ++poll % 64) {
             return;
         }
         snprintf(path, sizeof(path), "%s.go", pre);
@@ -3250,7 +3256,7 @@ static void r300_framecap(PPCMacGPUState *s, const R300DrawPacket *pkt,
     s->renderer->flush_r200(s->renderer_opaque);
     snprintf(path, sizeof(path), "%s.d%04d_%06x_p%u_h%u.bin", pre, n,
              pkt->rt_gpu_addr, pkt->rt_pitch * pkt->rt_bpp, pkt->rt_height);
-    if ((uint64_t)pkt->rt_gpu_addr + (uint64_t)pkt->rt_pitch * pkt->rt_bpp *
+    if (!texmode && (uint64_t)pkt->rt_gpu_addr + (uint64_t)pkt->rt_pitch * pkt->rt_bpp *
         pkt->rt_height <= s->vram_size && (f = fopen(path, "wb"))) {
         fwrite(vram + pkt->rt_gpu_addr, 1,
                (size_t)pkt->rt_pitch * pkt->rt_bpp * pkt->rt_height, f);
@@ -3272,18 +3278,41 @@ static void r300_framecap(PPCMacGPUState *s, const R300DrawPacket *pkt,
         }
     }
     fprintf(log, "\n");
+    for (int t = 0; texmode && t < R300_NUM_TEX_UNITS; t++) {
+        const R300TexDesc *td = &pkt->tex[t];
+        if (td->bound) {
+            fprintf(log, "L%04d t%d %06x swap %u gart %d size %u", n, t, td->gpu_addr,
+                    td->endian, td->host_data != NULL, td->size_bytes);
+            for (uint32_t l = 0; l < td->levels && l < R300_TEX_MAX_LEVELS; l++) {
+                fprintf(log, " | %u %u %u %u", td->lvl_off[l], td->lvl_pitch[l],
+                        td->lvl_rows[l], td->lvl_face[l]);
+            }
+            fprintf(log, "\n");
+        }
+    }
     fflush(log);
     for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
         const R300TexDesc *td = &pkt->tex[t];
         gpointer key = GUINT_TO_POINTER(td->gpu_addr);
+        uint64_t len = (uint64_t)td->size_bytes + 256;
         if (!td->bound || td->host_data || !td->size_bytes ||
-            td->size_bytes > (4u << 20) ||
-            (uint64_t)td->gpu_addr + td->size_bytes > s->vram_size || g_hash_table_contains(txdone, key)) {
+            td->size_bytes > (texmode ? 32u << 20 : 4u << 20) ||
+            (uint64_t)td->gpu_addr + td->size_bytes > s->vram_size) {
             continue;
         }
-        if (td->width == td->height && td->width != 128 && td->levels > 1 &&
-            td->dim == 0 && (td->format & 0x1F) >= 0xF) {
+        if (texmode) {
+            uint32_t h = 2166136261u;
+            len = MIN(2 * (uint64_t)td->size_bytes + 65536, s->vram_size - td->gpu_addr);
+            for (uint64_t i = 0; i < len; i++) {
+                h = (h ^ vram[td->gpu_addr + i]) * 16777619u;
+            }
+            key = GUINT_TO_POINTER(td->gpu_addr ^ h);
+        } else if (td->width == td->height && td->width != 128 && td->levels > 1 &&
+                   td->dim == 0 && (td->format & 0x1F) >= 0xF) {
             continue;                   /* ordinary square DXT art */
+        }
+        if (g_hash_table_contains(txdone, key)) {
+            continue;
         }
         g_hash_table_add(txdone, key);
         snprintf(path, sizeof(path), "%s.t%06x_d%04d_f%02x_%ux%u_p%u.bin", pre,
@@ -3291,8 +3320,7 @@ static void r300_framecap(PPCMacGPUState *s, const R300DrawPacket *pkt,
                  td->pitch_bytes);
         if ((f = fopen(path, "wb"))) {
             /* and what follows, in case the layout is the thing in doubt */
-            fwrite(vram + td->gpu_addr, 1, MIN((uint64_t)td->size_bytes + 256,
-                                               s->vram_size - td->gpu_addr), f);
+            fwrite(vram + td->gpu_addr, 1, MIN(len, s->vram_size - td->gpu_addr), f);
             fclose(f);
         }
     }
