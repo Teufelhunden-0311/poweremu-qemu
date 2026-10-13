@@ -746,6 +746,18 @@ static void pg_write(PVSGlsl *g, uint32_t d0, const char *r)
     }
 }
 
+/* Whether the expression e reads the operand named by the letter v. */
+static bool pg_reads(const char *e, char v)
+{
+    for (const char *p = e; *p; p++) {
+        if (*p == v && (p == e || !(isalnum((unsigned char)p[-1]) || p[-1] == '_')) &&
+            !(isalnum((unsigned char)p[1]) || p[1] == '_')) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void pg_inst(PVSGlsl *g, const uint32_t *d)
 {
     uint32_t d0 = d[0];
@@ -759,28 +771,32 @@ static void pg_inst(PVSGlsl *g, const uint32_t *d)
         g->ok = false;              /* predication */
         return;
     }
-    pg_src(g, "A", d[1]);
-    pg_src(g, "B", d[2]);
-    if (!dual) {
-        pg_src(g, "C", d[3]);
-    } else {
-        r300_sb_printf(g->sb, "    C = vec4(0.0);\n");
+    /* The operation first: an operand it does not read is not translated
+     * (the interpreter fetches all three and ignores those).  Apple's
+     * driver leaves A0-relative inputs in the unread third slot of
+     * two-operand instructions in programs that use the address register,
+     * Halo's skinning programs among them; refusing those kept every such
+     * draw on the interpreter. */
+    if (math ? !pg_math(op, "A.w", "B.w", "C.w", e, sizeof(e))
+             : !pg_vector(macro ? ((op & 1) ? VE_MULTIPLYX2_ADD : VE_MULTIPLY_ADD) : op,
+                          e, sizeof(e))) {
+        g->ok = false;
+        return;
+    }
+    for (int k = 0; k < 3; k++) {
+        const char name[2] = { "ABC"[k], 0 };
+        if (pg_reads(e, name[0]) && !(k == 2 && dual)) {
+            pg_src(g, name, d[1 + k]);
+        } else {
+            r300_sb_printf(g->sb, "    %s = vec4(0.0);\n", name);
+        }
     }
     if (math) {
-        if (!pg_math(op, "A.w", "B.w", "C.w", e, sizeof(e))) {
-            g->ok = false;
-            return;
-        }
         r300_sb_printf(g->sb, "    R = %s;\n", e);
         if ((d0 >> 25) & 1) {
             r300_sb_printf(g->sb, "    R = clamp(R, 0.0, 1.0);\n");
         }
         pg_write(g, d0, "R");
-        return;
-    }
-    if (!pg_vector(macro ? ((op & 1) ? VE_MULTIPLYX2_ADD : VE_MULTIPLY_ADD) : op,
-                   e, sizeof(e))) {
-        g->ok = false;
         return;
     }
     r300_sb_printf(g->sb, "    R = %s;\n", e);

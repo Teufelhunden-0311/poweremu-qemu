@@ -2,7 +2,8 @@
  * Vertex shading on the GPU (R300_GLSL_GPU_VS) against the CPU path:
  *
  * 1. Random PVS programs (every vector and math op, swizzles, abs/negate,
- *    saturation, dual and macro instructions, A0-relative constants) run
+ *    saturation, dual and macro instructions, A0-relative constants,
+ *    A0-relative inputs where the operation reads no operand) run
  *    through r300_pvs_run and through r300_pvs_to_glsl on Metal.
  * 2. The captured Quartz Extreme draw built both ways: the interpolated
  *    varyings and the covered pixels must match.
@@ -128,6 +129,14 @@ static void random_program(uint32_t *code, unsigned *ninst)
             d[3] = s;
         } else {
             d[3] = rsrc(a0);
+            /* An operand the operation does not read may hold anything,
+             * an A0-relative input for one. */
+            if (kind > 4 && rnd(3) == 0 &&
+                ((1u << (d0 & 0x3F)) & (1u << 1 | 1u << 2 | 1u << 3 | 1u << 5 | 1u << 7 |
+                                        1u << 8 | 1u << 9 | 1u << 10 | 1u << 26 | 1u << 27 |
+                                        1u << 28))) {
+                d[3] = (d[3] & ~3u) | 1u | 1u << 4;
+            }
         }
         if (dt == 1) {
             a0 = true;
@@ -275,6 +284,25 @@ static void random_programs(unsigned count)
     CHECK(skipped < count / 4, "too many skipped (%u)", skipped);
 }
 
+/*
+ * An instruction of Halo's skinning programs: t2 = c[29 + a0] + c[29 + a0],
+ * with an A0-relative input in the third slot, which ADD does not read.
+ */
+static void unread_operand(void)
+{
+    static const uint32_t code[4] = { 0x00f04003, 0x00d103b2, 0x012483b2, 0x012483b5 };
+    static const float consts[32][4];
+    R300PVSProgram prog = { code, 0, 0, consts, 31 };
+    uint32_t used = 0;
+    R300Sb body;
+
+    r300_sb_init(&body);
+    CHECK(r300_pvs_to_glsl(&prog, &body, &used), "an unread A0-relative input was refused");
+    CHECK(used == 0, "an unread input was fetched (%x)", used);
+    r300_sb_free(&body);
+    printf("unread operand: translated\n");
+}
+
 /* ---- 2. a whole draw, both ways ---- */
 
 #define W 256
@@ -420,6 +448,7 @@ int main(void)
         dev = MTLCreateSystemDefaultDevice();
         q = [dev newCommandQueue];
         random_programs(400);
+        unread_operand();
 
         static R300State st;
         load_qe(&st);
