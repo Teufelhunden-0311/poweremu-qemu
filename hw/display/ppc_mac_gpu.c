@@ -3731,6 +3731,118 @@ static void r300_xfer_end(PPCMacGPUState *s, R300SysXfer *x, uint8_t *vram)
     }
 }
 
+/*
+ * A colour buffer in VRAM that the renderer cannot draw where it is
+ * (PPC_MAC_GPU_DRAW_REMAP).  Metal maps a colour buffer as a linear
+ * texture, whose address and bytes a row must be multiples of an alignment,
+ * 16 bytes on Apple's GPUs; an 8-pixel 8-bit surface has 8-byte rows.  The
+ * Mac OS X driver draws into one for glTexSubImage2D on an 8-texel-wide
+ * level of an 8-bit texture, and the draw was dropped: the update never
+ * reached the texture.
+ *
+ * It is drawn in the private staging instead, in rows of a length any
+ * renderer maps, around the waits a system-memory colour buffer has
+ * (R300SysXfer above).  The buffer's rows are loaded first, so what the
+ * draw leaves alone (uncovered pixels, masks, blending) comes back as it
+ * was; and only the buffer's own bytes are copied back, none of the
+ * staging's longer rows and nothing outside the buffer -- the next mip
+ * level starts right after it.  The copy back is suppressed, as there,
+ * after a device reset or failed GPU work.
+ *
+ * Only what the driver was seen to do: one linear, single-sample target
+ * without a depth buffer.  Anything else stays dropped.  Two waits for the
+ * renderer a draw, so the count and the time are logged.
+ */
+#define R300_STAGE_ROW 256u
+static int r300_draw_staged(PPCMacGPUState *s, uint8_t *vram, R300DrawPacket *pkt)
+{
+    static uint64_t count, usec;
+    uint32_t dst = pkt->rt_gpu_addr, pitch = pkt->rt_pitch;
+    uint32_t row = pitch * pkt->rt_bpp, rows = pkt->rt_height;
+    uint32_t srow = ROUND_UP(row, R300_STAGE_ROW);
+    uint64_t off = s->vram_size, len = (uint64_t)srow * rows;
+    uint32_t resets = s->reset_count;
+    int64_t t0 = g_get_monotonic_time();
+    const char *why =
+        !s->stage_size ? "colour buffer not drawn: not where the renderer can "
+                         "draw it, and no private staging" :
+        pkt->num_cb > 1 ? "colour buffer not drawn: not where the renderer can "
+                          "draw it, and several targets" :
+        pkt->aa_samples > 1 ? "colour buffer not drawn: not where the renderer "
+                              "can draw it, and multisampled" :
+        pkt->depth.attach ? "colour buffer not drawn: not where the renderer can "
+                            "draw it, and it has a depth buffer" :
+        !len || len > s->stage_size ? "colour buffer not drawn: not where the "
+                                      "renderer can draw it, and larger than the staging" :
+        NULL;
+    int rr;
+
+    if (why) {
+        r300_warn_once(why, NULL);
+        return -1;
+    }
+    /* Earlier work on the staging, and earlier drawing into the buffer:
+     * both may let go of the BQL, and a reset meanwhile makes the packet
+     * stale (see r300_xfer_begin). */
+    r200_vram_access(s, off, off + len, true, 9);
+    r200_vram_access(s, dst, dst + (uint64_t)row * rows, false, 9);
+    if (s->reset_count != resets) {
+        r300_warn_once("colour buffer not drawn in the staging: device reset", NULL);
+        return -1;
+    }
+    uint64_t failures = r300_gpu_failures(s);
+    for (uint32_t y = 0; y < rows; y++) {
+        memcpy(vram + off + (uint64_t)y * srow, vram + dst + (uint64_t)y * row, row);
+    }
+    if (s->stage_dirty_hi > s->stage_dirty_lo) {    /* as r300_xfer_begin */
+        s->stage_dirty_lo = MIN(s->stage_dirty_lo, off);
+        s->stage_dirty_hi = MAX(s->stage_dirty_hi, off + len);
+    } else {
+        s->stage_dirty_lo = off;
+        s->stage_dirty_hi = off + len;
+    }
+    r300_rt_forget(off, off + len);
+
+    pkt->rt_gpu_addr = off;
+    pkt->rt_pitch = srow / pkt->rt_bpp;     /* rt_width stays the buffer's */
+    rr = s->renderer->draw_r300(s->renderer_opaque, vram,
+                                s->vram_size + s->stage_size, pkt);
+    pkt->rt_gpu_addr = dst;
+    pkt->rt_pitch = pitch;
+    if (rr < 0) {
+        return -1;                          /* PPC_MAC_GPU_DRAW_REMAP again: no */
+    }
+    r200_vram_access(s, off, off + len, false, 9);              /* the draw */
+    if (s->reset_count != resets) {
+        r300_warn_once("staged colour buffer not copied back: device reset", NULL);
+    } else if (r300_gpu_failures(s) != failures) {
+        r300_warn_once("staged colour buffer not copied back: GPU work failed", NULL);
+    } else {
+        /* A write to VRAM from this side: whatever still reads or draws
+         * these bytes goes first, and the texture caches hear of it. */
+        r200_vram_access(s, dst, dst + (uint64_t)row * rows, true, 9);
+        if (s->reset_count == resets) {
+            for (uint32_t y = 0; y < rows; y++) {
+                memcpy(vram + dst + (uint64_t)y * row, vram + off + (uint64_t)y * srow, row);
+            }
+            memory_region_set_dirty(&s->vram, dst, (uint64_t)row * rows);
+        }
+    }
+    usec += g_get_monotonic_time() - t0;
+    count++;
+    if (count == 1) {
+        qemu_log("ppc-mac-gpu r300: colour buffer %06x (%ux%u, %u B a row) is not "
+                 "where the renderer can draw it: drawn in the private staging "
+                 "and copied back (%.2f ms)\n", dst, pkt->rt_width, rows, row,
+                 usec / 1000.0);
+    }
+    if (count == 2 || count == 10 || count == 100 || count % 1000 == 0) {
+        qemu_log("ppc-mac-gpu r300: %llu colour buffers drawn in the staging "
+                 "so far, %.1f ms in all\n", (unsigned long long)count, usec / 1000.0);
+    }
+    return rr;
+}
+
 static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                         uint32_t body_dw, const R300Indices *idx)
 {
@@ -4117,6 +4229,11 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         int rr = sys_ok ? s->renderer->draw_r300(s->renderer_opaque, vram,
                                                  s->vram_size + (sys.len ? s->stage_size : 0),
                                                  &pkt) : 0;
+        if (rr == PPC_MAC_GPU_DRAW_REMAP) {
+            /* (a system-memory buffer is in the staging already, rows as
+             * the guest's: not moved again) */
+            rr = sys.len ? -1 : r300_draw_staged(s, vram, &pkt);
+        }
         if (sys.len && sys_ok && rr >= 0) {
             r300_xfer_end(s, &sys, vram);
         }

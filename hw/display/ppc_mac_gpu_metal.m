@@ -8796,26 +8796,38 @@ static void r300_metal_warn(uint32_t bit, const char *msg)
     }
 }
 
-/* A colour buffer the draw is dropped for, with the numbers (the first few). */
-static void r300_metal_cb_unusable(const R300DrawPacket *pkt, uint32_t addr,
-                                   uint32_t bpr, NSUInteger align,
-                                   uint64_t vram_size)
+/*
+ * A colour buffer that cannot be mapped as a linear texture, with the
+ * numbers (the first few).  Returns -1 when it is outside video memory or
+ * has no rows; PPC_MAC_GPU_DRAW_REMAP when only its address or its bytes a
+ * row are in the way, and the device can draw it elsewhere.
+ */
+static int r300_metal_cb_unusable(const R300DrawPacket *pkt, uint32_t addr,
+                                  uint32_t bpr, NSUInteger align,
+                                  uint64_t vram_size)
 {
     static unsigned said;
-    char why[64];
+    bool remap = bpr && (uint64_t)addr + (uint64_t)bpr * pkt->rt_height <= vram_size;
+    char why[112];
 
-    r300_metal_warn(1, "colour buffer unusable as a linear view");
+    if (!remap) {
+        r300_metal_warn(1, "colour buffer unusable as a linear view");
+    }
     if (said < 8) {
         said++;
-        snprintf(why, sizeof(why), "address and row must be multiples of %lu B",
-                 (unsigned long)align);
+        if (remap) {
+            snprintf(why, sizeof(why), "address and row must be multiples of %lu B "
+                     "to be drawn in place; handed back to be drawn elsewhere",
+                     (unsigned long)align);
+        } else {
+            snprintf(why, sizeof(why), "%s, not drawn",
+                     bpr ? "past the end of video memory" : "no rows");
+        }
         qemu_log("ppc-mac-gpu r300: colour buffer %06x, %ux%u, %u px a row "
                  "of %u B = %u B, view %u: %s\n", addr, pkt->rt_width,
-                 pkt->rt_height, pkt->rt_pitch, pkt->rt_bpp, bpr, pkt->rt_view,
-                 !bpr ? "no rows" :
-                 (uint64_t)addr + (uint64_t)bpr * pkt->rt_height > vram_size ?
-                     "past the end of video memory" : why);
+                 pkt->rt_height, pkt->rt_pitch, pkt->rt_bpp, bpr, pkt->rt_view, why);
     }
+    return remap ? PPC_MAC_GPU_DRAW_REMAP : -1;
 }
 
 /*
@@ -9630,8 +9642,7 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
         if ((addr % align) || (bpr % align) || !bpr ||
             (uint64_t)addr + (uint64_t)bpr * pkt->rt_height > vram_size) {
             if (k == 0) {
-                r300_metal_cb_unusable(pkt, addr, bpr, align, vram_size);
-                return -1;
+                return r300_metal_cb_unusable(pkt, addr, bpr, align, vram_size);
             }
             r300_metal_warn(256, "render target B-D unusable as a linear view");
             ncb = k;
@@ -9878,7 +9889,8 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
 }
 
 /* A draw's deterministic rejections, as r200_draw_rejects().  Returns
- * -1 (rejected), 1 (nothing to draw) or 0 (encode it). */
+ * -1 (rejected), PPC_MAC_GPU_DRAW_REMAP, 1 (nothing to draw) or 0 (encode
+ * it). */
 static int r300_draw_rejects(PPCMacGPUMetalState *st, uint64_t vram_size,
                              const R300DrawPacket *pkt)
 {
@@ -9915,8 +9927,7 @@ static int r300_draw_rejects(PPCMacGPUMetalState *st, uint64_t vram_size,
         if ((addr % align) || (bpr % align) || !bpr ||
             (uint64_t)addr + (uint64_t)bpr * pkt->rt_height > vram_size) {
             if (k == 0) {
-                r300_metal_cb_unusable(pkt, addr, bpr, align, vram_size);
-                return -1;
+                return r300_metal_cb_unusable(pkt, addr, bpr, align, vram_size);
             }
             break;      /* targets B-D are dropped, as the encode side does */
         }
@@ -9942,7 +9953,7 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     }
     r = r300_draw_rejects(st, vram_size, pkt);
     if (r) {
-        return r < 0 ? -1 : 0;      /* rejected, or nothing to draw */
+        return r < 0 ? r : 0;       /* rejected, or nothing to draw */
     }
     /* The job takes the packet's heap buffers over (see r300_job_new);
      * the device's r300_draw_free frees what is left. */

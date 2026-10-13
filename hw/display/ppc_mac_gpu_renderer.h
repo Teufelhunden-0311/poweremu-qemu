@@ -352,7 +352,15 @@ typedef struct PPCMacGPURenderer {
      * tex[].host_data, nulling them in pkt); after the call the packet's
      * scalar fields may still be read, and r300_draw_free() frees what is
      * left.
+     *
+     * Returns 0, or -1 for a draw it does not render, or
+     * PPC_MAC_GPU_DRAW_REMAP: nothing was drawn or taken over, because the
+     * first colour buffer cannot be drawn where it is (its address or its
+     * bytes a row; Metal maps it as a linear texture) though it could be
+     * elsewhere.  The device then draws it in its private staging, in rows
+     * of R300_STAGE_ROW bytes' multiples, and copies it back.
      */
+#define PPC_MAC_GPU_DRAW_REMAP (-2)
     int (*draw_r300)(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
                      const struct R300DrawPacket *pkt);
 
