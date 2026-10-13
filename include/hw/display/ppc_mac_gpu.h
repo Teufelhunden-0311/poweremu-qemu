@@ -713,6 +713,7 @@ struct PPCMacGPUState {
     PPCMacGPUDisplayMode disp;  /* Current display mode */
     QEMUTimer vblank_timer;     /* VBlank interrupt timer */
     Notifier exit_notifier;     /* finish drawing before exit() */
+    struct VMChangeStateEntry *vm_state;    /* and whenever the machine stops */
     bool display_invalid;       /* Display needs full redraw */
 
     /* PM4 PIO FIFO for CP command processing */

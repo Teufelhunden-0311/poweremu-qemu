@@ -46,6 +46,7 @@
 #include "ui/console.h"
 #include "ui/qemu-pixman.h"
 #include "system/system.h"
+#include "system/runstate.h"
 #include "hw/display/ppc_mac_gpu_vp.h"
 #include "trace.h"
 
@@ -10491,24 +10492,9 @@ static void ppc_mac_gpu_cp_stop(void)
     cp.started = false;
 }
 
-/*
- * exit() runs the host libraries' destructors while every other thread
- * goes on: a CP thread still drawing would call into a renderer that is
- * being taken apart (an abort in the Vulkan validation layer at quit looked
- * like that, though it was not reproduced).  So stop the producers first
- * and let the renderer finish what it was given.  QEMU does not unrealize
- * devices when it quits, hence the notifier; it is called with the BQL.
- * Only exit() from another thread comes through here: not abort(), _exit()
- * or a kill, and not exit() from the CP thread itself.
- */
-static void ppc_mac_gpu_exit_notify(Notifier *n, void *data)
+/* Wait for the draw workers and the renderer to finish.  BQL held. */
+static void ppc_mac_gpu_drain(PPCMacGPUState *s)
 {
-    PPCMacGPUState *s = container_of(n, PPCMacGPUState, exit_notifier);
-
-    if (ppc_mac_gpu_cp_on_thread()) {
-        return;
-    }
-    ppc_mac_gpu_cp_stop();
     /*
      * A draw worker job may be waiting for the BQL (a synchronous
      * renderer is called under it), so the queue is waited for without.
@@ -10521,6 +10507,64 @@ static void ppc_mac_gpu_exit_notify(Notifier *n, void *data)
         bql_lock();
     }
     r200_flush(s);
+}
+
+/*
+ * The machine stopped: a pause, a snapshot, or the last stop before QEMU
+ * exits.  The virtual CPUs are stopped by now, so once the work in hand is
+ * finished the GPU threads stay idle until the machine runs again.
+ *
+ * At a quit that is what keeps them out of the host's libraries while
+ * exit() takes those apart.  The exit notifier below comes too late for
+ * it: exit() calls its handlers newest first, QEMU registers the one that
+ * runs the notifiers at startup, and a C++ static constructed on first use
+ * registers its destructor then -- so it is destroyed before the notifier
+ * is called.  A draw still queued at that point crashed translating its
+ * shader (SPIRV-Cross's table of reserved names; two crash reports of
+ * 2026-10-11).  An ordinary quit leaves the threads time to catch up; a
+ * backlog, as a frame capture ($R300_CAP) makes, does not.
+ */
+static void ppc_mac_gpu_vm_state(void *opaque, bool running, RunState state)
+{
+    PPCMacGPUState *s = opaque;
+
+    if (!running) {
+        ppc_mac_gpu_cp_sync(s, ~(hwaddr)0);     /* the ring, to its end */
+        ppc_mac_gpu_drain(s);
+    }
+}
+
+/*
+ * exit() runs the host libraries' destructors while every other thread
+ * goes on: a CP thread still drawing would call into a renderer that is
+ * being taken apart (an abort in the Vulkan validation layer at quit looked
+ * like that, though it was not reproduced).  So stop the producers and let
+ * the renderer finish what it was given.  QEMU does not unrealize devices
+ * when it quits, hence the notifier.
+ *
+ * A quit stops the machine first, and ppc_mac_gpu_vm_state() has left
+ * nothing to do here.  This is for exit() called anywhere else, where it
+ * is the best that can be done: some statics are gone already (see there).
+ * It is called with or without the BQL (QEMU's own exit has released it).
+ * Not reached by abort(), _exit() or a kill, and exit() from the CP thread
+ * itself is left alone.
+ */
+static void ppc_mac_gpu_exit_notify(Notifier *n, void *data)
+{
+    PPCMacGPUState *s = container_of(n, PPCMacGPUState, exit_notifier);
+    bool locked = bql_locked();
+
+    if (ppc_mac_gpu_cp_on_thread()) {
+        return;
+    }
+    ppc_mac_gpu_cp_stop();
+    if (!locked) {
+        bql_lock();
+    }
+    ppc_mac_gpu_drain(s);       /* what is left in the ring is not begun */
+    if (!locked) {
+        bql_unlock();
+    }
 }
 
 /* The last command packets pushed in by hand, for the stall report. */
@@ -13529,6 +13573,7 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
     ppc_mac_gpu_cp_start(s);
     s->exit_notifier.notify = ppc_mac_gpu_exit_notify;
     qemu_add_exit_notifier(&s->exit_notifier);
+    s->vm_state = qemu_add_vm_change_state_handler(ppc_mac_gpu_vm_state, s);
 
     /* BAR1: I/O space alias to first 256 bytes of MMIO */
     memory_region_init_alias(&s->io, obj, "ppc-mac-gpu-io",
@@ -13902,6 +13947,7 @@ static void ppc_mac_gpu_exit(PCIDevice *dev)
 {
     PPCMacGPUState *s = PPC_MAC_GPU(dev);
 
+    qemu_del_vm_change_state_handler(s->vm_state);
     qemu_remove_exit_notifier(&s->exit_notifier);
     ppc_mac_gpu_cp_stop();
     timer_del(&s->vblank_timer);
