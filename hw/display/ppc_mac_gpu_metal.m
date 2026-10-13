@@ -9500,8 +9500,10 @@ static id<MTLTexture> r300_texture(PPCMacGPUMetalState *st, id<MTLDevice> dev,
         /* Zero-copy view over VRAM. */
         NSUInteger align = [dev minimumLinearTextureAlignmentForPixelFormat:pf];
         if ((td->gpu_addr % align) || (td->pitch_bytes % align)) {
-            r300_metal_warn(8, "texture not aligned for a linear view");
-            return nil;
+            /* No linear view of rows like these (a micro-tiled 8-bit
+             * texture's are a multiple of 8 bytes): a copy, as for the
+             * textures with mip levels. */
+            return r300_texture_full(st, dev, vram_ptr, td);
         }
         R200TexKey k = { td->gpu_addr, td->width, td->height, td->pitch_bytes,
                          (uint32_t)pf };

@@ -289,6 +289,39 @@ int main(void)
             CHECK(nm == 2, "mip filter none uses MAX_MIP_LEVEL %g", nm);
         }
 
+        /* ---- Y4X4 8x8, 4 levels, micro-tiled as 8-bit texels are: rows of
+         * 8 bytes, every level a multiple of four rows.  The rows of level
+         * L hold X = L, the rows added for the microtile 15. ---- */
+        {
+            R300TexDesc td;
+            memset(&td, 0, sizeof(td));
+            td.width = td.height = 8; td.levels = 4; td.depth = 1; td.tiling = 3;
+            r300_tex_layout(&td, 1, false, false);
+            CHECK(td.lvl_pitch[0] == 8 && td.lvl_off[1] == 64 && td.lvl_off[2] == 96 &&
+                  td.lvl_off[3] == 128 && td.size_bytes == 160, "8x8 Y4X4 layout %u %u %u %u",
+                  td.lvl_off[1], td.lvl_off[2], td.lvl_off[3], td.size_bytes);
+            static uint8_t mem[256];
+            memset(mem, 0xFF, sizeof(mem));
+            for (uint32_t l = 0; l < 4; l++) {
+                memset(mem + td.lvl_off[l], l, td.lvl_pitch[l] * (8u >> l));
+            }
+            R300FSUniforms u = base_uniforms();
+            u.tex_info[0][0] = 1; u.tex_info[0][1] = td.lvl_pitch[0] / 4;
+            u.tex_info[0][2] = 8; u.tex_info[0][3] = 8;
+            u.tex_lod[0][0] = 0; u.tex_lod[0][1] = 0; u.tex_lod[0][2] = 3; u.tex_lod[0][3] = 1;
+            u.tex_dim[0][0] = 0; u.tex_dim[0][1] = 1; u.tex_dim[0][2] = td.lvl_pitch[0];
+            u.tex_dim[0][3] = R300_TEXF_POT_ROWS | R300_TEXF_MICROTILE8;
+            float l0 = raw_sample(0x02, 0, mem, td.size_bytes, &u, 64, NULL) * 15;
+            float l1 = raw_sample(0x02, 0, mem, td.size_bytes, &u, 4, NULL) * 15;
+            float l2 = raw_sample(0x02, 0, mem, td.size_bytes, &u, 2, NULL) * 15;
+            float l3 = raw_sample(0x02, 0, mem, td.size_bytes, &u, 1, NULL) * 15;
+            CHECK(fabsf(l0) < 0.01f && fabsf(l1 - 1) < 0.01f && fabsf(l2 - 2) < 0.01f &&
+                  fabsf(l3 - 3) < 0.01f, "8-bit micro-tiled mip levels %g %g %g %g", l0, l1, l2, l3);
+            u.tex_dim[0][3] = R300_TEXF_POT_ROWS;       /* read untiled, the levels are elsewhere */
+            float w2 = raw_sample(0x02, 0, mem, sizeof(mem), &u, 2, NULL) * 15;
+            CHECK(fabsf(w2 - 2) > 0.01f, "the 8-bit layout flag changes nothing (%g)", w2);
+        }
+
         /* ---- 32F 2x2x2 volume: slice from r ---- */
         {
             R300TexDesc td;

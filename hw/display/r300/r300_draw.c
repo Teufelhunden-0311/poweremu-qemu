@@ -549,11 +549,16 @@ void r300_tex_level_dims(const R300TexDesc *td, uint32_t l, uint32_t *w,
     }
 }
 
-/* Whether a texture is laid out in 16-byte by 2-row microtiles (see
- * r300_tex_layout). */
-bool r300_tex_microtiled(uint32_t tiling, uint32_t bpp, bool dxt)
+/* The microtile a texture's levels are padded to (see r300_tex_layout). */
+unsigned r300_tex_microtile(uint32_t tiling, uint32_t bpp, bool dxt)
 {
-    return ((tiling >> 1) & 3) == 1 && (dxt ? bpp == 8 : bpp == 2 || bpp == 4);
+    if (((tiling >> 1) & 3) != 1) {
+        return R300_MT_NONE;            /* untiled, or square microtiles */
+    }
+    if (dxt) {
+        return bpp == 8 ? R300_MT_16X2 : R300_MT_NONE;
+    }
+    return bpp == 1 ? R300_MT_8X4 : bpp == 2 || bpp == 4 ? R300_MT_16X2 : R300_MT_NONE;
 }
 
 /* The hardware's addressing, as Mesa's r300_texture_desc.c lays out
@@ -578,23 +583,43 @@ bool r300_tex_microtiled(uint32_t tiling, uint32_t bpp, bool dxt)
  *   DXT1 1024x256: the 16x4 level (one row of four blocks, 32 bytes)
  *   takes 64 bytes, the levels after it 32 each;
  *   DXT3 512x256: the 8x4 level (one row of two blocks) takes 32 bytes.
- * (The driver also leaves a copy of each one-row level where it would
- * sit without the height rule; which copy the card samples is taken from
- * the textures' extents, not from a probe on hardware.)
+ * 8-bit texels: Mesa's table has 8 texels by 4 rows, and that is where
+ * the driver put the levels of tests/r300/texprobe's textures (same
+ * driver, in this emulator's memory):
+ *   A8 16x16: rows 16, 8, 8, 8 and 8 bytes apart, levels at 0x100, 0x140,
+ *   0x160 and 0x180;
+ *   A8 1024x4: levels at 0x1000, 0x1800, 0x1c00, 0x1e00, 0x1f00, 0x1f80:
+ *   the 512x2 level and each one-row level four rows.
+ *
+ * The driver's commands say the same ($PPCGPU_SEQ_LOG): it uploads a level
+ * with one blit, from a source in AGP memory where the levels follow one
+ * another untiled, to these offsets and pitches, the rectangle rounded up
+ * to whole microtiles.  A8 1024x4: 512x4 to +0x1000 at pitch 512, 256x4
+ * to +0x1800, ... 8x4 to +0x1fc0 at pitch 8.  ARGB8888 1024x4: 256x2 to
+ * +0x5000 at pitch 1024, ... 4x2 to +0x5fc0 at pitch 16.  The rows a blit
+ * adds carry what comes next in the source, the smaller levels, which is
+ * why memory holds each of those more than once.  What a real card's
+ * memory holds after such a blit, and in what order, has not been
+ * observed.
  *
  * This is a compatibility model for those layouts, applied to every
- * 2-byte and 4-byte texel format, DXT1, and 3D slices alike, not a model
- * of tiling.  The order of texels inside a tiled level is not modelled,
- * here or where the guest's writes land; for the upload paths seen the
- * levels read back in row order.  Macro tiling is not modelled at all.
- * The microtiles of 8-bit texels (8 by 4) and the square ones of 16-bit
- * texels (4 by 4) stay on the untiled rule, unmeasured.  Rows that are
- * not a multiple of 32 bytes but more than 16 follow Mesa (multiples of
- * 16) without having been measured. */
+ * 1-byte, 2-byte and 4-byte texel format, DXT1, and 3D slices alike, not
+ * a model of tiling.  The order of texels inside a tiled level is not
+ * modelled, here or where the guest's writes land; for the upload paths
+ * seen the levels read back in row order.  Macro tiling is not modelled
+ * at all: texprobe's 2048x8 and 8x2048 chains (wider or taller than a
+ * macrotile, not both) lie as without it.  The square microtiles of
+ * 16-bit texels (4 by 4) and 8-byte texels stay on the untiled rule,
+ * unmeasured.  Rows that are not a multiple of 32 bytes but more than 16
+ * follow Mesa (multiples of the microtile's width) without having been
+ * measured. */
 void r300_tex_layout(R300TexDesc *td, uint32_t bpp, bool dxt, bool pitch_en)
 {
     bool pot_rows = td->levels > 1 || td->dim != R300_TEXDIM_2D;
-    bool micro = r300_tex_microtiled(td->tiling, bpp, dxt);
+    unsigned mt = r300_tex_microtile(td->tiling, bpp, dxt);
+    /* a row a multiple of ra + 1 bytes, a face of ha + 1 rows */
+    uint32_t ra = mt == R300_MT_8X4 ? 7 : mt == R300_MT_16X2 ? 15 : 31;
+    uint32_t ha = mt == R300_MT_8X4 ? 3 : mt == R300_MT_16X2 ? 1 : 0;
     uint32_t off = 0;
 
     for (uint32_t l = 0; l < td->levels; l++) {
@@ -611,11 +636,11 @@ void r300_tex_layout(R300TexDesc *td, uint32_t bpp, bool dxt, bool pitch_en)
             pitch = w * bpp;
             rows = h;
         }
-        pitch = micro ? (pitch + 15) & ~15u : (pitch + 31) & ~31u;
+        pitch = (pitch + ra) & ~ra;
         if (l == 0 && pitch_en) {
             pitch = td->pitch_bytes;
         }
-        face = pitch * (micro ? (rows + 1) & ~1u : rows);
+        face = pitch * ((rows + ha) & ~ha);
         td->lvl_off[l] = off;
         td->lvl_pitch[l] = pitch;
         td->lvl_rows[l] = rows;
@@ -890,7 +915,10 @@ static void set_textures(const R300State *st, R300DrawPacket *pkt)
         u->tex_dim[k][3] = ((f1 >> 8) & 1) | ((f1 >> 6) & 2) | ((f1 >> 4) & 4) |
                            ((f1 >> 2) & 8) | ((f1 >> 21) & 1 ? R300_TEXF_GAMMA : 0) |
                            (t->levels > 1 || t->dim != R300_TEXDIM_2D ? R300_TEXF_POT_ROWS : 0) |
-                           (r300_tex_microtiled(t->tiling, bpp, dxt) ? R300_TEXF_MICROTILED : 0) |
+                           (r300_tex_microtile(t->tiling, bpp, dxt) == R300_MT_16X2 ?
+                            R300_TEXF_MICROTILED : 0) |
+                           (r300_tex_microtile(t->tiling, bpp, dxt) == R300_MT_8X4 ?
+                            R300_TEXF_MICROTILE8 : 0) |
                            (t->kind == R300_TEXK_DXT1 ? R300_TEXF_DXT1_ALPHA : 0);
     }
 }

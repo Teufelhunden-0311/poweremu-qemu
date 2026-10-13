@@ -158,13 +158,40 @@ static void rendering_completeness(void)
     r300_tex_layout(&t, 16, true, false);           /* DXT3: no microtile */
     CHECK(t.lvl_off[6] == 0x2aa80 && t.lvl_off[7] == 0x2aaa0 && t.lvl_off[9] == 0x2aae0 &&
           t.size_bytes == 0x2ab00, "512x256 dxt3 %x %x", t.lvl_off[7], t.size_bytes);
-    /* Not measured, so on the untiled rule though micro-tiled: 8-bit
-     * texels, square microtiles; and macro tiling alone. */
+    /* 8-bit texels: 8 bytes by 4 rows.  Where the driver put the levels
+     * of tests/r300/texprobe's A8 textures. */
     memset(&t, 0, sizeof(t));
-    t.width = t.height = 4; t.levels = 3; t.depth = 1; t.tiling = 3;
+    t.width = t.height = 16; t.levels = 5; t.depth = 1; t.tiling = 3;
     r300_tex_layout(&t, 1, false, false);
-    CHECK(t.lvl_pitch[0] == 32 && t.lvl_off[1] == 128 && t.size_bytes == 224, "4x4 X8 %u %u",
+    CHECK(t.lvl_pitch[0] == 16 && t.lvl_pitch[1] == 8 && t.lvl_pitch[4] == 8 &&
+          t.lvl_off[1] == 0x100 && t.lvl_off[2] == 0x140 && t.lvl_off[3] == 0x160 &&
+          t.lvl_off[4] == 0x180 && t.size_bytes == 0x1a0, "16x16 X8 %x %x %x %x %x",
+          t.lvl_off[1], t.lvl_off[2], t.lvl_off[3], t.lvl_off[4], t.size_bytes);
+    memset(&t, 0, sizeof(t));
+    t.width = 1024; t.height = 4; t.levels = 11; t.depth = 1; t.tiling = 3;
+    r300_tex_layout(&t, 1, false, false);           /* the 512x2 and one-row levels take four */
+    CHECK(t.lvl_off[1] == 0x1000 && t.lvl_off[2] == 0x1800 && t.lvl_off[3] == 0x1c00 &&
+          t.lvl_off[4] == 0x1e00 && t.lvl_off[5] == 0x1f00 && t.lvl_off[6] == 0x1f80 &&
+          t.lvl_off[7] == 0x1fc0 && t.lvl_off[10] == 0x2020 && t.size_bytes == 0x2040,
+          "1024x4 X8 %x %x %x %x", t.lvl_off[2], t.lvl_off[6], t.lvl_off[10], t.size_bytes);
+    memset(&t, 0, sizeof(t));
+    t.width = t.height = 4; t.levels = 3; t.depth = 1;
+    r300_tex_layout(&t, 1, false, false);           /* untiled X8 keeps 32-byte rows */
+    CHECK(t.lvl_pitch[0] == 32 && t.lvl_off[1] == 128 && t.size_bytes == 224, "4x4 X8 untiled %u %u",
           t.lvl_off[1], t.size_bytes);
+    t.tiling = 5;                                   /* macro + square: not measured */
+    r300_tex_layout(&t, 1, false, false);
+    CHECK(t.lvl_pitch[0] == 32 && t.size_bytes == 224, "4x4 X8 square %u", t.size_bytes);
+    CHECK(r300_tex_microtile(3, 1, false) == R300_MT_8X4 &&
+          r300_tex_microtile(3, 2, false) == R300_MT_16X2 &&
+          r300_tex_microtile(3, 4, false) == R300_MT_16X2 &&
+          r300_tex_microtile(3, 8, true) == R300_MT_16X2 &&
+          r300_tex_microtile(3, 8, false) == R300_MT_NONE &&
+          r300_tex_microtile(3, 16, true) == R300_MT_NONE &&
+          r300_tex_microtile(1, 1, false) == R300_MT_NONE &&
+          r300_tex_microtile(4, 1, false) == R300_MT_NONE, "microtile classes");
+    /* Not measured, so on the untiled rule though micro-tiled: DXT3/5,
+     * square microtiles; and macro tiling alone. */
     memset(&t, 0, sizeof(t));
     t.width = 4; t.height = 16; t.levels = 1; t.depth = 1; t.tiling = 3;
     r300_tex_layout(&t, 16, true, false);
@@ -213,6 +240,14 @@ static void rendering_completeness(void)
     CHECK(p.tex[0].gpu_addr == 0x00100000 && p.tex[0].tiling == 3 &&
           p.tex[0].size_bytes == 16384 + 4096 + 1024 + 256 + 64 + 32 + 32 &&
           (p.uniforms.tex_dim[0][3] & R300_TEXF_MICROTILED), "micro-tiled: size %u flags %x",
+          p.tex[0].size_bytes, p.uniforms.tex_dim[0][3]);
+    r300_draw_free(&p);
+    r300_state_write(&st, 0x44C0, 0x00);                                   /* X8, same unit */
+    r300_draw_build(&st, &none, 0x35, d, n, rd, NULL, &p, &err);
+    CHECK(p.tex[0].kind == R300_TEXK_R8 && p.tex[0].lvl_pitch[3] == 8 &&
+          p.tex[0].size_bytes == 4096 + 1024 + 256 + 64 + 32 + 32 + 32 &&
+          (p.uniforms.tex_dim[0][3] & (R300_TEXF_MICROTILED | R300_TEXF_MICROTILE8)) ==
+          R300_TEXF_MICROTILE8, "micro-tiled X8: size %u flags %x",
           p.tex[0].size_bytes, p.uniforms.tex_dim[0][3]);
     r300_draw_free(&p);
     r300_state_write(&st, 0x4540, 0x00100000);

@@ -75,7 +75,8 @@ typedef struct R300TexDesc {
      * back to back.  Rows are 32-byte aligned below level 0 (and at level
      * 0 without TX_PITCH_EN), or, in a micro-tiled texture of 16-bit
      * or 32-bit texels or DXT1, 16-byte aligned with an even number of
-     * rows to a face or slice.  Heights round up to a power of two when the
+     * rows to a face or slice; of 8-bit texels, 8-byte aligned with a
+     * multiple of four rows.  Heights round up to a power of two when the
      * texture has mip levels or is 3D or a cube.
      */
     uint32_t dim;               /* R300_TEXDIM_* */
@@ -102,7 +103,11 @@ void r300_tex_level_dims(const R300TexDesc *td, uint32_t l, uint32_t *w,
 
 /* Fill the layout fields of td from its size, format, dim and levels;
  * bpp is bytes per texel (per 4x4 block for DXT, flagged by dxt). */
-bool r300_tex_microtiled(uint32_t tiling, uint32_t bpp, bool dxt);
+/* How r300_tex_layout pads the levels of a texture with these TX_OFFSET
+ * tiling bits: not at all, or to microtiles of 16 bytes by 2 rows (16-bit
+ * and 32-bit texels, DXT1 blocks) or of 8 bytes by 4 rows (8-bit texels). */
+enum { R300_MT_NONE = 0, R300_MT_16X2, R300_MT_8X4 };
+unsigned r300_tex_microtile(uint32_t tiling, uint32_t bpp, bool dxt);
 void r300_tex_layout(R300TexDesc *td, uint32_t bpp, bool dxt, bool pitch_en);
 
 /* A TX_BORDER_COLOR dword as the unit's XYZW before the swizzle: packed
