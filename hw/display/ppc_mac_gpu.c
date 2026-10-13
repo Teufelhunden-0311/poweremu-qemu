@@ -3785,12 +3785,22 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                     r300_reg(s->r3, 0x43E4), r300_reg(s->r3, 0x4F00),
                     r300_reg(s->r3, 0x4E04), r300_reg(s->r3, 0x4E0C));
         }
-        seq_log("R3D  rt=%06x/%u tex0=%s%06x %ux%u/%u vf=%08x v0=%08x %08x",
-                r300_reg(s->r3, 0x4E28) & ~0x1Fu,
-                (r300_reg(s->r3, 0x4E38) & 0x3FFE) * 4,
+        /* Pitches in pixels and in bytes: the colour buffer's from its
+         * format (an 8-bit target's row is a quarter of a 32-bit one's);
+         * the texture's in texels only, its registers given raw. */
+        uint32_t cp = r300_reg(s->r3, 0x4E38), ofmt = r300_reg(s->r3, 0x46A4);
+        uint32_t cbpp = 0;
+        r300_cb_view((cp >> 21) & 0xF, ofmt, &cbpp);
+        seq_log("R3D  rt=%06x colorpitch=%08x fmt=%u endian=%u tile=%u %uB/px "
+                "pitch=%upx=%uB outfmt=%08x tex0=%s%06x txoffset=%08x %ux%u "
+                "pitch=%utx f0=%08x f1=%08x f2=%08x vf=%08x v0=%08x %08x",
+                r300_reg(s->r3, 0x4E28) & ~0x1Fu, cp, (cp >> 21) & 0xF,
+                (cp >> 19) & 3, (cp >> 16) & 7, cbpp, cp & 0x3FFE,
+                (cp & 0x3FFE) * cbpp, ofmt,
                 (r300_reg(s->r3, 0x4104) & 1) ? "" : "(off)",
-                r300_reg(s->r3, 0x4540) & ~0x1Fu, (f0 & 0x7FF) + 1,
-                ((f0 >> 11) & 0x7FF) + 1, ((f2 & 0x3FFF) + 1) * 4,
+                r300_reg(s->r3, 0x4540) & ~0x1Fu, r300_reg(s->r3, 0x4540),
+                (f0 & 0x7FF) + 1, ((f0 >> 11) & 0x7FF) + 1, (f2 & 0x3FFF) + 1,
+                f0, r300_reg(s->r3, 0x44C0), f2,
                 body_dw ? d[0] : 0, body_dw > 1 ? d[1] : 0,
                 body_dw > 2 ? d[2] : 0);
     }

@@ -8796,6 +8796,28 @@ static void r300_metal_warn(uint32_t bit, const char *msg)
     }
 }
 
+/* A colour buffer the draw is dropped for, with the numbers (the first few). */
+static void r300_metal_cb_unusable(const R300DrawPacket *pkt, uint32_t addr,
+                                   uint32_t bpr, NSUInteger align,
+                                   uint64_t vram_size)
+{
+    static unsigned said;
+    char why[64];
+
+    r300_metal_warn(1, "colour buffer unusable as a linear view");
+    if (said < 8) {
+        said++;
+        snprintf(why, sizeof(why), "address and row must be multiples of %lu B",
+                 (unsigned long)align);
+        qemu_log("ppc-mac-gpu r300: colour buffer %06x, %ux%u, %u px a row "
+                 "of %u B = %u B, view %u: %s\n", addr, pkt->rt_width,
+                 pkt->rt_height, pkt->rt_pitch, pkt->rt_bpp, bpr, pkt->rt_view,
+                 !bpr ? "no rows" :
+                 (uint64_t)addr + (uint64_t)bpr * pkt->rt_height > vram_size ?
+                     "past the end of video memory" : why);
+    }
+}
+
 /*
  * A stage of a r300_us_to_glsl() source as a Metal function: GLSL ->
  * SPIR-V -> MSL (r300_spirv.c), compiled once per source and stage.
@@ -9608,7 +9630,7 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
         if ((addr % align) || (bpr % align) || !bpr ||
             (uint64_t)addr + (uint64_t)bpr * pkt->rt_height > vram_size) {
             if (k == 0) {
-                r300_metal_warn(1, "colour buffer unusable as a linear view");
+                r300_metal_cb_unusable(pkt, addr, bpr, align, vram_size);
                 return -1;
             }
             r300_metal_warn(256, "render target B-D unusable as a linear view");
@@ -9893,7 +9915,7 @@ static int r300_draw_rejects(PPCMacGPUMetalState *st, uint64_t vram_size,
         if ((addr % align) || (bpr % align) || !bpr ||
             (uint64_t)addr + (uint64_t)bpr * pkt->rt_height > vram_size) {
             if (k == 0) {
-                r300_metal_warn(1, "colour buffer unusable as a linear view");
+                r300_metal_cb_unusable(pkt, addr, bpr, align, vram_size);
                 return -1;
             }
             break;      /* targets B-D are dropped, as the encode side does */
