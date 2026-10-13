@@ -10,7 +10,9 @@ emulator's own layout (the L lines of the log) names one of those places.
 That is where the emulator stored the texels while executing the driver's
 commands.  A row found in several places is listed in all of them; "ok" means
 the emulator's offset is among them, which does not single it out.  The
-texel rules are those of texprobe.c.  Exit status 1 when a level differs."""
+texel rules are those of texprobe.c.  Exit status 1 when a level differs, 2 when
+nothing differs but not every case of the stage was captured and checked (the
+capture is best effort; an empty one proves nothing)."""
 import sys, re, glob, os, struct
 
 SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "texprobe.c")
@@ -149,7 +151,7 @@ def main():
         if m:
             lv = [tuple(int(v) for v in g.split()) for g in m.group(6).split("|")[1:]]
             lay[(int(m.group(1)), int(m.group(2), 16))] = dict(swap=int(m.group(3)), size=int(m.group(5)), lv=lv)
-    bad = 0
+    bad = nlev = nolayout = 0
     seen = set()
     for path in sorted(glob.glob(pre + ".t*_d*_f*_*x*_p*.bin"), key=lambda p: int(re.search(r"_d(\d+)_", p).group(1))):
         m = re.search(r"\.t([0-9a-f]+)_d(\d+)_f([0-9a-f]+)_(\d+)x(\d+)_p(\d+)\.bin$", path)
@@ -189,17 +191,26 @@ def main():
                     # every row of the level, where the sampler will look for it
                     whole = all(d[want[0] + y * lp:want[0] + y * lp + len(r0)] ==
                                 row(c, c["id"], face, lv, y, subs) for y in range(nrows(c, lv)))
-                if not whole:
-                    bad += 1
+                if want is None:
+                    nolayout += 1
+                else:
+                    nlev += 1
+                    bad += not whole
                 if want is not None and whole:
                     end = max(end, want[0] + lp * (nrows(c, lv) - 1) + len(r0))
                 print("  lv%-2d f%d %4dx%-4d row %5d B: row 0 found at %s | emulator %s: %s" % (
                     lv, face, dim(w, lv), dim(h, lv), len(r0),
                     ",".join("%#x" % o for o in offs[:8]) + ("..." if len(offs) > 8 else "") if offs else "NOWHERE",
                     ("%#x pitch %d" % want) if want else "?",
-                    "whole level there" if whole else "DIFFERS"))
+                    "whole level there" if whole else "DIFFERS" if want else "not checked"))
         print("  data ends at %#x" % end)
-    print("\nlevels that differ from the emulator's layout: %d" % bad)
-    return 1 if bad else 0
+    missing = sorted(c["id"] for c in cs if not any(i == c["id"] for i, _ in seen))
+    print("\ntextures examined: %d of %d cases; levels and faces checked: %d; without a layout line: %d" % (
+        len(set(i for i, _ in seen)), len(cs), nlev, nolayout))
+    if missing:
+        print("cases with no capture (not checked): %s" % " ".join("T%02d" % i for i in missing))
+    print("levels that differ from the emulator's layout: %d" % bad)
+    # 1: a level differs.  2: nothing, or not every case, was examined.
+    return 1 if bad else 2 if not nlev or missing or nolayout else 0
 
 sys.exit(main())

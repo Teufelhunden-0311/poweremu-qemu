@@ -561,9 +561,10 @@ unsigned r300_tex_microtile(uint32_t tiling, uint32_t bpp, bool dxt)
     return bpp == 1 ? R300_MT_8X4 : bpp == 2 || bpp == 4 ? R300_MT_16X2 : R300_MT_NONE;
 }
 
-/* The hardware's addressing, as Mesa's r300_texture_desc.c lays out
- * textures: power-of-two heights for mipmapped, 3D and cube textures,
- * levels one after another, each holding its faces or slices in turn.
+/* The compatibility layout used by this emulator, after the way Mesa's
+ * r300_texture_desc.c lays out textures: power-of-two heights for
+ * mipmapped, 3D and cube textures, levels one after another, each holding
+ * its faces or slices in turn.
  *
  * Untiled, a row is a multiple of 32 bytes.  Micro-tiled (TX_OFFSET bits
  * 4:3 = 1), a row is a whole number of microtiles and a level's height a
@@ -591,16 +592,20 @@ unsigned r300_tex_microtile(uint32_t tiling, uint32_t bpp, bool dxt)
  *   A8 1024x4: levels at 0x1000, 0x1800, 0x1c00, 0x1e00, 0x1f00, 0x1f80:
  *   the 512x2 level and each one-row level four rows.
  *
- * The driver's commands say the same ($PPCGPU_SEQ_LOG): it uploads a level
- * with one blit, from a source in AGP memory where the levels follow one
- * another untiled, to these offsets and pitches, the rectangle rounded up
- * to whole microtiles.  A8 1024x4: 512x4 to +0x1000 at pitch 512, 256x4
- * to +0x1800, ... 8x4 to +0x1fc0 at pitch 8.  ARGB8888 1024x4: 256x2 to
- * +0x5000 at pitch 1024, ... 4x2 to +0x5fc0 at pitch 16.  The rows a blit
- * adds carry what comes next in the source, the smaller levels, which is
- * why memory holds each of those more than once.  What a real card's
- * memory holds after such a blit, and in what order, has not been
- * observed.
+ * The driver's commands say the same ($PPCGPU_SEQ_LOG): in the first
+ * uploads captured, each level is one blit, from AGP memory, to these
+ * offsets and pitches, the rectangle rounded up to whole microtiles.  A8
+ * 1024x4: 512x4 to +0x1000 at pitch 512, 256x4 to +0x1800, ... 8x4 to
+ * +0x1fc0 at pitch 8.  ARGB8888 1024x4: 256x2 to +0x5000 at pitch 1024,
+ * ... 4x2 to +0x5fc0 at pitch 16.  The source offsets and pitches logged
+ * (levels one after another, untiled) and the bytes found at the
+ * destinations are consistent with the rows a blit adds carrying the
+ * smaller levels that follow in the source, which would be why memory
+ * holds each of those more than once; the source bytes themselves were
+ * not captured.  A glTexSubImage2D is a draw with the level as its colour
+ * buffer, at the same offsets (the 8x1 levels of those two textures at
+ * +0x1fc0 and +0x5f80).  What a real card's memory holds after such a
+ * blit, and in what order, has not been observed.
  *
  * This is a compatibility model for those layouts, applied to every
  * 1-byte, 2-byte and 4-byte texel format, DXT1, and 3D slices alike, not

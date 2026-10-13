@@ -40,8 +40,12 @@ What they say, and what they do not:
   driver meant: a small level's row is usually found several times (all
   listed), and "ok" only means the sampler's offset is one of them.
 - The driver's commands are the better witness for placement: with
-  PPCGPU_SEQ_LOG=1 the emulator logs each blit (/tmp/gpu_seq.log), and the
-  upload of a level is one blit to that level's offset and pitch.
+  PPCGPU_SEQ_LOG=1 the emulator logs each blit (/tmp/gpu_seq.log), and in
+  the first uploads captured a level is one blit to that level's offset
+  and pitch.  A blit says where and how much; what filled the rows it
+  adds is inferred from the logged source offsets and the bytes found.
+- tags.py exits 1 when a level differs and 2 when nothing differs but a
+  case of the stage was not captured: no data is not a pass.
 - The capture is best effort: a texture is dumped again when a hash of its
   bytes changes, so a state that returns, or a collision, is not recorded.
 
@@ -63,4 +67,19 @@ Results, 2026-10-12 (Tiger 10.4.11, ATI-1.4.18):
   +0x1f80 (16x4, pitch 16), +0x1fc0 (8x4, pitch 8), +0x1fe0, +0x2000,
   +0x2020; ARGB8888 1024x4 to +0x4000 (512x2, pitch 2048), +0x5000 (256x2),
   +0x5800, +0x5c00, +0x5e00, +0x5f00, +0x5f80, +0x5fc0 (4x2, pitch 16),
-  +0x5fe0, +0x6000.  No blit is logged for glTexSubImage2D.
+  +0x5fe0, +0x6000.
+- glTexSubImage2D (same log): no blit; a 3D draw with the level as its
+  colour buffer and the new texels as a texture in AGP memory, e.g.
+  "R3D rt=3e0000/4096 tex0=103904a0 5x3" for the base level and
+  "R3D rt=3e1fc0/32 tex0=10390980 3x1" for the 8x1 level of the A8
+  chain, "rt=533f80/32 ... 3x1" for that of the ARGB8888 one: the
+  height-rounded offsets again.  So the emulator's failures after an
+  update are failures of drawing into a texture.  Read from the code,
+  not yet tested by a fix: the emulator stores what the card draws in
+  the card's byte order and remembers the address as such a surface, so
+  a 32-bit texture is then read that way as a whole and a 16-bit one
+  holds the drawn texels in the other order; and the Metal renderer
+  returns without drawing when a colour buffer's rows are not a multiple
+  of its linear-texture alignment (16 bytes), which an 8-texel 8-bit
+  level's are not.  Measured: on Vulkan stage 2 passes 182 of 182, and
+  stage 1 fails the same 22 levels as on Metal.
