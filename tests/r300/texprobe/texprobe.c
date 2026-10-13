@@ -11,7 +11,9 @@
  * A level is drawn with GL_NEAREST_MIPMAP_NEAREST at one texel per pixel,
  * so the card chooses the level itself.  When what comes back is another
  * level's texels the draw is repeated with a LOD bias, and the bias that
- * was needed is reported.
+ * was needed is reported: a PASS with a bias other than +0 says the
+ * level's texels are right, not that the level was chosen rightly.
+ * Exit status 1 when a level failed.
  */
 #include <GLUT/glut.h>
 #include <OpenGL/gl.h>
@@ -37,6 +39,7 @@ static const char *const kname[] = { "rgba8", "1555", "565", "4444", "dxt1",
 
 typedef struct {
     int id, kind, w, h, cube, sub, stage;
+    int single;                 /* no mip levels */
     /* filled in */
     GLuint name;
     int levels;
@@ -79,7 +82,7 @@ static Tex cases[] = {
     /* stage 2: eight-bit texels and two-byte pairs */
     { 40, K_A8,     256,  256, 0, 1, 2 },
     { 41, K_A8,      16,   16, 0, 0, 2 },
-    { 42, K_A8,    1024,    4, 0, 0, 2 },
+    { 42, K_A8,    1024,    4, 0, 1, 2 },   /* sub: where does a one-row level's update land */
     { 43, K_A8,       4, 1024, 0, 0, 2 },
     { 44, K_L8,     256,  256, 0, 0, 2 },
     { 45, K_I8,      64,   64, 1, 0, 2 },
@@ -89,6 +92,16 @@ static Tex cases[] = {
     { 49, K_A8,      32, 2048, 0, 0, 2 },
     { 50, K_L8,       4,    4, 0, 0, 2 },
     { 51, K_A8,       4,    4, 1, 0, 2 },
+    /* single-level textures: other paths in a driver and in a renderer */
+    { 60, K_A8,       4,    4, 0, 0, 2, 1 },
+    { 61, K_A8,      16,   16, 0, 1, 2, 1 },
+    { 62, K_L8,       8,    2, 0, 0, 2, 1 },
+    { 63, K_A8,     256,   64, 0, 0, 2, 1 },
+    { 64, K_AL88,     4,    4, 0, 0, 2, 1 },
+    { 65, K_RGBA8,    4,    4, 0, 0, 2, 1 },
+    { 66, K_1555,     8,    8, 0, 0, 2, 1 },
+    { 67, K_DXT1,     8,    8, 0, 0, 2, 1 },
+    { 68, K_A8,       2,    2, 0, 0, 2, 1 },
 };
 #define NCASES ((int)(sizeof(cases) / sizeof(cases[0])))
 
@@ -324,13 +337,14 @@ static void upload(Tex *t)
     GLenum internal, format, type, tgt = target_of(t);
     int m = t->w > t->h ? t->w : t->h;
 
-    for (t->levels = 1; m > 1; m >>= 1) {
+    for (t->levels = 1; m > 1 && !t->single; m >>= 1) {
         t->levels++;
     }
     formats(t->kind, &internal, &format, &type);
     glGenTextures(1, &t->name);
     glBindTexture(tgt, t->name);
-    glTexParameteri(tgt, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
+    glTexParameteri(tgt, GL_TEXTURE_MIN_FILTER,
+                    t->single ? GL_NEAREST : GL_NEAREST_MIPMAP_NEAREST);
     glTexParameteri(tgt, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(tgt, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(tgt, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
@@ -546,8 +560,9 @@ static void check_level(const Tex *t, int face, int lv, const char *pass)
     if (bias != 0) {
         n_biased++;
     }
-    say("T%02d %s%s %dx%d f%d lv%d %dx%d %s bias %+.0f px %d ok %d crc %08x %s%s\n",
-        t->id, kname[t->kind], t->cube ? " cube" : "", t->w, t->h, face, lv, lw, lh, pass,
+    say("T%02d %s%s%s %dx%d f%d lv%d %dx%d %s bias %+.0f px %d ok %d crc %08x %s%s\n",
+        t->id, kname[t->kind], t->cube ? " cube" : "", t->single ? " single" : "",
+        t->w, t->h, face, lv, lw, lh, pass,
         bias, total, ok, h, ok == total ? "PASS" : "FAIL", note);
 }
 
@@ -639,7 +654,7 @@ static void run_tests(void)
 }
 
 static int phase;
-static void quit_cb(int v) { exit(0); }
+static void quit_cb(int v) { exit(n_bad ? 1 : 0); }
 
 static void display(void)
 {

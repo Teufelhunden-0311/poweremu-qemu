@@ -2,10 +2,15 @@
 """tags.py PREFIX [stage]: find texprobe's levels in an R300_CAP_TEX capture.
 
 PREFIX is the R300_CAP prefix (PREFIX.log, PREFIX.t<addr>_d<draw>_f<fmt>_<w>x<h>_p<pitch>.bin).
-For every dumped texture that is one of texprobe's, print where each level
-(and cube face) lies in the card's memory, the row pitch seen there, any
-further copies, and whether the emulator's own layout (the L lines of the
-log) says the same.  The texel rules are those of texprobe.c."""
+For every dumped texture that is one of texprobe's, print where each level's
+(and cube face's) texels are found in the captured emulator memory, the row
+pitch seen there, every further place the same row is found, and whether the
+emulator's own layout (the L lines of the log) names one of those places.
+
+That is where the emulator stored the texels while executing the driver's
+commands.  A row found in several places is listed in all of them; "ok" means
+the emulator's offset is among them, which does not single it out.  The
+texel rules are those of texprobe.c.  Exit status 1 when a level differs."""
 import sys, re, glob, os, struct
 
 SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "texprobe.c")
@@ -16,9 +21,10 @@ SUBSALT = 77
 
 def cases():
     out = []
-    for m in re.finditer(r"\{\s*(\d+),\s*(K_\w+),\s*(\d+),\s*(\d+),\s*(\d),\s*(\d),\s*(\d)\s*\}", open(SRC).read()):
-        i, k, w, h, cube, sub, stage = m.groups()
-        out.append(dict(id=int(i), kind=KMAP[k], w=int(w), h=int(h), cube=int(cube), sub=int(sub), stage=int(stage)))
+    for m in re.finditer(r"\{\s*(\d+),\s*(K_\w+),\s*(\d+),\s*(\d+),\s*(\d),\s*(\d),\s*(\d)(?:,\s*(\d))?\s*\}", open(SRC).read()):
+        i, k, w, h, cube, sub, stage, single = m.groups()
+        out.append(dict(id=int(i), kind=KMAP[k], w=int(w), h=int(h), cube=int(cube), sub=int(sub),
+                        stage=int(stage), single=int(single or 0)))
     return out
 
 def dim(d, lv):
@@ -108,7 +114,7 @@ def nrows(c, lv):
 
 def nlevels(c):
     m, n = max(c["w"], c["h"]), 1
-    while m > 1:
+    while m > 1 and not c["single"]:
         m >>= 1
         n += 1
     return n
@@ -175,31 +181,25 @@ def main():
             for face in range(6 if c["cube"] else 1):
                 r0 = row(c, c["id"], face, lv, 0, subs)
                 offs = [unswap_off(o, sw) for o in find_all(d, r0)]
-                pitch = None
-                if nrows(c, lv) > 1 and offs:
-                    r1 = row(c, c["id"], face, lv, 1, subs)
-                    o1 = [unswap_off(o, sw) for o in find_all(d, r1) if o > offs[0]]
-                    pitch = o1[0] - offs[0] if o1 else None
                 want = None
+                whole = False
                 if L and lv < len(L["lv"]):
                     off, lp, rows, facesz = L["lv"][lv]
                     want = (off + face * facesz, lp)
-                where = offs[0] if offs else None
-                ok = want is not None and where == want[0] and (pitch is None or pitch == want[1])
-                # the live copy may not be the first one found
-                if want is not None and not ok and want[0] in offs and (pitch is None or pitch == want[1]):
-                    ok = True
-                    where = want[0]
-                if not ok:
+                    # every row of the level, where the sampler will look for it
+                    whole = all(d[want[0] + y * lp:want[0] + y * lp + len(r0)] ==
+                                row(c, c["id"], face, lv, y, subs) for y in range(nrows(c, lv)))
+                if not whole:
                     bad += 1
-                if where is not None:
-                    end = max(end, where + (pitch or len(r0)) * (nrows(c, lv) - 1) + len(r0))
-                print("  lv%-2d f%d %4dx%-4d row %5d B: found at %s pitch %s | emulator %s %s" % (
+                if want is not None and whole:
+                    end = max(end, want[0] + lp * (nrows(c, lv) - 1) + len(r0))
+                print("  lv%-2d f%d %4dx%-4d row %5d B: row 0 found at %s | emulator %s: %s" % (
                     lv, face, dim(w, lv), dim(h, lv), len(r0),
-                    ",".join("%#x" % o for o in offs[:6]) + ("..." if len(offs) > 6 else "") if offs else "NOWHERE",
-                    pitch if pitch is not None else "-",
-                    ("%#x pitch %d" % want) if want else "?", "ok" if ok else "DIFFERS"))
+                    ",".join("%#x" % o for o in offs[:8]) + ("..." if len(offs) > 8 else "") if offs else "NOWHERE",
+                    ("%#x pitch %d" % want) if want else "?",
+                    "whole level there" if whole else "DIFFERS"))
         print("  data ends at %#x" % end)
     print("\nlevels that differ from the emulator's layout: %d" % bad)
+    return 1 if bad else 0
 
-main()
+sys.exit(main())
