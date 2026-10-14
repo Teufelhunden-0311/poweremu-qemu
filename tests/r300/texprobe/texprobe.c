@@ -21,7 +21,9 @@
  * level's texels the draw is repeated with a LOD bias, and the bias that
  * was needed is reported: a PASS with a bias other than +0 says the
  * level's texels are right, not that the level was chosen rightly.
- * Exit status 1 when a level failed.
+ * Exit status 1 when a level failed, a stage 3 source pattern did not
+ * read back as drawn, GL reported an error, or nothing was run; the last
+ * lines say which (TOTAL, CONTROLS, RESULT).
  */
 #include <GLUT/glut.h>
 #include <OpenGL/gl.h>
@@ -54,6 +56,7 @@ typedef struct {
     int nsub;
     struct { int lv, x, y, w, h; } subr[2];
     uint32_t *own[16];          /* stage 3: what each texel of a level holds */
+    int src_invalid;            /* stage 3: a copy into it had a bad source */
 } Tex;
 
 /* own[]: an upload's salt, or OWN_PAT | pattern | i << 16 | j << 24 for
@@ -132,6 +135,21 @@ static FILE *out;
 static GLint abits, maxsize;
 static int stage = 1, only = -1, hold = 4, waits, src_pixels;
 static int n_levels, n_ok, n_bad, n_biased;
+static int n_src, n_src_bad, n_glerr;   /* controls: patterns read back, GL errors */
+
+/* glGetError, counted: an error makes the run fail. */
+static GLenum gl_err(void)
+{
+    GLenum e = glGetError();
+
+    n_glerr += e != GL_NO_ERROR;
+    return e;
+}
+
+static int failed(void)
+{
+    return !n_levels || n_bad || n_src_bad || n_glerr;
+}
 
 static void say(const char *fmt, ...)
 {
@@ -616,10 +634,11 @@ static void check_level(const Tex *t, int face, int lv, const char *pass)
     if (bias != 0) {
         n_biased++;
     }
-    say("T%02d %s%s%s %dx%d f%d lv%d %dx%d %s bias %+.0f px %d ok %d crc %08x %s%s\n",
+    say("T%02d %s%s%s %dx%d f%d lv%d %dx%d %s bias %+.0f px %d ok %d crc %08x %s%s%s\n",
         t->id, kname[t->kind], t->cube ? " cube" : "", t->single ? " single" : "",
         t->w, t->h, face, lv, lw, lh, pass,
-        bias, total, ok, h, ok == total ? "PASS" : "FAIL", note);
+        bias, total, ok, h, ok == total ? "PASS" : "FAIL",
+        t->src_invalid ? " SOURCE-INVALID (a copy's source pattern was wrong)" : "", note);
 }
 
 static void check_tex(const Tex *t, const char *pass)
@@ -633,11 +652,11 @@ static void check_tex(const Tex *t, const char *pass)
 
 /*
  * Draw pattern p, w x h (at most 32 x 16), at PX, PY of the back buffer,
- * and read it back.  As a quad textured one texel a pixel from a 32 x 16
+ * and read it back; 1 when it reads back as drawn.  As a quad textured one texel a pixel from a 32 x 16
  * RGBA8 texture holding the whole pattern, uploaded as the stage 1
  * textures are; with src=pixels by glDrawPixels.
  */
-static void draw_pattern(int p, int w, int h)
+static int draw_pattern(int p, int w, int h)
 {
     static GLuint pattex;
     uint8_t *buf = malloc(w * h * 4), mask[4] = { 0xFF, 0xFF, 0xFF, 0xFF };
@@ -708,14 +727,19 @@ static void draw_pattern(int p, int w, int h)
         say("\n");
     }
     free(buf);
+    n_src++;
+    n_src_bad += ok != w * h;
+    return ok == w * h;
 }
 
 /* Copy pattern p into x, y, w, h of level lv (glCopyTexSubImage2D). */
 static void copy_in(Tex *t, int p, int lv, int x, int y, int w, int h)
 {
-    int lw = dim(t->w, lv);
+    int lw = dim(t->w, lv), src_ok = draw_pattern(p, w, h);
 
-    draw_pattern(p, w, h);
+    if (!src_ok) {
+        t->src_invalid = 1;     /* what is checked from here on proves nothing */
+    }
     glBindTexture(GL_TEXTURE_2D, t->name);
     glCopyTexSubImage2D(GL_TEXTURE_2D, lv, x, y, PX, PY, w, h);
     for (int j = 0; j < h; j++) {
@@ -723,8 +747,8 @@ static void copy_in(Tex *t, int p, int lv, int x, int y, int w, int h)
             t->own[lv][(y + j) * lw + x + i] = OWN_PAT | p | i << 16 | (uint32_t)j << 24;
         }
     }
-    say("COPY T%02d P%d -> lv%d %d,%d %dx%d, GL error %04x\n", t->id, p, lv, x, y, w, h,
-        glGetError());
+    say("COPY T%02d P%d -> lv%d %d,%d %dx%d, GL error %04x%s\n", t->id, p, lv, x, y, w, h,
+        gl_err(), src_ok ? "" : ", SOURCE CONTROL FAILED");
 }
 
 /* glTexSubImage2D x, y, w, h of level lv with texels of salt id + SUBSALT. */
@@ -743,7 +767,7 @@ static void sub_in(Tex *t, int lv, int x, int y, int w, int h)
             t->own[lv][(y + j) * lw + x + i] = t->id + SUBSALT;
         }
     }
-    say("SUB  T%02d -> lv%d %d,%d %dx%d, GL error %04x\n", t->id, lv, x, y, w, h, glGetError());
+    say("SUB  T%02d -> lv%d %d,%d %dx%d, GL error %04x\n", t->id, lv, x, y, w, h, gl_err());
 }
 
 static void run_copy_tests(void)
@@ -762,7 +786,7 @@ static void run_copy_tests(void)
             }
         }
     }
-    say("uploaded, GL error %04x\n", glGetError());
+    say("uploaded, GL error %04x\n", gl_err());
     for (int i = 0; i < NCOPY; i++) {
         Tex *t = &copycases[i];
         if (only >= 0 && t->id != only) {
@@ -787,6 +811,16 @@ static int has_ext(const char *name)
 {
     const char *e = (const char *)glGetString(GL_EXTENSIONS);
     return e && strstr(e, name) != NULL;
+}
+
+/* The texture levels, the controls apart from them, and the verdict. */
+static void totals(void)
+{
+    say("GL error %04x\n", gl_err());
+    say("TOTAL levels %d ok %d bad %d biased %d\n", n_levels, n_ok, n_bad, n_biased);
+    say("CONTROLS source patterns %d bad %d, GL errors %d\n", n_src, n_src_bad, n_glerr);
+    say("RESULT %s%s\nDONE\n", failed() ? "FAIL" : "PASS",
+        !n_levels ? " (nothing was run)" : "");
 }
 
 static void run_tests(void)
@@ -826,8 +860,7 @@ static void run_tests(void)
 
     if (stage == 3) {
         run_copy_tests();
-        say("GL error %04x\n", glGetError());
-        say("TOTAL levels %d ok %d bad %d biased %d\nDONE\n", n_levels, n_ok, n_bad, n_biased);
+        totals();
         return;
     }
     /* everything is uploaded before anything is drawn, as a game would */
@@ -843,7 +876,7 @@ static void run_tests(void)
         }
         upload(t);
     }
-    say("uploaded, GL error %04x\n", glGetError());
+    say("uploaded, GL error %04x\n", gl_err());
     if (waits) {
         glFinish();
         sleep(waits);
@@ -863,12 +896,11 @@ static void run_tests(void)
         subimage(t);
         check_tex(t, "sub");
     }
-    say("GL error %04x\n", glGetError());
-    say("TOTAL levels %d ok %d bad %d biased %d\nDONE\n", n_levels, n_ok, n_bad, n_biased);
+    totals();
 }
 
 static int phase;
-static void quit_cb(int v) { exit(n_bad ? 1 : 0); }
+static void quit_cb(int v) { exit(failed() ? 1 : 0); }
 
 static void display(void)
 {
@@ -882,7 +914,7 @@ static void display(void)
         glutTimerFunc(hold * 1000, quit_cb, 0);
     }
     glDrawBuffer(GL_BACK);
-    if (n_bad) {
+    if (failed()) {
         glClearColor(0.8f, 0.1f, 0.1f, 1);
     } else {
         glClearColor(0.1f, 0.7f, 0.1f, 1);

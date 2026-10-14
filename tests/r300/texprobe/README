@@ -7,8 +7,13 @@ texprobe.c   Mac OS X 10.4 (PowerPC), GLUT.  Uploads textures in which
              picks the level) and reads the pixels back.  One line per
              level in /tmp/texprobe.txt, PASS or FAIL with the first wrong
              texels.  Then replaces part of two levels with
-             glTexSubImage2D and checks again ("sub").  Exit status 1 when
-             a level failed.
+             glTexSubImage2D and checks again ("sub").  The last lines:
+             TOTAL (texture levels), CONTROLS (stage 3 source patterns
+             that did not read back as drawn, GL errors) and RESULT.
+             Exit status 1 when a level failed, a control failed, or
+             nothing was run (only= naming no case).  A level line
+             checked after a copy whose source pattern was wrong says
+             SOURCE-INVALID: it says nothing about the copy.
                gcc -std=gnu99 -O2 -o texprobe texprobe.c \
                    -framework GLUT -framework OpenGL
                ./texprobe [stage=1|2|3] [only=ID] [hold=SECONDS] [wait=SECONDS]
@@ -122,6 +127,7 @@ Results, 2026-10-13 (same machines; emulator at vs-unread 27a0bc5):
   draw.  With the frame noted as the blocks it clears (81bc7e9): 0 of 4.  The
   stage 2 stale read of 2026-10-12 (A8 1024x4 at 0x3e1000) was in the
   same block; likely the same cause, not run often enough since to show.
-- With src=pixels the emulator draws nothing: glDrawPixels arrives as a
+- With src=pixels the emulator drew nothing: glDrawPixels arrives as a
   PM4 type-3 packet 0x94 (CNTL_HOSTDATA_BLT in the radeon headers), which
-  the device does not handle.
+  the device did not handle.  Since fdd7a91 all 10 patterns read back,
+  and every level line is the same as with the quad, checksums included.
