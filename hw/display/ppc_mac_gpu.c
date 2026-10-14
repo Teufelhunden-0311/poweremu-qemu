@@ -11013,6 +11013,21 @@ static uint32_t ppc_mac_gpu_hwc_read(PPCMacGPUState *s, uint32_t reg)
     return 0;
 }
 
+/* $R300_SURFLOG: each SURFACEn register read and write, as the device
+ * sees it (what the driver does with surfaces around a readback). */
+static void r300_surf_log(hwaddr addr, uint64_t val, bool wr)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("R300_SURFLOG") != NULL;
+    }
+    if (on) {
+        qemu_log("r300 surface: %s 0x%04x %s 0x%08x\n", wr ? "write" : "read",
+                 (unsigned)addr, wr ? "=" : "->", (uint32_t)val);
+    }
+}
+
 static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
                                        unsigned int size)
 {
@@ -11750,6 +11765,18 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
 
     default:
         /*
+         * SURFACEn bounds and info as written (SURFACE_CNTL, 0x0B00, is
+         * above).  Apple's driver saves a surface, maps one of its own for
+         * a CPU readback and writes the saved one back: read as zero, it
+         * put back no surface at all.
+         */
+        if (s->r300 && addr > 0x0B00 && addr < 0x0B80) {
+            val = s->r300_surf[(addr - 0x0B00) / 4] >> (8 * (addr & 3));
+            r300_surf_log(addr, val, false);
+            break;
+        }
+
+        /*
          * 3D engine register range (0x1C00-0x3FFF) — return shadow values.
          * This allows the kext to read back any 3D register it has written.
          */
@@ -12139,6 +12166,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     }
     if (s->r300 && addr >= 0x0B00 && addr < 0x0B80) {
         s->r300_surf[(addr - 0x0B00) / 4] = val;   /* SURFACEn bounds/info */
+        r300_surf_log(addr, val, true);
         if (addr == 0x0B0C) {
             r300_surface_changed(s);
             r300_surfwatch_update(s);
