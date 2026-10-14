@@ -327,6 +327,8 @@ static void qemu_toggle_full_panel(void);
      */
     BOOL isMouseGrabbed;
     BOOL isAbsoluteEnabled;
+    /* The user asked for the relative pointer (toggleMouseLock). */
+    BOOL mouseLocked;
     CFMachPortRef eventsTap;
     CGColorSpaceRef colorspace;
     CALayer *cursorLayer;
@@ -343,6 +345,7 @@ static void qemu_toggle_full_panel(void);
 - (void) switchSurface:(pixman_image_t *)image;
 - (void) grabMouse;
 - (void) ungrabMouse;
+- (void) toggleMouseLock;
 - (void) setFullGrab:(id)sender;
 - (void) handleMonitorInput:(NSEvent *)event;
 - (bool) handleEvent:(NSEvent *)event;
@@ -1232,9 +1235,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
                             [self selectConsoleLocked:key - '0' - 1]; /* ascii math */
                             return true;
 
-                        // release the mouse grab
+                        // lock the mouse for a game, or release it
                         case 'g':
-                            [self ungrabMouse];
+                            [self toggleMouseLock];
                             return true;
 
                         // toggle (full-panel) fullscreen
@@ -1420,11 +1423,13 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 {
     COCOA_DEBUG("QemuCocoaView: grabMouse\n");
 
-    if (qemu_name)
-        [[self window] setTitle:window_title("  (Press  " UC_CTRL_KEY " " UC_ALT_KEY " G  to release Mouse)")];
-    else
-        [[self window] setTitle:window_title("  (Press  " UC_CTRL_KEY " " UC_ALT_KEY " G  to release Mouse)")];
-    [self hideCursor];
+    /* The absolute pointer is "grabbed" whenever it is over the window;
+     * only the relative one has to be released. */
+    [[self window] setTitle:window_title(isAbsoluteEnabled ? NULL :
+        "  (Press  " UC_CTRL_KEY " " UC_ALT_KEY " G  to release Mouse)")];
+    if (!isMouseGrabbed) {
+        [self hideCursor];      /* NSCursor counts its hides */
+    }
     CGAssociateMouseAndMouseCursorPosition(isAbsoluteEnabled);
     isMouseGrabbed = TRUE; // while isMouseGrabbed = TRUE, QemuCocoaApp sends all events to [cocoaView handleEvent:]
 }
@@ -1433,18 +1438,39 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 {
     COCOA_DEBUG("QemuCocoaView: ungrabMouse\n");
 
-    if (qemu_name)
-        [[self window] setTitle:window_title(NULL)];
-    else
-        [[self window] setTitle:window_title(NULL)];
-    [self unhideCursor];
+    [[self window] setTitle:window_title(NULL)];
+    if (isMouseGrabbed) {
+        [self unhideCursor];
+    }
     CGAssociateMouseAndMouseCursorPosition(TRUE);
     isMouseGrabbed = FALSE;
     [self raiseAllButtons];
 }
 
+- (BOOL) isPointerInView
+{
+    NSPoint p = [self convertPoint:[[self window] mouseLocationOutsideOfEventStream]
+                          fromView:nil];
+    return NSPointInRect(p, [self bounds]);
+}
+
+/*
+ * A guest with both a USB tablet and a USB mouse (the Radeon 9700 machine)
+ * makes each the active pointer the first time it polls it, so the one it
+ * happens to poll last wins -- on Tiger, a relative mouse.  The window then
+ * had to grab the pointer and sent it movement macOS had already
+ * accelerated, which the guest accelerated again: too fast, and running
+ * away now and then.  The tablet is put back in front instead, so the
+ * guest's pointer follows the Mac's one to one.  Games that turn with the
+ * mouse need the relative one, which never stops at the window's edge:
+ * Ctrl-Alt-G (toggleMouseLock) asks for it.  A guest without a tablet
+ * (Jaguar) keeps its relative mouse as before.
+ */
 - (void) notifyMouseModeChange {
+    BOOL want_rel = mouseLocked;
     bool tIsAbsoluteEnabled = bool_with_bql(^{
+        qemu_input_handler_activate_kind(want_rel ? INPUT_EVENT_MASK_REL
+                                                  : INPUT_EVENT_MASK_ABS);
         return qemu_input_is_absolute(dcl.con);
     });
 
@@ -1460,6 +1486,25 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         } else {
             CGAssociateMouseAndMouseCursorPosition(isAbsoluteEnabled);
         }
+    }
+    if (isAbsoluteEnabled && !isMouseGrabbed && [self isPointerInView]) {
+        [self grabMouse];
+    }
+}
+
+/* Ctrl-Alt-G: the relative pointer, locked to the window, for a game;
+ * again (or from the relative pointer) to release it. */
+- (void) toggleMouseLock
+{
+    if (!isAbsoluteEnabled) {
+        mouseLocked = NO;
+        [self ungrabMouse];
+    } else {
+        mouseLocked = YES;
+    }
+    [self notifyMouseModeChange];
+    if (!isAbsoluteEnabled && mouseLocked) {
+        [self grabMouse];
     }
 }
 - (BOOL) isMouseGrabbed {return isMouseGrabbed;}
