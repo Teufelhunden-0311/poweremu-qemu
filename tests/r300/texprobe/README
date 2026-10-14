@@ -11,12 +11,24 @@ texprobe.c   Mac OS X 10.4 (PowerPC), GLUT.  Uploads textures in which
              a level failed.
                gcc -std=gnu99 -O2 -o texprobe texprobe.c \
                    -framework GLUT -framework OpenGL
-               ./texprobe [stage=1|2] [only=ID] [hold=SECONDS] [wait=SECONDS]
+               ./texprobe [stage=1|2|3] [only=ID] [hold=SECONDS] [wait=SECONDS]
+                          [src=pixels]
              stage 1: 32-bit, 16-bit and DXT textures, among them chains
              with one-row levels many microtiles wide (1024x4), levels
              wider than a macrotile but not as tall (2048x8), and cubes.
              stage 2: 8-bit textures and two-byte luminance-alpha, and
              textures of every kind without mip levels.
+             stage 3: copies from the frame buffer (glCopyTexSubImage2D,
+             as Doom 3's heat haze) into an RGBA8 and a 1555 texture,
+             32x16 with mip levels: a pattern of known colours is drawn
+             (a quad textured one texel a pixel, or with src=pixels by
+             glDrawPixels) and read back ("SRC" lines), then copied
+             into part of level 0, the whole of it, two overlapping
+             parts, overwritten in part by glTexSubImage2D, and copied
+             into part of level 1.  Every level is checked after each
+             step, so the texels outside a rectangle and the other
+             levels are checked as well.  tags.py does not know what
+             these textures hold.
              When a level reads back as another level's texels the draw is
              repeated with a LOD bias; the line then says "bias +N".  Such
              a PASS says the level's texels are right, not that the level
@@ -72,7 +84,9 @@ Results, 2026-10-12 (Tiger 10.4.11, ATI-1.4.18):
   colour buffer and the new texels as a texture in AGP memory, e.g.
   "R3D rt=3e0000/4096 tex0=103904a0 5x3" for the base level and
   "R3D rt=3e1fc0/32 tex0=10390980 3x1" for the 8x1 level of the A8
-  chain, "rt=533f80/32 ... 3x1" for that of the ARGB8888 one: the
+  chain, "rt=533f80/32 ... 3x1" for that of the ARGB8888 one (that log
+  gave pixels times four whatever the format: the A8 level's rows are
+  8 bytes, not 32; it now prints both): the
   height-rounded offsets again.  So the emulator's failures after an
   update are failures of drawing into a texture.  Read from the code,
   not yet tested by a fix: the emulator stores what the card draws in
@@ -83,3 +97,31 @@ Results, 2026-10-12 (Tiger 10.4.11, ATI-1.4.18):
   of its linear-texture alignment (16 bytes), which an 8-texel 8-bit
   level's are not.  Measured: on Vulkan stage 2 passes 182 of 182, and
   stage 1 fails the same 22 levels as on Metal.
+
+Results, 2026-10-13 (same machines; emulator at vs-unread 27a0bc5):
+- Stage 2 on Metal: 182 of 182 since 3bd899e (an 8-texel 8-bit level's
+  update is drawn in the private staging and copied back).
+- Stage 1 with R300_RT_LE=0: 484 of 486.  The twenty 32-bit failures come
+  from the emulator's record of surfaces drawn by the 3D engine, which
+  switches the whole texture to the drawn byte order after a partial
+  update; the two left are 16-bit (T09): the replaced texels hold the
+  right values in the opposite byte order to their neighbours.
+- Stage 3 on the PowerBook: 72 of 72, the pattern drawn either way.
+- Stage 3 in the emulator, Metal and Vulkan: the copies are 3D draws
+  into the texture level (format 6 or 3, endian 0) from the GL back
+  buffer as a texture (endian 0, macro-tiled).  RGBA8: the copied texels
+  are stored in the host's order (B G R A), the uploaded ones and those
+  of glTexSubImage2D in the CPU's (A R G B); with the record on, every
+  texel but the copied ones then reads wrong, with R300_RT_LE=0 only the
+  copied ones.  1555: every texel the GPU wrote, copied or replaced, is
+  byte-swapped.  On Metal the partial copy sometimes read back the old
+  texels although memory held the new ones (3 of 6 runs, the 1555 level
+  and once the RGBA8 one; Vulkan never): the display's dirty-log clear
+  covers whole 256 KB blocks, and the textures lay in the block the frame
+  ends in, so the write count that vouches for a cached copy missed the
+  draw.  With the frame noted as the blocks it clears (81bc7e9): 0 of 4.  The
+  stage 2 stale read of 2026-10-12 (A8 1024x4 at 0x3e1000) was in the
+  same block; likely the same cause, not run often enough since to show.
+- With src=pixels the emulator draws nothing: glDrawPixels arrives as a
+  PM4 type-3 packet 0x94 (CNTL_HOSTDATA_BLT in the radeon headers), which
+  the device does not handle.

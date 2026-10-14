@@ -5,8 +5,16 @@
  * (and so each level can be found again in a dump of the card's memory).
  * Build on Tiger:
  *   gcc -std=gnu99 -O2 -o texprobe texprobe.c -framework GLUT -framework OpenGL
- * Run: texprobe [stage=N] [only=ID] [hold=SECONDS] [wait=SECONDS] [list]
- * Writes /tmp/texprobe.txt.  tags.py computes the same texels.
+ * Run: texprobe [stage=N] [only=ID] [hold=SECONDS] [wait=SECONDS] [src=pixels] [list]
+ * Writes /tmp/texprobe.txt.  tags.py computes the same texels (stages 1, 2).
+ *
+ * Stage 3 copies from the frame buffer into textures (glCopyTexSubImage2D,
+ * as Doom 3's heat haze does): a pattern of known colours is drawn (a
+ * textured quad; with src=pixels, glDrawPixels) and read back (SRC
+ * lines), copied into part of a level, the whole of it, two
+ * overlapping parts, then overwritten in part by glTexSubImage2D, and part
+ * of level 1 last; after each step every level is checked, so texels
+ * outside the rectangle and the other levels are checked too.
  *
  * A level is drawn with GL_NEAREST_MIPMAP_NEAREST at one texel per pixel,
  * so the card chooses the level itself.  When what comes back is another
@@ -45,7 +53,12 @@ typedef struct {
     int levels;
     int nsub;
     struct { int lv, x, y, w, h; } subr[2];
+    uint32_t *own[16];          /* stage 3: what each texel of a level holds */
 } Tex;
+
+/* own[]: an upload's salt, or OWN_PAT | pattern | i << 16 | j << 24 for
+ * the pattern's texel i, j copied there. */
+#define OWN_PAT 0x100u
 
 static Tex cases[] = {
     /* id kind     w     h  cube sub stage */
@@ -105,9 +118,19 @@ static Tex cases[] = {
 };
 #define NCASES ((int)(sizeof(cases) / sizeof(cases[0])))
 
+/* stage 3: copies from the frame buffer (a table of its own: tags.py does
+ * not know what they hold) */
+static Tex copycases[] = {
+    { .id = 70, .kind = K_RGBA8, .w = 32, .h = 16, .stage = 3 },
+    { .id = 71, .kind = K_1555,  .w = 32, .h = 16, .stage = 3 },
+};
+#define NCOPY ((int)(sizeof(copycases) / sizeof(copycases[0])))
+#define PX 300                  /* where the patterns are drawn */
+#define PY 300
+
 static FILE *out;
 static GLint abits, maxsize;
-static int stage = 1, only = -1, hold = 4, waits;
+static int stage = 1, only = -1, hold = 4, waits, src_pixels;
 static int n_levels, n_ok, n_bad, n_biased;
 
 static void say(const char *fmt, ...)
@@ -242,13 +265,46 @@ static int salt_at(const Tex *t, int lv, int x, int y)
     return t->id;
 }
 
+/*
+ * Pattern p's pixel i, j: five significant bits a colour channel (the
+ * value repeated into the low bits, so a 1555 texture keeps it exactly and
+ * gives it back), red, green and blue different, and an alpha whose top
+ * bit changes from pixel to pixel.
+ */
+static void pattern_rgba(int p, int i, int j, uint8_t c[4])
+{
+    int r = (i + 3 * p) & 31, g = (j + 7 * p + 11) & 31, b = (5 * p + 2 * i + j + 17) & 31;
+
+    c[0] = r << 3 | r >> 2;
+    c[1] = g << 3 | g >> 2;
+    c[2] = b << 3 | b >> 2;
+    c[3] = ((i + j + p) & 1) << 7 | ((3 * i + j + 5 * p) & 0x7F);
+}
+
 /* What a read should give for the pixel at px, py of a level. */
 static void expect(const Tex *t, int face, int lv, int px, int py,
                    uint8_t want[4], uint8_t mask[4])
 {
-    uint32_t v[4];
+    uint32_t v[4], o;
     int x = is_dxt(t->kind) ? px / 4 : px, y = is_dxt(t->kind) ? py / 4 : py;
 
+    if (t->own[lv]) {
+        o = t->own[lv][py * dim(t->w, lv) + px];
+        if (o & OWN_PAT) {
+            pattern_rgba(o & 0xFF, (o >> 16) & 0xFF, o >> 24, want);
+            if (t->kind == K_1555) {
+                mask[0] = mask[1] = mask[2] = 0xF8; mask[3] = 0x80;
+            } else {
+                mask[0] = mask[1] = mask[2] = mask[3] = 0xFF;
+            }
+        } else {
+            texel(t->kind, o, face, lv, x, y, v, want, mask);
+        }
+        if (!abits) {
+            mask[3] = 0;
+        }
+        return;
+    }
     texel(t->kind, salt_at(t, lv, px, py), face, lv, x, y, v, want, mask);
     if (!abits) {
         mask[3] = 0;
@@ -575,6 +631,158 @@ static void check_tex(const Tex *t, const char *pass)
     }
 }
 
+/*
+ * Draw pattern p, w x h (at most 32 x 16), at PX, PY of the back buffer,
+ * and read it back.  As a quad textured one texel a pixel from a 32 x 16
+ * RGBA8 texture holding the whole pattern, uploaded as the stage 1
+ * textures are; with src=pixels by glDrawPixels.
+ */
+static void draw_pattern(int p, int w, int h)
+{
+    static GLuint pattex;
+    uint8_t *buf = malloc(w * h * 4), mask[4] = { 0xFF, 0xFF, 0xFF, 0xFF };
+    int ok = 0;
+
+    if (!abits) {
+        mask[3] = 0;
+    }
+    for (int j = 0; j < h; j++) {
+        for (int i = 0; i < w; i++) {
+            pattern_rgba(p, i, j, buf + (j * w + i) * 4);
+        }
+    }
+    glClearColor(0.07f, 0.13f, 0.19f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    if (src_pixels) {
+        glDisable(GL_TEXTURE_2D);
+        glRasterPos2i(PX, PY);
+        glDrawPixels(w, h, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+    } else {
+        uint32_t texels[32 * 16];
+        for (int j = 0; j < 16; j++) {
+            for (int i = 0; i < 32; i++) {
+                uint8_t c[4];
+                pattern_rgba(p, i, j, c);
+                texels[j * 32 + i] = (uint32_t)c[3] << 24 | c[0] << 16 | c[1] << 8 | c[2];
+            }
+        }
+        if (!pattex) {
+            glGenTextures(1, &pattex);
+        }
+        glBindTexture(GL_TEXTURE_2D, pattex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 32, 16, 0, GL_BGRA,
+                     GL_UNSIGNED_INT_8_8_8_8_REV, texels);
+        glEnable(GL_TEXTURE_2D);
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+        glTexEnvf(GL_TEXTURE_FILTER_CONTROL, GL_TEXTURE_LOD_BIAS, 0);
+        glColor4f(1, 1, 1, 1);
+        glBegin(GL_QUADS);
+        glTexCoord2f(0, 0); glVertex2f(PX, PY);
+        glTexCoord2f(w / 32.0f, 0); glVertex2f(PX + w, PY);
+        glTexCoord2f(w / 32.0f, h / 16.0f); glVertex2f(PX + w, PY + h);
+        glTexCoord2f(0, h / 16.0f); glVertex2f(PX, PY + h);
+        glEnd();
+        glDisable(GL_TEXTURE_2D);
+    }
+    glReadBuffer(GL_BACK);
+    glReadPixels(PX, PY, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    for (int k = 0; k < w * h; k++) {
+        ok += same(px + k * 4, buf + k * 4, mask);
+    }
+    say("SRC P%d %dx%d %s ok %d of %d%s", p, w, h, src_pixels ? "pixels" : "quad", ok, w * h,
+        ok == w * h ? "\n" : "");
+    if (ok != w * h) {
+        for (int k = 0, shown = 0; k < w * h && shown < 3; k++) {
+            if (!same(px + k * 4, buf + k * 4, mask)) {
+                uint8_t *g = px + k * 4, *e = buf + k * 4;
+                say(" (%d,%d) got %02x%02x%02x%02x want %02x%02x%02x%02x", k % w, k / w,
+                    g[0], g[1], g[2], g[3], e[0], e[1], e[2], e[3]);
+                shown++;
+            }
+        }
+        say("\n");
+    }
+    free(buf);
+}
+
+/* Copy pattern p into x, y, w, h of level lv (glCopyTexSubImage2D). */
+static void copy_in(Tex *t, int p, int lv, int x, int y, int w, int h)
+{
+    int lw = dim(t->w, lv);
+
+    draw_pattern(p, w, h);
+    glBindTexture(GL_TEXTURE_2D, t->name);
+    glCopyTexSubImage2D(GL_TEXTURE_2D, lv, x, y, PX, PY, w, h);
+    for (int j = 0; j < h; j++) {
+        for (int i = 0; i < w; i++) {
+            t->own[lv][(y + j) * lw + x + i] = OWN_PAT | p | i << 16 | (uint32_t)j << 24;
+        }
+    }
+    say("COPY T%02d P%d -> lv%d %d,%d %dx%d, GL error %04x\n", t->id, p, lv, x, y, w, h,
+        glGetError());
+}
+
+/* glTexSubImage2D x, y, w, h of level lv with texels of salt id + SUBSALT. */
+static void sub_in(Tex *t, int lv, int x, int y, int w, int h)
+{
+    GLenum internal, format, type;
+    int lw = dim(t->w, lv), size;
+    uint8_t *buf = level_bytes(t, t->id + SUBSALT, 0, lv, x, y, w, h, &size);
+
+    formats(t->kind, &internal, &format, &type);
+    glBindTexture(GL_TEXTURE_2D, t->name);
+    glTexSubImage2D(GL_TEXTURE_2D, lv, x, y, w, h, format, type, buf);
+    free(buf);
+    for (int j = 0; j < h; j++) {
+        for (int i = 0; i < w; i++) {
+            t->own[lv][(y + j) * lw + x + i] = t->id + SUBSALT;
+        }
+    }
+    say("SUB  T%02d -> lv%d %d,%d %dx%d, GL error %04x\n", t->id, lv, x, y, w, h, glGetError());
+}
+
+static void run_copy_tests(void)
+{
+    for (int i = 0; i < NCOPY; i++) {
+        Tex *t = &copycases[i];
+        if (only >= 0 && t->id != only) {
+            continue;
+        }
+        upload(t);
+        for (int lv = 0; lv < t->levels; lv++) {
+            int n = dim(t->w, lv) * dim(t->h, lv);
+            t->own[lv] = malloc(n * sizeof(uint32_t));
+            for (int k = 0; k < n; k++) {
+                t->own[lv][k] = t->id;
+            }
+        }
+    }
+    say("uploaded, GL error %04x\n", glGetError());
+    for (int i = 0; i < NCOPY; i++) {
+        Tex *t = &copycases[i];
+        if (only >= 0 && t->id != only) {
+            continue;
+        }
+        check_tex(t, "first");
+        copy_in(t, 1, 0, 3, 1, 5, 3);
+        check_tex(t, "copy-part");
+        copy_in(t, 2, 0, 0, 0, t->w, t->h);
+        check_tex(t, "copy-full");
+        copy_in(t, 3, 0, 2, 2, 6, 4);
+        copy_in(t, 4, 0, 5, 3, 6, 4);           /* over the last one's right part */
+        check_tex(t, "copy-over");
+        sub_in(t, 0, 4, 1, 4, 4);               /* over both */
+        check_tex(t, "sub-over");
+        copy_in(t, 5, 1, 1, 1, 4, 2);
+        check_tex(t, "copy-lv1");
+    }
+}
+
 static int has_ext(const char *name)
 {
     const char *e = (const char *)glGetString(GL_EXTENSIONS);
@@ -616,6 +824,12 @@ static void run_tests(void)
         v[3], maxsize, s3tc, has_ext("GL_EXT_texture_lod_bias"),
         has_ext("GL_ARB_texture_cube_map"));
 
+    if (stage == 3) {
+        run_copy_tests();
+        say("GL error %04x\n", glGetError());
+        say("TOTAL levels %d ok %d bad %d biased %d\nDONE\n", n_levels, n_ok, n_bad, n_biased);
+        return;
+    }
     /* everything is uploaded before anything is drawn, as a game would */
     for (int i = 0; i < NCASES; i++) {
         Tex *t = &cases[i];
@@ -689,11 +903,17 @@ int main(int argc, char **argv)
             hold = atoi(argv[i] + 5);
         } else if (!strncmp(argv[i], "wait=", 5)) {
             waits = atoi(argv[i] + 5);
+        } else if (!strcmp(argv[i], "src=pixels")) {
+            src_pixels = 1;
         } else if (!strcmp(argv[i], "list")) {
             for (int k = 0; k < NCASES; k++) {
                 printf("%d %s %d %d cube %d sub %d stage %d\n", cases[k].id,
                        kname[cases[k].kind], cases[k].w, cases[k].h, cases[k].cube,
                        cases[k].sub, cases[k].stage);
+            }
+            for (int k = 0; k < NCOPY; k++) {
+                printf("%d %s %d %d copies stage 3\n", copycases[k].id,
+                       kname[copycases[k].kind], copycases[k].w, copycases[k].h);
             }
             return 0;
         }
