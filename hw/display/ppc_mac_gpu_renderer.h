@@ -358,7 +358,9 @@ typedef struct PPCMacGPURenderer {
      * first colour buffer cannot be drawn where it is (its address or its
      * bytes a row; Metal maps it as a linear texture) though it could be
      * elsewhere.  The device then draws it in its private staging, in rows
-     * of R300_STAGE_ROW bytes' multiples, and copies it back.
+     * of a multiple of R300_STAGE_ROW bytes (an alignment chosen there, not
+     * one every renderer promises), and copies it back.  Returned again for
+     * the staging, the draw is dropped.
      */
 #define PPC_MAC_GPU_DRAW_REMAP (-2)
     int (*draw_r300)(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,

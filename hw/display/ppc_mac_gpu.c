@@ -3733,30 +3733,36 @@ static void r300_xfer_end(PPCMacGPUState *s, R300SysXfer *x, uint8_t *vram)
 
 /*
  * A colour buffer in VRAM that the renderer cannot draw where it is
- * (PPC_MAC_GPU_DRAW_REMAP).  Metal maps a colour buffer as a linear
- * texture, whose address and bytes a row must be multiples of an alignment,
- * 16 bytes on Apple's GPUs; an 8-pixel 8-bit surface has 8-byte rows.  The
- * Mac OS X driver draws into one for glTexSubImage2D on an 8-texel-wide
- * level of an 8-bit texture, and the draw was dropped: the update never
- * reached the texture.
+ * (PPC_MAC_GPU_DRAW_REMAP).  The emulator keeps a colour buffer in plain
+ * rows whatever its tiling field says (the driver marks the ones below
+ * micro-tiled), and Metal maps it as a linear texture, whose address and
+ * bytes a row must be multiples of an alignment: 16 bytes on the M1 Max it
+ * was measured on.  An 8-pixel 8-bit surface has 8-byte rows.  The Mac OS X
+ * driver draws into one for glTexSubImage2D on an 8-texel-wide level of an
+ * 8-bit texture, and the draw was dropped: the update never reached the
+ * texture.
  *
- * It is drawn in the private staging instead, in rows of a length any
- * renderer maps, around the waits a system-memory colour buffer has
- * (R300SysXfer above).  The buffer's rows are loaded first, so what the
- * draw leaves alone (uncovered pixels, masks, blending) comes back as it
- * was; and only the buffer's own bytes are copied back, none of the
- * staging's longer rows and nothing outside the buffer -- the next mip
- * level starts right after it.  The copy back is suppressed, as there,
- * after a device reset or failed GPU work.
+ * It is drawn in the private staging instead, around the waits a
+ * system-memory colour buffer has (R300SysXfer above), in rows of a
+ * multiple of R300_STAGE_ROW bytes.  That alignment is chosen to be
+ * generous, not one every renderer promises: a renderer that still cannot
+ * map the buffer hands it back again, and it is dropped.  The buffer's rows
+ * are loaded first, so what the draw leaves alone (uncovered pixels, masks,
+ * blending) comes back as it was; and only the buffer's own bytes are
+ * copied back, none of the staging's longer rows and nothing outside the
+ * buffer -- the next mip level starts right after it.  The copy back is
+ * suppressed, as there, after a device reset or failed GPU work, checked
+ * after the last wait.
  *
- * Only what the driver was seen to do: one linear, single-sample target
+ * Only what the driver was seen to do: one single-sample target
  * without a depth buffer.  Anything else stays dropped.  Two waits for the
- * renderer a draw, so the count and the time are logged.
+ * renderer a draw, so the count, how many were copied back, and the time
+ * are logged.
  */
 #define R300_STAGE_ROW 256u
 static int r300_draw_staged(PPCMacGPUState *s, uint8_t *vram, R300DrawPacket *pkt)
 {
-    static uint64_t count, usec;
+    static uint64_t count, copied, usec;
     uint32_t dst = pkt->rt_gpu_addr, pitch = pkt->rt_pitch;
     uint32_t row = pitch * pkt->rt_bpp, rows = pkt->rt_height;
     uint32_t srow = ROUND_UP(row, R300_STAGE_ROW);
@@ -3812,33 +3818,38 @@ static int r300_draw_staged(PPCMacGPUState *s, uint8_t *vram, R300DrawPacket *pk
     if (rr < 0) {
         return -1;                          /* PPC_MAC_GPU_DRAW_REMAP again: no */
     }
-    r200_vram_access(s, off, off + len, false, 9);              /* the draw */
+    /* The draw; then a write to VRAM from this side, so whatever still reads
+     * or draws the buffer's bytes goes first.  Either wait may finish other
+     * work, and with it learn of a reset or a failure: the checks come after
+     * both. */
+    r200_vram_access(s, off, off + len, false, 9);
+    r200_vram_access(s, dst, dst + (uint64_t)row * rows, true, 9);
+    bool back = false;
     if (s->reset_count != resets) {
         r300_warn_once("staged colour buffer not copied back: device reset", NULL);
     } else if (r300_gpu_failures(s) != failures) {
         r300_warn_once("staged colour buffer not copied back: GPU work failed", NULL);
     } else {
-        /* A write to VRAM from this side: whatever still reads or draws
-         * these bytes goes first, and the texture caches hear of it. */
-        r200_vram_access(s, dst, dst + (uint64_t)row * rows, true, 9);
-        if (s->reset_count == resets) {
-            for (uint32_t y = 0; y < rows; y++) {
-                memcpy(vram + dst + (uint64_t)y * row, vram + off + (uint64_t)y * srow, row);
-            }
-            memory_region_set_dirty(&s->vram, dst, (uint64_t)row * rows);
+        for (uint32_t y = 0; y < rows; y++) {
+            memcpy(vram + dst + (uint64_t)y * row, vram + off + (uint64_t)y * srow, row);
         }
+        memory_region_set_dirty(&s->vram, dst, (uint64_t)row * rows); /* texture caches */
+        back = true;
     }
     usec += g_get_monotonic_time() - t0;
     count++;
+    copied += back;
     if (count == 1) {
         qemu_log("ppc-mac-gpu r300: colour buffer %06x (%ux%u, %u B a row) is not "
-                 "where the renderer can draw it: drawn in the private staging "
-                 "and copied back (%.2f ms)\n", dst, pkt->rt_width, rows, row,
-                 usec / 1000.0);
+                 "where the renderer can draw it: drawn in the private staging, "
+                 "%s (%.2f ms)\n", dst, pkt->rt_width, rows, row,
+                 back ? "copied back" : "NOT copied back", usec / 1000.0);
     }
     if (count == 2 || count == 10 || count == 100 || count % 1000 == 0) {
         qemu_log("ppc-mac-gpu r300: %llu colour buffers drawn in the staging "
-                 "so far, %.1f ms in all\n", (unsigned long long)count, usec / 1000.0);
+                 "so far, %llu copied back, %.1f ms in all\n",
+                 (unsigned long long)count, (unsigned long long)copied,
+                 usec / 1000.0);
     }
     return rr;
 }
@@ -3898,14 +3909,16 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                     r300_reg(s->r3, 0x4E04), r300_reg(s->r3, 0x4E0C));
         }
         /* Pitches in pixels and in bytes: the colour buffer's from its
-         * format (an 8-bit target's row is a quarter of a 32-bit one's);
-         * the texture's in texels only, its registers given raw. */
+         * format (an 8-bit target's row is a quarter of a 32-bit one's).
+         * The texture's registers raw, and TX_FORMAT2's pitch field as
+         * encoded (+1, texels): the sampler uses it only with TX_PITCH_EN,
+         * TX_FORMAT0 bit 31. */
         uint32_t cp = r300_reg(s->r3, 0x4E38), ofmt = r300_reg(s->r3, 0x46A4);
         uint32_t cbpp = 0;
         r300_cb_view((cp >> 21) & 0xF, ofmt, &cbpp);
         seq_log("R3D  rt=%06x colorpitch=%08x fmt=%u endian=%u tile=%u %uB/px "
                 "pitch=%upx=%uB outfmt=%08x tex0=%s%06x txoffset=%08x %ux%u "
-                "pitch=%utx f0=%08x f1=%08x f2=%08x vf=%08x v0=%08x %08x",
+                "f2pitch=%u f0=%08x f1=%08x f2=%08x vf=%08x v0=%08x %08x",
                 r300_reg(s->r3, 0x4E28) & ~0x1Fu, cp, (cp >> 21) & 0xF,
                 (cp >> 19) & 3, (cp >> 16) & 7, cbpp, cp & 0x3FFE,
                 (cp & 0x3FFE) * cbpp, ofmt,
@@ -10639,17 +10652,21 @@ static void ppc_mac_gpu_drain(PPCMacGPUState *s)
 /*
  * The machine stopped: a pause, a snapshot, or the last stop before QEMU
  * exits.  The virtual CPUs are stopped by now, so once the work in hand is
- * finished the GPU threads stay idle until the machine runs again.
+ * finished the GPU threads stay idle until the machine runs again.  A pause
+ * waits for that work too, and like every flush has no time limit should
+ * the host GPU never answer.
  *
  * At a quit that is what keeps them out of the host's libraries while
- * exit() takes those apart.  The exit notifier below comes too late for
- * it: exit() calls its handlers newest first, QEMU registers the one that
- * runs the notifiers at startup, and a C++ static constructed on first use
- * registers its destructor then -- so it is destroyed before the notifier
- * is called.  A draw still queued at that point crashed translating its
- * shader (SPIRV-Cross's table of reserved names; two crash reports of
- * 2026-10-11).  An ordinary quit leaves the threads time to catch up; a
- * backlog, as a frame capture ($R300_CAP) makes, does not.
+ * exit() takes those apart.  The exit notifier below may come too late for
+ * it.  Two crash reports of 2026-10-11 have the render thread translating
+ * a shader (SPIRV-Cross's table of reserved names) while exit() runs the
+ * notifiers.  Reconstructed from those stacks and the order of exit()'s
+ * handlers, not observed: exit() calls them newest first, QEMU registers
+ * the one that runs the notifiers at startup, and a C++ static constructed
+ * on first use registers its destructor then -- so that table would be
+ * destroyed before the notifier is called.  An ordinary quit leaves the
+ * threads time to catch up; a backlog, as a frame capture ($R300_CAP)
+ * makes, does not (measured).
  */
 static void ppc_mac_gpu_vm_state(void *opaque, bool running, RunState state)
 {
@@ -10671,27 +10688,20 @@ static void ppc_mac_gpu_vm_state(void *opaque, bool running, RunState state)
  *
  * A quit stops the machine first, and ppc_mac_gpu_vm_state() has left
  * nothing to do here.  This is for exit() called anywhere else, where it
- * is the best that can be done: some statics are gone already (see there).
- * It is called with or without the BQL (QEMU's own exit has released it).
- * Not reached by abort(), _exit() or a kill, and exit() from the CP thread
- * itself is left alone.
+ * is the best that can be done: some statics may be gone already (see
+ * there).  BQL held (qemu_run_exit_notifiers takes it).  Not reached by
+ * abort(), _exit() or a kill, and exit() from the CP thread itself is left
+ * alone.
  */
 static void ppc_mac_gpu_exit_notify(Notifier *n, void *data)
 {
     PPCMacGPUState *s = container_of(n, PPCMacGPUState, exit_notifier);
-    bool locked = bql_locked();
 
     if (ppc_mac_gpu_cp_on_thread()) {
         return;
     }
     ppc_mac_gpu_cp_stop();
-    if (!locked) {
-        bql_lock();
-    }
     ppc_mac_gpu_drain(s);       /* what is left in the ring is not begun */
-    if (!locked) {
-        bql_unlock();
-    }
 }
 
 /* The last command packets pushed in by hand, for the stall report. */
