@@ -493,7 +493,10 @@ static void set_uniforms(const R300State *st, R300DrawPacket *pkt)
     for (int n = 0; n < 4; n++) {
         u->out_sel[n] = (outfmt >> (8 + 2 * n)) & 3;
     }
-    u->rt_swap32 = ((r300_reg(st, RB3D_COLORPITCH0) >> 19) & 3) == 2;
+    u->rt_swap32 = ((r300_reg(st, RB3D_COLORPITCH0) >> 19) & 3) == 2 ||
+                   (((r300_reg(st, RB3D_COLORPITCH0) >> 19) & 3) == 0 &&
+                    (st->glsl_flags & R300_GLSL_ENDIAN_MODEL) &&
+                    (st->glsl_flags & R300_GLSL_CB_VRAM(0)));   /* see r300_endian_model */
     u->rt_endian = (r300_reg(st, RB3D_COLORPITCH0) >> 19) & 3;
     u->clip_rule = r300_reg(st, SC_CLIP_RULE) & 0xFFFF;
     for (int i = 0; i < 4; i++) {
@@ -733,12 +736,77 @@ void r300_border_color(uint32_t fmt, uint32_t v, float c[4])
 static struct { uint32_t lo, hi; } rt_le[RT_LE_SLOTS];
 static unsigned rt_le_n;
 
+/*
+ * The experimental byte-order model, $R300_ENDIAN_MODEL=1 (off by default;
+ * the record above is then off too).  Written down before any default is
+ * chosen, as the rules each path follows rather than a record of what was
+ * drawn where.
+ *
+ * Backing: VRAM here holds what the big-endian CPU sees, each element (a
+ * texel or pixel of 1, 2 or 4 bytes) a big-endian value at its own address
+ * -- what aperture 0 shows with the swap matching the element size (mode 2
+ * for 32 bits, as r300_ap1_read assumes; mode 1 for 16).  The card's own
+ * bytes are each element byte-reversed: a little-endian value.
+ * GART: guest RAM, the card's bytes as they are (the CPU writes them with
+ * no aperture between).
+ * The card's swaps (AMD R300 register reference: TX_OFFSET.ENDIAN_SWAP,
+ * RB3D_COLORPITCH.COLORENDIAN): 0 none, 1 bytes within 16 bits, 2 bytes
+ * within 32 bits, 3 the 16-bit halves; between memory and the unit's
+ * little-endian word.
+ * So, per path:
+ *   texture, VRAM:  32-bit TX 0 reverses the stored bytes, TX 2 does not
+ *                   (unchanged); 16-bit TX 0 reads big-endian, TX 1
+ *                   little-endian
+ *   texture, GART:  the card's bytes, so the other way round: 32-bit TX 0
+ *                   as they are, TX 2 reversed; 16-bit TX 0 little-endian,
+ *                   TX 1 big-endian.  (DXT and shader-decoded units already
+ *                   convert GART words to VRAM's side first; RGBA8 and
+ *                   16-bit units did not.)
+ *   colour, GART:   COLORENDIAN as it is (unchanged: readback and other
+ *                   system-memory targets)
+ *   colour, VRAM:   COLORENDIAN 0 stores big-endian elements.  Today a VRAM
+ *                   draw with COLORENDIAN 2 (32-bit) or 1 (16-bit) also
+ *                   stores big-endian, and the model would store those
+ *                   little-endian; that part is NOT changed, because the
+ *                   window server draws the screen and the GL back buffer
+ *                   that way and the display, the CPU and the copy source
+ *                   all read it as stored now.  Why the same card reads
+ *                   back both COLORENDIAN 0 and 2 surfaces correctly with
+ *                   TX 0 is the open question; this part is outside the
+ *                   model.  (texprobe stage 4: through a framebuffer
+ *                   object the driver draws the same kind of texture --
+ *                   tiling 3, US_OUT_FMT 1b01 -- with COLORENDIAN 2 where
+ *                   glCopyTexSubImage2D uses 0, and the PowerBook reads
+ *                   both back right.  One candidate, not established:
+ *                   the colour swap acts only on what goes out to system
+ *                   memory, where readback draws with 2.)
+ * Not covered: 64- and 128-bit colour formats, COLORENDIAN 3, 16-bit
+ * textures read with TX 2 or 3.
+ * Known break, the missing piece: the CPU's aperture 0 is mapped straight
+ * onto VRAM, as if it always had the 32-bit swap.  glGetTexImage after
+ * glCopyTexImage2D reads the texture through aperture 0 with a SURFACE0
+ * over it that sets no swap (0x3e0000-0x3e3fff, info 0): with the model
+ * the copy is stored as the CPU's view, and that read comes back
+ * byte-reversed (rbprobe: 0 of 4096 exact; 4096 without the model).  The
+ * model needs aperture 0 converted where a surface sets another swap, as
+ * aperture 1 is (r300_ap1_read).
+ */
+bool r300_endian_model(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("R300_ENDIAN_MODEL");
+        on = e && e[0] == '1';
+    }
+    return on;
+}
+
 static bool rt_le_on(void)
 {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("R300_RT_LE");
-        on = !(e && e[0] == '0');
+        on = !(e && e[0] == '0') && !r300_endian_model();
     }
     return on;
 }
@@ -2301,7 +2369,8 @@ uint8_t *r300_tex_level_bytes(const R300TexDesc *td, const uint8_t *src,
         for (uint32_t y = 0; y < h; y++) {
             const uint8_t *row = src + (uint64_t)y * pitch;
             for (uint32_t x = 0; x < w; x++) {
-                uint16_t v = (uint16_t)(row[2 * x] << 8 | row[2 * x + 1]);
+                uint16_t v = td->le16 ? (uint16_t)(row[2 * x] | row[2 * x + 1] << 8)
+                                      : (uint16_t)(row[2 * x] << 8 | row[2 * x + 1]);
                 r300_decode16(td->format, v, out + ((size_t)y * w + x) * 4);
             }
         }

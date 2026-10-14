@@ -1177,6 +1177,12 @@ static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k, uint32_t fla
     uint32_t cf = (pitch >> 21) & 0xF, e = (pitch >> 19) & 3;
     uint32_t ofr = r300_us_out_fmt(st, k), of = ofr & 0x1F;
     uint32_t bpp, view = r300_cb_view(cf, of, &bpp);
+    /* The byte-order model (r300_endian_model): a VRAM target drawn with
+     * COLORENDIAN 0 stores big-endian elements, as one drawn with 2 (32-bit)
+     * or 1 (16-bit) already does. */
+    bool vram_be = (flags & R300_GLSL_ENDIAN_MODEL) && (flags & R300_GLSL_CB_VRAM(k)) &&
+                   e == 0 && bpp >= 2 && bpp <= 4;
+    uint32_t es = vram_be ? (bpp == 2 ? 1 : 2) : e;     /* the swap the store makes */
     bool sg[4];
     const char *type, *load, *pad;
     char sel[64], swap[16];
@@ -1191,7 +1197,7 @@ static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k, uint32_t fla
     } else {
         snprintf(sel, sizeof(sel), "uvec4(%uu, %uu, %uu, %uu)", (ofr >> 8) & 3,
                  (ofr >> 10) & 3, (ofr >> 12) & 3, (ofr >> 14) & 3);
-        snprintf(swap, sizeof(swap), "%uu", e == 2);
+        snprintf(swap, sizeof(swap), "%uu", es == 2);
     }
     for (int n = 0; n < 4; n++) {
         sg[n] = (ofr >> (16 + n)) & 1;
@@ -1216,10 +1222,11 @@ static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k, uint32_t fla
      * attachment's input and output types to agree. */
     pad = view == R300_RTV_RG32U ? "uvec4(x, 0u, 0u)" : view == R300_RTV_RGBA32U ? "(x)"
                                  : "uvec4(x, 0u, 0u, 0u)";
-    r300_sb_printf(sb, "// colour buffer %u: format %u, US_OUT_FMT %08x, endian %u, %u bytes\n"
+    r300_sb_printf(sb, "// colour buffer %u: format %u, US_OUT_FMT %08x, endian %u (stored with "
+                   "swap %u), %u bytes\n"
                    "#define r300_cb%u_t %s\n#define r300_cb%u_o uvec4\n#define R300_CB%u_OUT(x) %s\n"
                    "#define R300_CB%u_CLAMP %s\n#define R300_CB%u_BLEND %s\n",
-                   k, cf, ofr, e, bpp, k, type, k, k, pad, k, fp ? "false" : "true",
+                   k, cf, ofr, e, es, bpp, k, type, k, k, pad, k, fp ? "false" : "true",
                    k, blend ? "true" : "false");
     us_fb_decl(sb, flags, k, name, mac, true,
                view == R300_RTV_R8U ? "r8ui" : view == R300_RTV_R16U ? "r16ui" :
@@ -1231,10 +1238,10 @@ static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k, uint32_t fla
     if (bpp == 1) {
         snprintf(swb, sizeof(swb), "uint w = fb;");
     } else if (bpp == 2) {
-        snprintf(swb, sizeof(swb), "%s", e == 1 || e == 2 ?
+        snprintf(swb, sizeof(swb), "%s", es == 1 || es == 2 ?
                  "uint w = ((fb >> 8) & 0xffu) | ((fb & 0xffu) << 8);" : "uint w = fb & 0xffffu;");
     } else if (bpp == 4) {
-        snprintf(swb, sizeof(swb), "uint w = r300_cswap(fb, %uu);", e);
+        snprintf(swb, sizeof(swb), "uint w = r300_cswap(fb, %uu);", es);
     } else if (bpp == 8) {
         snprintf(swb, sizeof(swb), "uvec2 w = uvec2(r300_cswap(fb.x, %uu), r300_cswap(fb.y, %uu));", e, e);
     } else {
@@ -1328,10 +1335,10 @@ static void us_emit_cb(R300Sb *sb, const R300State *st, unsigned k, uint32_t fla
     if (bpp == 1) {
         snprintf(back, sizeof(back), "return w & 0xffu;");
     } else if (bpp == 2) {
-        snprintf(back, sizeof(back), "%s", e == 1 || e == 2 ?
+        snprintf(back, sizeof(back), "%s", es == 1 || es == 2 ?
                  "return ((w >> 8) & 0xffu) | ((w & 0xffu) << 8);" : "return w & 0xffffu;");
     } else if (bpp == 4) {
-        snprintf(back, sizeof(back), "return r300_cswap(w, %uu);", e);
+        snprintf(back, sizeof(back), "return r300_cswap(w, %uu);", es);
     } else if (bpp == 8) {
         snprintf(back, sizeof(back), "return uvec2(r300_cswap(w.x, %uu), r300_cswap(w.y, %uu));", e, e);
     } else {

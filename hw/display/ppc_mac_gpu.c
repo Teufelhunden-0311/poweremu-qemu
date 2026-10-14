@@ -3953,6 +3953,16 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         }
     }
     s->r3->glsl_flags = s->renderer ? s->renderer->r300_glsl_flags : 0;
+    if (r300_endian_model()) {
+        /* The byte-order model's VRAM colour store (r300_endian_model)
+         * needs to know which colour buffers are VRAM (RB3D_COLOROFFSETn). */
+        s->r3->glsl_flags |= R300_GLSL_ENDIAN_MODEL;
+        for (unsigned k = 0; k < 4; k++) {
+            if (r300_in_fb(s, r300_reg(s->r3, 0x4E28 + 4 * k) & ~0x1Fu, 1)) {
+                s->r3->glsl_flags |= R300_GLSL_CB_VRAM(k);
+            }
+        }
+    }
     {
         /* R300_CPU_VS=1: run every vertex program on the interpreter */
         static int cpu_vs = -1;
@@ -4098,6 +4108,22 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             said = true;
             qemu_log("ppc-mac-gpu r300: texture in AGP/GART memory at %08x "
                      "(%ux%u), read through the GART\n", ga, td->width, td->height);
+        }
+    }
+    if (s->r3->glsl_flags & R300_GLSL_ENDIAN_MODEL) {
+        /* The byte-order model's texture reads (r300_endian_model): GART
+         * holds the card's bytes, VRAM the CPU's view of them. */
+        for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
+            R300TexDesc *td = &pkt.tex[t];
+            if (!td->bound) {
+                continue;
+            }
+            if (td->kind == R300_TEXK_CONVERT16) {
+                td->le16 = td->host_data ? td->endian == 0 : td->endian == 1;
+            } else if (td->kind == R300_TEXK_RGBA8 && td->host_data &&
+                       (td->endian == 0 || td->endian == 2)) {
+                pkt.uniforms.tex_info[t][1] = td->endian == 2;
+            }
         }
     }
     r300_framecap_fs(&pkt);

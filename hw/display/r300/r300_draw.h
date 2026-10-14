@@ -60,6 +60,8 @@ typedef struct R300TexDesc {
     uint32_t gpu_addr;          /* TX_OFFSET, low bits cleared */
     uint32_t width, height;
     uint32_t endian;            /* TX_OFFSET[1:0]: the card's dword swap */
+    bool le16;                  /* CONVERT16: texels read little-endian (the
+                                   byte-order model; set by the device) */
     uint32_t tiling;            /* TX_OFFSET[4:2]: macro tiling, micro tiling (2 bits) */
     uint32_t pitch_bytes;       /* level 0: bytes per row (per row of blocks for DXT) */
     uint32_t format;            /* TX_FORMAT1 & 0x1F */
@@ -308,6 +310,8 @@ void r300_draw_free(R300DrawPacket *pkt);
 /* VRAM [lo, hi) was written by something other than the card's own
  * unswapped rendering (an upload); see rt_note in r300_draw.c. */
 void r300_rt_forget(uint64_t lo, uint64_t hi);
+/* $R300_ENDIAN_MODEL=1: the experimental byte-order model (r300_draw.c). */
+bool r300_endian_model(void);
 
 /*
  * One face/slice of mip level l of a texture a renderer uploads (kinds
