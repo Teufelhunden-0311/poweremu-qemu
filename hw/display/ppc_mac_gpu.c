@@ -13978,6 +13978,8 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
     Object *obj = OBJECT(dev);
 
     s->regs_size = sizeof(PPCMacGPURegs);   /* saved with the machine */
+    s->r3_layout = R300_REG_COUNT ^ (R300_PVS_MEM_VECS << 16) ^
+                   ((uint32_t)sizeof(R300Arrays) << 24);
     s->r300 = object_dynamic_cast(obj, TYPE_ATI_RADEON_9700) != NULL;
     s->rv250 = object_dynamic_cast(obj, TYPE_ATI_RADEON_9000) != NULL;
     s->r300_src_swap = 2;       /* plain copy until the driver says otherwise */
@@ -14607,10 +14609,11 @@ static char *ppc_mac_gpu_get_perf(Object *obj, Error **errp)
  * plain data with several hundred members, and a hand-written list of
  * them would be wrong within a week.  Its size travels with it, so a
  * machine saved by one build refuses to load into a build whose registers
- * have moved, instead of restoring nonsense.  Nothing outside it needs
- * saving: the display mode, the scanout address and the rest are worked
- * out again from the registers on the next screen update, and the command
- * buffers are refilled by the driver.
+ * have moved, instead of restoring nonsense.  The display mode, the
+ * scanout address and the rest are worked out again from the registers on
+ * the next screen update, and the command buffers are refilled by the
+ * driver.  What else the guest programmed and the card keeps outside the
+ * block (the surfaces, the 3D engine) travels in the subsections below.
  * ======================================================================== */
 
 static int ppc_mac_gpu_pre_save(void *opaque)
@@ -14631,6 +14634,18 @@ static int ppc_mac_gpu_pre_load(void *opaque)
 
     memset(s->r300_surf, 0, sizeof(s->r300_surf));
     s->r3_zconv = false;
+    /* Likewise the 3D engine's state below, as a fresh card has it. */
+    if (s->r3) {
+        uint64_t gen = s->r3->pvs_gen, draws = s->r3->draws;
+
+        r300_state_reset(s->r3);
+        s->r3->pvs_gen = gen;
+        s->r3->draws = draws;
+    }
+    memset(&s->r3_arrays, 0, sizeof(s->r3_arrays));
+    s->r300_src_swap = 2;
+    s->r3_indx_vf = 0;
+    s->r3_indx_buf_pending = false;
     return 0;
 }
 
@@ -14689,6 +14704,9 @@ static int ppc_mac_gpu_post_load(void *opaque, int version_id)
     /* The aperture's views over the restored surfaces. */
     r300_ap0s_update(s);
     r300_surfwatch_update(s);
+    if (s->r3) {
+        s->r3->pvs_gen++;       /* the vertex programs have changed under it */
+    }
     if (s->r300) {
         int n = 0;
         for (int i = 0; i < 8; i++) {
@@ -14737,6 +14755,52 @@ static const VMStateDescription vmstate_ppc_mac_gpu_surfaces = {
         VMSTATE_UINT32(r3_zconv_pitch, PPCMacGPUState),
         VMSTATE_UINT32(r3_zconv_rows, PPCMacGPUState),
         VMSTATE_UINT32(r3_zconv_ns, PPCMacGPUState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+/*
+ * The 3D engine's state, which the driver programs once and then relies
+ * on: its registers, the vertex programs and constants in PVS memory and
+ * where the next upload goes, the vertex arrays last pointed at, and the
+ * 2D upload byte swap.  Without it a fresh process came back with a blank
+ * engine, and a machine loaded into a running one kept that one's
+ * programs.  What the renderer derives from it is keyed by its contents
+ * and follows by itself.
+ */
+static bool ppc_mac_gpu_r300_needed(void *opaque)
+{
+    PPCMacGPUState *s = opaque;
+
+    return s->r3 != NULL;
+}
+
+static const VMStateDescription vmstate_r300_state = {
+    .name = "r300-state",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_ARRAY(regs, R300State, R300_REG_COUNT),
+        VMSTATE_UINT32_ARRAY(pvs_mem, R300State, R300_PVS_MEM_VECS * 4),
+        VMSTATE_UINT32(pvs_upload_dw, R300State),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static const VMStateDescription vmstate_ppc_mac_gpu_r300 = {
+    .name = "ppc-mac-gpu/r300",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = ppc_mac_gpu_r300_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_EQUAL(r3_layout, PPCMacGPUState,
+                             "this machine was saved by a build whose "
+                             "3D engine state was laid out differently"),
+        VMSTATE_STRUCT_POINTER(r3, PPCMacGPUState, vmstate_r300_state,
+                               R300State),
+        VMSTATE_BUFFER_UNSAFE(r3_arrays, PPCMacGPUState, 1,
+                              sizeof(R300Arrays)),
+        VMSTATE_UINT32(r300_src_swap, PPCMacGPUState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -14807,6 +14871,7 @@ static const VMStateDescription vmstate_ppc_mac_gpu = {
     },
     .subsections = (const VMStateDescription * const []) {
         &vmstate_ppc_mac_gpu_surfaces,
+        &vmstate_ppc_mac_gpu_r300,
         NULL
     }
 };

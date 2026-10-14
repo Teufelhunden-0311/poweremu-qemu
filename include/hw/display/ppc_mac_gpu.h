@@ -722,6 +722,7 @@ struct PPCMacGPUState {
     /* How big that register file is, saved with the machine so a state
      * written by another build cannot be poured into a different layout. */
     uint32_t regs_size;
+    uint32_t r3_layout;         /* the same for the 3D engine's state */
     PPCMacGPUDisplayMode disp;  /* Current display mode */
     QEMUTimer vblank_timer;     /* VBlank interrupt timer */
     Notifier exit_notifier;     /* finish drawing before exit() */
