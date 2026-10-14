@@ -35,10 +35,12 @@
 #include "qemu/datadir.h"
 #include "qemu/rcu.h"
 #include "qemu/main-loop.h"
+#include "qemu/hbitmap.h"
 #include "hw/pci/pci_device.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "exec/address-spaces.h"
+#include "exec/target_page.h"
 #include "hw/display/ppc_mac_gpu.h"
 #include "ppc_mac_gpu_3d_regs.h"
 #include "ppc_mac_gpu_renderer.h"
@@ -294,7 +296,7 @@ static uint64_t disp_last_sample;
  *                         instead of draining it on the UI thread
  *   PPCGPU_DIAG           per-frame diagnostic VRAM scans (default off)
  */
-static void ppc_mac_gpu_note_scanout(uint64_t lo, uint64_t hi);
+static void ppc_mac_gpu_note_scanout(PPCMacGPUState *s, uint64_t lo, uint64_t hi);
 static bool ppc_mac_gpu_vram_gen(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
                                  uint64_t *gen);
 
@@ -2227,7 +2229,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
 
     /* 32bpp path: shadow buffer with bswap32 */
     uint64_t frame_size = (uint64_t)stride * height;
-    ppc_mac_gpu_note_scanout(s->disp.offset, s->disp.offset + frame_size);
+    ppc_mac_gpu_note_scanout(s, s->disp.offset, s->disp.offset + frame_size);
 
     /* (Re)allocate shadow buffer if needed */
     if (!s->shadow_buf || s->shadow_buf_size < frame_size) {
@@ -13451,12 +13453,28 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
  * over the scanout; so outside every recent scanout this function can own
  * the bits (a write to any page under the texture counts against all of
  * them; then they are cleared), and inside one it declines.
+ *
+ * "Over the scanout" as QEMU clears it: memory_region_snapshot_and_clear_
+ * dirty() works in whole blocks of the log, 2^(page bits + BITS_PER_LEVEL)
+ * bytes of RAM (256 KB with 4 KB pages), so a frame ending mid-block takes
+ * the rest of that block's bits with it.  Noted as the frame alone, a
+ * texture just past the frame's end lost the mark of a draw into it now
+ * and then, and its cached copy was used unchanged (texprobe stage 3 on
+ * Metal: textures at 0x3e0000-0x3f2000, in the block a 1152x870 frame
+ * ends in).
  */
 static uint64_t g_scanout_seen[8][2];  /* [lo, hi) of recent scanouts */
 static unsigned g_scanout_seen_n;
 
-static void ppc_mac_gpu_note_scanout(uint64_t lo, uint64_t hi)
+static void ppc_mac_gpu_note_scanout(PPCMacGPUState *s, uint64_t lo, uint64_t hi)
 {
+    uint64_t align = 1ull << (qemu_target_page_bits() + BITS_PER_LEVEL);
+    uint64_t base = memory_region_get_ram_addr(&s->vram);
+
+    lo = QEMU_ALIGN_DOWN(base + lo, align);
+    lo = lo > base ? lo - base : 0;
+    hi = QEMU_ALIGN_UP(base + hi, align) - base;
+
     for (unsigned i = 0; i < ARRAY_SIZE(g_scanout_seen); i++) {
         if (qatomic_read(&g_scanout_seen[i][0]) == lo &&
             qatomic_read(&g_scanout_seen[i][1]) == hi) {
