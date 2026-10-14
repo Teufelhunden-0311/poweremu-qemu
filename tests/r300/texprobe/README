@@ -55,6 +55,13 @@ texprobe.c   Mac OS X 10.4 (PowerPC), GLUT.  Uploads textures in which
              with glGetTexImage first, after the copy, after the drawing
              and last (GET lines, counted as levels): a read of the
              texture's memory by the driver, not a draw.
+             stage 6: textures made by glCopyTexImage2D instead of uploaded,
+             the kind the driver reads back through a swap-0 surface: an
+             RGBA8 and a 1555 (GL_RGB5_A1) texture, one level each, with
+             the format the driver reports it chose (MAKE lines); then a
+             copy into part, a framebuffer object's drawing and a
+             glTexSubImage2D, each overlapping the last.  After each step
+             the level is read back with glGetTexImage and drawn from.
              When a level reads back as another level's texels the draw is
              repeated with a LOD bias; the line then says "bias +N".  Such
              a PASS says the level's texels are right, not that the level
@@ -196,3 +203,25 @@ surfaces looked up after the catch-up and SURFACEn registers readable:
   Stages 1-4 as before: 486, 182, 72 (and 72 src=pixels), 24 on Metal
   and Vulkan.  Without the model: stage 1 464, stage 3 38, stage 4 24,
   stage 5 74 of 96.
+
+Stage 6, 2026-10-14 (textures made by glCopyTexImage2D; emulator at
+surf-save, R300_ENDIAN_MODEL=1 unless said):
+- PowerBook: 16 of 16 (quad and src=pixels); fbo=none fails (exit
+  status 1).  For GL_RGB5_A1 the driver reports 8057, bits 5 5 5 1: it
+  keeps a 16-bit texture.
+- Emulator: 16 of 16 on Metal (quad and src=pixels) and Vulkan; fbo=none
+  fails as on the PowerBook.  With R300_AP0_SURFACES=0: 12 of 16, the
+  four RGBA8 GET lines 0 of 512 with each texel's bytes reversed (got
+  85b59418 want 1894b585) and every draw right -- this stage tells the
+  two apart, as rbprobe does.  Without the model: 6 of 16 (the 1555
+  texture wrong throughout; the RGBA8 one's glTexSubImage2D texels
+  reversed).
+- $R300_SURFLOG: the driver reads the RGBA8 texture back through a swap-0
+  surface (512 reads converted for each GET) and the 1555 one through
+  swap 1, left straight; the swap-0 settings the 1555 one passes through
+  get no reads.  16-bit data under swap 0 was not seen here either: that
+  case remains unexercised.
+- $R300_DRAWLOG: both are sampled macro- and micro-tiled with endian 0
+  (TX_OFFSET 0x003e100c, 0x003e200c); the framebuffer object draws into
+  the RGBA8 one with COLORENDIAN 0 (RB3D_COLORPITCH0 0x00c30020), where
+  stage 4's uploaded textures were drawn into with 2.

@@ -34,6 +34,13 @@
  * checked after each step, and read back with glGetTexImage (GET lines)
  * first and last.
  *
+ * Stage 6 makes an RGBA8 and a 1555 texture (one level each) with
+ * glCopyTexImage2D instead of uploading them, says what format the driver
+ * reports it chose (MAKE lines), then copies into part of each, draws into
+ * them through a framebuffer object and overwrites part with
+ * glTexSubImage2D; after each step the level is read back with
+ * glGetTexImage and drawn from.
+ *
  * A level is drawn with GL_NEAREST_MIPMAP_NEAREST at one texel per pixel,
  * so the card chooses the level itself.  When what comes back is another
  * level's texels the draw is repeated with a LOD bias, and the bias that
@@ -162,6 +169,13 @@ static Tex mixcases[] = {
     { .id = 91, .kind = K_1555,  .w = 32, .h = 16, .stage = 5 },
 };
 #define NMIX ((int)(sizeof(mixcases) / sizeof(mixcases[0])))
+
+/* stage 6: made by glCopyTexImage2D, then copied into, drawn into, updated */
+static Tex ctcases[] = {
+    { .id = 100, .kind = K_RGBA8, .w = 32, .h = 16, .stage = 6, .single = 1 },
+    { .id = 101, .kind = K_1555,  .w = 32, .h = 16, .stage = 6, .single = 1 },
+};
+#define NCT ((int)(sizeof(ctcases) / sizeof(ctcases[0])))
 #define PX 300                  /* where the patterns are drawn */
 #define PY 300
 
@@ -1169,6 +1183,91 @@ static void run_mix_tests(void)
     glDeleteFramebuffersEXT(1, &fbo);
 }
 
+/*
+ * Make t's only level from pattern p with glCopyTexImage2D, in the internal
+ * format its kind asks for, and say what the driver reports it chose: the
+ * request alone does not say how the texels are stored.
+ */
+static void copy_create(Tex *t, int p)
+{
+    GLenum internal, format, type;
+    GLint fmt = 0, r = 0, g = 0, b = 0, a = 0;
+    int src_ok = draw_pattern(p, t->w, t->h);
+
+    if (!src_ok) {
+        t->src_invalid = 1;
+    }
+    formats(t->kind, &internal, &format, &type);
+    t->levels = 1;
+    glGenTextures(1, &t->name);
+    glBindTexture(GL_TEXTURE_2D, t->name);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glCopyTexImage2D(GL_TEXTURE_2D, 0, internal, PX, PY, t->w, t->h, 0);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &fmt);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_RED_SIZE, &r);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_GREEN_SIZE, &g);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_BLUE_SIZE, &b);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_ALPHA_SIZE, &a);
+    t->expv[0] = malloc(t->w * t->h * 4);
+    for (int j = 0; j < t->h; j++) {
+        for (int i = 0; i < t->w; i++) {
+            pattern_rgba(p, i, j, t->expv[0] + (j * t->w + i) * 4);
+        }
+    }
+    say("MAKE T%02d P%d %dx%d asked %04x, driver reports %04x bits r%d g%d b%d a%d, "
+        "GL error %04x%s\n", t->id, p, t->w, t->h, internal, fmt, r, g, b, a, gl_err(),
+        src_ok ? "" : ", SOURCE CONTROL FAILED");
+}
+
+/*
+ * Stage 6: textures made by glCopyTexImage2D -- the kind Apple's driver
+ * reads back through a swap-0 surface -- read back and drawn from at once,
+ * then after a copy into part, a framebuffer object's drawing and a
+ * glTexSubImage2D, each overlapping the last.
+ */
+static void run_copytex_tests(void)
+{
+    uint8_t a1[4], a2[4], a3[4];
+    GLuint fbo;
+
+    fbo_colours(a1, a2, a3);
+    if (!has_ext("GL_EXT_framebuffer_object")) {
+        say("no GL_EXT_framebuffer_object\n");
+        n_fbo_bad++;
+        return;
+    }
+    glGenFramebuffersEXT(1, &fbo);
+    for (int i = 0; i < NCT; i++) {
+        Tex *t = &ctcases[i];
+        if (only >= 0 && t->id != only) {
+            continue;
+        }
+        copy_create(t, 1);
+        get_check(t, 0, "made");
+        check_tex(t, "made");
+        copy_in(t, 2, 0, 3, 2, 10, 6);
+        get_check(t, 0, "copy");
+        check_tex(t, "copy");
+        if (fbo_begin(fbo, t)) {
+            fbo_rect(t, 8, 4, 8, 6, a1, 1, all);        /* over the copy's right part */
+            fbo_rect(t, 0, 0, 5, 4, a2, 0, rb);         /* over its corner and the first */
+            fbo_rect(t, 4, 3, 9, 5, a3, 1, ga);         /* over all three */
+            fbo_end();
+            get_check(t, 0, "fbo");
+            check_tex(t, "fbo");
+        } else {
+            fbo_end();
+        }
+        sub_in(t, 0, 6, 1, 6, 5);                       /* over the copy, the drawing, the first */
+        get_check(t, 0, "sub");
+        check_tex(t, "sub");
+    }
+    glDeleteFramebuffersEXT(1, &fbo);
+}
+
 static int has_ext(const char *name)
 {
     const char *e = (const char *)glGetString(GL_EXTENSIONS);
@@ -1233,6 +1332,11 @@ static void run_tests(void)
     }
     if (stage == 5) {
         run_mix_tests();
+        totals();
+        return;
+    }
+    if (stage == 6) {
+        run_copytex_tests();
         totals();
         return;
     }
@@ -1329,6 +1433,10 @@ int main(int argc, char **argv)
             for (int k = 0; k < NMIX; k++) {
                 printf("%d %s %d %d all of them stage 5\n", mixcases[k].id,
                        kname[mixcases[k].kind], mixcases[k].w, mixcases[k].h);
+            }
+            for (int k = 0; k < NCT; k++) {
+                printf("%d %s %d %d made by a copy stage 6\n", ctcases[k].id,
+                       kname[ctcases[k].kind], ctcases[k].w, ctcases[k].h);
             }
             return 0;
         }
