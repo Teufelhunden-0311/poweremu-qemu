@@ -2026,6 +2026,77 @@ static void ppc_mac_gpu_display_update(void *opaque)
                 disp_last_sample = h;
             }
         }
+        /* TEST ONLY ($R300_FRAMEPROBE=dir): per refresh, the scanout's mean
+         * over a rect ($R300_FRAMEPROBE_RECT=x,y,w,h; default the bottom
+         * eighth) and the scanout address; a refresh whose mean jumps away
+         * from the running average is dumped as PPM with the next one. */
+        {
+            static const char *dir;
+            static int init, dumps, dump_next;
+            static FILE *log;
+            static int rx, ry, rw, rh;
+            static double ema = -1;
+            static uint64_t n;
+            const uint8_t *v = memory_region_get_ram_ptr(&s->vram);
+            if (!init) {
+                init = 1;
+                dir = getenv("R300_FRAMEPROBE");
+                if (dir) {
+                    char p[512];
+                    snprintf(p, sizeof(p), "%s/probe.log", dir);
+                    log = fopen(p, "w");
+                    const char *r = getenv("R300_FRAMEPROBE_RECT");
+                    if (!r || sscanf(r, "%d,%d,%d,%d", &rx, &ry, &rw, &rh) != 4) {
+                        rw = 0;
+                    }
+                }
+            }
+            if (log && s->disp.bpp == 32 && s->disp.offset +
+                (uint64_t)s->disp.stride * s->disp.height <= s->vram_size) {
+                int W = s->disp.width, H = s->disp.height;
+                int x0 = rw ? rx : 0, y0 = rw ? ry : H - H / 8;
+                int w = rw ? rw : W, hh = rw ? rh : H / 8;
+                double sum = 0;
+                long cnt = 0;
+                for (int y = y0; y < y0 + hh && y < H; y += 2) {
+                    for (int x = x0; x < x0 + w && x < W; x += 2) {
+                        const uint8_t *px = v + s->disp.offset + (uint64_t)y * s->disp.stride
+                                            + x * 4;
+                        sum += px[1] + px[2] + px[3];
+                        cnt++;
+                    }
+                }
+                double m = cnt ? sum / (3.0 * cnt) : 0;
+                bool odd = ema >= 0 && fabs(m - ema) > 12;
+                n++;
+                fprintf(log, "%llu %lld %.1f %08x %08x%s\n", (unsigned long long)n,
+                        (long long)g_get_monotonic_time(), m,
+                        (unsigned)s->regs.crtc_offset, (unsigned)s->disp.offset,
+                        odd ? " ODD" : "");
+                fflush(log);
+                if ((odd || dump_next || n % 600 == 0) && dumps < 60) {
+                    char p[512];
+                    snprintf(p, sizeof(p), "%s/f%06llu.ppm", dir,
+                             (unsigned long long)n);
+                    FILE *f = fopen(p, "wb");
+                    if (f) {
+                        fprintf(f, "P6\n%d %d\n255\n", W, H);
+                        for (int y = 0; y < H; y++) {
+                            const uint8_t *row = v + s->disp.offset + (uint64_t)y * s->disp.stride;
+                            for (int x = 0; x < W; x++) {
+                                fwrite(row + x * 4 + 1, 1, 3, f);
+                            }
+                        }
+                        fclose(f);
+                        dumps++;
+                    }
+                    dump_next = odd;
+                } else {
+                    dump_next = 0;
+                }
+                ema = ema < 0 ? m : ema * 0.9 + m * 0.1;
+            }
+        }
     } else {
         r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
     }
