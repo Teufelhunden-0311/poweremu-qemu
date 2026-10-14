@@ -14620,9 +14620,10 @@ static int ppc_mac_gpu_pre_save(void *opaque)
 }
 
 /*
- * A state without the surfaces below had none mapped, so none of this
- * machine's may outlive the load.  Only forgotten, not undone: VRAM is
- * about to be replaced by the saved one.
+ * A state without the surfaces below had none mapped, or was saved by an
+ * older build that did not keep them; either way none of this machine's
+ * may outlive the load, and an older build's cannot be recovered.  Only
+ * forgotten, not undone: VRAM is about to be replaced by the saved one.
  */
 static int ppc_mac_gpu_pre_load(void *opaque)
 {
