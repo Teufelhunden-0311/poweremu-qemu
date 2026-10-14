@@ -38,6 +38,22 @@ static uint8_t cpu_byte(const uint8_t *vram, int off, int m)
     return vram[(off & ~3) + view[m][off & 3]];
 }
 
+/* A mapping, as ppc_mac_gpu.c's surfaces: one range converted with mode 0,
+ * the rest straight (mode 2).  ctx: the mapping now and after a catch-up. */
+struct mock_range { int lo, hi, on; };
+
+static void mock_catch_up(void *ctx)
+{
+    void **mp = ctx;
+    *(struct mock_range *)mp[0] = *(struct mock_range *)mp[1];
+}
+
+static unsigned mock_mode_at(void *ctx, uint64_t off)
+{
+    struct mock_range *r = ((void **)ctx)[0];
+    return r->on && off >= (uint64_t)r->lo && off <= (uint64_t)r->hi ? 0 : 2;
+}
+
 int main(void)
 {
     uint8_t vram[N], ref[N];
@@ -113,6 +129,68 @@ int main(void)
         check(r300_ap_load(t, 0, 4, 1) == 0x33441122, "16-bit pair, swap 1 exchanges",
               1, 0, 4);
         check(r300_ap_load(t, 0, 2, 1) == 0x3344, "16-bit pair, swap 1 exchanges", 1, 0, 2);
+    }
+
+    /*
+     * A mapping changed by the catch-up an access starts with (ring
+     * commands carried out before it): the access goes through the mapping
+     * as it is after, at the CPU's own offset, group by group across a
+     * boundary.  A swap-0 surface over 16..31: kept, turned to swap 2,
+     * moved to 24..39, removed; reads and writes at 16 and across 24.
+     */
+    {
+        enum { M = 48 };
+        uint8_t mv[M], mr[M];
+        struct mock_range now, after;
+        static const struct { int lo, hi, on; const char *what; } to[] = {
+            { 16, 31, 1, "kept" },
+            { 16, 31, 0, "turned to swap 2" },
+            { 24, 39, 1, "moved" },
+            { 0, 0, 0, "removed" },
+        };
+        void *mp[2] = { &now, &after };
+        R300ApMap map = {
+            .vram = mv,
+            .catch_up = mock_catch_up,
+            .mode_at = mock_mode_at,
+            .ctx = mp,
+        };
+        int remaps = 0;
+
+        for (int t = 0; t < 4; t++) {
+            for (int wr = 0; wr < 2; wr++) {
+                for (int off = 16; off <= 22; off += 6) {
+                    uint64_t val = 0xC1C2C3C4, got = 0;
+
+                    for (int i = 0; i < M; i++) {
+                        mv[i] = mr[i] = 0x40 + i * 3;
+                    }
+                    now.lo = 16, now.hi = 31, now.on = 1;
+                    after.lo = to[t].lo, after.hi = to[t].hi, after.on = to[t].on;
+                    if (wr) {
+                        r300_ap_write_at(&map, off, 4, val);
+                    } else {
+                        got = r300_ap_read_at(&map, off, 4);
+                    }
+                    for (int i = 0; i < 4; i++) {
+                        int o = off + i;
+                        int m = after.on && o >= after.lo && o <= after.hi ? 0 : 2;
+                        if (wr) {
+                            mr[(o & ~3) + view[m][o & 3]] = val >> (8 * (3 - i));
+                        } else {
+                            check(cpu_byte(mr, o, m) == (uint8_t)(got >> (8 * (3 - i))),
+                                  to[t].what, m, off, 4);
+                        }
+                    }
+                    if (wr) {
+                        check(!memcmp(mv, mr, M), to[t].what, -1, off, 4);
+                    }
+                    remaps++;
+                }
+            }
+        }
+        printf("aperture views: %d accesses with the mapping changed under them\n",
+               remaps);
     }
 
     printf("aperture views: %d loads, %d stores, %d failed\n", loads, stores, fails);

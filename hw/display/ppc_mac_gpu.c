@@ -13434,12 +13434,14 @@ static void r300_surfwatch_update(PPCMacGPUState *s)
  * data under swap 1 or 3, or 16-bit data under swap 0, would read wrong;
  * neither has been seen.  One backing for every element size would end
  * this limit.
- * Also left straight, and logged: a surface overlapping another, one over
- * the multisampled depth buffer r300_zconv rewrites for its own readback,
- * one not four-byte aligned, and a NONSURF_AP0_SWP other than 2 (outside
- * surfaces).  Each converted surface's reads and writes are counted, and
- * logged when it goes.  Surface registers are not part of the saved
- * machine, so after a restore this follows whatever they hold.
+ * Also left straight, and logged: a surface overlapping another, one
+ * overlapping the multisampled depth buffer r300_zconv rewrites for its own
+ * readback, one not four-byte aligned, and a NONSURF_AP0_SWP other than 2
+ * (outside surfaces).  An access looks its surface up again after the card
+ * has caught up (r300_ap_read_at), and is counted to the one it went
+ * through; each converted surface's counts are logged when it goes.
+ * Surface registers are not part of the saved machine, and nothing here is
+ * rebuilt after a restore: not right across a save and restore.
  */
 static void r300_ap0s_note(const char *what, int n, uint32_t lo, uint32_t hi,
                            unsigned mode)
@@ -13462,20 +13464,84 @@ static void r300_ap0s_first(struct R300Ap0Surf *a, uint64_t off, unsigned size,
     }
 }
 
+/* The surface converting aperture 0 at VRAM offset off now, if any. */
+static struct R300Ap0Surf *r300_ap0s_at(PPCMacGPUState *s, uint64_t off)
+{
+    for (int n = 0; n < 8; n++) {
+        struct R300Ap0Surf *a = &s->r300_ap0s[n];
+        if (a->on && off >= a->lo && off <= a->hi) {
+            return a;
+        }
+    }
+    return NULL;
+}
+
+static unsigned r300_ap0s_mode_at(void *ctx, uint64_t off)
+{
+    struct R300Ap0Surf *a = r300_ap0s_at(ctx, off);
+    return a ? a->mode : 2;                 /* outside a surface: straight */
+}
+
+/* Ring and deferred drawing done first: a readback sees what came before
+ * it, and earlier commands see the old bytes under a write.  Surface
+ * writes among them can change the mapping (r300_ap_read_at). */
+static void r300_ap0s_catch_up(void *ctx)
+{
+    ppc_mac_gpu_cp_sync(ctx, 0xFFFFFFFF);
+    r200_flush_at(ctx, R200_WHY_TAG(R200_WHY_DISPLAY));
+}
+
+static R300ApMap r300_ap0s_map(PPCMacGPUState *s)
+{
+    return (R300ApMap) {
+        .vram = memory_region_get_ram_ptr(&s->vram),
+        .catch_up = r300_ap0s_catch_up,
+        .mode_at = r300_ap0s_mode_at,
+        .ctx = s,
+    };
+}
+
+/* Counted to the surface the access went through, which after the
+ * catch-up need not be the one it came in by. */
+static void r300_ap0s_count(PPCMacGPUState *s, uint64_t off, unsigned size,
+                            bool wr)
+{
+    struct R300Ap0Surf *a = r300_ap0s_at(s, off);
+
+    if (!a) {
+        a = r300_ap0s_at(s, off + size - 1);
+    }
+    if (!a) {
+        static int logged;
+        if (logged++ < 16) {
+            qemu_log("ppc-mac-gpu r300: aperture 0 %s at 0x%" PRIx64 " left straight: "
+                     "its surface changed while the card caught up\n",
+                     wr ? "write" : "read", off);
+        }
+        return;
+    }
+    r300_ap0s_first(a, off, size, wr);
+    if (wr) {
+        a->writes++;
+    } else {
+        a->reads++;
+    }
+}
+
 static uint64_t r300_ap0s_read(void *opaque, hwaddr addr, unsigned size)
 {
     struct R300Ap0Surf *a = opaque;
     PPCMacGPUState *s = a->s;
-    uint64_t off = a->lo + addr;
+    uint64_t off = a->lo + addr;        /* taken while a is where it came in */
+    R300ApMap m = r300_ap0s_map(s);
+    uint64_t v;
 
     if (off + size > (uint64_t)a->hi + 1) {
         return 0;
     }
-    ppc_mac_gpu_cp_sync(s, 0xFFFFFFFF);     /* a readback: ring done first */
-    r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
-    r300_ap0s_first(a, off, size, false);
-    a->reads++;
-    return r300_ap_load(memory_region_get_ram_ptr(&s->vram), off, size, a->mode);
+    v = r300_ap_read_at(&m, off, size);
+    r300_ap0s_count(s, off, size, false);
+    return v;
 }
 
 static void r300_ap0s_write(void *opaque, hwaddr addr, uint64_t val,
@@ -13484,15 +13550,13 @@ static void r300_ap0s_write(void *opaque, hwaddr addr, uint64_t val,
     struct R300Ap0Surf *a = opaque;
     PPCMacGPUState *s = a->s;
     uint64_t off = a->lo + addr;
+    R300ApMap m = r300_ap0s_map(s);
 
     if (off + size > (uint64_t)a->hi + 1) {
         return;
     }
-    ppc_mac_gpu_cp_sync(s, 0xFFFFFFFF);     /* earlier commands see the old bytes */
-    r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
-    r300_ap0s_first(a, off, size, true);
-    a->writes++;
-    r300_ap_store(memory_region_get_ram_ptr(&s->vram), off, size, val, a->mode);
+    r300_ap_write_at(&m, off, size, val);
+    r300_ap0s_count(s, off, size, true);
     vram_mark(s, off & ~3ull, ((off + size + 3) & ~3ull) - (off & ~3ull));
 }
 
@@ -13503,6 +13567,20 @@ static const MemoryRegionOps r300_ap0s_ops = {
     .valid = { .min_access_size = 1, .max_access_size = 8, .unaligned = true },
     .impl = { .min_access_size = 1, .max_access_size = 4, .unaligned = true },
 };
+
+/* The VRAM r300_zconv rewrites while its surface is mapped, hi inclusive. */
+static bool r300_zconv_span(PPCMacGPUState *s, uint64_t *lo, uint64_t *hi)
+{
+    uint64_t card = (uint64_t)s->r3_zconv_pitch * 4 * s->r3_zconv_rows *
+                    s->r3_zconv_ns;
+
+    if (!s->r3_zconv) {
+        return false;
+    }
+    *lo = s->r3_zconv_off;
+    *hi = MIN(*lo + MAX(card, 1) - 1, s->vram_size - 1);
+    return true;
+}
 
 static void r300_ap0s_update(PPCMacGPUState *s)
 {
@@ -13537,6 +13615,7 @@ static void r300_ap0s_update(PPCMacGPUState *s)
         unsigned mode = (s->r300_surf[3 + 4 * n] >> 20) & 3;
         bool want = (lo || hi) && mode != 2;
         const char *no = NULL;
+        uint64_t zlo, zhi;
 
         if (want && hi < lo) {
             want = false;                   /* being set: bounds one at a time */
@@ -13553,8 +13632,8 @@ static void r300_ap0s_update(PPCMacGPUState *s)
                 no = "not converted: overlaps another surface";
             }
         }
-        if (want && !no && s->r3_zconv && lo == s->r3_zconv_off) {
-            no = "not converted: the depth buffer's multisample readback";
+        if (want && !no && r300_zconv_span(s, &zlo, &zhi) && lo <= zhi && hi >= zlo) {
+            no = "not converted: overlaps the depth buffer's multisample readback";
         }
         want = want && !no;
         if (a->on && (!want || a->lo != lo || a->hi != hi || a->mode != mode)) {

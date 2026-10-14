@@ -81,4 +81,51 @@ static inline void r300_ap_store(uint8_t *vram, uint64_t off, unsigned size,
     }
 }
 
+/*
+ * A CPU access through a mapping that can change under it.  catch_up
+ * brings the card up to date (the ring, deferred drawing), and that can
+ * carry out surface writes which move, end or change the very mapping the
+ * access came in by.  So the view is looked up only after it, group by
+ * group (mode_at: the mode at a VRAM offset now; an access can straddle a
+ * boundary the catch-up moved), and the offset is the CPU's own, taken by
+ * the caller before.
+ */
+typedef struct R300ApMap {
+    uint8_t *vram;
+    void (*catch_up)(void *ctx);
+    unsigned (*mode_at)(void *ctx, uint64_t off);
+    void *ctx;
+} R300ApMap;
+
+static inline unsigned r300_ap_in_group(uint64_t off, unsigned left)
+{
+    unsigned n = 4 - (off & 3);
+    return n < left ? n : left;
+}
+
+static inline uint64_t r300_ap_read_at(const R300ApMap *m, uint64_t off,
+                                       unsigned size)
+{
+    uint64_t v = 0;
+
+    m->catch_up(m->ctx);
+    for (unsigned i = 0, n; i < size; i += n) {
+        n = r300_ap_in_group(off + i, size - i);
+        v = v << (8 * n) |
+            r300_ap_load(m->vram, off + i, n, m->mode_at(m->ctx, off + i));
+    }
+    return v;
+}
+
+static inline void r300_ap_write_at(const R300ApMap *m, uint64_t off,
+                                    unsigned size, uint64_t val)
+{
+    m->catch_up(m->ctx);
+    for (unsigned i = 0, n; i < size; i += n) {
+        n = r300_ap_in_group(off + i, size - i);
+        r300_ap_store(m->vram, off + i, n, val >> (8 * (size - i - n)),
+                      m->mode_at(m->ctx, off + i));
+    }
+}
+
 #endif
