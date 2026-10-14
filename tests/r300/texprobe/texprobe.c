@@ -5,7 +5,8 @@
  * (and so each level can be found again in a dump of the card's memory).
  * Build on Tiger:
  *   gcc -std=gnu99 -O2 -o texprobe texprobe.c -framework GLUT -framework OpenGL
- * Run: texprobe [stage=N] [only=ID] [hold=SECONDS] [wait=SECONDS] [src=pixels] [list]
+ * Run: texprobe [stage=N] [only=ID] [hold=SECONDS] [wait=SECONDS] [src=pixels] [fbo=none]
+ *               [list]
  * Writes /tmp/texprobe.txt.  tags.py computes the same texels (stages 1, 2).
  *
  * Stage 3 copies from the frame buffer into textures (glCopyTexSubImage2D,
@@ -21,7 +22,17 @@
  * levels, level 0 attached, three overlapping rectangles -- added
  * (glBlendFunc ONE, ONE), written through a colour mask (red and blue
  * only), and both (green and alpha added) -- then every level checked
- * against what the probe computes from the texels uploaded.
+ * against what the probe computes from the texels uploaded.  A framebuffer
+ * object that is not complete is a failed control (fbo=none attaches
+ * nothing, to see that it is).
+ *
+ * Stage 5 does all of these to one texture, the conventions meeting in
+ * one resource: an RGBA8 and a 1555 texture with mip levels, uploaded,
+ * copied into in part, drawn into through a framebuffer object over the
+ * copy and the upload (added; written through a colour mask), then
+ * overwritten in part by glTexSubImage2D over all three; every level is
+ * checked after each step, and read back with glGetTexImage (GET lines)
+ * first and last.
  *
  * A level is drawn with GL_NEAREST_MIPMAP_NEAREST at one texel per pixel,
  * so the card chooses the level itself.  When what comes back is another
@@ -29,8 +40,9 @@
  * was needed is reported: a PASS with a bias other than +0 says the
  * level's texels are right, not that the level was chosen rightly.
  * Exit status 1 when a level failed, a stage 3 source pattern did not
- * read back as drawn, GL reported an error, or nothing was run; the last
- * lines say which (TOTAL, CONTROLS, RESULT).
+ * read back as drawn, a framebuffer object was incomplete, GL reported an
+ * error, or nothing was run; the last lines say which (TOTAL, CONTROLS,
+ * RESULT).
  */
 #include <GLUT/glut.h>
 #include <OpenGL/gl.h>
@@ -64,7 +76,7 @@ typedef struct {
     struct { int lv, x, y, w, h; } subr[2];
     uint32_t *own[16];          /* stage 3: what each texel of a level holds */
     int src_invalid;            /* stage 3: a copy into it had a bad source */
-    uint8_t *expv[16];          /* stage 4: what a read of each texel should give */
+    uint8_t *expv[16];          /* stages 4, 5: what a read of each texel should give */
 } Tex;
 
 /* own[]: an upload's salt, or OWN_PAT | pattern | i << 16 | j << 24 for
@@ -143,14 +155,22 @@ static Tex fbocases[] = {
     { .id = 81, .kind = K_1555,  .w = 32, .h = 16, .stage = 4 },
 };
 #define NFBO ((int)(sizeof(fbocases) / sizeof(fbocases[0])))
+
+/* stage 5: uploaded, copied into, drawn into, updated in part */
+static Tex mixcases[] = {
+    { .id = 90, .kind = K_RGBA8, .w = 32, .h = 16, .stage = 5 },
+    { .id = 91, .kind = K_1555,  .w = 32, .h = 16, .stage = 5 },
+};
+#define NMIX ((int)(sizeof(mixcases) / sizeof(mixcases[0])))
 #define PX 300                  /* where the patterns are drawn */
 #define PY 300
 
 static FILE *out;
 static GLint abits, maxsize;
-static int stage = 1, only = -1, hold = 4, waits, src_pixels;
+static int stage = 1, only = -1, hold = 4, waits, src_pixels, fbo_none;
 static int n_levels, n_ok, n_bad, n_biased;
 static int n_src, n_src_bad, n_glerr;   /* controls: patterns read back, GL errors */
+static int n_fbo, n_fbo_bad;            /* controls: framebuffer objects, incomplete ones */
 
 /* glGetError, counted: an error makes the run fail. */
 static GLenum gl_err(void)
@@ -163,7 +183,7 @@ static GLenum gl_err(void)
 
 static int failed(void)
 {
-    return !n_levels || n_bad || n_src_bad || n_glerr;
+    return !n_levels || n_bad || n_src_bad || n_fbo_bad || n_glerr;
 }
 
 static void say(const char *fmt, ...)
@@ -821,7 +841,11 @@ static void copy_in(Tex *t, int p, int lv, int x, int y, int w, int h)
     glCopyTexSubImage2D(GL_TEXTURE_2D, lv, x, y, PX, PY, w, h);
     for (int j = 0; j < h; j++) {
         for (int i = 0; i < w; i++) {
-            t->own[lv][(y + j) * lw + x + i] = OWN_PAT | p | i << 16 | (uint32_t)j << 24;
+            if (t->expv[lv]) {
+                pattern_rgba(p, i, j, t->expv[lv] + ((y + j) * lw + x + i) * 4);
+            } else {
+                t->own[lv][(y + j) * lw + x + i] = OWN_PAT | p | i << 16 | (uint32_t)j << 24;
+            }
         }
     }
     say("COPY T%02d P%d -> lv%d %d,%d %dx%d, GL error %04x%s\n", t->id, p, lv, x, y, w, h,
@@ -841,10 +865,58 @@ static void sub_in(Tex *t, int lv, int x, int y, int w, int h)
     free(buf);
     for (int j = 0; j < h; j++) {
         for (int i = 0; i < w; i++) {
-            t->own[lv][(y + j) * lw + x + i] = t->id + SUBSALT;
+            if (t->expv[lv]) {
+                uint32_t v[4];
+                uint8_t m[4];
+                texel(t->kind, t->id + SUBSALT, 0, lv, x + i, y + j, v,
+                      t->expv[lv] + ((y + j) * lw + x + i) * 4, m);
+            } else {
+                t->own[lv][(y + j) * lw + x + i] = t->id + SUBSALT;
+            }
         }
     }
     say("SUB  T%02d -> lv%d %d,%d %dx%d, GL error %04x\n", t->id, lv, x, y, w, h, gl_err());
+}
+
+/*
+ * Level lv read back whole with glGetTexImage (GL_RGBA, GL_UNSIGNED_BYTE)
+ * and compared texel by texel with what the probe expects; counted as a
+ * level, as a drawn one is.  Not a draw: the driver reads the texture's
+ * memory itself.
+ */
+static void get_check(const Tex *t, int lv, const char *pass)
+{
+    int lw = dim(t->w, lv), lh = dim(t->h, lv), ok = 0, shown = 0;
+    uint8_t *buf = calloc(lw * lh, 4);
+    char note[200] = "";
+
+    glBindTexture(GL_TEXTURE_2D, t->name);
+    glGetTexImage(GL_TEXTURE_2D, lv, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+    for (int y = 0; y < lh; y++) {
+        for (int x = 0; x < lw; x++) {
+            uint8_t want[4], mask[4], *g = buf + (y * lw + x) * 4;
+            expect(t, 0, lv, x, y, want, mask);
+            if (same(g, want, mask)) {
+                ok++;
+            } else if (shown++ < 3) {
+                int o = strlen(note);
+                snprintf(note + o, sizeof(note) - o,
+                         " (%d,%d) got %02x%02x%02x%02x want %02x%02x%02x%02x",
+                         x, y, g[0], g[1], g[2], g[3], want[0], want[1], want[2], want[3]);
+            }
+        }
+    }
+    n_levels++;
+    if (ok == lw * lh) {
+        n_ok++;
+    } else {
+        n_bad++;
+    }
+    say("GET  T%02d %s %dx%d lv%d %dx%d %s px %d ok %d crc %08x %s, GL error %04x%s%s\n",
+        t->id, kname[t->kind], t->w, t->h, lv, lw, lh, pass, lw * lh, ok,
+        crc(buf, lw * lh * 4), ok == lw * lh ? "PASS" : "FAIL", gl_err(),
+        t->src_invalid ? " SOURCE-INVALID (a copy's source pattern was wrong)" : "", note);
+    free(buf);
 }
 
 static void run_copy_tests(void)
@@ -944,68 +1016,148 @@ static void fbo_rect(Tex *t, int x, int y, int w, int h, const uint8_t c[4], int
         m[3] ? " a" : "", x, y, w, h, c[0], c[1], c[2], c[3], gl_err());
 }
 
+/* Upload t and fill in what a read of each of its texels should give. */
+static void upload_exp(Tex *t)
+{
+    uint32_t v[4];
+    uint8_t m[4];
+
+    upload(t);
+    for (int lv = 0; lv < t->levels; lv++) {
+        int lw = dim(t->w, lv), lh = dim(t->h, lv);
+        t->expv[lv] = malloc(lw * lh * 4);
+        for (int y = 0; y < lh; y++) {
+            for (int x = 0; x < lw; x++) {
+                texel(t->kind, t->id, 0, lv, x, y, v, t->expv[lv] + (y * lw + x) * 4, m);
+            }
+        }
+    }
+}
+
+/*
+ * Bind fbo with level 0 of t attached (with fbo=none nothing: incomplete
+ * on purpose) and set up drawing into it, one unit a texel; 1 when the
+ * framebuffer object is complete.  One that is not is a failed control:
+ * what was to be drawn into the texture was not, so the checks after it
+ * would pass on texels that were never changed.
+ */
+static int fbo_begin(GLuint fbo, const Tex *t)
+{
+    GLenum st;
+
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+    glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D,
+                              fbo_none ? 0 : t->name, 0);
+    st = glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT);
+    n_fbo++;
+    n_fbo_bad += st != GL_FRAMEBUFFER_COMPLETE_EXT;
+    say("FBO  T%02d status %04x%s\n", t->id, st,
+        st == GL_FRAMEBUFFER_COMPLETE_EXT ? " complete"
+                                          : " INCOMPLETE: not drawn, a failed control");
+    if (st == GL_FRAMEBUFFER_COMPLETE_EXT) {
+        glViewport(0, 0, t->w, t->h);
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glOrtho(0, t->w, 0, t->h, -1, 1);
+        glMatrixMode(GL_MODELVIEW);
+        glDisable(GL_TEXTURE_2D);
+    }
+    return st == GL_FRAMEBUFFER_COMPLETE_EXT;
+}
+
+/* Back to the window. */
+static void fbo_end(void)
+{
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, 0);
+    glViewport(0, 0, WW, WH);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0, WW, 0, WH, -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+}
+
+/* The colours drawn into the textures: five significant bits a channel. */
+static void fbo_colours(uint8_t a1[4], uint8_t a2[4], uint8_t a3[4])
+{
+    a1[0] = rep5(5); a1[1] = rep5(9); a1[2] = rep5(3); a1[3] = 0;       /* added, alpha 0 */
+    a2[0] = rep5(20); a2[1] = rep5(7); a2[2] = rep5(11); a2[3] = 255;   /* written: r, b */
+    a3[0] = rep5(2); a3[1] = rep5(6); a3[2] = rep5(4); a3[3] = 255;     /* added: g, a */
+}
+
+static const int all[4] = { 1, 1, 1, 1 }, rb[4] = { 1, 0, 1, 0 }, ga[4] = { 0, 1, 0, 1 };
+
 static void run_fbo_tests(void)
 {
-    static const uint8_t c1[4] = { 0, 0, 0, 0 }, c2[4] = { 0, 0, 0, 255 },
-                         c3[4] = { 0, 0, 0, 255 };
     uint8_t a1[4], a2[4], a3[4];
-    static const int all[4] = { 1, 1, 1, 1 }, rb[4] = { 1, 0, 1, 0 }, ga[4] = { 0, 1, 0, 1 };
     GLuint fbo;
 
-    memcpy(a1, c1, 4); memcpy(a2, c2, 4); memcpy(a3, c3, 4);
-    a1[0] = rep5(5); a1[1] = rep5(9); a1[2] = rep5(3);          /* added, alpha 0 */
-    a2[0] = rep5(20); a2[1] = rep5(7); a2[2] = rep5(11);        /* written: r, b */
-    a3[0] = rep5(2); a3[1] = rep5(6); a3[2] = rep5(4);          /* added: g, a */
+    fbo_colours(a1, a2, a3);
     if (!has_ext("GL_EXT_framebuffer_object")) {
         say("no GL_EXT_framebuffer_object\n");
-        n_src_bad++;
+        n_fbo_bad++;
         return;
     }
     glGenFramebuffersEXT(1, &fbo);
     for (int i = 0; i < NFBO; i++) {
         Tex *t = &fbocases[i];
-        GLenum st;
-        uint32_t v[4];
-        uint8_t m[4];
+        int drawn;
         if (only >= 0 && t->id != only) {
             continue;
         }
-        upload(t);
-        for (int lv = 0; lv < t->levels; lv++) {
-            int lw = dim(t->w, lv), lh = dim(t->h, lv);
-            t->expv[lv] = malloc(lw * lh * 4);
-            for (int y = 0; y < lh; y++) {
-                for (int x = 0; x < lw; x++) {
-                    texel(t->kind, t->id, 0, lv, x, y, v, t->expv[lv] + (y * lw + x) * 4, m);
-                }
-            }
-        }
+        upload_exp(t);
         check_tex(t, "first");
-        glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
-        glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D,
-                                  t->name, 0);
-        st = glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT);
-        say("FBO  T%02d status %04x%s\n", t->id, st,
-            st == GL_FRAMEBUFFER_COMPLETE_EXT ? " complete" : " INCOMPLETE: not drawn");
-        if (st == GL_FRAMEBUFFER_COMPLETE_EXT) {
-            glViewport(0, 0, t->w, t->h);
-            glMatrixMode(GL_PROJECTION);
-            glLoadIdentity();
-            glOrtho(0, t->w, 0, t->h, -1, 1);
-            glMatrixMode(GL_MODELVIEW);
-            glDisable(GL_TEXTURE_2D);
+        drawn = fbo_begin(fbo, t);
+        if (drawn) {
             fbo_rect(t, 3, 1, 5, 3, a1, 1, all);
             fbo_rect(t, 10, 4, 6, 5, a2, 0, rb);
             fbo_rect(t, 5, 2, 8, 6, a3, 1, ga);         /* over both */
         }
-        glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, 0);
-        glViewport(0, 0, WW, WH);
-        glMatrixMode(GL_PROJECTION);
-        glLoadIdentity();
-        glOrtho(0, WW, 0, WH, -1, 1);
-        glMatrixMode(GL_MODELVIEW);
-        if (st == GL_FRAMEBUFFER_COMPLETE_EXT) {
+        fbo_end();
+        if (drawn) {
             check_tex(t, "fbo");
+        }
+    }
+    glDeleteFramebuffersEXT(1, &fbo);
+}
+
+/* Stage 5: one texture uploaded, copied into, drawn into and updated in part. */
+static void run_mix_tests(void)
+{
+    uint8_t a1[4], a2[4], a3[4];
+    GLuint fbo;
+
+    fbo_colours(a1, a2, a3);
+    if (!has_ext("GL_EXT_framebuffer_object")) {
+        say("no GL_EXT_framebuffer_object\n");
+        n_fbo_bad++;
+        return;
+    }
+    glGenFramebuffersEXT(1, &fbo);
+    for (int i = 0; i < NMIX; i++) {
+        Tex *t = &mixcases[i];
+        if (only >= 0 && t->id != only) {
+            continue;
+        }
+        upload_exp(t);
+        check_tex(t, "first");
+        for (int lv = 0; lv < t->levels; lv++) {
+            get_check(t, lv, "first");
+        }
+        copy_in(t, 1, 0, 2, 2, 10, 6);                  /* level 0: 2..11, 2..7 */
+        check_tex(t, "copy");
+        if (fbo_begin(fbo, t)) {
+            fbo_rect(t, 8, 4, 8, 6, a1, 1, all);        /* over the copy's right part */
+            fbo_rect(t, 0, 0, 5, 4, a2, 0, rb);         /* over its corner and the upload */
+            fbo_rect(t, 4, 3, 9, 5, a3, 1, ga);         /* over all three */
+            fbo_end();
+            check_tex(t, "fbo");
+        } else {
+            fbo_end();
+        }
+        sub_in(t, 0, 6, 1, 6, 5);                       /* over the copy, the drawing, the upload */
+        check_tex(t, "sub");
+        for (int lv = 0; lv < t->levels; lv++) {
+            get_check(t, lv, "last");
         }
     }
     glDeleteFramebuffersEXT(1, &fbo);
@@ -1022,7 +1174,8 @@ static void totals(void)
 {
     say("GL error %04x\n", gl_err());
     say("TOTAL levels %d ok %d bad %d biased %d\n", n_levels, n_ok, n_bad, n_biased);
-    say("CONTROLS source patterns %d bad %d, GL errors %d\n", n_src, n_src_bad, n_glerr);
+    say("CONTROLS source patterns %d bad %d, framebuffer objects %d incomplete %d, "
+        "GL errors %d\n", n_src, n_src_bad, n_fbo, n_fbo_bad, n_glerr);
     say("RESULT %s%s\nDONE\n", failed() ? "FAIL" : "PASS",
         !n_levels ? " (nothing was run)" : "");
 }
@@ -1069,6 +1222,11 @@ static void run_tests(void)
     }
     if (stage == 4) {
         run_fbo_tests();
+        totals();
+        return;
+    }
+    if (stage == 5) {
+        run_mix_tests();
         totals();
         return;
     }
@@ -1146,6 +1304,8 @@ int main(int argc, char **argv)
             waits = atoi(argv[i] + 5);
         } else if (!strcmp(argv[i], "src=pixels")) {
             src_pixels = 1;
+        } else if (!strcmp(argv[i], "fbo=none")) {
+            fbo_none = 1;
         } else if (!strcmp(argv[i], "list")) {
             for (int k = 0; k < NCASES; k++) {
                 printf("%d %s %d %d cube %d sub %d stage %d\n", cases[k].id,
@@ -1159,6 +1319,10 @@ int main(int argc, char **argv)
             for (int k = 0; k < NFBO; k++) {
                 printf("%d %s %d %d framebuffer object stage 4\n", fbocases[k].id,
                        kname[fbocases[k].kind], fbocases[k].w, fbocases[k].h);
+            }
+            for (int k = 0; k < NMIX; k++) {
+                printf("%d %s %d %d all of them stage 5\n", mixcases[k].id,
+                       kname[mixcases[k].kind], mixcases[k].w, mixcases[k].h);
             }
             return 0;
         }

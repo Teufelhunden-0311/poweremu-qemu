@@ -9,15 +9,16 @@ texprobe.c   Mac OS X 10.4 (PowerPC), GLUT.  Uploads textures in which
              texels.  Then replaces part of two levels with
              glTexSubImage2D and checks again ("sub").  The last lines:
              TOTAL (texture levels), CONTROLS (stage 3 source patterns
-             that did not read back as drawn, GL errors) and RESULT.
+             that did not read back as drawn, framebuffer objects that
+             were not complete, GL errors) and RESULT.
              Exit status 1 when a level failed, a control failed, or
              nothing was run (only= naming no case).  A level line
              checked after a copy whose source pattern was wrong says
              SOURCE-INVALID: it says nothing about the copy.
                gcc -std=gnu99 -O2 -o texprobe texprobe.c \
                    -framework GLUT -framework OpenGL
-               ./texprobe [stage=1|2|3|4] [only=ID] [hold=SECONDS] [wait=SECONDS]
-                          [src=pixels]
+               ./texprobe [stage=1|2|3|4|5] [only=ID] [hold=SECONDS] [wait=SECONDS]
+                          [src=pixels] [fbo=none]
              stage 1: 32-bit, 16-bit and DXT textures, among them chains
              with one-row levels many microtiles wide (1024x4), levels
              wider than a macrotile but not as tall (2048x8), and cubes.
@@ -41,7 +42,19 @@ texprobe.c   Mac OS X 10.4 (PowerPC), GLUT.  Uploads textures in which
              mip levels, level 0 attached, three overlapping rectangles --
              added (glBlendFunc ONE, ONE), written through a colour mask
              (red and blue), and both (green and alpha added) -- then every
-             level checked against what the probe computes.
+             level checked against what the probe computes.  A framebuffer
+             object that is not complete is a failed control: nothing was
+             drawn, and the levels would pass unchanged.  fbo=none attaches
+             nothing, to show that such a run fails.
+             stage 5: all of these into one texture, where the conventions
+             meet: an RGBA8 and a 1555 texture with mip levels, uploaded,
+             copied into in part, drawn into through a framebuffer object
+             over the copy and the upload (added; written through a colour
+             mask), then replaced in part by glTexSubImage2D over all three.
+             Every level is checked after each step, and read back whole
+             with glGetTexImage first and last (GET lines, counted as
+             levels): a read of the texture's memory by the driver, not a
+             draw.
              When a level reads back as another level's texels the draw is
              repeated with a LOD bias; the line then says "bias +N".  Such
              a PASS says the level's texels are right, not that the level
