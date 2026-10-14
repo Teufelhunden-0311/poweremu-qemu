@@ -16,7 +16,7 @@ texprobe.c   Mac OS X 10.4 (PowerPC), GLUT.  Uploads textures in which
              SOURCE-INVALID: it says nothing about the copy.
                gcc -std=gnu99 -O2 -o texprobe texprobe.c \
                    -framework GLUT -framework OpenGL
-               ./texprobe [stage=1|2|3] [only=ID] [hold=SECONDS] [wait=SECONDS]
+               ./texprobe [stage=1|2|3|4] [only=ID] [hold=SECONDS] [wait=SECONDS]
                           [src=pixels]
              stage 1: 32-bit, 16-bit and DXT textures, among them chains
              with one-row levels many microtiles wide (1024x4), levels
@@ -36,6 +36,12 @@ texprobe.c   Mac OS X 10.4 (PowerPC), GLUT.  Uploads textures in which
              these textures hold.  With src=pixels it first draws three
              patterns cut by the window's right, left and bottom edges
              (CLIP lines, controls): the host-data blit's clipping.
+             stage 4: drawing into textures through a framebuffer object
+             (GL_EXT_framebuffer_object): an RGBA8 and a 1555 texture with
+             mip levels, level 0 attached, three overlapping rectangles --
+             added (glBlendFunc ONE, ONE), written through a colour mask
+             (red and blue), and both (green and alpha added) -- then every
+             level checked against what the probe computes.
              When a level reads back as another level's texels the draw is
              repeated with a LOD bias; the line then says "bias +N".  Such
              a PASS says the level's texels are right, not that the level
@@ -136,3 +142,8 @@ Results, 2026-10-13 (same machines; emulator at vs-unread 27a0bc5):
   The three CLIP cases read back whole there and on the PowerBook; the
   driver sends the whole rectangle (X -3, rows past the bottom) and lets
   the clip registers cut it.
+- Stage 4: PowerBook 24 of 24; emulator 24 of 24 on Metal and Vulkan.
+  The driver draws these textures with COLORENDIAN 2 (32-bit; 1 for
+  1555) and US_OUT_FMT 1b01, where glCopyTexSubImage2D into the same kind
+  of texture uses COLORENDIAN 0 with the same selectors; both read back
+  right on the PowerBook.

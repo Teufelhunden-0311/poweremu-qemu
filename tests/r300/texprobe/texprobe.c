@@ -16,6 +16,13 @@
  * of level 1 last; after each step every level is checked, so texels
  * outside the rectangle and the other levels are checked too.
  *
+ * Stage 4 draws into textures through a framebuffer object
+ * (GL_EXT_framebuffer_object): an RGBA8 and a 1555 texture with mip
+ * levels, level 0 attached, three overlapping rectangles -- added
+ * (glBlendFunc ONE, ONE), written through a colour mask (red and blue
+ * only), and both (green and alpha added) -- then every level checked
+ * against what the probe computes from the texels uploaded.
+ *
  * A level is drawn with GL_NEAREST_MIPMAP_NEAREST at one texel per pixel,
  * so the card chooses the level itself.  When what comes back is another
  * level's texels the draw is repeated with a LOD bias, and the bias that
@@ -57,6 +64,7 @@ typedef struct {
     struct { int lv, x, y, w, h; } subr[2];
     uint32_t *own[16];          /* stage 3: what each texel of a level holds */
     int src_invalid;            /* stage 3: a copy into it had a bad source */
+    uint8_t *expv[16];          /* stage 4: what a read of each texel should give */
 } Tex;
 
 /* own[]: an upload's salt, or OWN_PAT | pattern | i << 16 | j << 24 for
@@ -128,6 +136,13 @@ static Tex copycases[] = {
     { .id = 71, .kind = K_1555,  .w = 32, .h = 16, .stage = 3 },
 };
 #define NCOPY ((int)(sizeof(copycases) / sizeof(copycases[0])))
+
+/* stage 4: drawn into through a framebuffer object */
+static Tex fbocases[] = {
+    { .id = 80, .kind = K_RGBA8, .w = 32, .h = 16, .stage = 4 },
+    { .id = 81, .kind = K_1555,  .w = 32, .h = 16, .stage = 4 },
+};
+#define NFBO ((int)(sizeof(fbocases) / sizeof(fbocases[0])))
 #define PX 300                  /* where the patterns are drawn */
 #define PY 300
 
@@ -306,6 +321,18 @@ static void expect(const Tex *t, int face, int lv, int px, int py,
     uint32_t v[4], o;
     int x = is_dxt(t->kind) ? px / 4 : px, y = is_dxt(t->kind) ? py / 4 : py;
 
+    if (t->expv[lv]) {
+        memcpy(want, t->expv[lv] + (py * dim(t->w, lv) + px) * 4, 4);
+        if (t->kind == K_1555) {
+            mask[0] = mask[1] = mask[2] = 0xF8; mask[3] = 0x80;
+        } else {
+            mask[0] = mask[1] = mask[2] = mask[3] = 0xFF;
+        }
+        if (!abits) {
+            mask[3] = 0;
+        }
+        return;
+    }
     if (t->own[lv]) {
         o = t->own[lv][py * dim(t->w, lv) + px];
         if (o & OWN_PAT) {
@@ -862,6 +889,128 @@ static void run_copy_tests(void)
     }
 }
 
+static int has_ext(const char *name);
+
+/* An 8-bit value with five significant bits, k repeated into the low ones. */
+static int rep5(int k)
+{
+    return k << 3 | k >> 2;
+}
+
+/*
+ * Draw colour c over x, y, w, h of level 0 (attached to the bound
+ * framebuffer object), with blending ONE, ONE if add, through the colour
+ * mask m (r, g, b, a), and apply the same to the expected texels.
+ */
+static void fbo_rect(Tex *t, int x, int y, int w, int h, const uint8_t c[4], int add,
+                     const int m[4])
+{
+    int lw = dim(t->w, 0);
+
+    glColorMask(m[0], m[1], m[2], m[3]);
+    if (add) {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE);
+    } else {
+        glDisable(GL_BLEND);
+    }
+    glColor4ub(c[0], c[1], c[2], c[3]);
+    glBegin(GL_QUADS);
+    glVertex2f(x, y); glVertex2f(x + w, y); glVertex2f(x + w, y + h); glVertex2f(x, y + h);
+    glEnd();
+    glDisable(GL_BLEND);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    for (int j = y; j < y + h; j++) {
+        for (int i = x; i < x + w; i++) {
+            uint8_t *e = t->expv[0] + (j * lw + i) * 4;
+            for (int k = 0; k < 4; k++) {
+                if (!m[k]) {
+                    continue;
+                }
+                if (t->kind == K_1555 && k == 3) {          /* one bit */
+                    e[3] = ((add && e[3] >= 128) || c[3] >= 128) ? 255 : 0;
+                } else if (t->kind == K_1555) {             /* five bits, as sampled */
+                    int v = (add ? e[k] >> 3 : 0) + (c[k] >> 3);
+                    e[k] = (v > 31 ? 31 : v) << 3;
+                } else {
+                    int v = (add ? e[k] : 0) + c[k];
+                    e[k] = v > 255 ? 255 : v;
+                }
+            }
+        }
+    }
+    say("FBO  T%02d %s%s%s%s%s %d,%d %dx%d colour %02x%02x%02x%02x, GL error %04x\n", t->id,
+        add ? "add" : "write", m[0] ? " r" : "", m[1] ? " g" : "", m[2] ? " b" : "",
+        m[3] ? " a" : "", x, y, w, h, c[0], c[1], c[2], c[3], gl_err());
+}
+
+static void run_fbo_tests(void)
+{
+    static const uint8_t c1[4] = { 0, 0, 0, 0 }, c2[4] = { 0, 0, 0, 255 },
+                         c3[4] = { 0, 0, 0, 255 };
+    uint8_t a1[4], a2[4], a3[4];
+    static const int all[4] = { 1, 1, 1, 1 }, rb[4] = { 1, 0, 1, 0 }, ga[4] = { 0, 1, 0, 1 };
+    GLuint fbo;
+
+    memcpy(a1, c1, 4); memcpy(a2, c2, 4); memcpy(a3, c3, 4);
+    a1[0] = rep5(5); a1[1] = rep5(9); a1[2] = rep5(3);          /* added, alpha 0 */
+    a2[0] = rep5(20); a2[1] = rep5(7); a2[2] = rep5(11);        /* written: r, b */
+    a3[0] = rep5(2); a3[1] = rep5(6); a3[2] = rep5(4);          /* added: g, a */
+    if (!has_ext("GL_EXT_framebuffer_object")) {
+        say("no GL_EXT_framebuffer_object\n");
+        n_src_bad++;
+        return;
+    }
+    glGenFramebuffersEXT(1, &fbo);
+    for (int i = 0; i < NFBO; i++) {
+        Tex *t = &fbocases[i];
+        GLenum st;
+        uint32_t v[4];
+        uint8_t m[4];
+        if (only >= 0 && t->id != only) {
+            continue;
+        }
+        upload(t);
+        for (int lv = 0; lv < t->levels; lv++) {
+            int lw = dim(t->w, lv), lh = dim(t->h, lv);
+            t->expv[lv] = malloc(lw * lh * 4);
+            for (int y = 0; y < lh; y++) {
+                for (int x = 0; x < lw; x++) {
+                    texel(t->kind, t->id, 0, lv, x, y, v, t->expv[lv] + (y * lw + x) * 4, m);
+                }
+            }
+        }
+        check_tex(t, "first");
+        glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+        glFramebufferTexture2DEXT(GL_FRAMEBUFFER_EXT, GL_COLOR_ATTACHMENT0_EXT, GL_TEXTURE_2D,
+                                  t->name, 0);
+        st = glCheckFramebufferStatusEXT(GL_FRAMEBUFFER_EXT);
+        say("FBO  T%02d status %04x%s\n", t->id, st,
+            st == GL_FRAMEBUFFER_COMPLETE_EXT ? " complete" : " INCOMPLETE: not drawn");
+        if (st == GL_FRAMEBUFFER_COMPLETE_EXT) {
+            glViewport(0, 0, t->w, t->h);
+            glMatrixMode(GL_PROJECTION);
+            glLoadIdentity();
+            glOrtho(0, t->w, 0, t->h, -1, 1);
+            glMatrixMode(GL_MODELVIEW);
+            glDisable(GL_TEXTURE_2D);
+            fbo_rect(t, 3, 1, 5, 3, a1, 1, all);
+            fbo_rect(t, 10, 4, 6, 5, a2, 0, rb);
+            fbo_rect(t, 5, 2, 8, 6, a3, 1, ga);         /* over both */
+        }
+        glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, 0);
+        glViewport(0, 0, WW, WH);
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glOrtho(0, WW, 0, WH, -1, 1);
+        glMatrixMode(GL_MODELVIEW);
+        if (st == GL_FRAMEBUFFER_COMPLETE_EXT) {
+            check_tex(t, "fbo");
+        }
+    }
+    glDeleteFramebuffersEXT(1, &fbo);
+}
+
 static int has_ext(const char *name)
 {
     const char *e = (const char *)glGetString(GL_EXTENSIONS);
@@ -915,6 +1064,11 @@ static void run_tests(void)
 
     if (stage == 3) {
         run_copy_tests();
+        totals();
+        return;
+    }
+    if (stage == 4) {
+        run_fbo_tests();
         totals();
         return;
     }
@@ -1001,6 +1155,10 @@ int main(int argc, char **argv)
             for (int k = 0; k < NCOPY; k++) {
                 printf("%d %s %d %d copies stage 3\n", copycases[k].id,
                        kname[copycases[k].kind], copycases[k].w, copycases[k].h);
+            }
+            for (int k = 0; k < NFBO; k++) {
+                printf("%d %s %d %d framebuffer object stage 4\n", fbocases[k].id,
+                       kname[fbocases[k].kind], fbocases[k].w, fbocases[k].h);
             }
             return 0;
         }
