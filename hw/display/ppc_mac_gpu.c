@@ -14650,6 +14650,19 @@ static int ppc_mac_gpu_post_load(void *opaque, int version_id)
     s->surface_stride = 0;
     vram_mark(s, 0, s->vram_size);
     /*
+     * The vblank timer is not saved: it is armed by the GEN_INT_CNTL write
+     * that enables the interrupt, and a fresh process loading the machine
+     * restores that register without ever seeing the write, so a guest
+     * that had the interrupt on would never get another.  Mac OS X's
+     * driver leaves it off; this is for guests that use it.
+     */
+    if (s->regs.gen_int_cntl & R200_CRTC_VBLANK_INT) {
+        timer_mod(&s->vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  NANOSECONDS_PER_SECOND / 60);
+    } else {
+        timer_del(&s->vblank_timer);
+    }
+    /*
      * The pointer has to be handed to the window again.  Its picture and
      * position are restored above, but they reached the window in the first
      * place as one-off announcements when the guest uploaded them, and a
