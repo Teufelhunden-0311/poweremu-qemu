@@ -30,6 +30,7 @@
 #include "hw/pci/pci_host.h"
 #include "hw/pci-host/uninorth.h"
 #include "qemu/range.h"
+#include "migration/vmstate.h"
 #include "trace.h"
 
 /*
@@ -422,6 +423,35 @@ static void unin_internal_pci_host_realize(PCIDevice *d, Error **errp)
     d->config[PCI_CAPABILITY_LIST] = 0x00;
 }
 
+/*
+ * Saved with the machine for its GART registers, which the guest programs
+ * once at boot.  The table base above is kept outside the config space and
+ * is taken from it again.  Before this the bridge was not saved at all: a
+ * machine loaded by a fresh process had no GART, every command ring and
+ * buffer the driver placed in AGP memory failed to translate, and the
+ * desktop came back frozen while Mac OS X ran behind it.
+ */
+static int unin_main_pci_host_post_load(void *opaque, int version_id)
+{
+    PCIDevice *d = opaque;
+
+    unin_agp_gart_base =
+        (hwaddr)(pci_get_long(d->config + UNI_N_CFG_GART_BASE) & ~0xFFFU);
+    qatomic_inc(&unin_agp_gart_gen);
+    return 0;
+}
+
+static const VMStateDescription vmstate_unin_main_pci_host = {
+    .name = "uni-north-pci",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = unin_main_pci_host_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_PCI_DEVICE(parent_obj, UNINMainPCIHost),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const Property unin_main_pci_host_props[] = {
     DEFINE_PROP_BOOL("agp-capable", UNINMainPCIHost, agp_capable, false),
 };
@@ -435,6 +465,7 @@ static void unin_main_pci_host_class_init(ObjectClass *klass, void *data)
     k->config_write = unin_agp_pci_host_config_write;
     k->vendor_id = PCI_VENDOR_ID_APPLE;
     k->device_id = PCI_DEVICE_ID_APPLE_UNI_N_PCI;
+    dc->vmsd = &vmstate_unin_main_pci_host;
     device_class_set_props(dc, unin_main_pci_host_props);
     k->revision  = 0x00;
     k->class_id  = PCI_CLASS_BRIDGE_HOST;
