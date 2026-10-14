@@ -17,6 +17,7 @@ SPV="$SPV -lspirv-cross-glsl -lspirv-cross-util -lspirv-cross-core -lc++"
 for t in test_pvs test_us test_draw test_features; do
     cc -O1 -Wall -Wno-unused-function -o "$B/$t" $t.c $SRC -lm
 done
+cc -O1 -Wall -o "$B/test_aperture" test_aperture.c
 cc -O1 -Wall -o "$B/glsl2msl" glsl2msl.c $SPV
 clang -fobjc-arc -framework Metal -framework Foundation mslcheck.m -o "$B/mslcheck"
 for t in test_zs test_fmt test_raster test_gpuvs; do
@@ -24,6 +25,7 @@ for t in test_zs test_fmt test_raster test_gpuvs; do
 done
 "$B/test_pvs"
 "$B/test_draw"
+"$B/test_aperture"
 # Both shader outputs: 0 (Metal: uint texture views), 1 (Vulkan: VRAM SSBO).
 for flags in 0 1; do
     "$B/test_us" qe_state_draw1.txt $flags > "$B/qe$flags.glsl" 2>/dev/null

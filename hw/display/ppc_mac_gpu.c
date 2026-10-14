@@ -24,6 +24,7 @@
 #include "qemu/osdep.h"
 #include "r300/r300_state.h"
 #include "r300/r300_draw.h"
+#include "r300/r300_aperture.h"
 #include "ui/poweremu-harmony.h"
 #include <math.h>
 #include <sched.h>
@@ -13167,17 +13168,6 @@ static unsigned r300_ap_swap(PPCMacGPUState *s, uint32_t off, int ap)
         }
     }
     return (s->regs.surface_cntl >> (20 + 2 * ap)) & 3;
-}
-
-static void r300_permute(uint8_t b[4], unsigned mode)
-{
-    uint8_t t;
-    switch (mode & 3) {
-    case 1: t = b[0]; b[0] = b[1]; b[1] = t; t = b[2]; b[2] = b[3]; b[3] = t; break;
-    case 2: t = b[0]; b[0] = b[3]; b[3] = t; t = b[1]; b[1] = b[2]; b[2] = t; break;
-    case 3: t = b[0]; b[0] = b[2]; b[2] = t; t = b[1]; b[1] = b[3]; b[3] = t; break;
-    default: break;
-    }
 }
 
 static void r300_ap1_note(PPCMacGPUState *s, hwaddr off, bool wr, unsigned m)
