@@ -52,9 +52,9 @@ texprobe.c   Mac OS X 10.4 (PowerPC), GLUT.  Uploads textures in which
              over the copy and the upload (added; written through a colour
              mask), then replaced in part by glTexSubImage2D over all three.
              Every level is checked after each step, and read back whole
-             with glGetTexImage first and last (GET lines, counted as
-             levels): a read of the texture's memory by the driver, not a
-             draw.
+             with glGetTexImage first, after the copy, after the drawing
+             and last (GET lines, counted as levels): a read of the
+             texture's memory by the driver, not a draw.
              When a level reads back as another level's texels the draw is
              repeated with a LOD bias; the line then says "bias +N".  Such
              a PASS says the level's texels are right, not that the level
@@ -179,3 +179,20 @@ byte-order model's aperture 0 conversion, R300_ENDIAN_MODEL=1):
   reads at all, so this probe does not exercise the conversion itself;
   rbprobe's glCopyTexImage2D + glGetTexImage does (4096 reads converted,
   4096 of 4096 texels right; 0 of 4096 with R300_AP0_SURFACES=0).
+
+Later the same day, stage 5 with glGetTexImage after the copy and after
+the drawing as well (96 levels), the emulator with its aperture 0
+surfaces looked up after the catch-up and SURFACEn registers readable:
+- PowerBook: stage 5 96 of 96 (quad and src=pixels); fbo=none fails
+  (exit status 1).
+- Emulator, R300_ENDIAN_MODEL=1: stage 5 96 of 96 on Metal (quad and
+  src=pixels) and Vulkan, and 96 of 96 with R300_AP0_SURFACES=0 too:
+  stage 5 does not tell the two apart.  $R300_SURFLOG shows why: the
+  driver reads the RGBA8 levels back through surfaces set to swap 2
+  (SURFACE0_INFO 0x00a3....), which need no conversion, and the 1555
+  levels through swap 1.  Its swap-0 surfaces here are passing states,
+  INFO written before the bounds.  rbprobe's texture, made by
+  glCopyTexImage2D, is read through swap 0 (INFO 0x00030020).
+  Stages 1-4 as before: 486, 182, 72 (and 72 src=pixels), 24 on Metal
+  and Vulkan.  Without the model: stage 1 464, stage 3 38, stage 4 24,
+  stage 5 74 of 96.

@@ -1144,12 +1144,18 @@ static void run_mix_tests(void)
             get_check(t, lv, "first");
         }
         copy_in(t, 1, 0, 2, 2, 10, 6);                  /* level 0: 2..11, 2..7 */
-        check_tex(t, "copy");
+        for (int lv = 0; lv < t->levels; lv++) {        /* read back at once, */
+            get_check(t, lv, "copy");
+        }
+        check_tex(t, "copy");                           /* and drawn from */
         if (fbo_begin(fbo, t)) {
             fbo_rect(t, 8, 4, 8, 6, a1, 1, all);        /* over the copy's right part */
             fbo_rect(t, 0, 0, 5, 4, a2, 0, rb);         /* over its corner and the upload */
             fbo_rect(t, 4, 3, 9, 5, a3, 1, ga);         /* over all three */
             fbo_end();
+            for (int lv = 0; lv < t->levels; lv++) {
+                get_check(t, lv, "fbo");
+            }
             check_tex(t, "fbo");
         } else {
             fbo_end();
