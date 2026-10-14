@@ -732,6 +732,56 @@ static int draw_pattern(int p, int w, int h)
     return ok == w * h;
 }
 
+/*
+ * glDrawPixels cut by the window's edge (src=pixels only): pattern p, w x h,
+ * with the raster position at rx, ry (glWindowPos, so it may lie outside),
+ * read back where it is visible and compared texel by texel with the part
+ * of the pattern that belongs there.  A control, like the SRC lines.
+ */
+static void clip_check(const char *edge, int p, int rx, int ry, int w, int h)
+{
+    uint8_t *buf = malloc(w * h * 4), mask[4] = { 0xFF, 0xFF, 0xFF, 0xFF };
+    int x0 = rx < 0 ? 0 : rx, y0 = ry < 0 ? 0 : ry;
+    int x1 = rx + w > WW ? WW : rx + w, y1 = ry + h > WH ? WH : ry + h;
+    int vw = x1 - x0, vh = y1 - y0, ok = 0, shown = 0;
+    char note[200] = "";
+
+    if (!abits) {
+        mask[3] = 0;
+    }
+    for (int j = 0; j < h; j++) {
+        for (int i = 0; i < w; i++) {
+            pattern_rgba(p, i, j, buf + (j * w + i) * 4);
+        }
+    }
+    glClearColor(0.07f, 0.13f, 0.19f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDisable(GL_TEXTURE_2D);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glWindowPos2i(rx, ry);
+    glDrawPixels(w, h, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+    glReadBuffer(GL_BACK);
+    glReadPixels(x0, y0, vw, vh, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    for (int y = 0; y < vh; y++) {
+        for (int x = 0; x < vw; x++) {
+            int i = x0 + x - rx, j = y0 + y - ry, o = 0;
+            uint8_t *g = px + (y * vw + x) * 4, *e = buf + (j * w + i) * 4;
+            if (same(g, e, mask)) {
+                ok++;
+            } else if (shown++ < 2) {
+                o = strlen(note);
+                snprintf(note + o, sizeof(note) - o, " (%d,%d) got %02x%02x%02x%02x want %02x%02x%02x%02x",
+                         i, j, g[0], g[1], g[2], g[3], e[0], e[1], e[2], e[3]);
+            }
+        }
+    }
+    n_src++;
+    n_src_bad += ok != vw * vh;
+    say("CLIP %s P%d %dx%d at %d,%d: visible %dx%d ok %d of %d, GL error %04x%s\n", edge, p, w, h,
+        rx, ry, vw, vh, ok, vw * vh, gl_err(), note);
+    free(buf);
+}
+
 /* Copy pattern p into x, y, w, h of level lv (glCopyTexSubImage2D). */
 static void copy_in(Tex *t, int p, int lv, int x, int y, int w, int h)
 {
@@ -772,6 +822,11 @@ static void sub_in(Tex *t, int lv, int x, int y, int w, int h)
 
 static void run_copy_tests(void)
 {
+    if (src_pixels) {           /* the host-data blit's clipping, first */
+        clip_check("right", 6, WW - 4, 190, 7, 3);
+        clip_check("left", 7, -3, 140, 7, 3);
+        clip_check("bottom", 8, 200, -2, 5, 4);
+    }
     for (int i = 0; i < NCOPY; i++) {
         Tex *t = &copycases[i];
         if (only >= 0 && t->id != only) {

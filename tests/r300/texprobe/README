@@ -33,7 +33,9 @@ texprobe.c   Mac OS X 10.4 (PowerPC), GLUT.  Uploads textures in which
              into part of level 1.  Every level is checked after each
              step, so the texels outside a rectangle and the other
              levels are checked as well.  tags.py does not know what
-             these textures hold.
+             these textures hold.  With src=pixels it first draws three
+             patterns cut by the window's right, left and bottom edges
+             (CLIP lines, controls): the host-data blit's clipping.
              When a level reads back as another level's texels the draw is
              repeated with a LOD bias; the line then says "bias +N".  Such
              a PASS says the level's texels are right, not that the level
@@ -131,3 +133,6 @@ Results, 2026-10-13 (same machines; emulator at vs-unread 27a0bc5):
   PM4 type-3 packet 0x94 (CNTL_HOSTDATA_BLT in the radeon headers), which
   the device did not handle.  Since fdd7a91 all 10 patterns read back,
   and every level line is the same as with the quad, checksums included.
+  The three CLIP cases read back whole there and on the PowerBook; the
+  driver sends the whole rectangle (X -3, rows past the bottom) and lets
+  the clip registers cut it.

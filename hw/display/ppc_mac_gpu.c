@@ -9721,8 +9721,10 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                  * rows top to bottom.  Only that shape at 32 bpp, copying
                  * host data: anything else is logged once and dropped, as
                  * before.  A pixel arrives as a register value (the CPU's
-                 * 0xAARRGGBB) and VRAM holds pixels as the CPU sees them,
-                 * so it is stored big-endian, as a fill colour is.  Clipped
+                 * 0xAARRGGBB) and is stored big-endian, as a fill colour
+                 * is: this emulator's compatibility rule (its VRAM holds
+                 * what the CPU sees through aperture 0, r300_ap1_read), not
+                 * a statement about the card's own memory.  Clipped
                  * pixels are skipped, not packed: the data stays indexed by
                  * the whole rectangle.
                  */
