@@ -663,6 +663,18 @@ struct PPCMacGPUState {
     MemoryRegion vram_bar;      /* r300: BAR0 = aperture 0 (vram) + aperture 1 */
     MemoryRegion vram_ap1;      /* r300: aperture 1, byte-swapping view of vram */
     uint32_t r300_surf[32];     /* r300: SURFACE0..7 regs (0x0B00 + 4*i) */
+    /* Byte-order model only: aperture 0 converted inside a surface whose
+     * aperture 0 swap is 0 (r300_ap0s_update) */
+    struct R300Ap0Surf {
+        MemoryRegion mr;
+        struct PPCMacGPUState *s;
+        uint32_t lo, hi;        /* VRAM offsets, hi inclusive */
+        unsigned mode;          /* the surface's aperture 0 swap */
+        bool on;
+        const char *no;         /* why it is not converted, when it is not */
+        uint32_t reads, writes; /* CPU accesses converted while mapped */
+    } r300_ap0s[8];
+    bool r300_ap0s_made;
     MemoryRegion r300_watch;    /* $R300_SURFWATCH: logs CPU access to surface 0 */
     bool r300_watch_on;
     uint32_t r300_watch_base, r300_watch_logged;

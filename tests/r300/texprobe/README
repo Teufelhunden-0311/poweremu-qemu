@@ -160,3 +160,22 @@ Results, 2026-10-13 (same machines; emulator at vs-unread 27a0bc5):
   1555) and US_OUT_FMT 1b01, where glCopyTexSubImage2D into the same kind
   of texture uses COLORENDIAN 0 with the same selectors; both read back
   right on the PowerBook.
+
+Results, 2026-10-14 (same machines; emulator at vs-unread with the
+byte-order model's aperture 0 conversion, R300_ENDIAN_MODEL=1):
+- PowerBook: stage 4 24 of 24 and stage 5 72 of 72 (quad and
+  src=pixels); with fbo=none every level passes and the run fails
+  (framebuffer objects 2, incomplete 2; exit status 1).  The emulator
+  gives the same with fbo=none.
+- Emulator, R300_ENDIAN_MODEL=1, Metal and Vulkan: stage 1 486 of 486,
+  stage 2 182 of 182, stage 3 72 of 72 (quad and src=pixels), stage 4
+  24 of 24, stage 5 72 of 72.  Without the model: stage 1 464, stage 3
+  38, stage 4 24, stage 5 54 (the copies, as in stage 3).
+- The driver reads the 1555 texture back (glGetTexImage) through
+  aperture 0 with surfaces set to swap 1, one per level.  Converting
+  those as for 32-bit data gave neighbouring texels exchanged (lv0 0 of
+  512); left straight they read right, the model's 16-bit rule matching
+  that view.  The swap-0 surfaces the driver sets in stage 5 saw no CPU
+  reads at all, so this probe does not exercise the conversion itself;
+  rbprobe's glCopyTexImage2D + glGetTexImage does (4096 reads converted,
+  4096 of 4096 texels right; 0 of 4096 with R300_AP0_SURFACES=0).

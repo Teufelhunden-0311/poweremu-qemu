@@ -782,14 +782,16 @@ static unsigned rt_le_n;
  *                   memory, where readback draws with 2.)
  * Not covered: 64- and 128-bit colour formats, COLORENDIAN 3, 16-bit
  * textures read with TX 2 or 3.
- * Known break, the missing piece: the CPU's aperture 0 is mapped straight
- * onto VRAM, as if it always had the 32-bit swap.  glGetTexImage after
+ * CPU reads: aperture 0 is mapped straight onto VRAM, as if it always had
+ * the 32-bit swap, except inside a surface that sets swap 0, which the
+ * model converts as aperture 1 is (r300_ap0s_update in ppc_mac_gpu.c;
+ * $R300_AP0_SURFACES=0 leaves it out).  glGetTexImage after
  * glCopyTexImage2D reads the texture through aperture 0 with a SURFACE0
- * over it that sets no swap (0x3e0000-0x3e3fff, info 0): with the model
- * the copy is stored as the CPU's view, and that read comes back
- * byte-reversed (rbprobe: 0 of 4096 exact; 4096 without the model).  The
- * model needs aperture 0 converted where a surface sets another swap, as
- * aperture 1 is (r300_ap1_read).
+ * over it that sets no swap (info 0): without the conversion the copy,
+ * stored as the CPU's view, came back byte-reversed (rbprobe: 0 of 4096
+ * exact; 4096 with it, and without the model).  Swap 0 only: the
+ * conversion assumes 32-bit data, and a 1555 texture is read back through
+ * swap-1 surfaces, which the 16-bit rule above already matches straight.
  */
 bool r300_endian_model(void)
 {

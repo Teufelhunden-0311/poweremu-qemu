@@ -2785,6 +2785,7 @@ static uint8_t *r200_agp_page(PPCMacGPUState *s, uint32_t gpu_addr);
 static uint32_t g_r300_arm_rt;      /* debug: drag-frame capture target */
 static void r300_surfwatch_update(PPCMacGPUState *s);
 static void r300_surface_changed(PPCMacGPUState *s);
+static void r300_ap0s_update(PPCMacGPUState *s);
 static void r300_zconv(PPCMacGPUState *s, bool to_card);
 
 static bool ppc_mac_gpu_gart_translate(PPCMacGPUState *s, uint32_t gpu_addr,
@@ -12142,6 +12143,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
             r300_surface_changed(s);
             r300_surfwatch_update(s);
         }
+        r300_ap0s_update(s);
     }
     if (s->r300 && addr == 0x0AB0) {
         s->r300_aic_pt_base = val & ~0xFFFu;    /* PCI GART table base */
@@ -12221,6 +12223,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
     /* Surface */
     case R200_SURFACE_CNTL:
         s->regs.surface_cntl = val;
+        r300_ap0s_update(s);
         break;
 
     /*
@@ -13413,6 +13416,178 @@ static void r300_surfwatch_update(PPCMacGPUState *s)
     }
 }
 
+/*
+ * The byte-order model's aperture 0 (r300_endian_model; nothing here runs
+ * without it).  VRAM holds what aperture 0 shows with the 32-bit swap, so
+ * aperture 0 is mapped straight onto it -- except inside a surface
+ * (SURFACEn bounds) whose aperture 0 swap is 0: there each access is
+ * converted as aperture 1's are, through r300_ap_load/r300_ap_store.  A
+ * view, never a rewrite: VRAM keeps one representation whatever surfaces
+ * are mapped.  Apple's driver reads a 32-bit texture back (glGetTexImage
+ * after glCopyTexImage2D) through such a surface.
+ * Swap 0 only, an experiment's limit rather than a rule: the conversion
+ * assumes 32-bit data (r300_aperture.h), and the model stores 16-bit
+ * elements big-endian each, which is what a swap-1 view of the card's
+ * 16-bit data shows -- so a swap-1 surface reads them right mapped
+ * straight, and converted gives neighbours exchanged (texprobe stage 5:
+ * the driver reads a 1555 texture back through swap-1 surfaces).  32-bit
+ * data under swap 1 or 3, or 16-bit data under swap 0, would read wrong;
+ * neither has been seen.  One backing for every element size would end
+ * this limit.
+ * Also left straight, and logged: a surface overlapping another, one over
+ * the multisampled depth buffer r300_zconv rewrites for its own readback,
+ * one not four-byte aligned, and a NONSURF_AP0_SWP other than 2 (outside
+ * surfaces).  Each converted surface's reads and writes are counted, and
+ * logged when it goes.  Surface registers are not part of the saved
+ * machine, so after a restore this follows whatever they hold.
+ */
+static void r300_ap0s_note(const char *what, int n, uint32_t lo, uint32_t hi,
+                           unsigned mode)
+{
+    static int logged;
+    if (logged++ < 32) {
+        qemu_log("ppc-mac-gpu r300: aperture 0 surface %d 0x%x-0x%x swap %u: %s\n",
+                 n, lo, hi, mode, what);
+    }
+}
+
+static void r300_ap0s_first(struct R300Ap0Surf *a, uint64_t off, unsigned size,
+                            bool wr)
+{
+    static int logged;
+    if (!a->reads && !a->writes && logged++ < 64) {
+        qemu_log("ppc-mac-gpu r300: aperture 0 surface 0x%x-0x%x swap %u: first %s, "
+                 "%u bytes at 0x%" PRIx64 "\n", a->lo, a->hi, a->mode,
+                 wr ? "write" : "read", size, off);
+    }
+}
+
+static uint64_t r300_ap0s_read(void *opaque, hwaddr addr, unsigned size)
+{
+    struct R300Ap0Surf *a = opaque;
+    PPCMacGPUState *s = a->s;
+    uint64_t off = a->lo + addr;
+
+    if (off + size > (uint64_t)a->hi + 1) {
+        return 0;
+    }
+    ppc_mac_gpu_cp_sync(s, 0xFFFFFFFF);     /* a readback: ring done first */
+    r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
+    r300_ap0s_first(a, off, size, false);
+    a->reads++;
+    return r300_ap_load(memory_region_get_ram_ptr(&s->vram), off, size, a->mode);
+}
+
+static void r300_ap0s_write(void *opaque, hwaddr addr, uint64_t val,
+                            unsigned size)
+{
+    struct R300Ap0Surf *a = opaque;
+    PPCMacGPUState *s = a->s;
+    uint64_t off = a->lo + addr;
+
+    if (off + size > (uint64_t)a->hi + 1) {
+        return;
+    }
+    ppc_mac_gpu_cp_sync(s, 0xFFFFFFFF);     /* earlier commands see the old bytes */
+    r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
+    r300_ap0s_first(a, off, size, true);
+    a->writes++;
+    r300_ap_store(memory_region_get_ram_ptr(&s->vram), off, size, val, a->mode);
+    vram_mark(s, off & ~3ull, ((off + size + 3) & ~3ull) - (off & ~3ull));
+}
+
+static const MemoryRegionOps r300_ap0s_ops = {
+    .read = r300_ap0s_read,
+    .write = r300_ap0s_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 8, .unaligned = true },
+    .impl = { .min_access_size = 1, .max_access_size = 4, .unaligned = true },
+};
+
+static void r300_ap0s_update(PPCMacGPUState *s)
+{
+    static int off = -1;
+
+    if (off < 0) {
+        const char *e = getenv("R300_AP0_SURFACES");   /* 0: the model without this */
+        off = e && e[0] == '0';
+    }
+    if (!s->r300 || !r300_endian_model() || off) {
+        return;
+    }
+    if (!s->r300_ap0s_made) {
+        for (int n = 0; n < 8; n++) {
+            struct R300Ap0Surf *a = &s->r300_ap0s[n];
+            a->s = s;
+            memory_region_init_io(&a->mr, OBJECT(s), &r300_ap0s_ops, a,
+                                  "ppc-mac-gpu-ap0-surface", 4);
+            memory_region_set_enabled(&a->mr, false);
+            memory_region_add_subregion_overlap(&s->vram_bar, 0, &a->mr, 20);
+        }
+        s->r300_ap0s_made = true;
+    }
+    if (s->regs.surface_cntl && ((s->regs.surface_cntl >> 20) & 3) != 2) {
+        r300_ap0s_note("NONSURF_AP0_SWP is not 2: outside surfaces not converted",
+                       -1, 0, 0, (s->regs.surface_cntl >> 20) & 3);
+    }
+    memory_region_transaction_begin();
+    for (int n = 0; n < 8; n++) {
+        struct R300Ap0Surf *a = &s->r300_ap0s[n];
+        uint32_t lo = s->r300_surf[1 + 4 * n], hi = s->r300_surf[2 + 4 * n];
+        unsigned mode = (s->r300_surf[3 + 4 * n] >> 20) & 3;
+        bool want = (lo || hi) && mode != 2;
+        const char *no = NULL;
+
+        if (want && hi < lo) {
+            want = false;                   /* being set: bounds one at a time */
+        }
+        if (want && mode != 0) {
+            no = "left straight: only swap 0 is converted";
+        }
+        if (want && (hi >= s->vram_size || (lo & 3) || (hi & 3) != 3)) {
+            no = "not converted: bounds outside VRAM or not aligned";
+        }
+        for (int k = 0; want && !no && k < 8; k++) {
+            uint32_t l2 = s->r300_surf[1 + 4 * k], h2 = s->r300_surf[2 + 4 * k];
+            if (k != n && (l2 || h2) && l2 <= hi && h2 >= lo) {
+                no = "not converted: overlaps another surface";
+            }
+        }
+        if (want && !no && s->r3_zconv && lo == s->r3_zconv_off) {
+            no = "not converted: the depth buffer's multisample readback";
+        }
+        want = want && !no;
+        if (a->on && (!want || a->lo != lo || a->hi != hi || a->mode != mode)) {
+            static int logged;
+            memory_region_set_enabled(&a->mr, false);
+            a->on = false;
+            if ((a->reads || a->writes) && logged++ < 64) {
+                qemu_log("ppc-mac-gpu r300: aperture 0 surface %d 0x%x-0x%x swap %u: "
+                         "%u reads, %u writes converted\n", n, a->lo, a->hi, a->mode,
+                         a->reads, a->writes);
+            }
+            a->reads = a->writes = 0;
+        }
+        if (want && !a->on) {
+            a->lo = lo;
+            a->hi = hi;
+            a->mode = mode;
+            memory_region_set_size(&a->mr, (uint64_t)hi - lo + 1);
+            memory_region_set_address(&a->mr, lo);
+            memory_region_set_enabled(&a->mr, true);
+            a->on = true;
+            r300_ap0s_note("converted (byte-order model)", n, lo, hi, mode);
+        } else if (no && (no != a->no || a->lo != lo || a->hi != hi || a->mode != mode)) {
+            a->lo = lo;                     /* noted once per setting */
+            a->hi = hi;
+            a->mode = mode;
+            r300_ap0s_note(no, n, lo, hi, mode);
+        }
+        a->no = no;
+    }
+    memory_region_transaction_commit();
+}
+
 static const MemoryRegionOps r300_ap1_ops = {
     .read = r300_ap1_read,
     .write = r300_ap1_write,
@@ -13446,6 +13621,8 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
     cp.epoch++;                 /* a CP thread mid-ring drops what it has */
     s->reset_count++;
     memset(&s->regs, 0, sizeof(s->regs));
+    memset(s->r300_surf, 0, sizeof(s->r300_surf));     /* no surfaces after a reset */
+    r300_ap0s_update(s);
     s->hwc_w = s->hwc_h = s->hwc_idx = 0;
     s->regs.regs_3d[R200_3D_IDX(0x3230)] = 0xFFFFFFFFu;  /* DEPTHCLEARVALUE */
     s->hwc_visible = false;
