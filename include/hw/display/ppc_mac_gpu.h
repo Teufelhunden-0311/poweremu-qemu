@@ -702,6 +702,8 @@ struct PPCMacGPUState {
     uint32_t r3_trace_lines;    /* register trace after the first draw */
     uint32_t r300_src_swap;     /* 0x15D4: 2D upload source endian swap */
     bool r3_zpass_active;       /* ZB_ZPASS_DATA written, count Z-pass samples */
+    uint32_t r3_zpass_count;    /* the renderer's count, saved with the machine */
+    bool r3_zpass_reload;       /* ... and handed back to it at the next use */
     uint32_t r3_indx_vf;        /* DRAW_INDX_2 waiting for INDX_BUFFER (0: none) */
     uint32_t r3_indx_buf[3];    /* INDX_BUFFER waiting for its DRAW_INDX_2 */
     bool r3_indx_buf_pending;
@@ -722,7 +724,8 @@ struct PPCMacGPUState {
     /* How big that register file is, saved with the machine so a state
      * written by another build cannot be poured into a different layout. */
     uint32_t regs_size;
-    uint32_t r3_layout;         /* the same for the 3D engine's state */
+    /* The same for the 3D engine's state: registers, PVS vectors, arrays */
+    uint32_t r3_regs_n, r3_pvs_vecs, r3_arrays_size;
     PPCMacGPUDisplayMode disp;  /* Current display mode */
     QEMUTimer vblank_timer;     /* VBlank interrupt timer */
     Notifier exit_notifier;     /* finish drawing before exit() */

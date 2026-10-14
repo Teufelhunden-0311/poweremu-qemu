@@ -2985,7 +2985,24 @@ static uint32_t r300_swap_mode(uint32_t v, unsigned mode)
  * depth buffer's endian mode, for the pipes SU_REG_DEST selects.  The
  * renderer counts every sample on one counter, which is reported as
  * pipe 0's (the driver sums the pipes).
+ *
+ * A machine saved in the middle of a query keeps the count so far
+ * (r3_zpass_count, read in pre_save).  The renderer may not be up yet
+ * when it is loaded, so the count goes back to it at the next draw or
+ * ZB_ZPASS_ADDR rather than in post_load.
  */
+static void r300_zpass_reload(PPCMacGPUState *s)
+{
+    PPCMacGPURenderer *r = s->renderer;
+
+    if (s->r3_zpass_reload) {
+        s->r3_zpass_reload = false;
+        if (r && r->zpass_r300) {
+            r->zpass_r300(s->renderer_opaque, true, s->r3_zpass_count);
+        }
+    }
+}
+
 static void r300_zpass_write(PPCMacGPUState *s, uint32_t addr, uint32_t val)
 {
     PPCMacGPURenderer *r = s->renderer;
@@ -2995,8 +3012,10 @@ static void r300_zpass_write(PPCMacGPUState *s, uint32_t addr, uint32_t val)
             r->zpass_r300(s->renderer_opaque, true, val);
         }
         s->r3_zpass_active = true;
+        s->r3_zpass_reload = false;
         return;
     }
+    r300_zpass_reload(s);
     uint32_t dest = r300_reg(s->r3, 0x42C8);            /* SU_REG_DEST */
     uint32_t n = (r && r->zpass_r300) ?
                  r->zpass_r300(s->renderer_opaque, false, 0) : 0;
@@ -4218,6 +4237,9 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         }
     }
     pkt.uniforms.zpass_count = s->r3_zpass_active;
+    if (s->r3_zpass_active) {
+        r300_zpass_reload(s);
+    }
     if (r300_reg(s->r3, 0x4E88) & 1) {         /* RB3D_AARESOLVE_CTL */
         r300_aa_resolve(s, &pkt);
         r300_draw_free(&pkt);
@@ -13978,8 +14000,9 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
     Object *obj = OBJECT(dev);
 
     s->regs_size = sizeof(PPCMacGPURegs);   /* saved with the machine */
-    s->r3_layout = R300_REG_COUNT ^ (R300_PVS_MEM_VECS << 16) ^
-                   ((uint32_t)sizeof(R300Arrays) << 24);
+    s->r3_regs_n = R300_REG_COUNT;
+    s->r3_pvs_vecs = R300_PVS_MEM_VECS;
+    s->r3_arrays_size = sizeof(R300Arrays);
     s->r300 = object_dynamic_cast(obj, TYPE_ATI_RADEON_9700) != NULL;
     s->rv250 = object_dynamic_cast(obj, TYPE_ATI_RADEON_9000) != NULL;
     s->r300_src_swap = 2;       /* plain copy until the driver says otherwise */
@@ -14618,7 +14641,16 @@ static char *ppc_mac_gpu_get_perf(Object *obj, Error **errp)
 
 static int ppc_mac_gpu_pre_save(void *opaque)
 {
-    ppc_mac_gpu_cp_sync(opaque, 0xFFFFFFFF);  /* save with the ring done */
+    PPCMacGPUState *s = opaque;
+    PPCMacGPURenderer *r = s->renderer;
+
+    ppc_mac_gpu_cp_sync(s, 0xFFFFFFFF);     /* save with the ring done */
+    /* An occlusion query under way: its count so far is the renderer's. */
+    if (!s->r3_zpass_active) {
+        s->r3_zpass_count = 0;
+    } else if (!s->r3_zpass_reload && r && r->zpass_r300) {
+        s->r3_zpass_count = r->zpass_r300(s->renderer_opaque, false, 0);
+    }
     return 0;
 }
 
@@ -14644,8 +14676,14 @@ static int ppc_mac_gpu_pre_load(void *opaque)
     }
     memset(&s->r3_arrays, 0, sizeof(s->r3_arrays));
     s->r300_src_swap = 2;
+    s->r3_zpass_active = false;
+    s->r3_zpass_count = 0;
+    s->r3_zpass_reload = false;
     s->r3_indx_vf = 0;
+    memset(s->r3_indx_buf, 0, sizeof(s->r3_indx_buf));
     s->r3_indx_buf_pending = false;
+    s->r3_zb_offset = s->r3_zb_height = s->r3_zb_ns = 0;
+    s->r3_cb_aa_off = s->r3_cb_aa_ns = 0;
     return 0;
 }
 
@@ -14707,6 +14745,7 @@ static int ppc_mac_gpu_post_load(void *opaque, int version_id)
     if (s->r3) {
         s->r3->pvs_gen++;       /* the vertex programs have changed under it */
     }
+    s->r3_zpass_reload = s->r3_zpass_active;
     if (s->r300) {
         int n = 0;
         for (int i = 0; i < 8; i++) {
@@ -14767,6 +14806,17 @@ static const VMStateDescription vmstate_ppc_mac_gpu_surfaces = {
  * engine, and a machine loaded into a running one kept that one's
  * programs.  What the renderer derives from it is keyed by its contents
  * and follows by itself.
+ *
+ * So is what the engine was in the middle of: an indexed draw whose
+ * DRAW_INDX_2 came before the save and whose INDX_BUFFER comes after it
+ * (or the other way round) would otherwise never be drawn; an occlusion
+ * query keeps its count so far; and the depth and multisampled colour
+ * buffers last drawn, which later clears and resolves go by when
+ * GB_AA_CONFIG no longer says, are remembered.
+ *
+ * Each of the three sizes is checked on its own, so a build whose 3D
+ * state is laid out differently refuses the state instead of reading it
+ * out of step.
  */
 static bool ppc_mac_gpu_r300_needed(void *opaque)
 {
@@ -14787,20 +14837,33 @@ static const VMStateDescription vmstate_r300_state = {
     }
 };
 
+#define R300_LAYOUT_ERR "this machine was saved by a build whose 3D engine " \
+                        "state was laid out differently"
+
 static const VMStateDescription vmstate_ppc_mac_gpu_r300 = {
     .name = "ppc-mac-gpu/r300",
     .version_id = 1,
     .minimum_version_id = 1,
     .needed = ppc_mac_gpu_r300_needed,
     .fields = (const VMStateField[]) {
-        VMSTATE_UINT32_EQUAL(r3_layout, PPCMacGPUState,
-                             "this machine was saved by a build whose "
-                             "3D engine state was laid out differently"),
+        VMSTATE_UINT32_EQUAL(r3_regs_n, PPCMacGPUState, R300_LAYOUT_ERR),
+        VMSTATE_UINT32_EQUAL(r3_pvs_vecs, PPCMacGPUState, R300_LAYOUT_ERR),
+        VMSTATE_UINT32_EQUAL(r3_arrays_size, PPCMacGPUState, R300_LAYOUT_ERR),
         VMSTATE_STRUCT_POINTER(r3, PPCMacGPUState, vmstate_r300_state,
                                R300State),
         VMSTATE_BUFFER_UNSAFE(r3_arrays, PPCMacGPUState, 1,
                               sizeof(R300Arrays)),
         VMSTATE_UINT32(r300_src_swap, PPCMacGPUState),
+        VMSTATE_UINT32(r3_indx_vf, PPCMacGPUState),
+        VMSTATE_UINT32_ARRAY(r3_indx_buf, PPCMacGPUState, 3),
+        VMSTATE_BOOL(r3_indx_buf_pending, PPCMacGPUState),
+        VMSTATE_BOOL(r3_zpass_active, PPCMacGPUState),
+        VMSTATE_UINT32(r3_zpass_count, PPCMacGPUState),
+        VMSTATE_UINT32(r3_zb_offset, PPCMacGPUState),
+        VMSTATE_UINT32(r3_zb_height, PPCMacGPUState),
+        VMSTATE_UINT32(r3_zb_ns, PPCMacGPUState),
+        VMSTATE_UINT32(r3_cb_aa_off, PPCMacGPUState),
+        VMSTATE_UINT32(r3_cb_aa_ns, PPCMacGPUState),
         VMSTATE_END_OF_LIST()
     }
 };
