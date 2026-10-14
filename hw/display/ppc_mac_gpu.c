@@ -14645,6 +14645,16 @@ static int ppc_mac_gpu_post_load(void *opaque, int version_id)
     if (s->con) {
         dpy_gfx_update_full(s->con);
     }
+    /*
+     * The PCI GART table's base, kept in r300_shadow.  Left at zero, the
+     * GART's lookups fall back to AIC_PT_BASE, which this driver leaves at
+     * zero, and read their page table from the bottom of memory.  Pages
+     * translated before the load mean nothing after it.
+     */
+    if (s->r300) {
+        s->r300_aic_pt_base = s->r300_shadow[0x0AB0 / 4] & ~0xFFFu;
+    }
+    r200_agp_tc_flush();
     return 0;
 }
 
