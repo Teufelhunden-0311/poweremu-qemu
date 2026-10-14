@@ -13468,8 +13468,10 @@ static void r300_surfwatch_update(PPCMacGPUState *s)
  * (outside surfaces).  An access looks its surface up again after the card
  * has caught up (r300_ap_read_at), and is counted to the one it went
  * through; each converted surface's counts are logged when it goes.
- * Surface registers are not part of the saved machine, and nothing here is
- * rebuilt after a restore: not right across a save and restore.
+ * The surfaces are saved with the machine and these views built again from
+ * them after a load (ppc_mac_gpu_post_load).  The model itself is not:
+ * VRAM is kept in its representation, so a machine saved with it and
+ * loaded without it, or the other way round, is not supported.
  */
 static void r300_ap0s_note(const char *what, int n, uint32_t lo, uint32_t hi,
                            unsigned mode)
@@ -13729,6 +13731,7 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
     s->reset_count++;
     memset(&s->regs, 0, sizeof(s->regs));
     memset(s->r300_surf, 0, sizeof(s->r300_surf));     /* no surfaces after a reset */
+    s->r3_zconv = false;                /* nor a depth buffer converted for one */
     r300_ap0s_update(s);
     s->hwc_w = s->hwc_h = s->hwc_idx = 0;
     s->regs.regs_3d[R200_3D_IDX(0x3230)] = 0xFFFFFFFFu;  /* DEPTHCLEARVALUE */
@@ -14616,6 +14619,20 @@ static int ppc_mac_gpu_pre_save(void *opaque)
     return 0;
 }
 
+/*
+ * A state without the surfaces below had none mapped, so none of this
+ * machine's may outlive the load.  Only forgotten, not undone: VRAM is
+ * about to be replaced by the saved one.
+ */
+static int ppc_mac_gpu_pre_load(void *opaque)
+{
+    PPCMacGPUState *s = opaque;
+
+    memset(s->r300_surf, 0, sizeof(s->r300_surf));
+    s->r3_zconv = false;
+    return 0;
+}
+
 static int ppc_mac_gpu_post_load(void *opaque, int version_id)
 {
     PPCMacGPUState *s = opaque;
@@ -14655,8 +14672,60 @@ static int ppc_mac_gpu_post_load(void *opaque, int version_id)
         s->r300_aic_pt_base = s->r300_shadow[0x0AB0 / 4] & ~0xFFFu;
     }
     r200_agp_tc_flush();
+    /* The aperture's views over the restored surfaces. */
+    r300_ap0s_update(s);
+    r300_surfwatch_update(s);
+    if (s->r300) {
+        int n = 0;
+        for (int i = 0; i < 8; i++) {
+            n += s->r300_surf[1 + 4 * i] || s->r300_surf[2 + 4 * i];
+        }
+        qemu_log("ppc-mac-gpu r300: loaded with the PCI GART table at 0x%x, "
+                 "%d surfaces%s\n", s->r300_aic_pt_base, n,
+                 s->r3_zconv ? ", depth in the card's layout" : "");
+    }
     return 0;
 }
+
+/*
+ * The surfaces (SURFACEn, kept outside the register block) and the depth
+ * buffer r300_zconv has rewritten for one of them.  The driver maps a
+ * surface for each CPU readback and writes back the one it found there
+ * afterwards, so a machine saved in between has to come back with both:
+ * VRAM is saved in the layout it had, and r300_zconv converts the depth
+ * back only when the surface it converted it for goes.  Sent only when
+ * there is something to send, so a machine saved with none still loads
+ * into a build without this.
+ */
+static bool ppc_mac_gpu_surfaces_needed(void *opaque)
+{
+    PPCMacGPUState *s = opaque;
+
+    /* [0] is SURFACE_CNTL, also in the register block: not a surface */
+    for (int i = 1; i < ARRAY_SIZE(s->r300_surf); i++) {
+        if (s->r300_surf[i]) {
+            return true;
+        }
+    }
+    return s->r3_zconv;
+}
+
+static const VMStateDescription vmstate_ppc_mac_gpu_surfaces = {
+    .name = "ppc-mac-gpu/surfaces",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = ppc_mac_gpu_surfaces_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_ARRAY(r300_surf, PPCMacGPUState, 32),
+        VMSTATE_BOOL(r3_zconv, PPCMacGPUState),
+        VMSTATE_BOOL(r3_zconv_rows_ns, PPCMacGPUState),
+        VMSTATE_UINT32(r3_zconv_off, PPCMacGPUState),
+        VMSTATE_UINT32(r3_zconv_pitch, PPCMacGPUState),
+        VMSTATE_UINT32(r3_zconv_rows, PPCMacGPUState),
+        VMSTATE_UINT32(r3_zconv_ns, PPCMacGPUState),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 static const VMStateDescription vmstate_ppc_mac_gpu = {
     .name = "ppc-mac-gpu",
@@ -14668,6 +14737,7 @@ static const VMStateDescription vmstate_ppc_mac_gpu = {
     .version_id = 2,
     .minimum_version_id = 2,
     .pre_save = ppc_mac_gpu_pre_save,
+    .pre_load = ppc_mac_gpu_pre_load,
     .post_load = ppc_mac_gpu_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_PCI_DEVICE(pci, PPCMacGPUState),
@@ -14720,6 +14790,10 @@ static const VMStateDescription vmstate_ppc_mac_gpu = {
         VMSTATE_BUFFER_UNSAFE(r300_shadow, PPCMacGPUState, 1,
                               sizeof(((PPCMacGPUState *)0)->r300_shadow)),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_ppc_mac_gpu_surfaces,
+        NULL
     }
 };
 
