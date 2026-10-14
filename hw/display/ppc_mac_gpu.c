@@ -8921,6 +8921,22 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                         body_dw > 0 ? d[0] : 0, body_dw > 1 ? d[1] : 0,
                         body_dw > 2 ? d[2] : 0);
             }
+            if (opcode == 0x94 && body_dw >= 9) {
+                /* CNTL_HOSTDATA_BLT (see its handler below): the whole
+                 * header, which xf86-video-ati's RADEONCPScanlinePacket
+                 * writes as GMC, dst pitch/offset, clip top-left, clip
+                 * bottom-right, foreground, background, dst Y/X, H/W, data
+                 * dwords; then the first and last data words and the swap
+                 * state. */
+                seq_log("HD94 n=%u hdr %08x %08x %08x %08x %08x %08x %08x %08x %08x "
+                        "data[0..3] %08x %08x %08x %08x last %08x dp_datatype=%08x "
+                        "surface_cntl=%08x cp_rb_cntl=%08x", body_dw,
+                        d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8],
+                        body_dw > 9 ? d[9] : 0, body_dw > 10 ? d[10] : 0,
+                        body_dw > 11 ? d[11] : 0, body_dw > 12 ? d[12] : 0,
+                        d[body_dw - 1], s->regs.dp_datatype, s->regs.surface_cntl,
+                        s->regs.cp_rb_cntl);
+            }
 
 
             /* Phase A — VRAM watch: check before Type 3 processing */
@@ -9689,6 +9705,75 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                         }
                         r200_fill_notify(s, offset, pitch, dst_x, dst_y,
                                          blit_w, blit_h, bpp, color);
+                    }
+                }
+            } else if (opcode == 0x94 && body_dw >= 9) {
+                /*
+                 * CNTL_HOSTDATA_BLT: pixels carried in the packet; Mac OS X
+                 * sends it for glDrawPixels, and it was dropped (nothing
+                 * drawn).  The body, as xf86-video-ati's
+                 * RADEONCPScanlinePacket writes it for a GMC with destination
+                 * pitch/offset and destination clipping, and as Tiger's
+                 * driver was logged sending it (the HD94 line): GMC, dst
+                 * pitch/offset, clip top-left, clip bottom-right (Y << 16 |
+                 * X, the bottom-right exclusive), foreground, background,
+                 * dst Y/X, H/W, the number of data dwords, then the data,
+                 * rows top to bottom.  Only that shape at 32 bpp, copying
+                 * host data: anything else is logged once and dropped, as
+                 * before.  A pixel arrives as a register value (the CPU's
+                 * 0xAARRGGBB) and VRAM holds pixels as the CPU sees them,
+                 * so it is stored big-endian, as a fill colour is.  Clipped
+                 * pixels are skipped, not packed: the data stays indexed by
+                 * the whole rectangle.
+                 */
+                uint32_t gmc = d[0], po = d[1], n = d[8];
+                int32_t x0 = (int16_t)(d[6] & 0xFFFF), y0 = (int16_t)(d[6] >> 16);
+                uint32_t w = d[7] & 0xFFFF, h = d[7] >> 16;
+                uint32_t dst_off = (po & 0x3FFFFF) << 10;
+                uint32_t dst_pitch = ((po >> 22) & 0xFF) * 64;
+                bool shape = (gmc & 0xF) == 0xA &&             /* dst p/o, dst clip */
+                             ((gmc >> 4) & 0xF) == 0xF &&      /* no brush */
+                             ((gmc >> 12) & 3) == 3 &&         /* source colour */
+                             ((gmc >> 16) & 0xFF) == 0xCC &&   /* ROP3 copy */
+                             ((gmc >> 24) & 7) == 3 &&         /* from host data */
+                             gmc_dst_bpp(gmc) == 4 &&
+                             !(s->regs.dp_datatype & (1u << 29)) &&
+                             s->regs.dp_write_msk == 0xFFFFFFFF;
+                bool sized = w && h && dst_pitch && n == body_dw - 9 &&
+                             (uint64_t)w * h == n;
+
+                if (!shape || !sized) {
+                    static bool said;
+                    if (!said) {
+                        said = true;
+                        qemu_log("ppc-mac-gpu: CNTL_HOSTDATA_BLT not drawn (%s): gmc %08x "
+                                 "dp_datatype %08x write mask %08x, %ux%u, %u data "
+                                 "dwords, %u in the packet\n",
+                                 shape ? "size" : "unsupported form", gmc,
+                                 s->regs.dp_datatype, s->regs.dp_write_msk, w, h,
+                                 n, body_dw - 9);
+                    }
+                } else {
+                    int32_t cl = (int16_t)(d[2] & 0xFFFF), ct = (int16_t)(d[2] >> 16);
+                    int32_t cr = (int16_t)(d[3] & 0xFFFF), cb = (int16_t)(d[3] >> 16);
+                    int32_t x1 = MIN(x0 + (int32_t)w, cr), y1 = MIN(y0 + (int32_t)h, cb);
+                    int32_t xa = MAX(MAX(x0, cl), 0), ya = MAX(MAX(y0, ct), 0);
+                    uint64_t lo = dst_off + (uint64_t)ya * dst_pitch + (uint64_t)xa * 4;
+                    uint64_t hi = dst_off + (uint64_t)(y1 - 1) * dst_pitch + (uint64_t)x1 * 4;
+
+                    if (xa < x1 && ya < y1 && hi <= s->vram_size) {
+                        uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+
+                        r200_vram_access(s, lo, hi, true, 5);
+                        for (int32_t y = ya; y < y1; y++) {
+                            const uint32_t *src = &d[9 + (uint64_t)(y - y0) * w];
+                            uint8_t *row = vram + dst_off + (uint64_t)y * dst_pitch;
+                            for (int32_t x = xa; x < x1; x++) {
+                                stl_be_p(row + (uint64_t)x * 4, src[x - x0]);
+                            }
+                        }
+                        vram_mark(s, lo, hi - lo);
+                        s->display_invalid = true;
                     }
                 }
             } else if (opcode == 0x9c && body_dw >= 4) {
