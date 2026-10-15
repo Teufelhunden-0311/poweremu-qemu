@@ -4546,8 +4546,11 @@ static bool ppc_mac_gpu_r300_packet3(PPCMacGPUState *s, uint32_t opcode,
         fprintf(s->r3_dump ? s->r3_dump : stderr, "T3 %02x n=%u %08x %08x\n", opcode,
                 body_dw, body_dw ? d[0] : 0, body_dw > 1 ? d[1] : 0);
     }
-    if (!draw && r300_drawlog()) {
-        fprintf(r300_drawlog(), "P op%02x n=%u %08x %08x %08x %08x\n", opcode,
+    /* (once: each call counts a line, and the one that reaches the cap
+     * closes the log and returns NULL) */
+    FILE *dlog = draw ? NULL : r300_drawlog();
+    if (dlog) {
+        fprintf(dlog, "P op%02x n=%u %08x %08x %08x %08x\n", opcode,
                 body_dw, body_dw ? d[0] : 0, body_dw > 1 ? d[1] : 0,
                 body_dw > 2 ? d[2] : 0, body_dw > 3 ? d[3] : 0);
     }
