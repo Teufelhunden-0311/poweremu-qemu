@@ -3137,7 +3137,7 @@ static void r300_zmask_apply(PPCMacGPUState *s)
     r200_pattern_fill(vram + off, s->r3_zclear_len, v, s->r3_zclear_bpp);
     vram_mark(s, off, s->r3_zclear_len);
     static int logged;
-    if (logged++ < 4) {
+    if (logged++ < 400) {
         qemu_log("ppc-mac-gpu r300: 3D_CLEAR_ZMASK: depth at 0x%x, %llu bytes "
                  "<- %08x\n", off, (unsigned long long)s->r3_zclear_len,
                  r300_reg(s->r3, 0x4F28));
@@ -3184,6 +3184,9 @@ static void r300_zmask_clear(PPCMacGPUState *s)
         return;
     }
     r300_zmask_apply(s);                    /* an earlier one, for another buffer */
+    qemu_log("zclear-test: 3D_CLEAR_ZMASK at 0x%x, %u rows x %llu, value "
+             "now %08x\n", off, rows, (unsigned long long)bpr,
+             r300_reg(s->r3, 0x4F28));
     s->r3_zclear_pending = true;
     s->r3_zclear_off = off;
     s->r3_zclear_len = bpr * rows;
@@ -10913,6 +10916,21 @@ static void ppc_mac_gpu_vm_state(void *opaque, bool running, RunState state)
         ppc_mac_gpu_cp_sync(s, ~(hwaddr)0);     /* the ring, to its end */
         ppc_mac_gpu_drain(s);
     }
+    /* TEST ONLY: $R300_ZCLEAR_POKE=hex sets ZB_DEPTHCLEARVALUE when the
+     * machine runs again with a depth clear pending -- the guest writing
+     * a new clear value after a save. */
+    const char *poke = getenv("R300_ZCLEAR_POKE");
+    if (running && poke && s->r3 && s->r3_zclear_pending) {
+        uint32_t was = r300_reg(s->r3, 0x4F28);
+        r300_state_write(s->r3, 0x4F28, strtoul(poke, NULL, 16));
+        qemu_log("zclear-test: resumed with a clear pending at 0x%x (%llu "
+                 "bytes): ZB_DEPTHCLEARVALUE %08x -> %08x\n",
+                 s->r3_zclear_off, (unsigned long long)s->r3_zclear_len, was,
+                 r300_reg(s->r3, 0x4F28));
+    } else if (running && s->r3) {
+        qemu_log("zclear-test: resumed, %s clear pending\n",
+                 s->r3_zclear_pending ? "a" : "no");
+    }
 }
 
 /*
@@ -14745,6 +14763,12 @@ static int ppc_mac_gpu_pre_save(void *opaque)
     PPCMacGPURenderer *r = s->renderer;
 
     ppc_mac_gpu_cp_sync(s, 0xFFFFFFFF);     /* save with the ring done */
+    /* TEST ONLY: $R300_ZCLEAR_OLDSAVE, 3c76c52's save (writes it out). */
+    qemu_log("zclear-test: pre_save, %s clear pending\n",
+             s->r3_zclear_pending ? "a" : "no");
+    if (getenv("R300_ZCLEAR_OLDSAVE")) {
+        r300_zmask_apply(s);
+    }
     /* The Z-pass counter is the renderer's (unless a loaded one has not
      * gone back to it yet), counting or not. */
     if (s->r3 && !s->r3_zpass_reload && r && r->zpass_r300) {
