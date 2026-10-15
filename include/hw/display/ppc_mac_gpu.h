@@ -709,6 +709,12 @@ struct PPCMacGPUState {
     uint32_t r3_indx_buf[3];    /* INDX_BUFFER waiting for its DRAW_INDX_2 */
     bool r3_indx_buf_pending;
     uint32_t r3_zb_offset, r3_zb_height;   /* depth buffer extent seen at draws */
+    /* A 3D_CLEAR_ZMASK not yet written into the depth buffer: the card
+     * reads ZB_DEPTHCLEARVALUE when it next uses the tiles, and Apple's
+     * driver sets that value after the clear (r300_zmask_clear). */
+    bool r3_zclear_pending;
+    uint32_t r3_zclear_off, r3_zclear_bpp, r3_zclear_swap;
+    uint64_t r3_zclear_len;
     uint32_t r3_zb_ns;          /* GB_AA_CONFIG samples at the last depth draw */
     uint32_t r3_cb_aa_off, r3_cb_aa_ns; /* last multisampled colour buffer, samples */
     bool r3_zconv;              /* depth buffer currently in the card's MSAA layout */
