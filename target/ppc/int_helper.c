@@ -708,12 +708,88 @@ VARITHFP(minfp, float32_min, VFP_MIN)
 VARITHFP(maxfp, float32_max, VFP_MAX)
 #undef VARITHFP
 
+/*
+ * TEST ONLY ($PPC_VFP_COUNT): how often vmaddfp and vnmsubfp take the host
+ * fast path, per vCPU.  Every 2^25 calls of one, the counts since the last
+ * line go to stderr with the time; the first 16 fallbacks with their
+ * operands and VSCR.  Fallbacks are classified on the slow path only.
+ */
+#include "qemu/timer.h"
+
+static bool vfp_count_on;
+static struct VFPCount {
+    uint64_t calls, fast, in_special, res_tiny_or_special;
+    int64_t t_ms;
+} vfp_cnt[16][2];
+
+static void __attribute__((constructor)) vfp_count_init(void)
+{
+    vfp_count_on = getenv("PPC_VFP_COUNT") != NULL;
+}
+
+static bool vfp_lane_special(uint32_t x)
+{
+    uint32_t e = x & 0x7f800000;
+    return e == 0x7f800000 || (!e && (x & 0x007fffff));
+}
+
+static void vfp_count(CPUPPCState *env, int which, bool fast, ppc_avr_t *a,
+                      ppc_avr_t *b, ppc_avr_t *c)
+{
+    int cpu = MIN(env_cpu(env)->cpu_index, 15);
+    struct VFPCount *k = &vfp_cnt[cpu][which];
+    static int samples;
+
+    k->calls++;
+    if (fast) {
+        k->fast++;
+    } else {
+        bool in = false;
+        for (int i = 0; i < 4; i++) {
+            in |= vfp_lane_special(a->u32[i]) || vfp_lane_special(b->u32[i]) ||
+                  vfp_lane_special(c->u32[i]);
+        }
+        if (in) {
+            k->in_special++;
+        } else {
+            k->res_tiny_or_special++;
+        }
+        if (samples++ < 16) {
+            fprintf(stderr, "vfpcount: %s fallback (%s) vscr %08x "
+                    "a %08x %08x %08x %08x b %08x %08x %08x %08x "
+                    "c %08x %08x %08x %08x\n", which ? "vnmsubfp" : "vmaddfp",
+                    in ? "input" : "result", ppc_get_vscr(env),
+                    a->u32[0], a->u32[1], a->u32[2], a->u32[3],
+                    b->u32[0], b->u32[1], b->u32[2], b->u32[3],
+                    c->u32[0], c->u32[1], c->u32[2], c->u32[3]);
+        }
+    }
+    if (!(k->calls & ((1u << 25) - 1))) {
+        int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        fprintf(stderr, "vfpcount: t %" PRId64 " ms (+%" PRId64 ") cpu %d %s: "
+                "calls %" PRIu64 " fast %" PRIu64 " fallback input %" PRIu64
+                " result %" PRIu64 "\n", now, k->t_ms ? now - k->t_ms : 0, cpu,
+                which ? "vnmsubfp" : "vmaddfp", k->calls, k->fast,
+                k->in_special, k->res_tiny_or_special);
+        memset(k, 0, sizeof(*k));
+        k->t_ms = now;
+    }
+}
+
 #define VARITHFPFMA(suffix, type, fast_op)                              \
     void helper_v##suffix(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *a, \
                            ppc_avr_t *b, ppc_avr_t *c)                  \
     {                                                                   \
         int i;                                                          \
-        if (vfp_fast(fast_op, r, a, b, c)) {                            \
+        if (unlikely(vfp_count_on)) {                                   \
+            bool f = vfp_fast(fast_op, r, a, b, c);                     \
+            if (!f) {                                                   \
+                vfp_count(env, fast_op == VFP_NMSUB, false, a, b, c);   \
+            } else {                                                    \
+                vfp_count(env, fast_op == VFP_NMSUB, true, a, b, c);    \
+                return;                                                 \
+            }                                                           \
+        } else if (vfp_fast(fast_op, r, a, b, c)) {                     \
             return;                                                     \
         }                                                               \
         for (i = 0; i < ARRAY_SIZE(r->f32); i++) {                      \
