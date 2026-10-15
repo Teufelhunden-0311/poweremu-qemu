@@ -2059,7 +2059,13 @@ static void fp_frame(PPCMacGPUState *s, int y0, int y1)
     l_seq = seq; l_front = front; l_rej = rej; l_bf = bf; l_2d = f2d;
     l_flips = flips; l_skips = fp_skips; l_ro = ro; l_rv = rv; l_rs = rs;
     fp_defers = 0;
-    if ((odd || dump_next || n % 600 == 0) && dumps < 80) {
+    static int only_w = -1;
+    if (only_w < 0) {
+        const char *e = getenv("R300_FRAMEPROBE_W");    /* dump this width only */
+        only_w = e ? atoi(e) : 0;
+    }
+    if ((odd || dump_next || fp_chk_lo != lo || n % 600 == 0) && dumps < 80 &&
+        (!only_w || W == only_w)) {
         char p[512];
         snprintf(p, sizeof(p), "%s/f%06llu.ppm", fpt.dir,
                  (unsigned long long)n);
