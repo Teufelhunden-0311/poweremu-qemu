@@ -1833,8 +1833,9 @@ static bool ppc_gpu_async_present = true;
 static bool ppc_gpu_flip_recheck = true;
 
 /*
- * While the machine runs, the scanout base changes only through here, each
- * change counted (scanout_gen) for the display refresh: its checks let go
+ * While the machine runs, the scanout base changes only through here (and
+ * the device reset, which counts its clear itself), each change counted
+ * (scanout_gen) for the display refresh: its checks let go
  * of the BQL, and the count tells it whether the base moved meanwhile --
  * including away and back again, which comparing the offset alone cannot
  * see.
@@ -13810,6 +13811,7 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
 
     cp.epoch++;                 /* a CP thread mid-ring drops what it has */
     s->reset_count++;
+    s->scanout_gen++;           /* the clear below moves the scanout base too */
     memset(&s->regs, 0, sizeof(s->regs));
     memset(s->r300_surf, 0, sizeof(s->r300_surf));     /* no surfaces after a reset */
     s->r3_zconv = false;                /* nor a depth buffer converted for one */
