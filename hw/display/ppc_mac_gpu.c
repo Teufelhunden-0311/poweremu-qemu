@@ -4469,15 +4469,18 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                                             (uint64_t)pkt.cb[k].pitch * pkt.cb[k].bpp *
                                             pkt.rt_height);
                 }
-                /*
-                 * And the depth buffer, when the draw can write it (Z test
-                 * and Z writes on, or the stencil test).  The texture cache
-                 * vouches for a copy by this log, and Apple's driver reads
-                 * depth back by drawing with the depth buffer as a texture
-                 * (glReadPixels of GL_DEPTH_COMPONENT): unmarked, a second
-                 * readback got the first one's copy, without what was drawn
-                 * in between (zc: 0.5 read where 0.25 was drawn).
-                 */
+            }
+            /*
+             * And the depth buffer, when the draw can write it (Z test and
+             * Z writes on, or the stencil test); it is in VRAM even when the
+             * colour buffer is staged.  The texture cache vouches for a
+             * copy by this log, and Apple's driver reads depth back by
+             * drawing with the depth buffer as a texture (glReadPixels of
+             * GL_DEPTH_COMPONENT): unmarked, a second readback got the first
+             * one's copy, without what was drawn in between (zc: 0.5 read
+             * where 0.25 was drawn).
+             */
+            if (!s->renderer->set_dirty_source) {
                 uint32_t zc = pkt.uniforms.zinfo[0];
                 if (pkt.depth.attach && ((zc & 1) || (zc & 6) == 6)) {
                     memory_region_set_dirty(&s->vram, pkt.depth.gpu_addr,
