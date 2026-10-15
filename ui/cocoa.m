@@ -1474,8 +1474,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
  * pointer to the front when it sends its own events (selectPointer), not
  * whenever the mode changes: another frontend (poweremu-display) picks its
  * own pointer the same way, the guest's first poll of a device picks that
- * one, and neither should be undone behind its back.  Only this console's
- * pointers are considered, as qemu_input_is_absolute() would.
+ * one, and neither should be undone behind its back.  Only the pointers
+ * this console's events reach are considered (its own, or the shared
+ * unbound ones), as qemu_input_is_absolute() would.
  */
 - (void) notifyMouseModeChange {
     BOOL want_rel = mouseLocked;

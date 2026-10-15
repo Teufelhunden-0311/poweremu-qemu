@@ -169,9 +169,11 @@ static QemuInputHandlerState *qemu_input_con_kind(uint32_t mask,
 
 /*
  * qemu_input_handler_activate_kind() for one console: con's pointer events
- * go to its pointer of kind `mask` from now on.  Other consoles' pointers
- * are left alone, and nothing happens -- no mode-change notification
- * either -- when con's pointer already is of that kind.
+ * go to its pointer of kind `mask` from now on.  Pointers bound to other
+ * consoles are left alone; the unbound ones are shared, though, so for
+ * every console without pointers of its own this picks theirs too.
+ * Nothing happens -- no mode-change notification either -- when con's
+ * pointer already is of that kind.
  */
 void qemu_input_handler_activate_kind_con(uint32_t mask, QemuConsole *con)
 {
