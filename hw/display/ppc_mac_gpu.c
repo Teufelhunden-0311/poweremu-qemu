@@ -4533,6 +4533,23 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                                             (uint64_t)pkt.depth.pitch * pkt.depth.bpp *
                                             pkt.rt_height * ns);
                 }
+                /* TEST ONLY */
+                static uint64_t zt_n[2][2];
+                zt_n[!!sys.len][pkt.depth.attach && ((zc & 1) || (zc & 6) == 6)]++;
+                if (sys.len && pkt.depth.attach && zt_n[1][0] + zt_n[1][1] <= 40) {
+                    qemu_log("zb-test: staged colour %08x %ux%u, depth %08x attached, "
+                             "zinfo %08x -> %s\n", sys.gpu, pkt.rt_width, pkt.rt_height,
+                             pkt.depth.gpu_addr, zc,
+                             ((zc & 1) || (zc & 6) == 6) ? "MARKED" : "not written");
+                }
+                if (((zt_n[0][0] + zt_n[0][1] + zt_n[1][0] + zt_n[1][1]) & 0xFFF) == 0) {
+                    qemu_log("zb-test: vram colour %llu (+depth mark %llu), staged colour "
+                             "%llu (+depth mark %llu)\n",
+                             (unsigned long long)(zt_n[0][0] + zt_n[0][1]),
+                             (unsigned long long)zt_n[0][1],
+                             (unsigned long long)(zt_n[1][0] + zt_n[1][1]),
+                             (unsigned long long)zt_n[1][1]);
+                }
             }
             r200_rate.draws++;
             r200_perf.draws++;
