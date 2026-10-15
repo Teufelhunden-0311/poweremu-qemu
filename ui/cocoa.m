@@ -327,6 +327,8 @@ static void qemu_toggle_full_panel(void);
      */
     BOOL isMouseGrabbed;
     BOOL isAbsoluteEnabled;
+    /* The user asked for the relative pointer (toggleMouseLock). */
+    BOOL mouseLocked;
     CFMachPortRef eventsTap;
     CGColorSpaceRef colorspace;
     CALayer *cursorLayer;
@@ -343,6 +345,8 @@ static void qemu_toggle_full_panel(void);
 - (void) switchSurface:(pixman_image_t *)image;
 - (void) grabMouse;
 - (void) ungrabMouse;
+- (void) toggleMouseLock;
+- (void) selectPointer;
 - (void) setFullGrab:(id)sender;
 - (void) handleMonitorInput:(NSEvent *)event;
 - (bool) handleEvent:(NSEvent *)event;
@@ -1232,9 +1236,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
                             [self selectConsoleLocked:key - '0' - 1]; /* ascii math */
                             return true;
 
-                        // release the mouse grab
+                        // lock the mouse for a game, or release it
                         case 'g':
-                            [self ungrabMouse];
+                            [self toggleMouseLock];
                             return true;
 
                         // toggle (full-panel) fullscreen
@@ -1285,6 +1289,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
                 return true;
             }
 
+            [self selectPointer];
             qemu_input_queue_btn(dcl.con, button, true);
             qemu_input_event_sync();
             qemu_input_queue_btn(dcl.con, button, false);
@@ -1318,6 +1323,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     }
 
     with_bql(^{
+        [self selectPointer];
         qemu_input_queue_btn(dcl.con, button, down);
     });
 
@@ -1331,6 +1337,7 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
     }
 
     with_bql(^{
+        [self selectPointer];
         if (isAbsoluteEnabled) {
             /* Bounds are guest pixels (updateBounds); this also accounts
              * for the view being centred inside the fullscreen panel. */
@@ -1420,11 +1427,13 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 {
     COCOA_DEBUG("QemuCocoaView: grabMouse\n");
 
-    if (qemu_name)
-        [[self window] setTitle:window_title("  (Press  " UC_CTRL_KEY " " UC_ALT_KEY " G  to release Mouse)")];
-    else
-        [[self window] setTitle:window_title("  (Press  " UC_CTRL_KEY " " UC_ALT_KEY " G  to release Mouse)")];
-    [self hideCursor];
+    /* The absolute pointer is "grabbed" whenever it is over the window;
+     * only the relative one has to be released. */
+    [[self window] setTitle:window_title(isAbsoluteEnabled ? NULL :
+        "  (Press  " UC_CTRL_KEY " " UC_ALT_KEY " G  to release Mouse)")];
+    if (!isMouseGrabbed) {
+        [self hideCursor];      /* NSCursor counts its hides */
+    }
     CGAssociateMouseAndMouseCursorPosition(isAbsoluteEnabled);
     isMouseGrabbed = TRUE; // while isMouseGrabbed = TRUE, QemuCocoaApp sends all events to [cocoaView handleEvent:]
 }
@@ -1433,18 +1442,50 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 {
     COCOA_DEBUG("QemuCocoaView: ungrabMouse\n");
 
-    if (qemu_name)
-        [[self window] setTitle:window_title(NULL)];
-    else
-        [[self window] setTitle:window_title(NULL)];
-    [self unhideCursor];
+    [[self window] setTitle:window_title(NULL)];
+    if (isMouseGrabbed) {
+        [self unhideCursor];
+    }
     CGAssociateMouseAndMouseCursorPosition(TRUE);
     isMouseGrabbed = FALSE;
     [self raiseAllButtons];
 }
 
+- (BOOL) isPointerInView
+{
+    NSPoint p = [self convertPoint:[[self window] mouseLocationOutsideOfEventStream]
+                          fromView:nil];
+    return NSPointInRect(p, [self bounds]);
+}
+
+/*
+ * A guest with both a USB tablet and a USB mouse (the Radeon 9700 machine)
+ * makes each the active pointer the first time it polls it, so the one it
+ * happens to poll last wins -- on Tiger, a relative mouse.  The window then
+ * had to grab the pointer and sent it movement macOS had already
+ * accelerated, which the guest accelerated again: too fast, and running
+ * away now and then.  The window uses the tablet instead, so the guest's
+ * pointer follows the Mac's one to one.  Games that turn with the mouse
+ * need the relative one, which never stops at the window's edge:
+ * Ctrl-Alt-G (toggleMouseLock) asks for it.  A guest without a tablet
+ * (Jaguar) keeps its relative mouse as before.
+ *
+ * The window only says which kind it would use here.  It brings that
+ * pointer to the front when it sends its own events (selectPointer), not
+ * whenever the mode changes: another frontend (poweremu-display) picks its
+ * own pointer the same way, the guest's first poll of a device picks that
+ * one, and neither should be undone behind its back.  Only the pointers
+ * this console's events reach are considered (its own, or the shared
+ * unbound ones), as qemu_input_is_absolute() would.
+ */
 - (void) notifyMouseModeChange {
+    BOOL want_rel = mouseLocked;
     bool tIsAbsoluteEnabled = bool_with_bql(^{
+        uint32_t want = want_rel ? INPUT_EVENT_MASK_REL : INPUT_EVENT_MASK_ABS;
+
+        if (qemu_input_con_has_kind(want, dcl.con)) {
+            return (bool)!want_rel;
+        }
         return qemu_input_is_absolute(dcl.con);
     });
 
@@ -1452,6 +1493,9 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         return;
     }
 
+    if (isMouseGrabbed) {
+        [self raiseAllButtons];     /* on the pointer that had them */
+    }
     isAbsoluteEnabled = tIsAbsoluteEnabled;
 
     if (isMouseGrabbed) {
@@ -1460,6 +1504,40 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
         } else {
             CGAssociateMouseAndMouseCursorPosition(isAbsoluteEnabled);
         }
+    }
+    /* Over the window, the absolute pointer is the guest's at once -- but
+     * only when the window has the focus: a device appearing while the
+     * pointer merely crosses a window in the background takes nothing. */
+    if (isAbsoluteEnabled && !isMouseGrabbed && [NSApp isActive] &&
+        [[self window] isKeyWindow] && [self isPointerInView]) {
+        [self grabMouse];
+    }
+}
+
+/* With the BQL: this window's events go to the pointer of its kind. */
+- (void) selectPointer
+{
+    qemu_input_handler_activate_kind_con(isAbsoluteEnabled ?
+                                         INPUT_EVENT_MASK_ABS :
+                                         INPUT_EVENT_MASK_REL, dcl.con);
+}
+
+/* Ctrl-Alt-G: the relative pointer, locked to the window, for a game;
+ * again (or from the relative pointer) to release it.  A button held
+ * across it is let go on the pointer that had it, before the other takes
+ * over, so the guest is not left with it down. */
+- (void) toggleMouseLock
+{
+    [self raiseAllButtons];
+    if (!isAbsoluteEnabled) {
+        mouseLocked = NO;
+        [self ungrabMouse];
+    } else {
+        mouseLocked = YES;
+    }
+    [self notifyMouseModeChange];
+    if (!isAbsoluteEnabled && mouseLocked) {
+        [self grabMouse];
     }
 }
 - (BOOL) isMouseGrabbed {return isMouseGrabbed;}
@@ -1480,9 +1558,11 @@ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEven
 - (void) raiseAllButtons
 {
     with_bql(^{
+        [self selectPointer];
         qemu_input_queue_btn(dcl.con, INPUT_BUTTON_LEFT, false);
         qemu_input_queue_btn(dcl.con, INPUT_BUTTON_RIGHT, false);
         qemu_input_queue_btn(dcl.con, INPUT_BUTTON_MIDDLE, false);
+        qemu_input_event_sync();    /* now, before another pointer is used */
     });
 }
 @end
