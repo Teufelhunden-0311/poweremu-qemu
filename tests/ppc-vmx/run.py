@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Build vmx_test.c as a raw mac99 firmware image, run it, report results.
 
-usage: run.py [--fpdiff | --fpdiff-strict] [path/to/qemu-system-ppc]
+usage: run.py [--fpdiff | --fpdiff-strict | --vfpdiff] [path/to/qemu-system-ppc]
 
 --fpdiff runs the scalar FP cases with the inline FP ops off and on and
 compares results and FPSCR; --fpdiff-strict compares the inline results
 with softfloat's (PPC_STRICT_FP=1), whose FPSCR also has the inexact bits.
+--vfpdiff does the same for vmaddfp with the inline op off and on
+(PPC_NATIVE_VMX), comparing results and VSCR bit for bit.
 
 Needs Homebrew llvm (clang with the PowerPC target) and lld.
 """
@@ -150,9 +152,63 @@ def fpdiff(img, out, strict=False):
     return bad
 
 
+VFD_BASE = 0x02000000
+VFD_REC = 6 * 16
+
+
+def run_dump(img, out, tag, env, base, rec, count_word):
+    """Run the image with env; return count_word's count of rec-byte records."""
+    sock = os.path.join(out, f'mon{tag}.sock')
+    q = subprocess.Popen([QEMU, '-M', 'mac99', '-cpu', '7450', '-m', '64',
+                          '-bios', img, '-display', 'none',
+                          '-serial', 'none', '-monitor',
+                          f'unix:{sock},server=on,wait=off'],
+                         stdout=subprocess.DEVNULL, env=env)
+    try:
+        mon = Monitor(sock)
+        for _ in range(1200):
+            if mon.words(RESULTS, 1) == [0x564d5854]:
+                break
+            time.sleep(0.25)
+        else:
+            sys.exit('test did not finish')
+        n = mon.words(RESULTS + count_word * 4, 1)[0]
+        path = os.path.join(out, f'dump{tag}.bin')
+        mon.cmd(f'pmemsave {base:#x} {n * rec} "{path}"')
+        return open(path, 'rb').read()
+    finally:
+        q.kill()
+
+
+def vfpdiff(img, out):
+    """Run the vmaddfp cases on the helper and inline; compare them."""
+    import struct
+    dumps = [run_dump(img, out, f'v{native}',
+                      dict(os.environ, PPC_NATIVE_VMX=native),
+                      VFD_BASE, VFD_REC, 0x284) for native in ('0', '1')]
+    n = len(dumps[0]) // VFD_REC
+    bad = 0
+    forms = ('d distinct', 'd=a', 'd=b', 'd=c', 'all one register')
+    for i in range(n):
+        r0 = struct.unpack_from('>24I', dumps[0], i * VFD_REC)
+        r1 = struct.unpack_from('>24I', dumps[1], i * VFD_REC)
+        if r0 != r1:
+            bad += 1
+            if bad <= 10:
+                vec = lambda r, k: ' '.join(f'{w:08x}' for w in r[4 * k:4 * k + 4])
+                print(f'MISMATCH vmaddfp {forms[r0[20] & 0xff]} NJ={r0[20] >> 8}: '
+                      f'a={vec(r0, 0)} b={vec(r0, 1)} c={vec(r0, 2)}')
+                print(f'   helper: {vec(r0, 3)} vscr {r0[19]:08x}'
+                      f'   native: {vec(r1, 3)} vscr {r1[19]:08x}')
+    print(f'{n} vmaddfp cases compared (native vs helper), {bad} mismatches')
+    return bad
+
+
 def main():
     out = tempfile.mkdtemp(prefix='ppc-vmx-')
     img = build(out)
+    if '--vfpdiff' in sys.argv:
+        sys.exit(1 if vfpdiff(img, out) else 0)
     if '--fpdiff' in sys.argv or '--fpdiff-strict' in sys.argv:
         sys.exit(1 if fpdiff(img, out, '--fpdiff-strict' in sys.argv) else 0)
     sock = os.path.join(out, 'mon.sock')

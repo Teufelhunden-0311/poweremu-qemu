@@ -2871,6 +2871,16 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
         tcg_out32(s, (a2 ? 0x1e22c000 : 0x1e624000)
                   | (a1 & 0x1f) << 5 | (a0 & 0x1f));
         break;
+    case INDEX_op_vfma_vec:
+        /* FMLA Vd.4S, Vn.4S, Vm.4S: d += n*m, d being b (constraint) */
+        tcg_out32(s, 0x4e20cc00 | (a2 & 0x1f) << 16 | (a1 & 0x1f) << 5
+                  | (a0 & 0x1f));
+        break;
+    case INDEX_op_vany_vec:
+        /* UMAXV S(tmp), Vn.4S; FMOV Wd, S(tmp) */
+        tcg_out32(s, 0x6eb0a800 | (a1 & 0x1f) << 5 | (TCG_VEC_TMP0 & 0x1f));
+        tcg_out32(s, 0x1e260000 | (TCG_VEC_TMP0 & 0x1f) << 5 | (a0 & 0x1f));
+        break;
 
     case INDEX_op_tbl_vec:
         /*
@@ -2943,6 +2953,9 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_ffma_vec:
     case INDEX_op_fcvt_vec:
         return type == TCG_TYPE_V64 && (vece == MO_32 || vece == MO_64);
+    case INDEX_op_vfma_vec:
+    case INDEX_op_vany_vec:
+        return type == TCG_TYPE_V128 && vece == MO_32;
 
     default:
         return 0;
@@ -3209,6 +3222,10 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
         return C_O1_I2(w, w, w);
     case INDEX_op_fcvt_vec:
         return C_O1_I1(w, w);
+    case INDEX_op_vfma_vec:
+        return C_O1_I3(w, w, w, 0);
+    case INDEX_op_vany_vec:
+        return C_O1_I1(r, w);
     case INDEX_op_bitsel_vec:
     case INDEX_op_tbl_vec:
     case INDEX_op_ffma_vec:

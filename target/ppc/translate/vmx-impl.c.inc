@@ -2481,26 +2481,108 @@ static bool do_vclrb(DisasContext *ctx, arg_VX *a, bool right)
 TRANS(VCLRLB, do_vclrb, false)
 TRANS(VCLRRB, do_vclrb, true)
 
-#define GEN_VAFORM_PAIRED(name0, name1, opc2)                           \
-static void glue(gen_, name0##_##name1)(DisasContext *ctx)              \
-    {                                                                   \
-        TCGv_ptr ra, rb, rc, rd;                                        \
-        if (unlikely(!ctx->altivec_enabled)) {                          \
-            gen_exception(ctx, POWERPC_EXCP_VPU);                       \
-            return;                                                     \
-        }                                                               \
-        ra = gen_avr_ptr(rA(ctx->opcode));                              \
-        rb = gen_avr_ptr(rB(ctx->opcode));                              \
-        rc = gen_avr_ptr(rC(ctx->opcode));                              \
-        rd = gen_avr_ptr(rD(ctx->opcode));                              \
-        if (Rc(ctx->opcode)) {                                          \
-            gen_helper_##name1(tcg_env, rd, ra, rb, rc);                \
-        } else {                                                        \
-            gen_helper_##name0(tcg_env, rd, ra, rb, rc);                \
-        }                                                               \
+/*
+ * vmaddfp on the host, inline, as helper_vmaddfp's fast path (vfp_fast in
+ * int_helper.c) does it: when every lane of every input is normal or zero,
+ * and every lane of the result is zero or normal above the lowest binade,
+ * the host's fused multiply-add gives softfloat's bits (AltiVec always
+ * rounds to nearest and raises nothing).  Otherwise the op branches to a
+ * slow path, as the scalar ops do (fp-impl.c.inc, native_fp_op()), that
+ * calls helper_vmaddfp on the same registers, which are still intact: vD
+ * is written only after the branch.  The checks are the helper's, so its
+ * acceptance is not widened.  PPC_NATIVE_VMX=0 keeps the helper.
+ */
+static bool native_vmx(DisasContext *ctx)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPC_NATIVE_VMX");
+        on = !(e && e[0] == '0')
+             && tcg_can_emit_vec_op(INDEX_op_vfma_vec, TCG_TYPE_V128, MO_32) > 0;
     }
+    /* as native_fp(), without fp_fast: FPSCR does not apply to VMX */
+    return on && ctx->n_nfp < ARRAY_SIZE(ctx->nfp)
+           && !ctx->singlestep_enabled && !ctx->pmu_insn_cnt
+           && !(tb_cflags(ctx->base.tb) & CF_USE_ICOUNT);
+}
 
-GEN_VAFORM_PAIRED(vmaddfp, vnmsubfp, 23)
+/*
+ * OR into bad all ones in each lane of v that is neither zero nor
+ * normal with a biased exponent of at least lo (1 for an input, 2 for a
+ * result).  t = the bits without the sign; t - (lo << 24) is below
+ * (0xff - lo) << 24 exactly for those exponents, and t is 0 for a zero.
+ */
+static void native_vmx_check(TCGv_vec bad, TCGv_vec v, unsigned lo)
+{
+    TCGv_vec t = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec u = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec z = tcg_temp_new_vec(TCG_TYPE_V128);
+
+    tcg_gen_shli_vec(MO_32, t, v, 1);
+    tcg_gen_sub_vec(MO_32, u, t, tcg_constant_vec(TCG_TYPE_V128, MO_32,
+                                                  lo << 24));
+    tcg_gen_cmp_vec(TCG_COND_GEU, MO_32, u, u,
+                    tcg_constant_vec(TCG_TYPE_V128, MO_32, (0xffu - lo) << 24));
+    tcg_gen_cmp_vec(TCG_COND_EQ, MO_32, z, t,
+                    tcg_constant_vec(TCG_TYPE_V128, MO_32, 0));
+    tcg_gen_andc_vec(MO_32, u, u, z);
+    tcg_gen_or_vec(MO_32, bad, bad, u);
+}
+
+static void native_vmaddfp(DisasContext *ctx, int vrt, int vra, int vrb,
+                           int vrc)
+{
+    NativeFPSlow *sp = &ctx->nfp[ctx->n_nfp++];
+    TCGv_vec a = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec b = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec c = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec r = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_vec bad = tcg_temp_new_vec(TCG_TYPE_V128);
+    TCGv_i64 any = tcg_temp_new_i64();
+
+    *sp = (NativeFPSlow) {
+        .slow = gen_new_label(), .next = ctx->base.pc_next,
+        .op = NATIVE_VMADDFP, .frt = vrt, .x = vra, .y = vrb, .z = vrc,
+    };
+    tcg_gen_ld_vec(a, tcg_env, avr_full_offset(vra));
+    tcg_gen_ld_vec(b, tcg_env, avr_full_offset(vrb));
+    tcg_gen_ld_vec(c, tcg_env, avr_full_offset(vrc));
+    tcg_gen_vfma_vec(r, a, c, b);                       /* a * c + b */
+
+    tcg_gen_dupi_vec(MO_32, bad, 0);
+    native_vmx_check(bad, a, 1);
+    native_vmx_check(bad, b, 1);
+    native_vmx_check(bad, c, 1);
+    native_vmx_check(bad, r, 2);
+    tcg_gen_vany_vec(any, bad);
+    tcg_gen_brcondi_i64(TCG_COND_NE, any, 0, sp->slow);
+
+    tcg_gen_st_vec(r, tcg_env, avr_full_offset(vrt));
+}
+
+static void gen_vmaddfp_vnmsubfp(DisasContext *ctx)
+{
+    TCGv_ptr ra, rb, rc, rd;
+
+    if (unlikely(!ctx->altivec_enabled)) {
+        gen_exception(ctx, POWERPC_EXCP_VPU);
+        return;
+    }
+    if (!Rc(ctx->opcode) && native_vmx(ctx)) {
+        native_vmaddfp(ctx, rD(ctx->opcode), rA(ctx->opcode),
+                       rB(ctx->opcode), rC(ctx->opcode));
+        return;
+    }
+    ra = gen_avr_ptr(rA(ctx->opcode));
+    rb = gen_avr_ptr(rB(ctx->opcode));
+    rc = gen_avr_ptr(rC(ctx->opcode));
+    rd = gen_avr_ptr(rD(ctx->opcode));
+    if (Rc(ctx->opcode)) {
+        gen_helper_vnmsubfp(tcg_env, rd, ra, rb, rc);
+    } else {
+        gen_helper_vmaddfp(tcg_env, rd, ra, rb, rc);
+    }
+}
 
 static bool do_va_helper(DisasContext *ctx, arg_VA *a,
     void (*gen_helper)(TCGv_ptr, TCGv_ptr, TCGv_ptr, TCGv_ptr))
@@ -3830,6 +3912,5 @@ TRANS_FLAGS2(ISA310, VMODUQ, do_vx_helper, gen_helper_VMODUQ)
 #undef GEN_VXFORM_VSPLTI
 #undef GEN_VXFORM_NOA
 #undef GEN_VXFORM_UIMM
-#undef GEN_VAFORM_PAIRED
 
 #undef GEN_BCD2

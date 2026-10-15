@@ -802,6 +802,30 @@ void tcg_gen_fcvt_vec(bool to_double, TCGv_vec r, TCGv_vec a)
               temp_arg(rt), temp_arg(at), to_double);
 }
 
+/*
+ * Four singles at once, on a V128; callers check
+ * tcg_can_emit_vec_op(INDEX_op_vfma_vec, TCG_TYPE_V128, MO_32) (both
+ * are provided together).
+ */
+void tcg_gen_vfma_vec(TCGv_vec r, TCGv_vec a, TCGv_vec c, TCGv_vec b)
+{
+    TCGTemp *rt = tcgv_vec_temp(r);
+
+    tcg_debug_assert(rt->base_type == TCG_TYPE_V128);
+    vec_gen_4(INDEX_op_vfma_vec, TCG_TYPE_V128, MO_32, temp_arg(rt),
+              temp_arg(tcgv_vec_temp(a)), temp_arg(tcgv_vec_temp(c)),
+              temp_arg(tcgv_vec_temp(b)));
+}
+
+void tcg_gen_vany_vec(TCGv_i64 r, TCGv_vec a)
+{
+    TCGTemp *at = tcgv_vec_temp(a);
+
+    tcg_debug_assert(at->base_type == TCG_TYPE_V128);
+    vec_gen_2(INDEX_op_vany_vec, TCG_TYPE_V128, MO_32,
+              tcgv_i64_arg(r), temp_arg(at));
+}
+
 void tcg_gen_fop_vec(unsigned vece, unsigned op, TCGv_vec r,
                      TCGv_vec a, TCGv_vec b)
 {

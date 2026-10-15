@@ -286,6 +286,13 @@ DEF(tbl_vec, 1, 3, 0, TCG_OPF_VECTOR)
 DEF(fop_vec, 1, 2, 1, TCG_OPF_VECTOR)
 DEF(ffma_vec, 1, 3, 1, TCG_OPF_VECTOR)
 DEF(fcvt_vec, 1, 1, 1, TCG_OPF_VECTOR)
+/*
+ * On a V128 of four singles (vece MO_32), the same arithmetic:
+ * vfma_vec r = a*c + b in every lane, one rounding each.
+ * vany_vec: an I64 temp, nonzero if any 32-bit lane of the V128 is.
+ */
+DEF(vfma_vec, 1, 3, 0, TCG_OPF_VECTOR)
+DEF(vany_vec, 1, 1, 0, TCG_OPF_VECTOR)
 
 DEF(last_generic, 0, 0, 0, TCG_OPF_NOT_PRESENT)
 

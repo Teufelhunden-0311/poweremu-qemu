@@ -1067,6 +1067,106 @@ static void fp_diff(uint32_t *seed)
     asm volatile("mtfsfi 7,0");
 }
 
+/*
+ * Differential test for the inline vmaddfp (vmx-impl.c.inc
+ * native_vmaddfp()): lanes from the classes that decide between the
+ * inline path and the helper (zeros, denormals, the lowest normal binade,
+ * infinities, NaNs, moderate values, and products that land at the
+ * bottom of the normal range), with vD distinct from or equal to each
+ * input, under VSCR[NJ] = 0 and 1.  Each case stores a, b, c, the result,
+ * VSCR and a case id at VFD_BASE; run.py --vfpdiff runs this with
+ * PPC_NATIVE_VMX=0 and =1 and compares the two memory images.
+ */
+#define VFD_BASE    0x02000000u
+#define VFD_REC     6           /* a, b, c, result, vscr, case id (16 bytes each) */
+
+static uint32_t vfd_lane(uint32_t *seed)
+{
+    static const uint32_t special[] = {
+        0x00000000, 0x80000000, 0x00000001, 0x807fffff,     /* +-0, denormals */
+        0x00800000, 0x80800000, 0x00ffffff, 0x01000000,     /* lowest binade, next */
+        0x3f800000, 0xbf800000, 0x3f7fffff, 0x7f7fffff,     /* +-1, just under 1, max */
+        0x7f800000, 0xff800000, 0x7fc00000, 0xffc00123,     /* +-inf, qNaN */
+        0x7f800001, 0xff900000, 0x00400000, 0x80000001,     /* sNaN, denormals */
+        0x01800000, 0x00800001, 0x5f800000, 0x1f800000,     /* 2^-124, 2^64, 2^-64 */
+    };
+    uint32_t r = rnd(seed), x = rnd(seed);
+
+    switch (r & 7) {
+    case 0: case 1:
+        return special[(r >> 3) % (sizeof(special) / sizeof(special[0]))];
+    case 2:             /* the bottom of the normal range, either sign */
+        return (x & 0x807fffff) | ((r >> 8) % 4) << 23;
+    case 3:             /* around 2^-63: products near the lowest binade */
+        return (x & 0x807fffff) | (64 + (r >> 8) % 3) << 23;
+    case 4: case 5:     /* moderate */
+        return (x & 0x807fffff) | (108 + (r >> 8) % 40) << 23;
+    default:            /* anything */
+        return x;
+    }
+}
+
+static void vfd_one(volatile V *buf, int form)
+{
+    /* buf: a, b, c, out, vscr; v2 = a, v3 = b, v4 = c, v1 the result */
+#define VFD_ASM(insn, t)     asm volatile("lvx 2,0,%0\n\tlvx 3,%1,%0\n\tlvx 4,%2,%0\n\t"          \
+                 "lvx 5,%3,%0\n\tmtvscr 5\n\tvxor 1,1,1\n\t" insn "\n\t"   \
+                 "stvx " #t ",%4,%0\n\tmfvscr 5\n\tstvx 5,%3,%0"          \
+                 : : "b"(buf), "b"(16), "b"(32), "b"(64), "b"(48)          \
+                 : "v1", "v2", "v3", "v4", "v5", "memory")
+    switch (form) {
+    case 0: VFD_ASM("vmaddfp 1,2,4,3", 1); break;
+    case 1: VFD_ASM("vmaddfp 2,2,4,3", 2); break;     /* vD = vA */
+    case 2: VFD_ASM("vmaddfp 3,2,4,3", 3); break;     /* vD = vB */
+    case 3: VFD_ASM("vmaddfp 4,2,4,3", 4); break;     /* vD = vC */
+    case 4: VFD_ASM("vmaddfp 2,2,2,2", 2); break;     /* all one register */
+    }
+#undef VFD_ASM
+}
+
+static void vfp_diff(uint32_t *seed)
+{
+    volatile V *buf = (volatile V *)FPD_BUF;
+    volatile V *out = (volatile V *)VFD_BASE;
+    uint32_t n = 0;
+
+    for (int nj = 0; nj < 2; nj++) {
+        for (int it = 0; it < 4000; it++) {
+            V a, b, c;
+            for (int i = 0; i < 4; i++) {
+                a.w[i] = vfd_lane(seed);
+                b.w[i] = vfd_lane(seed);
+                c.w[i] = vfd_lane(seed);
+            }
+            if ((it & 7) == 0) {
+                for (int i = 0; i < 4; i++) {       /* a*c - a*c shapes */
+                    b.w[i] = (a.w[i] ^ 0x80000000);
+                    c.w[i] = 0x3f800000;
+                }
+            }
+            for (int form = 0; form < 5; form++) {
+                memset((void *)&buf[0], 0, 5 * sizeof(V));
+                buf[0] = a; buf[1] = b; buf[2] = c;
+                buf[4].w[3] = nj << 16;               /* VSCR[NJ] */
+                vfd_one(buf, form);
+                out[0] = a; out[1] = b; out[2] = c;
+                out[3] = buf[3]; out[4] = buf[4];
+                memset((void *)&out[5], 0, sizeof(V));
+                out[5].w[0] = nj << 8 | form;
+                out += VFD_REC;
+                n++;
+            }
+        }
+    }
+    res[0x284] = n;
+    {
+        V z;
+        memset(&z, 0, sizeof(z));
+        z.w[3] = 0x10000;                             /* NJ, the reset state */
+        asm volatile("mtvscr %0" : : "v"(z.v));
+    }
+}
+
 int main(void)
 {
     uint32_t seed = 0x2545f491;
@@ -1119,6 +1219,7 @@ int main(void)
     res[2] = fails;
     scalar_ldst(&seed);
     fp_diff(&seed);
+    vfp_diff(&seed);
     bench();
     res[0] = 0x564d5854; /* 'VMXT' */
     return 0;
