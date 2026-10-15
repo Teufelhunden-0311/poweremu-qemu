@@ -14988,12 +14988,17 @@ static bool ppc_mac_gpu_zclear_needed(void *opaque)
     return s->r3_zclear_pending;
 }
 
-/* It is written into video memory later, so it has to fit there. */
+/*
+ * It is written into video memory later, so it has to fit there, in
+ * whole depth values (the fill writes one at a time).
+ */
 static int ppc_mac_gpu_zclear_post_load(void *opaque, int version_id)
 {
     PPCMacGPUState *s = opaque;
 
     if (!s->r3 || (s->r3_zclear_bpp != 2 && s->r3_zclear_bpp != 4) ||
+        s->r3_zclear_len < s->r3_zclear_bpp ||
+        s->r3_zclear_len % s->r3_zclear_bpp ||
         s->r3_zclear_off > s->vram_size ||
         s->r3_zclear_len > s->vram_size - s->r3_zclear_off) {
         return -EINVAL;
