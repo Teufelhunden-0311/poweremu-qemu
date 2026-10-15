@@ -1236,7 +1236,7 @@ static void vfp_diff(uint32_t *seed)
                  "stfd 0,64(%0)"                                              \
                  : : "b"(buf), "b"(40)                                        \
                  : "fr0", "fr1", "fr2", "fr3", "fr4", "fr5", "fr6", "fr7",    \
-                   "r0", "memory")
+                   "r0", "cr0", "memory")
 #define SPD_OP3(op1, mid) switch (c3) { \
     case 0: SPD_ASM(op1, mid, "fmadds 7,1,3,4"); break; \
     case 1: SPD_ASM(op1, mid, "fmadds 7,2,1,4"); break; \
@@ -1256,9 +1256,11 @@ static void vfp_diff(uint32_t *seed)
     case 8:  SPD_OP3(op1, "fadds 1,5,6"); break; \
     case 9:  SPD_OP3(op1, "lfdx 1,0,%0"); break;           /* opcode 31 */ \
     case 10: SPD_OP3(op1, "lfsx 1,%1,%0"); break; \
-    case 11: SPD_OP3(op1, "fmul 1,1,5"); break; }
+    case 11: SPD_OP3(op1, "fmul 1,1,5"); break; \
+    case 12: SPD_OP3(op1, "lwarx 0,0,%0\n\tstwcx. 0,0,%0"); break; /* a label */ \
+    case 13: SPD_OP3(op1, "stwcx. 0,0,%0"); break; }
 #define SPD_NOP1 3
-#define SPD_NMID 12
+#define SPD_NMID 14
 #define SPD_NOP3 6
 
 static void spd_one(volatile uint64_t *buf, int o1, int m, int c3)

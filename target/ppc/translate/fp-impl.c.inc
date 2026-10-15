@@ -166,6 +166,40 @@ static int native_sp_prov(DisasContext *ctx)
     return mode;
 }
 
+/*
+ * Forwarding: an FPR in ctx->fpr_sval also has its single in
+ * ctx->sp_val[], the native op's (or frsp's) own single result, so a later
+ * single op in the TB uses that instead of loading the FPR and converting
+ * it to single (the same value: a single converted to double and back).
+ * That takes the store, reload and conversion off a dependent chain.  The
+ * temps are TCG's EBB temps, which live across the slow paths' conditional
+ * branches but not past a label, so an instruction that sets a label in
+ * the TB's code drops them all.  Not with TCG plugins, which add their
+ * code (and labels) after translation.  PPC_SP_FWD=0 turns this off.
+ */
+static bool native_sp_fwd(DisasContext *ctx)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPC_SP_FWD");
+        on = !(e && e[0] == '0');
+    }
+    return on && !ctx->base.plugin_enabled && native_sp_prov(ctx);
+}
+
+/* Whether an op after last (NULL: from the start) sets a label */
+static bool native_sp_label_since(TCGOp *last)
+{
+    TCGOp *op = last ? QTAILQ_NEXT(last, link) : QTAILQ_FIRST(&tcg_ctx->ops);
+
+    for (; op; op = QTAILQ_NEXT(op, link)) {
+        if (op->opc == INDEX_op_set_label) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* The facts in ctx->fpr_single that survive instruction insn */
 static uint32_t native_sp_keep(DisasContext *ctx, uint32_t insn)
 {
@@ -221,12 +255,16 @@ static void native_sp_stats(bool known)
 static TCGv_vec native_load(DisasContext *ctx, int regno, bool single,
                             TCGv_vec ok)
 {
-    TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V64);
+    TCGv_vec v;
 
-    tcg_gen_ld_vec(v, tcg_env, fpr_offset(regno));
     if (single) {
         native_sp_stats(ctx->fpr_single & (1u << regno));
+        if (ctx->fpr_sval & (1u << regno)) {
+            return ctx->sp_val[regno];
+        }
     }
+    v = tcg_temp_new_vec(TCG_TYPE_V64);
+    tcg_gen_ld_vec(v, tcg_env, fpr_offset(regno));
     if (single && (!ok || ctx->fpr_single & (1u << regno))) {
         TCGv_vec s = tcg_temp_new_vec(TCG_TYPE_V64);
 
@@ -257,7 +295,7 @@ static void native_fp_op(DisasContext *ctx, int op, int frt,
     bool fma = op >= 16;
     bool single = native_single(op);
     unsigned vece = single ? MO_32 : MO_64;
-    TCGv_vec r = tcg_temp_new_vec(TCG_TYPE_V64);
+    TCGv_vec r = tcg_temp_new_vec(TCG_TYPE_V64), rs = r;
     TCGv_vec ok = NULL, vx, vy, vz = NULL;
     TCGv_i64 res = tcg_temp_new_i64();
 
@@ -280,7 +318,9 @@ static void native_fp_op(DisasContext *ctx, int op, int frt,
         tcg_gen_fop_vec(vece, op >> 1, r, vx, vy);
     }
     if (single) {
-        tcg_gen_fcvt_vec(true, r, r);
+        /* rs keeps the single for forwarding */
+        r = tcg_temp_new_vec(TCG_TYPE_V64);
+        tcg_gen_fcvt_vec(true, r, rs);
     }
     if (ok) {
         /* all ones, a NaN, unless every input was a single */
@@ -303,6 +343,10 @@ static void native_fp_op(DisasContext *ctx, int op, int frt,
     }
     if (single && native_sp_prov(ctx)) {
         ctx->sp_set |= 1u << frt;
+        if (native_sp_fwd(ctx)) {
+            ctx->sp_val[frt] = rs;
+            ctx->sval_set |= 1u << frt;
+        }
     }
 }
 
@@ -477,6 +521,10 @@ static void native_frsp(DisasContext *ctx, int frt, int frb)
     }
     if (native_sp_prov(ctx)) {
         ctx->sp_set |= 1u << frt;
+        if (native_sp_fwd(ctx)) {
+            ctx->sp_val[frt] = s;
+            ctx->sval_set |= 1u << frt;
+        }
     }
 
     /* inexact: XX and FX set, FI set or cleared; softfloat's flags too */

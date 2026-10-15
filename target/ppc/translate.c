@@ -182,9 +182,12 @@ struct DisasContext {
      * FPRs known, at this point of the TB, to hold a single (or a NaN):
      * written earlier in this TB by a native single-precision op or frsp
      * (see native_sp_prov()).  sp_set: those the current instruction
-     * makes so.
+     * makes so.  fpr_sval: those of them whose single is also in
+     * sp_val[], a temp of this TB (native_sp_fwd()); sval_set: those the
+     * current instruction puts there.
      */
-    uint32_t fpr_single, sp_set;
+    uint32_t fpr_single, sp_set, fpr_sval, sval_set;
+    TCGv_vec sp_val[32];
     target_ulong cia;  /* current instruction address */
     uint32_t opcode;
     /* Routine used to access memory */
@@ -6564,6 +6567,7 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->fp_fast = (hflags >> HFLAGS_FP_FAST) & 1;
     ctx->n_nfp = 0;
     ctx->fpr_single = 0;
+    ctx->fpr_sval = 0;
     ctx->pr = (hflags >> HFLAGS_PR) & 1;
     ctx->mem_idx = (hflags >> HFLAGS_DMMU_IDX) & 7;
     if (!(ctx->mem_idx & 2)) {
@@ -6634,6 +6638,7 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     CPUPPCState *env = cpu_env(cs);
     target_ulong pc;
     uint32_t insn, keep;
+    TCGOp *last;
     bool ok;
 
     LOG_DISAS("----------------\n");
@@ -6646,6 +6651,8 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
 
     keep = native_sp_keep(ctx, insn);
     ctx->sp_set = 0;
+    ctx->sval_set = 0;
+    last = tcg_last_op();
     if (!is_prefix_insn(ctx, insn)) {
         ctx->opcode = insn;
         ok = (decode_insn32(ctx, insn) ||
@@ -6668,6 +6675,10 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
         gen_invalid(ctx);
     }
     ctx->fpr_single = (ctx->fpr_single & keep) | ctx->sp_set;
+    if (ctx->fpr_sval && native_sp_label_since(last)) {
+        ctx->fpr_sval = 0;
+    }
+    ctx->fpr_sval = (ctx->fpr_sval & keep) | ctx->sval_set;
 
     /* End the TB when crossing a page boundary. */
     if (ctx->base.is_jmp == DISAS_NEXT && !(pc & ~TARGET_PAGE_MASK)) {

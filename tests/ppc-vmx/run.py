@@ -9,8 +9,8 @@ with softfloat's (PPC_STRICT_FP=1), whose FPSCR also has the inexact bits.
 --vfpdiff does the same for vmaddfp with the inline op off and on
 (PPC_NATIVE_VMX), comparing results and VSCR bit for bit.
 --spdiff runs single-precision chains within one TB on the helper and with
-PPC_SP_PROV=0, 1 and 2 (single-precision provenance), comparing results
-and FPSCR bit for bit.
+PPC_SP_PROV=0, 1 and 2 (single-precision provenance; 1 also without
+forwarding, PPC_SP_FWD=0), comparing results and FPSCR bit for bit.
 
 Needs Homebrew llvm (clang with the PowerPC target) and lld.
 """
@@ -215,14 +215,15 @@ def vfpdiff(img, out):
 
 SPD_BASE = 0x03000000
 SPD_REC = 10 * 8
-SPD_CASES = 250 * 3 * 12 * 6    # iterations x op1 x mid x op3 (sp_diff())
+SPD_CASES = 250 * 3 * 14 * 6    # iterations x op1 x mid x op3 (sp_diff())
 
 
 def spdiff(img, out):
     """Run the provenance chains on the helper and with PPC_SP_PROV 0-2."""
     import struct
     runs = [('helper', {'PPC_NATIVE_FP': '0'}), ('prov0', {'PPC_SP_PROV': '0'}),
-            ('prov1', {'PPC_SP_PROV': '1'}), ('prov2', {'PPC_SP_PROV': '2'})]
+            ('prov1', {'PPC_SP_PROV': '1'}), ('prov2', {'PPC_SP_PROV': '2'}),
+            ('prov1-nofwd', {'PPC_SP_PROV': '1', 'PPC_SP_FWD': '0'})]
     dumps = {}
     for tag, extra in runs:
         d = run_dump(img, out, tag, dict(os.environ, **extra),
@@ -233,7 +234,7 @@ def spdiff(img, out):
         dumps[tag] = d
     o1s = ('fmadds', 'fadds', 'frsp')
     mids = ('-', 'fadd', 'lfd', 'fmr', 'lfs', 'stfd/ori/addi', 'frsp', 'fneg',
-            'fadds', 'lfdx', 'lfsx', 'fmul')
+            'fadds', 'lfdx', 'lfsx', 'fmul', 'lwarx/stwcx.', 'stwcx.')
     op3s = ('fmadds A', 'fmadds C', 'fmadds B', 'fmadds in place', 'fadds 1,1',
             'fmuls 5,1')
     bad = 0
