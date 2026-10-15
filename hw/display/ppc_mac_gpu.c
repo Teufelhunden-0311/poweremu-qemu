@@ -1830,6 +1830,7 @@ static void display_drag_paste(PPCMacGPUState *s, uint8_t *vram_ptr)
 static bool ppc_gpu_dirty_scanout = true;   /* read from env in realize */
 static bool ppc_gpu_flip_kick = true;
 static bool ppc_gpu_async_present = true;
+static bool ppc_gpu_flip_recheck = true;
 
 /*
  * Render-queue completion for a deferred present (see the head of
@@ -1935,31 +1936,55 @@ static void ppc_mac_gpu_display_update(void *opaque)
         }
     }
     if (s->disp.stride && s->disp.height) {
-        uint64_t lo = s->regs.crtc_offset;
-        uint64_t hi = lo + (uint64_t)s->disp.stride * s->disp.height;
-        if (s->renderer && s->renderer->range_busy_r200 &&
-            display_range_busy(s, lo, hi)) {
-            /*
-             * Unfinished 3D work may still write the scanout.  With an
-             * asynchronous render queue there is a cheaper answer than
-             * blocking this thread until it drains: commit the batch, take
-             * the completion callback, and come back when it fires.  A
-             * handful of deferrals is a frame of latency; after that fall
-             * back to the synchronous flush, so a busy queue can never
-             * starve the display.  The fallback waits for the host GPU
-             * without the BQL where it can (r200_flush_display).
-             */
-            if (s->renderer->draw_queue_async && s->scanout_log_owner &&
-                ppc_gpu_async_present && s->renderer->submit_r200 &&
-                s->scanout_defers < 4) {
-                s->scanout_defers++;
-                r200_rate.co_defers++;
-                s->renderer->submit_r200(s->renderer_opaque,
-                                         ppc_mac_gpu_present_done, s);
-                return;
+        uint64_t lo, hi;
+        /*
+         * Asking whether the scanout is still being drawn, and waiting for
+         * it, can let go of the BQL (display_range_busy, r200_flush_display),
+         * and while it is free the CP thread can flip.  Diablo II's ring
+         * writes CRTC_OFFSET right after the draws of the frame it shows;
+         * the buffer flipped to, with its last draws (the HUD) still
+         * queued, was then copied without anyone having asked about it: a
+         * frame of world without HUD, a few times a minute.  So ask again
+         * until the buffer asked about is still the one on screen.  A
+         * second flip during the asking is waited for with the lock held,
+         * which no flip gets past.
+         */
+        for (int tries = 0; ; tries++) {
+            lo = s->regs.crtc_offset;
+            hi = lo + (uint64_t)s->disp.stride * s->disp.height;
+            if (tries == 2) {
+                r200_rate.disp_wait++;
+                r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
+                break;
             }
-            r200_rate.disp_wait++;
-            r200_flush_display(s);     /* without the BQL when it can */
+            if (s->renderer && s->renderer->range_busy_r200 &&
+                display_range_busy(s, lo, hi)) {
+                /*
+                 * Unfinished 3D work may still write the scanout.  With an
+                 * asynchronous render queue there is a cheaper answer than
+                 * blocking this thread until it drains: commit the batch,
+                 * take the completion callback, and come back when it
+                 * fires.  A handful of deferrals is a frame of latency;
+                 * after that fall back to the synchronous flush, so a busy
+                 * queue can never starve the display.  The fallback waits
+                 * for the host GPU without the BQL where it can
+                 * (r200_flush_display).
+                 */
+                if (s->renderer->draw_queue_async && s->scanout_log_owner &&
+                    ppc_gpu_async_present && s->renderer->submit_r200 &&
+                    s->scanout_defers < 4) {
+                    s->scanout_defers++;
+                    r200_rate.co_defers++;
+                    s->renderer->submit_r200(s->renderer_opaque,
+                                             ppc_mac_gpu_present_done, s);
+                    return;
+                }
+                r200_rate.disp_wait++;
+                r200_flush_display(s);     /* without the BQL when it can */
+            }
+            if (s->regs.crtc_offset == lo || !ppc_gpu_flip_recheck) {
+                break;
+            }
         }
         /* pacing: did this refresh show something new? */
         {
@@ -2363,7 +2388,18 @@ static void ppc_mac_gpu_display_update(void *opaque)
     /* Flush any pending drag body paste — pastes saved body pixels
      * to the new position AFTER all compositor rendering is done. */
     if (s->renderer && s->renderer->flush_drag_paste) {
+        uint32_t shown = s->regs.crtc_offset;
+
         display_drag_paste(s, vram_ptr);
+        /*
+         * That can let go of the BQL too.  A flip meanwhile makes the
+         * buffer about to be copied the guest's back buffer, which the
+         * next frame's draws may already be writing: leave it, and show
+         * the new one at the next refresh.
+         */
+        if (ppc_gpu_flip_recheck && s->regs.crtc_offset != shown) {
+            return;
+        }
     }
 
     /*
@@ -14435,6 +14471,7 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
     ppc_gpu_dirty_scanout = ppc_gpu_env_on("PPCGPU_DIRTY_SCANOUT");
     ppc_gpu_flip_kick = ppc_gpu_env_on("PPCGPU_FLIP_KICK");
     ppc_gpu_async_present = ppc_gpu_env_on("PPCGPU_ASYNC_PRESENT");
+    ppc_gpu_flip_recheck = ppc_gpu_env_on("PPCGPU_FLIP_RECHECK");
     s->scanout_log_owner = !s->renderer || !s->renderer->set_dirty_source;
 
     /* Set PCI config space fields */
