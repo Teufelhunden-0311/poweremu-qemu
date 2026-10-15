@@ -782,6 +782,7 @@ struct PPCMacGPUState {
     bool scanout_dirty_valid;     /* shadow_buf/dirty log are in sync */
     bool scanout_log_owner;       /* this device consumes the VGA dirty log */
     int scanout_defers;           /* deferrals of the frame we are after */
+    uint32_t scanout_gen;         /* scanout base changes (ppc_mac_gpu_set_scanout) */
 
     /* Deferred present (PPCGPU_ASYNC_PRESENT): display updates skipped while
      * in-flight GPU work still owned the scanout range. */

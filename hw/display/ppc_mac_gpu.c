@@ -1833,6 +1833,21 @@ static bool ppc_gpu_async_present = true;
 static bool ppc_gpu_flip_recheck = true;
 
 /*
+ * While the machine runs, the scanout base changes only through here, each
+ * change counted (scanout_gen) for the display refresh: its checks let go
+ * of the BQL, and the count tells it whether the base moved meanwhile --
+ * including away and back again, which comparing the offset alone cannot
+ * see.
+ */
+static void ppc_mac_gpu_set_scanout(PPCMacGPUState *s, uint32_t offset)
+{
+    if (offset != s->regs.crtc_offset) {
+        s->scanout_gen++;
+    }
+    s->regs.crtc_offset = offset;
+}
+
+/*
  * Render-queue completion for a deferred present (see the head of
  * ppc_mac_gpu_display_update): runs on a backend completion thread, so it
  * touches nothing but the console, asking the main loop to run the refresh
@@ -1945,16 +1960,23 @@ static void ppc_mac_gpu_display_update(void *opaque)
          * the buffer flipped to, with its last draws (the HUD) still
          * queued, was then copied without anyone having asked about it: a
          * frame of world without HUD, a few times a minute.  So ask again
-         * until the buffer asked about is still the one on screen.  A
-         * second flip during the asking is waited for with the lock held,
-         * which no flip gets past.
+         * until no flip has happened during the asking (scanout_gen counts
+         * them, so a flip away and back counts too).  A second flip is
+         * waited for with the lock held, which no flip gets past -- unless
+         * the flush itself re-enters the device (fence write-backs may),
+         * in which case this refresh is skipped.
          */
         for (int tries = 0; ; tries++) {
+            uint32_t gen = s->scanout_gen;
+
             lo = s->regs.crtc_offset;
             hi = lo + (uint64_t)s->disp.stride * s->disp.height;
             if (tries == 2) {
                 r200_rate.disp_wait++;
                 r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
+                if (s->scanout_gen != gen) {
+                    return;
+                }
                 break;
             }
             if (s->renderer && s->renderer->range_busy_r200 &&
@@ -1982,7 +2004,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
                 r200_rate.disp_wait++;
                 r200_flush_display(s);     /* without the BQL when it can */
             }
-            if (s->regs.crtc_offset == lo || !ppc_gpu_flip_recheck) {
+            if (s->scanout_gen == gen || !ppc_gpu_flip_recheck) {
                 break;
             }
         }
@@ -2388,7 +2410,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
     /* Flush any pending drag body paste — pastes saved body pixels
      * to the new position AFTER all compositor rendering is done. */
     if (s->renderer && s->renderer->flush_drag_paste) {
-        uint32_t shown = s->regs.crtc_offset;
+        uint32_t gen = s->scanout_gen;
 
         display_drag_paste(s, vram_ptr);
         /*
@@ -2397,7 +2419,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
          * next frame's draws may already be writing: leave it, and show
          * the new one at the next refresh.
          */
-        if (ppc_gpu_flip_recheck && s->regs.crtc_offset != shown) {
+        if (ppc_gpu_flip_recheck && s->scanout_gen != gen) {
             return;
         }
     }
@@ -12414,7 +12436,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
                 }
             }
         }
-        s->regs.crtc_offset = val;
+        ppc_mac_gpu_set_scanout(s, val);
         s->display_invalid = true;
         break;
     case R200_CRTC_OFFSET_CNTL:
@@ -12948,7 +12970,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
                     uint32_t bpp = s->regs.vbe_regs[VBE_DISPI_INDEX_BPP];
                     if (w == 0) w = 800;
                     if (bpp == 0) bpp = 32;
-                    s->regs.crtc_offset = val * w * ((bpp + 7) / 8);
+                    ppc_mac_gpu_set_scanout(s, val * w * ((bpp + 7) / 8));
                     s->display_invalid = true;
                     gpu_debug_log("VBE Y_OFFSET=%u -> crtc_offset=0x%x",
                                   val, s->regs.crtc_offset);
@@ -12979,7 +13001,7 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
                     s->regs.crtc_v_total_disp = ((h - 1) << 16) | (h + 27);
                     s->regs.crtc_pitch = w / 8;
                     uint32_t y_off = s->regs.vbe_regs[VBE_DISPI_INDEX_Y_OFFSET];
-                    s->regs.crtc_offset = y_off * w * ((bpp + 7) / 8);
+                    ppc_mac_gpu_set_scanout(s, y_off * w * ((bpp + 7) / 8));
                     s->display_invalid = true;
 
                     gpu_debug_log("VBE mode set: %ux%ux%u", w, h, bpp);
@@ -13835,7 +13857,7 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
                                      (boot_w / 8 + 31);
         s->regs.crtc_v_total_disp = ((boot_h - 1) << 16) | (boot_h + 27);
         s->regs.crtc_pitch = boot_w / 8;
-        s->regs.crtc_offset = 0;
+        ppc_mac_gpu_set_scanout(s, 0);
     }
 
     /* AGP status */
