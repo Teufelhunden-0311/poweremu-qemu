@@ -62,7 +62,7 @@ static inline bool fp_exceptions_enabled(CPUPPCState *env)
  * This is the non-arithmatic conversion that happens e.g. on loads.
  * In the Power ISA pseudocode, this is called DOUBLE.
  */
-uint64_t helper_todouble(uint32_t arg)
+QEMU_HOT_HELPER uint64_t helper_todouble(uint32_t arg)
 {
     uint32_t abs_arg = arg & 0x7fffffff;
     uint64_t ret;

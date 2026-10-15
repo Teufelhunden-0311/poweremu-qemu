@@ -160,6 +160,19 @@
 #define QEMU_ALWAYS_INLINE
 #endif
 
+/*
+ * A helper that leaves the registers it used as they are on return,
+ * where the "hardening" build option (-fzero-call-used-regs) clears them.
+ * Only for TCG helpers measured hot enough that the clearing is a large
+ * part of what they cost.  Build with -DQEMU_HOT_HELPER_ZERO to have
+ * these cleared too.
+ */
+#if __has_attribute(zero_call_used_regs) && !defined(QEMU_HOT_HELPER_ZERO)
+# define QEMU_HOT_HELPER __attribute__((zero_call_used_regs("skip")))
+#else
+# define QEMU_HOT_HELPER
+#endif
+
 /**
  * In most cases, normal "fallthrough" comments are good enough for
  * switch-case statements, but sometimes the compiler has problems

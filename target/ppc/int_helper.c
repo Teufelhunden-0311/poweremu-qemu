@@ -709,7 +709,7 @@ VARITHFP(maxfp, float32_max, VFP_MAX)
 #undef VARITHFP
 
 #define VARITHFPFMA(suffix, type, fast_op)                              \
-    void helper_v##suffix(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *a, \
+    QEMU_HOT_HELPER void helper_v##suffix(CPUPPCState *env, ppc_avr_t *r, ppc_avr_t *a, \
                            ppc_avr_t *b, ppc_avr_t *c)                  \
     {                                                                   \
         int i;                                                          \
