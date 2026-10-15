@@ -702,7 +702,8 @@ struct PPCMacGPUState {
     uint32_t r3_trace_lines;    /* register trace after the first draw */
     uint32_t r300_src_swap;     /* 0x15D4: 2D upload source endian swap */
     bool r3_zpass_active;       /* ZB_ZPASS_DATA written, count Z-pass samples */
-    uint32_t r3_zpass_count;    /* the renderer's count, saved with the machine */
+    uint32_t r3_zpass_count;    /* the renderer's Z-pass counter, saved with
+                                   the machine, counting or not */
     bool r3_zpass_reload;       /* ... and handed back to it at the next use */
     uint32_t r3_indx_vf;        /* DRAW_INDX_2 waiting for INDX_BUFFER (0: none) */
     uint32_t r3_indx_buf[3];    /* INDX_BUFFER waiting for its DRAW_INDX_2 */

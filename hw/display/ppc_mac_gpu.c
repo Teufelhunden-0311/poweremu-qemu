@@ -2986,10 +2986,13 @@ static uint32_t r300_swap_mode(uint32_t v, unsigned mode)
  * renderer counts every sample on one counter, which is reported as
  * pipe 0's (the driver sums the pipes).
  *
- * A machine saved in the middle of a query keeps the count so far
- * (r3_zpass_count, read in pre_save).  The renderer may not be up yet
- * when it is loaded, so the count goes back to it at the next draw or
- * ZB_ZPASS_ADDR rather than in post_load.
+ * The counter outlives the query: ZB_ZPASS_ADDR reads it without
+ * clearing it, and a later ZB_ZPASS_ADDR (the next pipe's, say) reads it
+ * again.  So a saved machine keeps the renderer's count whether or not
+ * counting is on (r3_zpass_count, read in pre_save).  The renderer may not
+ * be up yet when the machine is loaded, so the count goes back to it at
+ * the next draw or ZB_ZPASS_ADDR rather than in post_load; a ZB_ZPASS_DATA
+ * before then replaces it.
  */
 static void r300_zpass_reload(PPCMacGPUState *s)
 {
@@ -4237,9 +4240,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         }
     }
     pkt.uniforms.zpass_count = s->r3_zpass_active;
-    if (s->r3_zpass_active) {
-        r300_zpass_reload(s);
-    }
+    r300_zpass_reload(s);
     if (r300_reg(s->r3, 0x4E88) & 1) {         /* RB3D_AARESOLVE_CTL */
         r300_aa_resolve(s, &pkt);
         r300_draw_free(&pkt);
@@ -14645,10 +14646,9 @@ static int ppc_mac_gpu_pre_save(void *opaque)
     PPCMacGPURenderer *r = s->renderer;
 
     ppc_mac_gpu_cp_sync(s, 0xFFFFFFFF);     /* save with the ring done */
-    /* An occlusion query under way: its count so far is the renderer's. */
-    if (!s->r3_zpass_active) {
-        s->r3_zpass_count = 0;
-    } else if (!s->r3_zpass_reload && r && r->zpass_r300) {
+    /* The Z-pass counter is the renderer's (unless a loaded one has not
+     * gone back to it yet), counting or not. */
+    if (s->r3 && !s->r3_zpass_reload && r && r->zpass_r300) {
         s->r3_zpass_count = r->zpass_r300(s->renderer_opaque, false, 0);
     }
     return 0;
@@ -14745,7 +14745,7 @@ static int ppc_mac_gpu_post_load(void *opaque, int version_id)
     if (s->r3) {
         s->r3->pvs_gen++;       /* the vertex programs have changed under it */
     }
-    s->r3_zpass_reload = s->r3_zpass_active;
+    s->r3_zpass_reload = s->r3 != NULL;     /* the counter, for the renderer */
     if (s->r300) {
         int n = 0;
         for (int i = 0; i < 8; i++) {
