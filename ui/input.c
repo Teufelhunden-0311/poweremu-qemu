@@ -143,6 +143,52 @@ qemu_input_find_handler(uint32_t mask, QemuConsole *con)
     return NULL;
 }
 
+/*
+ * The pointer of kind `mask` (INPUT_EVENT_MASK_ABS or INPUT_EVENT_MASK_REL)
+ * that console con's events can reach: the first of that kind among the
+ * handlers the one above picks from for con -- those bound to con when any
+ * pointer is, else the unbound ones.  NULL if there is none.
+ */
+static QemuInputHandlerState *qemu_input_con_kind(uint32_t mask,
+                                                  QemuConsole *con)
+{
+    QemuInputHandlerState *cur, *s;
+
+    cur = qemu_input_find_handler(INPUT_EVENT_MASK_REL | INPUT_EVENT_MASK_ABS,
+                                  con);
+    if (!cur) {
+        return NULL;
+    }
+    QTAILQ_FOREACH(s, &handlers, node) {
+        if (s->con == cur->con && (s->handler->mask & mask)) {
+            return s;
+        }
+    }
+    return NULL;
+}
+
+/*
+ * qemu_input_handler_activate_kind() for one console: con's pointer events
+ * go to its pointer of kind `mask` from now on.  Other consoles' pointers
+ * are left alone, and nothing happens -- no mode-change notification
+ * either -- when con's pointer already is of that kind.
+ */
+void qemu_input_handler_activate_kind_con(uint32_t mask, QemuConsole *con)
+{
+    QemuInputHandlerState *s = qemu_input_con_kind(mask, con);
+
+    if (s && s != qemu_input_find_handler(INPUT_EVENT_MASK_REL |
+                                          INPUT_EVENT_MASK_ABS, con)) {
+        qemu_input_handler_activate(s);
+    }
+}
+
+/* Whether con has a pointer of kind `mask` to activate. */
+bool qemu_input_con_has_kind(uint32_t mask, QemuConsole *con)
+{
+    return qemu_input_con_kind(mask, con) != NULL;
+}
+
 void qmp_input_send_event(const char *device,
                           bool has_head, int64_t head,
                           InputEventList *events, Error **errp)
