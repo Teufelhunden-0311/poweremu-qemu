@@ -3119,7 +3119,8 @@ static uint32_t r300_zb_samples(PPCMacGPUState *s, uint32_t gpu_off)
 /*
  * A 3D_CLEAR_ZMASK still pending (see r300_zmask_clear): write it now, with
  * the clear value the card would read at this point.  Called before every
- * draw, before 2D work that touches the buffer, and before a save.
+ * draw and before 2D work that touches the buffer.  Not before a save: a
+ * pending clear is saved as it is (vmstate_ppc_mac_gpu_zclear).
  */
 static void r300_zmask_apply(PPCMacGPUState *s)
 {
@@ -14744,7 +14745,6 @@ static int ppc_mac_gpu_pre_save(void *opaque)
     PPCMacGPURenderer *r = s->renderer;
 
     ppc_mac_gpu_cp_sync(s, 0xFFFFFFFF);     /* save with the ring done */
-    r300_zmask_apply(s);                    /* and no depth clear pending */
     /* The Z-pass counter is the renderer's (unless a loaded one has not
      * gone back to it yet), counting or not. */
     if (s->r3 && !s->r3_zpass_reload && r && r->zpass_r300) {
@@ -14783,7 +14783,7 @@ static int ppc_mac_gpu_pre_load(void *opaque)
     s->r3_indx_buf_pending = false;
     s->r3_zb_offset = s->r3_zb_height = s->r3_zb_ns = 0;
     s->r3_cb_aa_off = s->r3_cb_aa_ns = 0;
-    s->r3_zclear_pending = false;   /* pre_save wrote any into VRAM */
+    s->r3_zclear_pending = false;   /* unless the subsection says so */
     return 0;
 }
 
@@ -14968,6 +14968,55 @@ static const VMStateDescription vmstate_ppc_mac_gpu_r300 = {
     }
 };
 
+/*
+ * A depth clear the card has been given but not yet written (see
+ * r300_zmask_clear).  It is saved as it is rather than written out first:
+ * the value it takes is the one ZB_DEPTHCLEARVALUE holds when the depth is
+ * next used, and the guest may set that after the machine is saved, so
+ * writing it at the save would change what the machine goes on to do.
+ * (Nor would it reach the saved state: video memory is saved before the
+ * devices are.)  Sent only when a clear is pending, so a machine saved
+ * without one still loads into a build without this.  Not named
+ * "ppc-mac-gpu/r300-...": the loader hands a subsection to the first
+ * section whose name begins its own, and that would be the one above,
+ * which has none, and the load would fail.
+ */
+static bool ppc_mac_gpu_zclear_needed(void *opaque)
+{
+    PPCMacGPUState *s = opaque;
+
+    return s->r3_zclear_pending;
+}
+
+/* It is written into video memory later, so it has to fit there. */
+static int ppc_mac_gpu_zclear_post_load(void *opaque, int version_id)
+{
+    PPCMacGPUState *s = opaque;
+
+    if (!s->r3 || (s->r3_zclear_bpp != 2 && s->r3_zclear_bpp != 4) ||
+        s->r3_zclear_off > s->vram_size ||
+        s->r3_zclear_len > s->vram_size - s->r3_zclear_off) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+static const VMStateDescription vmstate_ppc_mac_gpu_zclear = {
+    .name = "ppc-mac-gpu/zclear",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = ppc_mac_gpu_zclear_needed,
+    .post_load = ppc_mac_gpu_zclear_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(r3_zclear_pending, PPCMacGPUState),
+        VMSTATE_UINT32(r3_zclear_off, PPCMacGPUState),
+        VMSTATE_UINT64(r3_zclear_len, PPCMacGPUState),
+        VMSTATE_UINT32(r3_zclear_bpp, PPCMacGPUState),
+        VMSTATE_UINT32(r3_zclear_swap, PPCMacGPUState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_ppc_mac_gpu = {
     .name = "ppc-mac-gpu",
     /*
@@ -15035,6 +15084,7 @@ static const VMStateDescription vmstate_ppc_mac_gpu = {
     .subsections = (const VMStateDescription * const []) {
         &vmstate_ppc_mac_gpu_surfaces,
         &vmstate_ppc_mac_gpu_r300,
+        &vmstate_ppc_mac_gpu_zclear,
         NULL
     }
 };
