@@ -687,6 +687,19 @@ static int64_t fp_last_flip;
 static uint64_t fp_chk_lo, fp_chk_seq0, fp_chk_seq;
 static int fp_chk_busy, fp_defers;
 
+/*
+ * TEST ONLY: a flip away and back (A -> B -> A) faked at the display
+ * refresh's re-check boundaries, every Nth refresh:
+ * $R300_FRAMEPROBE_ABA (after the busy check and flush, first try),
+ * $R300_FRAMEPROBE_FORCEFB (after the first two tries: forces the
+ * held-lock fallback), $R300_FRAMEPROBE_ABA_PASTE (after the drag paste).
+ */
+static int fp_knob(const char *name)
+{
+    const char *e = getenv(name);
+    return e ? atoi(e) : 0;
+}
+
 static FILE *fp_log(void)
 {
     if (!fpt.init) {
@@ -2214,6 +2227,22 @@ static void ppc_mac_gpu_display_update(void *opaque)
                 r200_flush_display(s);     /* without the BQL when it can */
                 fp_chk_busy = 2;
             }
+            {                                       /* TEST ONLY */
+                static int aba = -1, fb = -1;
+                static uint64_t nref;
+                if (aba < 0) {
+                    aba = fp_knob("R300_FRAMEPROBE_ABA");
+                    fb = fp_knob("R300_FRAMEPROBE_FORCEFB");
+                }
+                nref += !tries;
+                if ((aba && !tries && nref % aba == 0) ||
+                    (fb && tries < 2 && nref % fb == 0)) {
+                    ppc_mac_gpu_set_scanout(s, lo ^ 0x100000);
+                    ppc_mac_gpu_set_scanout(s, lo);
+                    fp_ev("INJECT aba try %d at %08x (offset same: %d)",
+                          tries, (unsigned)lo, s->regs.crtc_offset == lo);
+                }
+            }
             if (s->scanout_gen == gen || !ppc_gpu_flip_recheck) {
                 break;
             }
@@ -2632,7 +2661,21 @@ static void ppc_mac_gpu_display_update(void *opaque)
          * next frame's draws may already be writing: leave it, and show
          * the new one at the next refresh.
          */
+        {                                           /* TEST ONLY */
+            static int ap = -1;
+            static uint64_t np;
+            if (ap < 0) {
+                ap = fp_knob("R300_FRAMEPROBE_ABA_PASTE");
+            }
+            if (ap && ++np % ap == 0) {
+                uint32_t a = s->regs.crtc_offset;
+                ppc_mac_gpu_set_scanout(s, a ^ 0x100000);
+                ppc_mac_gpu_set_scanout(s, a);
+                fp_ev("INJECT aba after paste at %08x", (unsigned)a);
+            }
+        }
         if (ppc_gpu_flip_recheck && s->scanout_gen != gen) {
+            fp_ev("PASTE-SKIP");                    /* TEST ONLY */
             return;
         }
     }
