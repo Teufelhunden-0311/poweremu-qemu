@@ -154,6 +154,7 @@ def fpdiff(img, out, strict=False):
 
 VFD_BASE = 0x02000000
 VFD_REC = 6 * 16
+VFD_CASES = 2 * 4000 * 5        # NJ modes x iterations x forms (vfp_diff())
 
 
 def run_dump(img, out, tag, env, base, rec, count_word):
@@ -186,7 +187,12 @@ def vfpdiff(img, out):
     dumps = [run_dump(img, out, f'v{native}',
                       dict(os.environ, PPC_NATIVE_VMX=native),
                       VFD_BASE, VFD_REC, 0x284) for native in ('0', '1')]
-    n = len(dumps[0]) // VFD_REC
+    n = VFD_CASES
+    for native, d in zip('01', dumps):
+        if len(d) != n * VFD_REC:
+            print(f'PPC_NATIVE_VMX={native}: {len(d) // VFD_REC} cases dumped, '
+                  f'expected {n}')
+            return 1
     bad = 0
     forms = ('d distinct', 'd=a', 'd=b', 'd=c', 'all one register')
     for i in range(n):
