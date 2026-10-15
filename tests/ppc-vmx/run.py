@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Build vmx_test.c as a raw mac99 firmware image, run it, report results.
 
-usage: run.py [--fpdiff | --fpdiff-strict | --vfpdiff] [path/to/qemu-system-ppc]
+usage: run.py [--fpdiff | --fpdiff-strict | --vfpdiff | --spdiff] [path/to/qemu-system-ppc]
 
 --fpdiff runs the scalar FP cases with the inline FP ops off and on and
 compares results and FPSCR; --fpdiff-strict compares the inline results
 with softfloat's (PPC_STRICT_FP=1), whose FPSCR also has the inexact bits.
 --vfpdiff does the same for vmaddfp with the inline op off and on
 (PPC_NATIVE_VMX), comparing results and VSCR bit for bit.
+--spdiff runs single-precision chains within one TB on the helper and with
+PPC_SP_PROV=0, 1 and 2 (single-precision provenance), comparing results
+and FPSCR bit for bit.
 
 Needs Homebrew llvm (clang with the PowerPC target) and lld.
 """
@@ -210,9 +213,57 @@ def vfpdiff(img, out):
     return bad
 
 
+SPD_BASE = 0x03000000
+SPD_REC = 10 * 8
+SPD_CASES = 250 * 3 * 12 * 6    # iterations x op1 x mid x op3 (sp_diff())
+
+
+def spdiff(img, out):
+    """Run the provenance chains on the helper and with PPC_SP_PROV 0-2."""
+    import struct
+    runs = [('helper', {'PPC_NATIVE_FP': '0'}), ('prov0', {'PPC_SP_PROV': '0'}),
+            ('prov1', {'PPC_SP_PROV': '1'}), ('prov2', {'PPC_SP_PROV': '2'})]
+    dumps = {}
+    for tag, extra in runs:
+        d = run_dump(img, out, tag, dict(os.environ, **extra),
+                     SPD_BASE, SPD_REC, 0x285)
+        if len(d) != SPD_CASES * SPD_REC:
+            print(f'{tag}: {len(d) // SPD_REC} cases dumped, expected {SPD_CASES}')
+            return 1
+        dumps[tag] = d
+    o1s = ('fmadds', 'fadds', 'frsp')
+    mids = ('-', 'fadd', 'lfd', 'fmr', 'lfs', 'stfd/ori/addi', 'frsp', 'fneg',
+            'fadds', 'lfdx', 'lfsx', 'fmul')
+    op3s = ('fmadds A', 'fmadds C', 'fmadds B', 'fmadds in place', 'fadds 1,1',
+            'fmuls 5,1')
+    bad = 0
+    for tag, _ in runs[1:]:
+        nb = 0
+        by_mid = {}
+        for i in range(SPD_CASES):
+            r0 = struct.unpack_from('>10Q', dumps['helper'], i * SPD_REC)
+            r1 = struct.unpack_from('>10Q', dumps[tag], i * SPD_REC)
+            if r0 != r1:
+                nb += 1
+                by_mid[mids[(r0[9] >> 8) & 0xff]] = by_mid.get(mids[(r0[9] >> 8) & 0xff], 0) + 1
+                if nb <= 5:
+                    k = r0[9]
+                    print(f'MISMATCH {tag}: {o1s[k >> 16]} / {mids[(k >> 8) & 0xff]} / '
+                          f'{op3s[k & 0xff]}: ' +
+                          ' '.join(f'{x:016x}' for x in r0[:6]))
+                    print(f'   helper: f1 {r0[6]:016x} f7 {r0[7]:016x} fpscr {r0[8] & 0xffffffff:08x}'
+                          f'   {tag}: f1 {r1[6]:016x} f7 {r1[7]:016x} fpscr {r1[8] & 0xffffffff:08x}')
+        print(f'{SPD_CASES} chains compared ({tag} vs helper), {nb} mismatches'
+              + (f' (by middle instruction: {by_mid})' if nb else ''))
+        bad += nb
+    return bad
+
+
 def main():
     out = tempfile.mkdtemp(prefix='ppc-vmx-')
     img = build(out)
+    if '--spdiff' in sys.argv:
+        sys.exit(1 if spdiff(img, out) else 0)
     if '--vfpdiff' in sys.argv:
         sys.exit(1 if vfpdiff(img, out) else 0)
     if '--fpdiff' in sys.argv or '--fpdiff-strict' in sys.argv:
@@ -252,6 +303,10 @@ def main():
         print(f'bench {"GB mandel: inside set (127500 it)":36s} {g1 / tbfreq * 1e3:8.1f} ms')
         print(f'bench {"GB mandel: escaping (50000 pixels)":36s} {(gt - g1) / tbfreq * 1e3:8.1f} ms'
               f'  ({gn} iterations total)')
+        for k, name in enumerate(('fmadds x4 dependent', 'fmadds x4 independent',
+                                  'lfs x8/transform/stfs (SP chain)')):
+            t = mon.words(RESULTS + (0x212 + k) * 4, 1)[0]
+            print(f'bench {name:36s} {t / tbfreq * 1e3:8.1f} ms')
         ft, ff = mon.words(RESULTS + 0x210 * 4, 2)
         print(f'bench {"GB mandel: whole routine x4":36s} {ft / tbfreq * 1e3:8.1f} ms'
               f'  ({ff // 14} iterations)')

@@ -132,14 +132,107 @@ static bool native_single(int op)
 }
 
 /*
- * Load FPR regno, as a single if single; then ok is cleared (from all
- * ones) if it does not convert to single and back unchanged.
+ * Single-precision provenance, within one TB.  A native single-precision
+ * op that keeps its result (the fast path) writes a single converted to
+ * double; frsp too.  Until something else writes that FPR, a later single
+ * op in the same TB need not check that the FPR converts to single and
+ * back unchanged.  The check exists so that a double that is not a single
+ * goes to the helper; a single passes it, and a NaN that fails it makes
+ * the result a NaN either way, which goes to the slow path as before.  The
+ * slow path leaves the TB, so the code after a native op runs only when
+ * its result was kept.  Every FPR is still written to env as before.
+ *
+ * ctx->fpr_single holds the facts; the translation loop keeps them across
+ * an instruction according to native_sp_keep(), from the primary opcode:
+ * the integer, branch, CR, VMX and store opcodes write no FPR; the FP
+ * loads and the FP opcodes 59 and 63 write FRT only; any other opcode
+ * drops every fact.  Not with VSX or DFP, whose instructions write FPRs
+ * from opcodes 31, 60 and 61, or FPR pairs.
+ *
+ * PPC_SP_PROV=0 turns it off, 2 also counts lfs results (a single
+ * converted by helper_todouble; a signalling NaN stays a NaN, see above);
+ * PPC_SP_PROV_STATS=1 logs how many single-precision inputs were known.
  */
-static TCGv_vec native_load(int regno, bool single, TCGv_vec ok)
+static int native_sp_prov(DisasContext *ctx)
+{
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("PPC_SP_PROV");
+        mode = e && e[0] >= '0' && e[0] <= '2' ? e[0] - '0' : 1;
+    }
+    if (ctx->insns_flags2 & (PPC2_VSX | PPC2_DFP) || !native_fp_on()) {
+        return 0;
+    }
+    return mode;
+}
+
+/* The facts in ctx->fpr_single that survive instruction insn */
+static uint32_t native_sp_keep(DisasContext *ctx, uint32_t insn)
+{
+    uint32_t frt = 1u << ((insn >> 21) & 31);
+
+    if (!native_sp_prov(ctx)) {
+        return 0;
+    }
+    switch (insn >> 26) {
+    case 2: case 3: case 4: case 7 ... 30:   /* integer, branch, CR, VMX */
+    case 32 ... 47:                         /* integer loads and stores */
+    case 52 ... 55:                         /* stfs, stfsu, stfd, stfdu */
+    case 58: case 62:                       /* ld, std */
+        return ~0u;
+    case 48 ... 51:                         /* lfs, lfsu, lfd, lfdu */
+    case 59: case 63:                       /* FP arithmetic, moves, mffs */
+        return ~frt;
+    case 31:
+        switch ((insn >> 1) & 0x3ff) {
+        case 535: case 567: case 599: case 631: /* lfsx lfsux lfdx lfdux */
+        case 607: case 855: case 887:           /* lfdepx lfiwax lfiwzx */
+            return ~frt;
+        case 791:                               /* lfdpx: a pair */
+            return 0;
+        }
+        return ~0u;
+    }
+    return 0;
+}
+
+static void native_sp_stats(bool known)
+{
+    static int on = -1;
+    static uint64_t n, k;
+    if (on < 0) {
+        const char *e = getenv("PPC_SP_PROV_STATS");
+        on = e && e[0] == '1';
+    }
+    if (on) {
+        k += known;
+        if (!(++n & 0x3ff)) {
+            fprintf(stderr, "sp-prov: %" PRIu64 " single inputs emitted, "
+                    "%" PRIu64 " known (%.1f%%)\n", n, k, 100.0 * k / n);
+        }
+    }
+}
+
+/*
+ * Load FPR regno, as a single if single; then ok is cleared (from all
+ * ones) if it does not convert to single and back unchanged, unless it
+ * is known to hold a single (ok NULL, or regno in ctx->fpr_single).
+ */
+static TCGv_vec native_load(DisasContext *ctx, int regno, bool single,
+                            TCGv_vec ok)
 {
     TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V64);
 
     tcg_gen_ld_vec(v, tcg_env, fpr_offset(regno));
+    if (single) {
+        native_sp_stats(ctx->fpr_single & (1u << regno));
+    }
+    if (single && (!ok || ctx->fpr_single & (1u << regno))) {
+        TCGv_vec s = tcg_temp_new_vec(TCG_TYPE_V64);
+
+        tcg_gen_fcvt_vec(false, s, v);
+        return s;
+    }
     if (single) {
         TCGv_vec s = tcg_temp_new_vec(TCG_TYPE_V64);
         TCGv_vec d = tcg_temp_new_vec(TCG_TYPE_V64);
@@ -173,20 +266,23 @@ static void native_fp_op(DisasContext *ctx, int op, int frt,
         .op = op, .frt = frt, .x = x, .y = y, .z = z,
     };
 
-    if (single) {
+    if (single && ~ctx->fpr_single & ((1u << x) | (1u << y) |
+                                      (fma ? 1u << z : 0))) {
         ok = tcg_temp_new_vec(TCG_TYPE_V64);
         tcg_gen_dupi_vec(MO_64, ok, -1);
     }
-    vx = native_load(x, single, ok);
-    vy = native_load(y, single, ok);
+    vx = native_load(ctx, x, single, ok);
+    vy = native_load(ctx, y, single, ok);
     if (fma) {
-        vz = native_load(z, single, ok);
+        vz = native_load(ctx, z, single, ok);
         tcg_gen_ffma_vec(vece, (op - 16) >> 1, r, vx, vy, vz);
     } else {
         tcg_gen_fop_vec(vece, op >> 1, r, vx, vy);
     }
     if (single) {
         tcg_gen_fcvt_vec(true, r, r);
+    }
+    if (ok) {
         /* all ones, a NaN, unless every input was a single */
         tcg_gen_orc_vec(MO_64, r, r, ok);
     }
@@ -204,6 +300,9 @@ static void native_fp_op(DisasContext *ctx, int op, int frt,
     if (ctx->insns_flags2 & PPC2_VSX) {
         /* as set_fpr(); without VSX nothing else writes doubleword 1 */
         tcg_gen_st_i64(tcg_constant_i64(0), tcg_env, vsr64_offset(frt, false));
+    }
+    if (single && native_sp_prov(ctx)) {
+        ctx->sp_set |= 1u << frt;
     }
 }
 
@@ -375,6 +474,9 @@ static void native_frsp(DisasContext *ctx, int frt, int frb)
     tcg_gen_st_vec(v, tcg_env, fpr_offset(frt));
     if (ctx->insns_flags2 & PPC2_VSX) {
         tcg_gen_st_i64(tcg_constant_i64(0), tcg_env, vsr64_offset(frt, false));
+    }
+    if (native_sp_prov(ctx)) {
+        ctx->sp_set |= 1u << frt;
     }
 
     /* inexact: XX and FX set, FI set or cleared; softfloat's flags too */
@@ -1486,6 +1588,9 @@ static bool do_lsfpsd(DisasContext *ctx, int rt, int ra, TCGv displ,
             gen_qemu_ld64_i64(ctx, t0, ea);
         }
         set_fpr(rt, t0);
+        if (single && native_sp_prov(ctx) == 2) {
+            ctx->sp_set |= 1u << rt;
+        }
     }
     if (update) {
         tcg_gen_mov_tl(cpu_gpr[ra], ea);

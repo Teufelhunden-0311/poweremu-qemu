@@ -178,6 +178,13 @@ struct DisasContext {
     bool fp_fast;           /* HFLAGS_FP_FAST */
     int n_nfp;
     NativeFPSlow nfp[64];
+    /*
+     * FPRs known, at this point of the TB, to hold a single (or a NaN):
+     * written earlier in this TB by a native single-precision op or frsp
+     * (see native_sp_prov()).  sp_set: those the current instruction
+     * makes so.
+     */
+    uint32_t fpr_single, sp_set;
     target_ulong cia;  /* current instruction address */
     uint32_t opcode;
     /* Routine used to access memory */
@@ -6556,6 +6563,7 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->spr_cb = env->spr_cb;
     ctx->fp_fast = (hflags >> HFLAGS_FP_FAST) & 1;
     ctx->n_nfp = 0;
+    ctx->fpr_single = 0;
     ctx->pr = (hflags >> HFLAGS_PR) & 1;
     ctx->mem_idx = (hflags >> HFLAGS_DMMU_IDX) & 7;
     if (!(ctx->mem_idx & 2)) {
@@ -6625,7 +6633,7 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     PowerPCCPU *cpu = POWERPC_CPU(cs);
     CPUPPCState *env = cpu_env(cs);
     target_ulong pc;
-    uint32_t insn;
+    uint32_t insn, keep;
     bool ok;
 
     LOG_DISAS("----------------\n");
@@ -6636,6 +6644,8 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     insn = translator_ldl_swap(env, dcbase, pc, need_byteswap(ctx));
     ctx->base.pc_next = pc += 4;
 
+    keep = native_sp_keep(ctx, insn);
+    ctx->sp_set = 0;
     if (!is_prefix_insn(ctx, insn)) {
         ctx->opcode = insn;
         ok = (decode_insn32(ctx, insn) ||
@@ -6657,6 +6667,7 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     if (!ok) {
         gen_invalid(ctx);
     }
+    ctx->fpr_single = (ctx->fpr_single & keep) | ctx->sp_set;
 
     /* End the TB when crossing a page boundary. */
     if (ctx->base.is_jmp == DISAS_NEXT && !(pc & ~TARGET_PAGE_MASK)) {

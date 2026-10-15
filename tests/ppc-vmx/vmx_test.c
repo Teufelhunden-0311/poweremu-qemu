@@ -644,6 +644,52 @@ static void bench(void)
         res[0x20a] = r ^ (uint32_t)(x + y + z + w);
     }
 
+    /*
+     * Single-precision provenance (fp-impl.c.inc native_sp_prov()): a
+     * dependent chain, whose inputs after the first come from the op before
+     * it in the same TB; four independent chains, each used once per TB
+     * (as a loop's accumulators); a vertex transform, x' = a*x + b*y + c
+     * per row, whose temporaries are produced and used in the TB.
+     */
+    {
+        float x = 1.0f, y = 1.0f, z = 1.0f, w = 1.0f, h = 0.5f, q = 0.25f;
+        float m[8] = { 0.5f, 0.25f, 0.125f, 1.0f, 0.25f, 0.5f, 0.0625f, -1.0f };
+        float v[4] = { 1.0f, 2.0f, 0, 0 };
+
+        t0 = tb();
+        for (i = 0; i < BENCH_ITERS; i++) {
+            asm volatile("fmadds %0,%0,%1,%2\n\tfmadds %0,%0,%1,%2\n\t"
+                         "fmadds %0,%0,%1,%2\n\tfmadds %0,%0,%1,%2"
+                         : "+f"(x) : "f"(h), "f"(q));
+        }
+        res[0x212] = tb() - t0;
+
+        t0 = tb();
+        for (i = 0; i < BENCH_ITERS; i++) {
+            asm volatile("fmadds %0,%0,%4,%5\n\tfmadds %1,%1,%4,%5\n\t"
+                         "fmadds %2,%2,%4,%5\n\tfmadds %3,%3,%4,%5"
+                         : "+f"(x), "+f"(y), "+f"(z), "+f"(w) : "f"(h), "f"(q));
+        }
+        res[0x213] = tb() - t0;
+
+        t0 = tb();
+        for (i = 0; i < BENCH_ITERS; i++) {
+            asm volatile("lfs 1,0(%0)\n\tlfs 2,4(%0)\n\t"
+                         "lfs 3,0(%1)\n\tlfs 4,4(%1)\n\tlfs 5,8(%1)\n\t"
+                         "lfs 6,12(%1)\n\tlfs 7,16(%1)\n\tlfs 8,20(%1)\n\t"
+                         "fmuls 9,3,1\n\tfmadds 9,4,2,9\n\tfadds 9,9,5\n\t"
+                         "fmuls 10,6,1\n\tfmadds 10,7,2,10\n\tfadds 10,10,8\n\t"
+                         "fmuls 11,9,9\n\tfmadds 11,10,10,11\n\t"
+                         "stfs 9,8(%0)\n\tstfs 10,12(%0)\n\tstfs 11,8(%1)"
+                         : : "b"(v), "b"(m)
+                         : "fr1", "fr2", "fr3", "fr4", "fr5", "fr6", "fr7",
+                           "fr8", "fr9", "fr10", "fr11", "memory");
+            m[2] = 0.125f;
+        }
+        res[0x214] = tb() - t0;
+        res[0x215] = (uint32_t)(x + y + z + w + v[2] + v[3]);
+    }
+
     /* Mandelbrot escape loop, as compiled C: fcmpu decides every exit */
     {
         uint32_t total = 0;
@@ -1167,6 +1213,109 @@ static void vfp_diff(uint32_t *seed)
     }
 }
 
+/*
+ * Differential test for single-precision provenance within a TB
+ * (fp-impl.c.inc native_sp_prov()): a single-precision op (or frsp) writes
+ * f1, then another instruction maybe rewrites f1 (a double op, loads,
+ * fmr, fneg, a store or an integer op, which do not), then a single op
+ * reads f1, all in one TB.  If a stale fact skipped the check that an
+ * input is a single, a double would be rounded to single and the result
+ * would differ from the helper's.  Each case stores the inputs, f1, f7,
+ * FPSCR and a case id at SPD_BASE; run.py --spdiff runs it on the helper
+ * and inline with PPC_SP_PROV=0, 1 and 2, and compares.
+ */
+#define SPD_BASE    0x03000000u
+#define SPD_REC     10          /* a, c, b, d, e, s, f1, f7, fpscr, case id */
+
+/* buf: a c b d e s(word at 40) - f1 out at 48, f7 out at 56, fpscr at 64 */
+#define SPD_ASM(op1, mid, op3) \
+    asm volatile("lfd 2,0(%0)\n\tlfd 3,8(%0)\n\tlfd 4,16(%0)\n\t"             \
+                 "lfd 5,24(%0)\n\tlfd 6,32(%0)\n\tlfd 7,72(%0)\n\t"           \
+                 "mtfsf 0xff,7\n\t" op1 "\n\t" mid "\n\t" op3 "\n\t"          \
+                 "stfd 1,48(%0)\n\tstfd 7,56(%0)\n\tmffs 0\n\t"               \
+                 "stfd 0,64(%0)"                                              \
+                 : : "b"(buf), "b"(40)                                        \
+                 : "fr0", "fr1", "fr2", "fr3", "fr4", "fr5", "fr6", "fr7",    \
+                   "r0", "memory")
+#define SPD_OP3(op1, mid) switch (c3) { \
+    case 0: SPD_ASM(op1, mid, "fmadds 7,1,3,4"); break; \
+    case 1: SPD_ASM(op1, mid, "fmadds 7,2,1,4"); break; \
+    case 2: SPD_ASM(op1, mid, "fmadds 7,2,3,1"); break; \
+    case 3: SPD_ASM(op1, mid, "fmadds 1,1,3,1\n\tfmr 7,1"); break; \
+    case 4: SPD_ASM(op1, mid, "fadds 7,1,1"); break; \
+    case 5: SPD_ASM(op1, mid, "fmuls 7,5,1"); break; }
+#define SPD_MID(op1) switch (m) { \
+    case 0:  SPD_OP3(op1, ""); break; \
+    case 1:  SPD_OP3(op1, "fadd 1,5,6"); break;            /* a double */ \
+    case 2:  SPD_OP3(op1, "lfd 1,24(%0)"); break; \
+    case 3:  SPD_OP3(op1, "fmr 1,5"); break; \
+    case 4:  SPD_OP3(op1, "lfs 1,40(%0)"); break; \
+    case 5:  SPD_OP3(op1, "stfd 1,48(%0)\n\tori 0,0,0\n\taddi 0,0,1"); break; \
+    case 6:  SPD_OP3(op1, "frsp 1,5"); break; \
+    case 7:  SPD_OP3(op1, "fneg 1,1"); break; \
+    case 8:  SPD_OP3(op1, "fadds 1,5,6"); break; \
+    case 9:  SPD_OP3(op1, "lfdx 1,0,%0"); break;           /* opcode 31 */ \
+    case 10: SPD_OP3(op1, "lfsx 1,%1,%0"); break; \
+    case 11: SPD_OP3(op1, "fmul 1,1,5"); break; }
+#define SPD_NOP1 3
+#define SPD_NMID 12
+#define SPD_NOP3 6
+
+static void spd_one(volatile uint64_t *buf, int o1, int m, int c3)
+{
+    switch (o1) {
+    case 0: SPD_MID("fmadds 1,2,3,4"); break;
+    case 1: SPD_MID("fadds 1,2,4"); break;
+    case 2: SPD_MID("frsp 1,4"); break;
+    }
+}
+
+/* mostly singles, so the first op keeps its result */
+static uint64_t spd_single(uint32_t *seed)
+{
+    uint32_t r = rnd(seed);
+    uint64_t m = (uint64_t)rnd(seed) << 32 | rnd(seed);
+
+    if ((r & 3) == 0) {
+        return fpd_pool(seed);
+    }
+    return (m & 0x800fffffe0000000ull) | (uint64_t)(1000 + (r >> 8) % 46) << 52;
+}
+
+static void sp_diff(uint32_t *seed)
+{
+    volatile uint64_t *buf = (volatile uint64_t *)FPD_BUF;
+    volatile uint64_t *out = (volatile uint64_t *)SPD_BASE;
+    uint32_t n = 0;
+
+    for (int it = 0; it < 250; it++) {
+        uint64_t a = spd_single(seed), c = spd_single(seed);
+        uint64_t b = spd_single(seed), d = fpd_pool(seed), e = fpd_pool(seed);
+        uint64_t sw = (uint64_t)rnd(seed) << 32;
+        if (it & 1) {
+            sw = (uint64_t)(rnd(seed) & 0x80ffffff | 0x3c000000) << 32;
+        }
+        for (int o1 = 0; o1 < SPD_NOP1; o1++) {
+            for (int m = 0; m < SPD_NMID; m++) {
+                for (int c3 = 0; c3 < SPD_NOP3; c3++) {
+                    buf[0] = a; buf[1] = c; buf[2] = b; buf[3] = d; buf[4] = e;
+                    buf[5] = sw; buf[6] = buf[7] = 0x7ff8dead0000beefull;
+                    buf[8] = 0x7ff8dead0000beefull; buf[9] = 0;
+                    spd_one(buf, o1, m, c3);
+                    out[0] = a; out[1] = c; out[2] = b; out[3] = d;
+                    out[4] = e; out[5] = sw;
+                    out[6] = buf[6]; out[7] = buf[7]; out[8] = buf[8];
+                    out[9] = o1 << 16 | m << 8 | c3;
+                    out += SPD_REC;
+                    n++;
+                }
+            }
+        }
+    }
+    res[0x285] = n;
+    asm volatile("mtfsfi 7,0");
+}
+
 int main(void)
 {
     uint32_t seed = 0x2545f491;
@@ -1220,6 +1369,7 @@ int main(void)
     scalar_ldst(&seed);
     fp_diff(&seed);
     vfp_diff(&seed);
+    sp_diff(&seed);
     bench();
     res[0] = 0x564d5854; /* 'VMXT' */
     return 0;
