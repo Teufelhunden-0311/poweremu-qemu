@@ -660,6 +660,102 @@ enum { R200_WHY_T3 = 1, R200_WHY_DISPLAY, R200_WHY_FENCE, R200_WHY_OTHER };
 #define r200_flush(s) r200_flush_at((s), R200_WHY_TAG(R200_WHY_OTHER))
 enum { R200_WHY_2D = 0x40 };
 
+/*
+ * TEST ONLY ($R300_FRAMEPROBE=dir): a trace in dir/probe.log of what each
+ * presented frame was made from.  Events (flips, CRTC writes, rejected
+ * draws) and one line per presented frame, all stamped with the monotonic
+ * clock in microseconds.  fp_ring remembers the last draws' colour buffers
+ * by sequence number, so a frame can say whether draws into the buffer it
+ * showed were handed over after the display last checked that buffer.
+ */
+static struct {
+    bool init;
+    FILE *log;
+    const char *dir;
+    int rx, ry, rw, rh;
+} fpt;
+#define FP_RING 4096
+static struct {
+    uint64_t seq;
+    uint32_t rt;
+} fp_ring[FP_RING];
+static uint64_t fp_seq, fp_front, fp_rej, fp_bfail, fp_2dfront, fp_flips;
+static uint64_t fp_rd_off, fp_rd_vline, fp_rd_status;
+static int64_t fp_last_flip;
+/* The display's last scanout check: the offset, the draw sequence before
+ * and after it, and its outcome (-1 none, 0 idle, 1 busy, 2 flushed). */
+static uint64_t fp_chk_lo, fp_chk_seq0, fp_chk_seq;
+static int fp_chk_busy, fp_defers;
+
+static FILE *fp_log(void)
+{
+    if (!fpt.init) {
+        fpt.init = true;
+        fpt.dir = getenv("R300_FRAMEPROBE");
+        if (fpt.dir) {
+            char p[512];
+            const char *r = getenv("R300_FRAMEPROBE_RECT");
+            snprintf(p, sizeof(p), "%s/probe.log", fpt.dir);
+            fpt.log = fopen(p, "w");
+            if (!r || sscanf(r, "%d,%d,%d,%d", &fpt.rx, &fpt.ry, &fpt.rw,
+                             &fpt.rh) != 4) {
+                fpt.rw = 0;
+            }
+        }
+    }
+    return fpt.log;
+}
+
+static void G_GNUC_PRINTF(1, 2) fp_ev(const char *fmt, ...)
+{
+    FILE *f = fp_log();
+    va_list ap;
+
+    if (!f) {
+        return;
+    }
+    flockfile(f);
+    fprintf(f, "%lld ", (long long)g_get_monotonic_time());
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fflush(f);
+    funlockfile(f);
+}
+
+/* A draw handed to the renderer, into colour buffer rt. */
+static void fp_note_draw(uint32_t rt, uint32_t front)
+{
+    if (!fp_log()) {
+        return;
+    }
+    uint64_t seq = qatomic_fetch_inc(&fp_seq) + 1;
+    fp_ring[seq % FP_RING].rt = rt;
+    qatomic_store_release(&fp_ring[seq % FP_RING].seq, seq);
+    if (rt == front) {
+        qatomic_inc(&fp_front);
+    }
+}
+
+/* Draws into [lo, hi) with sequence numbers in (after, upto]. */
+static unsigned fp_draws_into(uint64_t after, uint64_t upto, uint64_t lo,
+                              uint64_t hi)
+{
+    unsigned n = 0;
+
+    if (upto - after > FP_RING - 64) {
+        after = upto - (FP_RING - 64);
+    }
+    for (uint64_t q = after + 1; q <= upto; q++) {
+        if (qatomic_load_acquire(&fp_ring[q % FP_RING].seq) == q &&
+            fp_ring[q % FP_RING].rt >= lo && fp_ring[q % FP_RING].rt < hi) {
+            n++;
+        }
+    }
+    return n;
+}
+
 static int cp_wait_unlock(void);
 static void cp_wait_relock(int saved);
 
@@ -677,6 +773,7 @@ static void r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
             hi > s->regs.crtc_offset) {
             r200_rate.presents++;          /* 2D write into the scanout */
             r200_perf_present();
+            qatomic_inc(&fp_2dfront);
         }
     }
     if (!s->renderer || !s->renderer->range_busy_r200 || hi <= lo) {
@@ -1894,6 +1991,99 @@ static uint8_t r200_dac_port_read(PPCMacGPUState *s, uint8_t idx, unsigned sub)
     return r200_dac_8bit(s) ? val : val >> 2;
 }
 
+/*
+ * TEST ONLY: one line per presented frame, from the shadow buffer the
+ * window shows: the mean over a rect ($R300_FRAMEPROBE_RECT=x,y,w,h;
+ * default the bottom eighth), the offset shown and the one the busy check
+ * covered, and the draws into the shown buffer handed over after the check
+ * began ("late0") and after it ended ("late").  A frame whose mean jumps
+ * away from the running average is dumped as PPM with the next one.
+ */
+static uint64_t fp_skips;
+
+static void fp_frame(PPCMacGPUState *s, int y0, int y1)
+{
+    static uint64_t n, l_seq, l_front, l_rej, l_bf, l_2d, l_flips, l_skips;
+    static uint64_t l_ro, l_rv, l_rs;
+    static int dumps, dump_next;
+    static double ema = -1;
+    FILE *log = fp_log();
+    int W = s->disp.width, H = s->disp.height;
+
+    if (!log || !s->shadow_buf || W <= 0 || H <= 0) {
+        return;
+    }
+    const uint8_t *sb = s->shadow_buf;
+    uint32_t stride = s->surface_stride;
+    int x0 = fpt.rw ? fpt.rx : 0, ry0 = fpt.rw ? fpt.ry : H - H / 8;
+    int w = fpt.rw ? fpt.rw : W, hh = fpt.rw ? fpt.rh : H / 8;
+    double sum = 0;
+    long cnt = 0;
+    for (int y = ry0; y < ry0 + hh && y < H; y += 2) {
+        for (int x = x0; x < x0 + w && x < W; x += 2) {
+            const uint8_t *px = sb + (uint64_t)y * stride + x * 4;
+            sum += px[0] + px[1] + px[2];
+            cnt++;
+        }
+    }
+    double m = cnt ? sum / (3.0 * cnt) : 0;
+    bool odd = ema >= 0 && fabs(m - ema) > 12;
+    uint64_t seq = qatomic_read(&fp_seq);
+    uint64_t lo = s->disp.offset, hi = lo + (uint64_t)stride * H;
+    unsigned late0 = fp_draws_into(fp_chk_seq0, seq, lo, hi);
+    unsigned late = fp_draws_into(fp_chk_seq, seq, lo, hi);
+    uint64_t front = qatomic_read(&fp_front), rej = qatomic_read(&fp_rej);
+    uint64_t bf = qatomic_read(&fp_bfail), f2d = qatomic_read(&fp_2dfront);
+    uint64_t flips = qatomic_read(&fp_flips);
+    uint64_t ro = qatomic_read(&fp_rd_off), rv = qatomic_read(&fp_rd_vline);
+    uint64_t rs = qatomic_read(&fp_rd_status);
+    int64_t now = g_get_monotonic_time();
+
+    n++;
+    fp_ev("P n=%llu mean=%.1f off=%08x chk=%08x crtc=%08x busy=%d defers=%d "
+          "late0=%u late=%u rows=%d-%d d=+%llu front=+%llu f2d=+%llu "
+          "flips=+%llu rej=+%llu bf=+%llu skips=+%llu rd=%llu/%llu/%llu "
+          "sinceflip=%.1fms%s%s",
+          (unsigned long long)n, m, (unsigned)lo, (unsigned)fp_chk_lo,
+          (unsigned)s->regs.crtc_offset, fp_chk_busy, fp_defers, late0, late,
+          y0, y1, (unsigned long long)(seq - l_seq),
+          (unsigned long long)(front - l_front),
+          (unsigned long long)(f2d - l_2d),
+          (unsigned long long)(flips - l_flips),
+          (unsigned long long)(rej - l_rej), (unsigned long long)(bf - l_bf),
+          (unsigned long long)(fp_skips - l_skips),
+          (unsigned long long)(ro - l_ro), (unsigned long long)(rv - l_rv),
+          (unsigned long long)(rs - l_rs),
+          fp_last_flip ? (now - fp_last_flip) / 1000.0 : -1.0,
+          fp_chk_lo != lo ? " UNCHECKED" : "", odd ? " ODD" : "");
+    l_seq = seq; l_front = front; l_rej = rej; l_bf = bf; l_2d = f2d;
+    l_flips = flips; l_skips = fp_skips; l_ro = ro; l_rv = rv; l_rs = rs;
+    fp_defers = 0;
+    if ((odd || dump_next || n % 600 == 0) && dumps < 80) {
+        char p[512];
+        snprintf(p, sizeof(p), "%s/f%06llu.ppm", fpt.dir,
+                 (unsigned long long)n);
+        FILE *f = fopen(p, "wb");
+        if (f) {
+            fprintf(f, "P6\n%d %d\n255\n", W, H);
+            for (int y = 0; y < H; y++) {
+                const uint8_t *row = sb + (uint64_t)y * stride;
+                for (int x = 0; x < W; x++) {
+                    uint8_t rgb[3] = { row[x * 4 + 2], row[x * 4 + 1],
+                                       row[x * 4] };
+                    fwrite(rgb, 1, 3, f);
+                }
+            }
+            fclose(f);
+            dumps++;
+        }
+        dump_next = odd;
+    } else {
+        dump_next = 0;
+    }
+    ema = ema < 0 ? m : ema * 0.9 + m * 0.1;
+}
+
 static void ppc_mac_gpu_display_update(void *opaque)
 {
     PPCMacGPUState *s = opaque;
@@ -1951,6 +2141,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
             r200_rate.since = now;
         }
     }
+    fp_chk_busy = -1;           /* TEST ONLY: no check this refresh */
     if (s->disp.stride && s->disp.height) {
         uint64_t lo, hi;
         /*
@@ -1972,9 +2163,18 @@ static void ppc_mac_gpu_display_update(void *opaque)
 
             lo = s->regs.crtc_offset;
             hi = lo + (uint64_t)s->disp.stride * s->disp.height;
+            fp_chk_lo = lo;                         /* TEST ONLY */
+            fp_chk_seq0 = qatomic_read(&fp_seq);
+            fp_chk_busy = 0;
+            if (tries) {
+                fp_ev("RECHECK try %d %08x", tries, (unsigned)lo);
+            }
             if (tries == 2) {
                 r200_rate.disp_wait++;
                 r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
+                fp_chk_busy = 3;
+                fp_ev("FALLBACK done gen %s", s->scanout_gen != gen ?
+                      "moved: skip" : "same");
                 if (s->scanout_gen != gen) {
                     return;
                 }
@@ -1982,6 +2182,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
             }
             if (s->renderer && s->renderer->range_busy_r200 &&
                 display_range_busy(s, lo, hi)) {
+                fp_chk_busy = 1;
                 /*
                  * Unfinished 3D work may still write the scanout.  With an
                  * asynchronous render queue there is a cheaper answer than
@@ -1998,17 +2199,22 @@ static void ppc_mac_gpu_display_update(void *opaque)
                     s->scanout_defers < 4) {
                     s->scanout_defers++;
                     r200_rate.co_defers++;
+                    fp_defers++;
                     s->renderer->submit_r200(s->renderer_opaque,
                                              ppc_mac_gpu_present_done, s);
                     return;
                 }
                 r200_rate.disp_wait++;
                 r200_flush_display(s);     /* without the BQL when it can */
+                fp_chk_busy = 2;
             }
             if (s->scanout_gen == gen || !ppc_gpu_flip_recheck) {
                 break;
             }
         }
+        /* TEST ONLY: what the check covered.  Draws handed over before
+         * this were either finished or waited for above. */
+        fp_chk_seq = qatomic_read(&fp_seq);
         /* pacing: did this refresh show something new? */
         {
             const uint8_t *v = memory_region_get_ram_ptr(&s->vram);
@@ -2024,77 +2230,6 @@ static void ppc_mac_gpu_display_update(void *opaque)
             if (h != disp_last_sample) {
                 r200_rate.disp_distinct++;
                 disp_last_sample = h;
-            }
-        }
-        /* TEST ONLY ($R300_FRAMEPROBE=dir): per refresh, the scanout's mean
-         * over a rect ($R300_FRAMEPROBE_RECT=x,y,w,h; default the bottom
-         * eighth) and the scanout address; a refresh whose mean jumps away
-         * from the running average is dumped as PPM with the next one. */
-        {
-            static const char *dir;
-            static int init, dumps, dump_next;
-            static FILE *log;
-            static int rx, ry, rw, rh;
-            static double ema = -1;
-            static uint64_t n;
-            const uint8_t *v = memory_region_get_ram_ptr(&s->vram);
-            if (!init) {
-                init = 1;
-                dir = getenv("R300_FRAMEPROBE");
-                if (dir) {
-                    char p[512];
-                    snprintf(p, sizeof(p), "%s/probe.log", dir);
-                    log = fopen(p, "w");
-                    const char *r = getenv("R300_FRAMEPROBE_RECT");
-                    if (!r || sscanf(r, "%d,%d,%d,%d", &rx, &ry, &rw, &rh) != 4) {
-                        rw = 0;
-                    }
-                }
-            }
-            if (log && s->disp.bpp == 32 && s->disp.offset +
-                (uint64_t)s->disp.stride * s->disp.height <= s->vram_size) {
-                int W = s->disp.width, H = s->disp.height;
-                int x0 = rw ? rx : 0, y0 = rw ? ry : H - H / 8;
-                int w = rw ? rw : W, hh = rw ? rh : H / 8;
-                double sum = 0;
-                long cnt = 0;
-                for (int y = y0; y < y0 + hh && y < H; y += 2) {
-                    for (int x = x0; x < x0 + w && x < W; x += 2) {
-                        const uint8_t *px = v + s->disp.offset + (uint64_t)y * s->disp.stride
-                                            + x * 4;
-                        sum += px[1] + px[2] + px[3];
-                        cnt++;
-                    }
-                }
-                double m = cnt ? sum / (3.0 * cnt) : 0;
-                bool odd = ema >= 0 && fabs(m - ema) > 12;
-                n++;
-                fprintf(log, "%llu %lld %.1f %08x %08x%s\n", (unsigned long long)n,
-                        (long long)g_get_monotonic_time(), m,
-                        (unsigned)s->regs.crtc_offset, (unsigned)s->disp.offset,
-                        odd ? " ODD" : "");
-                fflush(log);
-                if ((odd || dump_next || n % 600 == 0) && dumps < 60) {
-                    char p[512];
-                    snprintf(p, sizeof(p), "%s/f%06llu.ppm", dir,
-                             (unsigned long long)n);
-                    FILE *f = fopen(p, "wb");
-                    if (f) {
-                        fprintf(f, "P6\n%d %d\n255\n", W, H);
-                        for (int y = 0; y < H; y++) {
-                            const uint8_t *row = v + s->disp.offset + (uint64_t)y * s->disp.stride;
-                            for (int x = 0; x < W; x++) {
-                                fwrite(row + x * 4 + 1, 1, 3, f);
-                            }
-                        }
-                        fclose(f);
-                        dumps++;
-                    }
-                    dump_next = odd;
-                } else {
-                    dump_next = 0;
-                }
-                ema = ema < 0 ? m : ema * 0.9 + m * 0.1;
             }
         }
     } else {
@@ -2532,6 +2667,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
         snap = NULL;
         if (lo < 0) {
             r200_rate.co_skips++;
+            fp_skips++;
             return;                 /* nothing was written: nothing to show */
         }
         y0 = lo;
@@ -2558,6 +2694,7 @@ static void ppc_mac_gpu_display_update(void *opaque)
     s->scanout_offset = s->disp.offset;
     s->scanout_dirty_valid = s->scanout_log_owner;
     s->scanout_defers = 0;
+    fp_frame(s, y0, y1);
 
     if (y0 == 0 && y1 == (int)height) {
         dpy_gfx_update_full(s->con);
@@ -4154,6 +4291,10 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     if (!build_ok) {
         static int fail_dumps;
         r300_warn_once(err, NULL);
+        if (fp_log() && qatomic_fetch_inc(&fp_bfail) < 500) {    /* TEST ONLY */
+            fp_ev("BUILDFAIL op%02x rt=%08x %s", opcode,
+                  r300_reg(s->r3, 0x4E28) & ~0x1Fu, err);
+        }
         if (s->r3_dump && fail_dumps++ < 3) {
             fprintf(s->r3_dump, "--- draw failed (%s): op %02x vf %08x vtx_size %u "
                     "psc %08x %08x %08x %08x ext %08x %08x, %u arrays:",
@@ -4422,9 +4563,14 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
          * into it, copy it out -- all while this packet is processed, so
          * before any later fence the guest waits on. */
         bool sys_ok = !sys.len || r300_xfer_begin(s, &sys, vram);
+        fp_note_draw(pkt.rt_gpu_addr, s->regs.crtc_offset);     /* TEST ONLY */
         int rr = sys_ok ? s->renderer->draw_r300(s->renderer_opaque, vram,
                                                  s->vram_size + (sys.len ? s->stage_size : 0),
                                                  &pkt) : 0;
+        if (rr < 0 && fp_log() && qatomic_fetch_inc(&fp_rej) < 500) {  /* TEST ONLY */
+            fp_ev("REJECT rt=%08x %ux%u verts=%u", pkt.rt_gpu_addr,
+                  pkt.rt_width, pkt.rt_height, pkt.num_verts);
+        }
         if (rr == PPC_MAC_GPU_DRAW_REMAP) {
             /* (a system-memory buffer is in the staging already, rows as
              * the guest's: not moved again) */
@@ -11504,6 +11650,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         break;
     case R200_CRTC_STATUS:
         val = s->regs.crtc_status;
+        qatomic_inc(&fp_rd_status); /* TEST ONLY */
         break;
     case R200_CRTC_H_TOTAL_DISP:
         val = s->regs.crtc_h_total_disp;
@@ -11528,6 +11675,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
          * to ever be handed out); the scanout itself still starts at 0.
          */
         val = s->regs.crtc_offset | (s->rv250 ? R200_CRTC_OFFSET_BIAS : 0);
+        qatomic_inc(&fp_rd_off);    /* TEST ONLY */
         break;
     case R200_CRTC_OFFSET_CNTL:
         val = s->regs.crtc_offset_cntl;
@@ -11539,6 +11687,7 @@ static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
         val = 0;
         break;
     case R200_CRTC_VLINE_CRNT_VLINE: {
+        qatomic_inc(&fp_rd_vline);  /* TEST ONLY */
         /*
          * A scanline that walks with time.  The line the beam is on is
          * reported in bits [26:16]; bits [10:0] are the line the guest
@@ -12487,6 +12636,22 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         if (s->rv250) {
             val &= ~R200_CRTC_OFFSET_BIAS;
         }
+        if (fp_log()) {             /* TEST ONLY */
+            uint64_t sq = qatomic_read(&fp_seq);
+            fp_ev("FLIP %s %08x -> %08x%s cntl=%08x seq=%llu "
+                  "draws-into-new-since-check=%u",
+                  ppc_mac_gpu_cp_on_thread() ? "cp" : "cpu",
+                  (unsigned)s->regs.crtc_offset, (unsigned)val,
+                  val == s->regs.crtc_offset ? " (same)" : "",
+                  (unsigned)s->regs.crtc_offset_cntl, (unsigned long long)sq,
+                  fp_draws_into(fp_chk_seq, sq, val,
+                                (uint64_t)val + (uint64_t)s->disp.stride *
+                                s->disp.height));
+            if (val != s->regs.crtc_offset) {
+                qatomic_inc(&fp_flips);
+                fp_last_flip = g_get_monotonic_time();
+            }
+        }
         if (val != s->regs.crtc_offset) {
             blit_path_log("CRTC", "OFFSET changed 0x%x -> 0x%x",
                           s->regs.crtc_offset, val);
@@ -12512,6 +12677,8 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         s->display_invalid = true;
         break;
     case R200_CRTC_OFFSET_CNTL:
+        fp_ev("OCNTL %s %08x", ppc_mac_gpu_cp_on_thread() ? "cp" : "cpu",
+              (unsigned)val);      /* TEST ONLY */
         if (val != s->regs.crtc_offset_cntl) {
             blit_path_log("CRTC", "OFFSET_CNTL changed 0x%x -> 0x%x",
                           s->regs.crtc_offset_cntl, val);
@@ -12528,6 +12695,8 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         break;
     case R200_CRTC_GUI_TRIG_VLINE:
         /* Write-only trigger, no state to store */
+        fp_ev("TRIGVLINE %s %08x", ppc_mac_gpu_cp_on_thread() ? "cp" : "cpu",
+              (unsigned)val);      /* TEST ONLY */
         break;
 
     /* DAC */
@@ -12884,6 +13053,10 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
 
     /* Wait/sync */
     case R200_WAIT_UNTIL:
+        if (val & 0xF) {            /* TEST ONLY: the CRTC waits */
+            fp_ev("WAIT %s %08x", ppc_mac_gpu_cp_on_thread() ? "cp" : "cpu",
+                  (unsigned)val);
+        }
         /* Writing WAIT_UNTIL on real hardware causes the CP to stall until
          * the specified conditions are met. Since we execute everything
          * synchronously, all conditions are always met instantly.
