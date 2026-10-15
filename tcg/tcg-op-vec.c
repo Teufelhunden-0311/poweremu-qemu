@@ -802,6 +802,16 @@ void tcg_gen_fcvt_vec(bool to_double, TCGv_vec r, TCGv_vec a)
               temp_arg(rt), temp_arg(at), to_double);
 }
 
+/* The raw bits of a V64, for an integer test without a trip through memory. */
+void tcg_gen_fmovx_vec(TCGv_i64 r, TCGv_vec a)
+{
+    TCGTemp *at = tcgv_vec_temp(a);
+
+    tcg_debug_assert(at->base_type == TCG_TYPE_V64);
+    vec_gen_2(INDEX_op_fmovx_vec, TCG_TYPE_V64, MO_64,
+              tcgv_i64_arg(r), temp_arg(at));
+}
+
 void tcg_gen_fop_vec(unsigned vece, unsigned op, TCGv_vec r,
                      TCGv_vec a, TCGv_vec b)
 {

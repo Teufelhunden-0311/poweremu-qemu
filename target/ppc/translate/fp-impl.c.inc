@@ -153,6 +153,16 @@ static TCGv_vec native_load(int regno, bool single, TCGv_vec ok)
     return v;
 }
 
+static bool native_fprf_fmov_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPC_FPRF_FMOV");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 /*
  * Emit op (an FF_* code) on inputs x, y, z in the helper's order (z < 0
  * for the two-operand ops), writing frt.  Only when native_fp(ctx).
@@ -193,10 +203,17 @@ static void native_fp_op(DisasContext *ctx, int op, int frt,
 
     /*
      * FPRF is now due from this result.  On the slow path the helper sets
-     * FPRF itself, which drops this.
+     * FPRF itself, which drops this.  The test below takes the result's
+     * bits straight from the vector register, not back from fprf_res: the
+     * store and integer reload survived to the host code (Codex's C).
+     * PPC_FPRF_FMOV=0 reloads, for A/B tests.
      */
     tcg_gen_st_vec(r, tcg_env, offsetof(CPUPPCState, fprf_res));
-    tcg_gen_ld_i64(res, tcg_env, offsetof(CPUPPCState, fprf_res));
+    if (native_fprf_fmov_on()) {
+        tcg_gen_fmovx_vec(res, r);
+    } else {
+        tcg_gen_ld_i64(res, tcg_env, offsetof(CPUPPCState, fprf_res));
+    }
     tcg_gen_shli_i64(res, res, 1);
     tcg_gen_brcondi_i64(TCG_COND_GTU, res, 0xffe0000000000000ull, sp->slow);
 

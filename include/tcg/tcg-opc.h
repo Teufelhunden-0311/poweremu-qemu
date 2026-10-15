@@ -282,10 +282,12 @@ DEF(tbl_vec, 1, 3, 0, TCG_OPF_VECTOR)
  * ffma_vec r = a*c + b with one rounding, constant: 0 a*c+b, 1 a*c-b,
  * 2 -(a*c+b), 3 -(a*c-b) (the negated forms negate the rounded result).
  * fcvt_vec: constant 0 double -> single (rounding), 1 single -> double.
+ * fmovx_vec: the 64 bits of a V64 into an I64 temp, unchanged.
  */
 DEF(fop_vec, 1, 2, 1, TCG_OPF_VECTOR)
 DEF(ffma_vec, 1, 3, 1, TCG_OPF_VECTOR)
 DEF(fcvt_vec, 1, 1, 1, TCG_OPF_VECTOR)
+DEF(fmovx_vec, 1, 1, 0, TCG_OPF_VECTOR)
 
 DEF(last_generic, 0, 0, 0, TCG_OPF_NOT_PRESENT)
 
