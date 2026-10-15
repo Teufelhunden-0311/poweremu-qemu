@@ -3156,6 +3156,9 @@ static void r300_zmask_apply(PPCMacGPUState *s)
  * samples.  So remember the clear, and fill at the next draw
  * (r300_zmask_apply).
  */
+/* TEST ONLY: the last clear, for $R300_ZCLEAR_FAKEPEND (pre_save) */
+static struct { uint32_t off, bpp, swap; uint64_t len; } zc_last;
+
 static void r300_zmask_clear(PPCMacGPUState *s)
 {
     uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
@@ -3192,6 +3195,10 @@ static void r300_zmask_clear(PPCMacGPUState *s)
     s->r3_zclear_len = bpr * rows;
     s->r3_zclear_bpp = bpp;
     s->r3_zclear_swap = (pitch >> 19) & 3;
+    zc_last.off = off;
+    zc_last.len = bpr * rows;
+    zc_last.bpp = bpp;
+    zc_last.swap = (pitch >> 19) & 3;
 }
 
 /*
@@ -14763,6 +14770,20 @@ static int ppc_mac_gpu_pre_save(void *opaque)
     PPCMacGPURenderer *r = s->renderer;
 
     ppc_mac_gpu_cp_sync(s, 0xFFFFFFFF);     /* save with the ring done */
+    /* TEST ONLY: $R300_ZCLEAR_FAKEPEND makes the last clear pending again
+     * (Apple's driver draws right after every clear, so none is pending
+     * at a save by itself). */
+    if (getenv("R300_ZCLEAR_FAKEPEND") && s->r3 && !s->r3_zclear_pending &&
+        zc_last.len) {
+        s->r3_zclear_pending = true;
+        s->r3_zclear_off = zc_last.off;
+        s->r3_zclear_len = zc_last.len;
+        s->r3_zclear_bpp = zc_last.bpp;
+        s->r3_zclear_swap = zc_last.swap;
+        qemu_log("zclear-test: pre_save made the last clear pending again "
+                 "(0x%x, %llu bytes)\n", zc_last.off,
+                 (unsigned long long)zc_last.len);
+    }
     /* TEST ONLY: $R300_ZCLEAR_OLDSAVE, 3c76c52's save (writes it out). */
     qemu_log("zclear-test: pre_save, %s clear pending\n",
              s->r3_zclear_pending ? "a" : "no");
