@@ -668,9 +668,15 @@ static void cp_wait_relock(int saved);
  * VRAM rows [lo, hi).  Flush batched 3D work only if it overlaps: work in
  * flight that neither reads nor writes these bytes can keep running.
  */
+static void r300_zmask_apply(PPCMacGPUState *s);
+
 static void r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
                              bool write_access, uint32_t tag)
 {
+    if (s->r3_zclear_pending && lo < s->r3_zclear_off + s->r3_zclear_len &&
+        hi > s->r3_zclear_off) {
+        r300_zmask_apply(s);    /* a depth clear this work must see first */
+    }
     if (write_access && tag <= 5) {
         r200_rate.ops2d++;
         if (lo < (uint64_t)s->regs.crtc_offset + (uint64_t)s->disp.stride * s->disp.height &&
@@ -3111,10 +3117,43 @@ static uint32_t r300_zb_samples(PPCMacGPUState *s, uint32_t gpu_off)
 }
 
 /*
+ * A 3D_CLEAR_ZMASK still pending (see r300_zmask_clear): write it now, with
+ * the clear value the card would read at this point.  Called before every
+ * draw, before 2D work that touches the buffer, and before a save.
+ */
+static void r300_zmask_apply(PPCMacGPUState *s)
+{
+    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
+    uint32_t off = s->r3_zclear_off;
+    uint32_t v;
+
+    if (!s->r3_zclear_pending || !s->r3) {
+        return;
+    }
+    s->r3_zclear_pending = false;          /* before r200_vram_access */
+    v = r300_swap_mode(r300_reg(s->r3, 0x4F28), s->r3_zclear_swap);
+    r200_vram_access(s, off, off + s->r3_zclear_len, true, 7);
+    r200_pattern_fill(vram + off, s->r3_zclear_len, v, s->r3_zclear_bpp);
+    vram_mark(s, off, s->r3_zclear_len);
+    static int logged;
+    if (logged++ < 4) {
+        qemu_log("ppc-mac-gpu r300: 3D_CLEAR_ZMASK: depth at 0x%x, %llu bytes "
+                 "<- %08x\n", off, (unsigned long long)s->r3_zclear_len,
+                 r300_reg(s->r3, 0x4F28));
+    }
+}
+
+/*
  * 3D_CLEAR_ZMASK (0x32) marks every Z tile as holding ZB_DEPTHCLEARVALUE.
- * Depth is kept uncompressed in memory here, so write the clear value
+ * Depth is kept uncompressed in memory here, so the clear value is written
  * over the buffer (the extent seen at earlier draws, else the scissor),
- * every sample of it.
+ * every sample of it -- but not yet: the card reads the value when it next
+ * uses the tiles, and Apple's driver writes ZB_DEPTHCLEARVALUE only after
+ * the clear packet.  Filling at once took the value left by the previous
+ * clear, or by another context: a GLUT game's first frame got depth 0
+ * (nearest), drew nothing that passed the depth test and counted no
+ * samples.  So remember the clear, and fill at the next draw
+ * (r300_zmask_apply).
  */
 static void r300_zmask_clear(PPCMacGPUState *s)
 {
@@ -3123,9 +3162,7 @@ static void r300_zmask_clear(PPCMacGPUState *s)
     uint32_t pitch = r300_reg(s->r3, 0x4F24);
     uint32_t bpp = (r300_reg(s->r3, 0x4F10) & 0xF) == 2 ? 4 : 2;
     uint32_t rows = ((r300_reg(s->r3, 0x43E4) >> 13) & 0x1FFF);
-    uint32_t v = r300_swap_mode(r300_reg(s->r3, 0x4F28), (pitch >> 19) & 3);
     uint64_t bpr = (uint64_t)(pitch & 0x3FFC) * bpp;
-    uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
 
     rows = rows > 1440 ? rows - 1440 + 1 : 0;
     if (s->r3_zb_offset == off && s->r3_zb_height > rows) {
@@ -3145,15 +3182,12 @@ static void r300_zmask_clear(PPCMacGPUState *s)
     if (!rows) {
         return;
     }
-    r200_vram_access(s, off, off + bpr * rows, true, 7);
-    r200_pattern_fill(vram + off, bpr * rows, v, bpp);
-    vram_mark(s, off, bpr * rows);
-    static int logged;
-    if (logged++ < 4) {
-        qemu_log("ppc-mac-gpu r300: 3D_CLEAR_ZMASK: depth at 0x%x, %u rows of "
-                 "%llu bytes <- %08x\n", off, rows, (unsigned long long)bpr,
-                 r300_reg(s->r3, 0x4F28));
-    }
+    r300_zmask_apply(s);                    /* an earlier one, for another buffer */
+    s->r3_zclear_pending = true;
+    s->r3_zclear_off = off;
+    s->r3_zclear_len = bpr * rows;
+    s->r3_zclear_bpp = bpp;
+    s->r3_zclear_swap = (pitch >> 19) & 3;
 }
 
 /*
@@ -3945,6 +3979,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     const char *err;
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
 
+    r300_zmask_apply(s);
     r300_drawlog_draw(s, opcode, d, body_dw);
 
     if (s->r3_dump) {
@@ -13810,6 +13845,7 @@ static void ppc_mac_gpu_reset(DeviceState *dev)
 
     cp.epoch++;                 /* a CP thread mid-ring drops what it has */
     s->reset_count++;
+    s->r3_zclear_pending = false;
     memset(&s->regs, 0, sizeof(s->regs));
     memset(s->r300_surf, 0, sizeof(s->r300_surf));     /* no surfaces after a reset */
     s->r3_zconv = false;                /* nor a depth buffer converted for one */
@@ -14705,6 +14741,7 @@ static int ppc_mac_gpu_pre_save(void *opaque)
     PPCMacGPURenderer *r = s->renderer;
 
     ppc_mac_gpu_cp_sync(s, 0xFFFFFFFF);     /* save with the ring done */
+    r300_zmask_apply(s);                    /* and no depth clear pending */
     /* The Z-pass counter is the renderer's (unless a loaded one has not
      * gone back to it yet), counting or not. */
     if (s->r3 && !s->r3_zpass_reload && r && r->zpass_r300) {
@@ -14743,6 +14780,7 @@ static int ppc_mac_gpu_pre_load(void *opaque)
     s->r3_indx_buf_pending = false;
     s->r3_zb_offset = s->r3_zb_height = s->r3_zb_ns = 0;
     s->r3_cb_aa_off = s->r3_cb_aa_ns = 0;
+    s->r3_zclear_pending = false;   /* pre_save wrote any into VRAM */
     return 0;
 }
 
