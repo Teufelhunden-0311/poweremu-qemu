@@ -585,6 +585,15 @@ static void bench(void)
     }
     res[0x204] = tb() - t0;
 
+    /* the same chain with vnmsubfp: x = -(x * c - b) stays near 0.8 */
+    t0 = tb();
+    for (i = 0; i < BENCH_ITERS; i++) {
+        asm volatile("vnmsubfp %0,%0,%2,%1\n\tvnmsubfp %0,%0,%2,%1\n\t"
+                     "vnmsubfp %0,%0,%2,%1\n\tvnmsubfp %0,%0,%2,%1"
+                     : "+v"(a.v) : "v"(b.v), "v"(c.v));
+    }
+    res[0x216] = tb() - t0;
+
     /* lfs; fmadds; stfs on an array of normal singles, x4 per iteration */
     {
         float buf[64];
@@ -1106,7 +1115,7 @@ static uint32_t vfd_lane(uint32_t *seed)
     }
 }
 
-static void vfd_one(volatile V *buf, int form)
+static void vfd_one(volatile V *buf, int op, int form)
 {
     /* buf: a, b, c, out, vscr; v2 = a, v3 = b, v4 = c, v1 the result */
 #define VFD_ASM(insn, t)     asm volatile("lvx 2,0,%0\n\tlvx 3,%1,%0\n\tlvx 4,%2,%0\n\t"          \
@@ -1114,12 +1123,17 @@ static void vfd_one(volatile V *buf, int form)
                  "stvx " #t ",%4,%0\n\tmfvscr 5\n\tstvx 5,%3,%0"          \
                  : : "b"(buf), "b"(16), "b"(32), "b"(64), "b"(48)          \
                  : "v1", "v2", "v3", "v4", "v5", "memory")
-    switch (form) {
+    switch (op * 5 + form) {
     case 0: VFD_ASM("vmaddfp 1,2,4,3", 1); break;
     case 1: VFD_ASM("vmaddfp 2,2,4,3", 2); break;     /* vD = vA */
     case 2: VFD_ASM("vmaddfp 3,2,4,3", 3); break;     /* vD = vB */
     case 3: VFD_ASM("vmaddfp 4,2,4,3", 4); break;     /* vD = vC */
     case 4: VFD_ASM("vmaddfp 2,2,2,2", 2); break;     /* all one register */
+    case 5: VFD_ASM("vnmsubfp 1,2,4,3", 1); break;
+    case 6: VFD_ASM("vnmsubfp 2,2,4,3", 2); break;
+    case 7: VFD_ASM("vnmsubfp 3,2,4,3", 3); break;
+    case 8: VFD_ASM("vnmsubfp 4,2,4,3", 4); break;
+    case 9: VFD_ASM("vnmsubfp 2,2,2,2", 2); break;
     }
 #undef VFD_ASM
 }
@@ -1138,21 +1152,22 @@ static void vfp_diff(uint32_t *seed)
                 b.w[i] = vfd_lane(seed);
                 c.w[i] = vfd_lane(seed);
             }
-            if ((it & 7) == 0) {
+            if ((it & 7) == 0 || (it & 7) == 1) {
                 for (int i = 0; i < 4; i++) {       /* a*c - a*c shapes */
-                    b.w[i] = (a.w[i] ^ 0x80000000);
+                    b.w[i] = (it & 7) ? a.w[i] : (a.w[i] ^ 0x80000000);
                     c.w[i] = 0x3f800000;
                 }
             }
+            for (int op = 0; op < 2; op++)
             for (int form = 0; form < 5; form++) {
                 memset((void *)&buf[0], 0, 5 * sizeof(V));
                 buf[0] = a; buf[1] = b; buf[2] = c;
                 buf[4].w[3] = nj << 16;               /* VSCR[NJ] */
-                vfd_one(buf, form);
+                vfd_one(buf, op, form);
                 out[0] = a; out[1] = b; out[2] = c;
                 out[3] = buf[3]; out[4] = buf[4];
                 memset((void *)&out[5], 0, sizeof(V));
-                out[5].w[0] = nj << 8 | form;
+                out[5].w[0] = op << 16 | nj << 8 | form;
                 out += VFD_REC;
                 n++;
             }

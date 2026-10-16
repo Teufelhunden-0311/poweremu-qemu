@@ -6,8 +6,9 @@ usage: run.py [--fpdiff | --fpdiff-strict | --vfpdiff] [path/to/qemu-system-ppc]
 --fpdiff runs the scalar FP cases with the inline FP ops off and on and
 compares results and FPSCR; --fpdiff-strict compares the inline results
 with softfloat's (PPC_STRICT_FP=1), whose FPSCR also has the inexact bits.
---vfpdiff does the same for vmaddfp with the inline op off and on
-(PPC_NATIVE_VMX), comparing results and VSCR bit for bit.
+--vfpdiff does the same for vmaddfp and vnmsubfp with the inline ops off
+and on (PPC_NATIVE_VMX; PPC_NATIVE_VNMSUB=0 leaves vnmsubfp on the helper),
+comparing results and VSCR bit for bit.
 
 Needs Homebrew llvm (clang with the PowerPC target) and lld.
 """
@@ -154,7 +155,7 @@ def fpdiff(img, out, strict=False):
 
 VFD_BASE = 0x02000000
 VFD_REC = 6 * 16
-VFD_CASES = 2 * 4000 * 5        # NJ modes x iterations x forms (vfp_diff())
+VFD_CASES = 2 * 4000 * 2 * 5    # NJ modes x iterations x ops x forms (vfp_diff())
 
 
 def run_dump(img, out, tag, env, base, rec, count_word):
@@ -182,32 +183,42 @@ def run_dump(img, out, tag, env, base, rec, count_word):
 
 
 def vfpdiff(img, out):
-    """Run the vmaddfp cases on the helper and inline; compare them."""
+    """Run the vmaddfp/vnmsubfp cases on the helper and inline; compare them."""
     import struct
-    dumps = [run_dump(img, out, f'v{native}',
-                      dict(os.environ, PPC_NATIVE_VMX=native),
-                      VFD_BASE, VFD_REC, 0x284) for native in ('0', '1')]
+    # every switch set explicitly, so the caller's environment cannot
+    # turn off the path a run is meant to take
+    base = {'PPC_NATIVE_VMX': '1', 'PPC_NATIVE_VNMSUB': '1'}
+    runs = [('helper', {'PPC_NATIVE_VMX': '0'}), ('native', {}),
+            ('native, vnmsubfp on the helper', {'PPC_NATIVE_VNMSUB': '0'})]
+    dumps = [run_dump(img, out, f'v{k}', {**os.environ, **base, **env},
+                      VFD_BASE, VFD_REC, 0x284) for k, (_, env) in enumerate(runs)]
     n = VFD_CASES
-    for native, d in zip('01', dumps):
+    for (tag, _), d in zip(runs, dumps):
         if len(d) != n * VFD_REC:
-            print(f'PPC_NATIVE_VMX={native}: {len(d) // VFD_REC} cases dumped, '
-                  f'expected {n}')
+            print(f'{tag}: {len(d) // VFD_REC} cases dumped, expected {n}')
             return 1
-    bad = 0
+    total = 0
     forms = ('d distinct', 'd=a', 'd=b', 'd=c', 'all one register')
-    for i in range(n):
-        r0 = struct.unpack_from('>24I', dumps[0], i * VFD_REC)
-        r1 = struct.unpack_from('>24I', dumps[1], i * VFD_REC)
-        if r0 != r1:
-            bad += 1
-            if bad <= 10:
-                vec = lambda r, k: ' '.join(f'{w:08x}' for w in r[4 * k:4 * k + 4])
-                print(f'MISMATCH vmaddfp {forms[r0[20] & 0xff]} NJ={r0[20] >> 8}: '
-                      f'a={vec(r0, 0)} b={vec(r0, 1)} c={vec(r0, 2)}')
-                print(f'   helper: {vec(r0, 3)} vscr {r0[19]:08x}'
-                      f'   native: {vec(r1, 3)} vscr {r1[19]:08x}')
-    print(f'{n} vmaddfp cases compared (native vs helper), {bad} mismatches')
-    return bad
+    ops = ('vmaddfp', 'vnmsubfp')
+    for (tag, _), d in zip(runs[1:], dumps[1:]):
+        bad = [0, 0]
+        for i in range(n):
+            r0 = struct.unpack_from('>24I', dumps[0], i * VFD_REC)
+            r1 = struct.unpack_from('>24I', d, i * VFD_REC)
+            if r0 != r1:
+                op = r0[20] >> 16
+                bad[op] += 1
+                if sum(bad) <= 10:
+                    vec = lambda r, k: ' '.join(f'{w:08x}' for w in r[4 * k:4 * k + 4])
+                    print(f'MISMATCH ({tag}) {ops[op]} {forms[r0[20] & 0xff]} '
+                          f'NJ={(r0[20] >> 8) & 0xff}: '
+                          f'a={vec(r0, 0)} b={vec(r0, 1)} c={vec(r0, 2)}')
+                    print(f'   helper: {vec(r0, 3)} vscr {r0[19]:08x}'
+                          f'   {tag}: {vec(r1, 3)} vscr {r1[19]:08x}')
+        print(f'{n} vmaddfp/vnmsubfp cases compared ({tag} vs helper), '
+              f'{sum(bad)} mismatches (vmaddfp {bad[0]}, vnmsubfp {bad[1]})')
+        total += sum(bad)
+    return total
 
 
 def main():
@@ -252,6 +263,8 @@ def main():
         print(f'bench {"GB mandel: inside set (127500 it)":36s} {g1 / tbfreq * 1e3:8.1f} ms')
         print(f'bench {"GB mandel: escaping (50000 pixels)":36s} {(gt - g1) / tbfreq * 1e3:8.1f} ms'
               f'  ({gn} iterations total)')
+        t = mon.words(RESULTS + 0x216 * 4, 1)[0]
+        print(f'bench {"vnmsubfp x4 (float)":36s} {t / tbfreq * 1e3:8.1f} ms')
         ft, ff = mon.words(RESULTS + 0x210 * 4, 2)
         print(f'bench {"GB mandel: whole routine x4":36s} {ft / tbfreq * 1e3:8.1f} ms'
               f'  ({ff // 14} iterations)')

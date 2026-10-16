@@ -315,8 +315,9 @@ static void native_fcmpu(DisasContext *ctx, int crf, int ra, int rb)
 /* A NativeFPSlow op for frsp */
 #define NATIVE_FRSP (-2)
 
-/* A NativeFPSlow op for vmaddfp (vmx-impl.c.inc): VRs, not FPRs */
+/* NativeFPSlow ops for vmaddfp, vnmsubfp (vmx-impl.c.inc): VRs, not FPRs */
 #define NATIVE_VMADDFP (-3)
+#define NATIVE_VNMSUBFP (-4)
 static inline TCGv_ptr gen_avr_ptr(int reg);
 
 /* PPC_NATIVE_FRSP=0 keeps frsp on the helpers (for A/B tests). */
@@ -401,11 +402,11 @@ static void native_fp_emit_slow_paths(DisasContext *ctx)
         TCGv_i32 op = tcg_constant_i32(sp->op);
 
         gen_set_label(sp->slow);
-        if (sp->op == NATIVE_VMADDFP) {
+        if (sp->op == NATIVE_VMADDFP || sp->op == NATIVE_VNMSUBFP) {
             /* no FPR, FPSCR or FPRF here: the helper on the same VRs */
-            gen_helper_vmaddfp(tcg_env, gen_avr_ptr(sp->frt),
-                               gen_avr_ptr(sp->x), gen_avr_ptr(sp->y),
-                               gen_avr_ptr(sp->z));
+            (sp->op == NATIVE_VMADDFP ? gen_helper_vmaddfp : gen_helper_vnmsubfp)
+                (tcg_env, gen_avr_ptr(sp->frt), gen_avr_ptr(sp->x),
+                 gen_avr_ptr(sp->y), gen_avr_ptr(sp->z));
             gen_update_nip(ctx, sp->next);
             tcg_gen_lookup_and_goto_ptr();
             continue;
