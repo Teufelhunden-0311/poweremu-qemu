@@ -2529,8 +2529,24 @@ static void native_vmx_check(TCGv_vec bad, TCGv_vec v, unsigned lo)
     tcg_gen_or_vec(MO_32, bad, bad, u);
 }
 
+/*
+ * vnmsubfp too, as -(a * c - b): helper_vnmsubfp's fast path negates b,
+ * does the fused multiply-add and negates the result, so the same steps
+ * here give its bits, the sign of a zero result included.  The checks do
+ * not look at signs.  PPC_NATIVE_VNMSUB=0 keeps vnmsubfp on the helper.
+ */
+static bool native_vnmsub_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPC_NATIVE_VNMSUB");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
 static void native_vmaddfp(DisasContext *ctx, int vrt, int vra, int vrb,
-                           int vrc)
+                           int vrc, bool nmsub)
 {
     NativeFPSlow *sp = &ctx->nfp[ctx->n_nfp++];
     TCGv_vec a = tcg_temp_new_vec(TCG_TYPE_V128);
@@ -2540,14 +2556,24 @@ static void native_vmaddfp(DisasContext *ctx, int vrt, int vra, int vrb,
     TCGv_vec bad = tcg_temp_new_vec(TCG_TYPE_V128);
     TCGv_i64 any = tcg_temp_new_i64();
 
+    TCGv_vec sign = tcg_constant_vec(TCG_TYPE_V128, MO_32, 0x80000000u);
+
     *sp = (NativeFPSlow) {
         .slow = gen_new_label(), .next = ctx->base.pc_next,
-        .op = NATIVE_VMADDFP, .frt = vrt, .x = vra, .y = vrb, .z = vrc,
+        .op = nmsub ? NATIVE_VNMSUBFP : NATIVE_VMADDFP,
+        .frt = vrt, .x = vra, .y = vrb, .z = vrc,
     };
     tcg_gen_ld_vec(a, tcg_env, avr_full_offset(vra));
     tcg_gen_ld_vec(b, tcg_env, avr_full_offset(vrb));
     tcg_gen_ld_vec(c, tcg_env, avr_full_offset(vrc));
-    tcg_gen_vfma_vec(r, a, c, b);                       /* a * c + b */
+    if (nmsub) {
+        TCGv_vec nb = tcg_temp_new_vec(TCG_TYPE_V128);
+
+        tcg_gen_xor_vec(MO_32, nb, b, sign);
+        tcg_gen_vfma_vec(r, a, c, nb);                  /* a * c - b */
+    } else {
+        tcg_gen_vfma_vec(r, a, c, b);                   /* a * c + b */
+    }
 
     tcg_gen_dupi_vec(MO_32, bad, 0);
     native_vmx_check(bad, a, 1);
@@ -2557,6 +2583,9 @@ static void native_vmaddfp(DisasContext *ctx, int vrt, int vra, int vrb,
     tcg_gen_vany_vec(any, bad);
     tcg_gen_brcondi_i64(TCG_COND_NE, any, 0, sp->slow);
 
+    if (nmsub) {
+        tcg_gen_xor_vec(MO_32, r, r, sign);             /* -(a * c - b) */
+    }
     tcg_gen_st_vec(r, tcg_env, avr_full_offset(vrt));
 }
 
@@ -2568,9 +2597,9 @@ static void gen_vmaddfp_vnmsubfp(DisasContext *ctx)
         gen_exception(ctx, POWERPC_EXCP_VPU);
         return;
     }
-    if (!Rc(ctx->opcode) && native_vmx(ctx)) {
+    if (native_vmx(ctx) && (!Rc(ctx->opcode) || native_vnmsub_on())) {
         native_vmaddfp(ctx, rD(ctx->opcode), rA(ctx->opcode),
-                       rB(ctx->opcode), rC(ctx->opcode));
+                       rB(ctx->opcode), rC(ctx->opcode), Rc(ctx->opcode));
         return;
     }
     ra = gen_avr_ptr(rA(ctx->opcode));
