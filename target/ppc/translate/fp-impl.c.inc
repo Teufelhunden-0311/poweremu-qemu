@@ -461,6 +461,28 @@ static void native_fcmpu(DisasContext *ctx, int crf, int ra, int rb)
 /* NativeFPSlow ops for vmaddfp, vnmsubfp (vmx-impl.c.inc): VRs, not FPRs */
 #define NATIVE_VMADDFP (-3)
 #define NATIVE_VNMSUBFP (-4)
+
+/*
+ * lfs widened on the host instead of by helper_todouble: fcvt gives the
+ * helper's bits for every single but a signalling NaN, which the host
+ * quiets and PowerPC keeps signalling.  Those branch to a slow path that
+ * calls the helper on the loaded word and rewrites FRT; the load and any
+ * base update are done by then.  FPSCR is not involved, so this needs no
+ * FP mode, only a slow path slot.  PPC_NATIVE_LFS=0 keeps the helper.
+ */
+#define NATIVE_LFS (-5)
+
+static bool native_lfs_ok(DisasContext *ctx)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPC_NATIVE_LFS");
+        on = !(e && e[0] == '0');
+    }
+    return on && native_fp_on() && ctx->n_nfp < ARRAY_SIZE(ctx->nfp)
+           && !ctx->singlestep_enabled && !ctx->pmu_insn_cnt
+           && !(tb_cflags(ctx->base.tb) & CF_USE_ICOUNT);
+}
 static inline TCGv_ptr gen_avr_ptr(int reg);
 
 /* PPC_NATIVE_FRSP=0 keeps frsp on the helpers (for A/B tests). */
@@ -552,6 +574,13 @@ static void native_fp_emit_slow_paths(DisasContext *ctx)
         TCGv_i32 op = tcg_constant_i32(sp->op);
 
         gen_set_label(sp->slow);
+        if (sp->op == NATIVE_LFS) {
+            gen_helper_todouble(t3, sp->w);
+            set_fpr(sp->frt, t3);
+            gen_update_nip(ctx, sp->next);
+            tcg_gen_lookup_and_goto_ptr();
+            continue;
+        }
         if (sp->op == NATIVE_VMADDFP || sp->op == NATIVE_VNMSUBFP) {
             /* no FPR, FPSCR or FPRF here: the helper on the same VRs */
             (sp->op == NATIVE_VMADDFP ? gen_helper_vmaddfp : gen_helper_vnmsubfp)
@@ -1612,6 +1641,7 @@ GEN_STXF(stfiw, st32fiw, 0x17, 0x1E, PPC_FLOAT_STFIWX);
 static bool do_lsfpsd(DisasContext *ctx, int rt, int ra, TCGv displ,
                       bool update, bool store, bool single)
 {
+    NativeFPSlow *sp = NULL;
     TCGv ea;
     TCGv_i64 t0;
     REQUIRE_INSNS_FLAGS(ctx, FLOAT);
@@ -1630,19 +1660,59 @@ static bool do_lsfpsd(DisasContext *ctx, int rt, int ra, TCGv displ,
         } else {
             gen_qemu_st64_i64(ctx, t0, ea);
         }
-    } else {
-        if (single) {
-            gen_qemu_ld32fs(ctx, t0, ea);
+    } else if (single) {
+        TCGv_i32 w = tcg_temp_new_i32();
+        TCGv_vec v = NULL;
+
+        tcg_gen_qemu_ld_i32(w, ea, ctx->mem_idx, DEF_MEMOP(MO_UL));
+        if (native_lfs_ok(ctx)) {
+            TCGv_vec d = tcg_temp_new_vec(TCG_TYPE_V64);
+
+            sp = &ctx->nfp[ctx->n_nfp++];
+            *sp = (NativeFPSlow) {
+                .slow = gen_new_label(), .next = ctx->base.pc_next,
+                .op = NATIVE_LFS, .frt = rt, .x = rt, .y = rt, .z = -1,
+                .w = w,
+            };
+            v = tcg_temp_new_vec(TCG_TYPE_V64);
+            tcg_gen_dup_i32_vec(MO_32, v, w);
+            tcg_gen_fcvt_vec(true, d, v);
+            tcg_gen_st_vec(d, tcg_env, fpr_offset(rt));
+            if (ctx->insns_flags2 & PPC2_VSX) {
+                tcg_gen_st_i64(tcg_constant_i64(0), tcg_env,
+                               vsr64_offset(rt, false));
+            }
         } else {
-            gen_qemu_ld64_i64(ctx, t0, ea);
+            gen_helper_todouble(t0, w);
+            set_fpr(rt, t0);
         }
-        set_fpr(rt, t0);
-        if (single && native_sp_prov(ctx) == 2) {
+        if (native_sp_prov(ctx) == 2) {
+            /* a single, or a NaN (see native_sp_prov()) */
             ctx->sp_set |= 1u << rt;
+            if (native_sp_fwd(ctx)) {
+                if (!v) {
+                    v = tcg_temp_new_vec(TCG_TYPE_V64);
+                    tcg_gen_dup_i32_vec(MO_32, v, w);
+                }
+                ctx->sp_val[rt] = v;
+                ctx->sval_set |= 1u << rt;
+            }
         }
+    } else {
+        gen_qemu_ld64_i64(ctx, t0, ea);
+        set_fpr(rt, t0);
     }
     if (update) {
         tcg_gen_mov_tl(cpu_gpr[ra], ea);
+    }
+    if (sp) {
+        /* a signalling NaN: 0x7f800001 <= |w| < 0x7fc00000 */
+        TCGv_i32 t = tcg_temp_new_i32();
+
+        tcg_gen_andi_i32(t, sp->w, 0x7fffffff);
+        tcg_gen_subi_i32(t, t, 0x7f800001);
+        tcg_gen_brcondi_i32(TCG_COND_LTU, t, 0x7fc00000 - 0x7f800001,
+                            sp->slow);
     }
     return true;
 }

@@ -171,6 +171,7 @@ typedef struct NativeFPSlow {
     TCGLabel *slow;
     target_ulong next;      /* address of the following instruction */
     int op, frt, x, y, z;
+    TCGv_i32 w;             /* NATIVE_LFS: the loaded word */
 } NativeFPSlow;
 
 struct DisasContext {
