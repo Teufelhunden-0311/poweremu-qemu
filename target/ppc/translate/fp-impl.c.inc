@@ -1544,10 +1544,60 @@ static void glue(gen_, name##x)(DisasContext *ctx)                            \
     gen_qemu_##stop(ctx, t0, EA);                                             \
 }
 
+/* PPC_NATIVE_STFS=0 keeps stfs on helper_tosingle (for A/B tests). */
+static bool native_stfs_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPC_NATIVE_STFS");
+        on = !(e && e[0] == '0');
+    }
+    return on && native_fp_on();
+}
+
+/*
+ * helper_tosingle without the call: stfs stores its result and PowerPC
+ * defines it by bits, so there is no slow path to fall back to.  Exponent
+ * above 896: the top two bits and bits 58:29 (this also gives Inf and
+ * NaNs, signalling ones unchanged); 874..896: a single denormal, the
+ * significand shifted right by 926 - e; below that: the sign alone.
+ */
+static void gen_tosingle_inline(TCGv_i32 dest, TCGv_i64 src)
+{
+    TCGv_i64 e = tcg_temp_new_i64(), n = tcg_temp_new_i64();
+    TCGv_i64 d = tcg_temp_new_i64(), t = tcg_temp_new_i64();
+    TCGv_i64 sg = tcg_temp_new_i64();
+
+    tcg_gen_extract_i64(e, src, 52, 11);
+
+    tcg_gen_shri_i64(n, src, 32);
+    tcg_gen_andi_i64(n, n, 0xc0000000);
+    tcg_gen_extract_i64(t, src, 29, 30);
+    tcg_gen_or_i64(n, n, t);
+
+    tcg_gen_shri_i64(sg, src, 32);
+    tcg_gen_andi_i64(sg, sg, 0x80000000);
+
+    tcg_gen_extract_i64(d, src, 0, 52);
+    tcg_gen_ori_i64(d, d, 1ull << 52);
+    tcg_gen_subfi_i64(t, 926, e);
+    tcg_gen_andi_i64(t, t, 63);
+    tcg_gen_shr_i64(d, d, t);
+    tcg_gen_or_i64(d, d, sg);
+    tcg_gen_movcond_i64(TCG_COND_GEU, d, e, tcg_constant_i64(874), d, sg);
+
+    tcg_gen_movcond_i64(TCG_COND_GTU, n, e, tcg_constant_i64(896), n, d);
+    tcg_gen_extrl_i64_i32(dest, n);
+}
+
 static void gen_qemu_st32fs(DisasContext *ctx, TCGv_i64 src, TCGv addr)
 {
     TCGv_i32 tmp = tcg_temp_new_i32();
-    gen_helper_tosingle(tmp, src);
+    if (native_stfs_on()) {
+        gen_tosingle_inline(tmp, src);
+    } else {
+        gen_helper_tosingle(tmp, src);
+    }
     tcg_gen_qemu_st_i32(tmp, addr, ctx->mem_idx, DEF_MEMOP(MO_UL));
 }
 
