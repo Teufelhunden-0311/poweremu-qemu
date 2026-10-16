@@ -149,8 +149,9 @@ static bool native_single(int op)
  * drops every fact.  Not with VSX or DFP, whose instructions write FPRs
  * from opcodes 31, 60 and 61, or FPR pairs.
  *
- * PPC_SP_PROV=0 turns it off, 2 also counts lfs results (a single
- * converted by helper_todouble; a signalling NaN stays a NaN, see above);
+ * PPC_SP_PROV=0 turns it off, 1 counts only the native ops' results, 2
+ * (the default) also lfs results (a single widened to double; a NaN stays
+ * a NaN, see above);
  * PPC_SP_PROV_STATS=1 logs how many single-precision inputs were known.
  */
 static int native_sp_prov(DisasContext *ctx)
@@ -158,7 +159,7 @@ static int native_sp_prov(DisasContext *ctx)
     static int mode = -1;
     if (mode < 0) {
         const char *e = getenv("PPC_SP_PROV");
-        mode = e && e[0] >= '0' && e[0] <= '2' ? e[0] - '0' : 1;
+        mode = e && e[0] >= '0' && e[0] <= '2' ? e[0] - '0' : 2;
     }
     if (ctx->insns_flags2 & (PPC2_VSX | PPC2_DFP) || !native_fp_on()) {
         return 0;
