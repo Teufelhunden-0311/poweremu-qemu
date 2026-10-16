@@ -11,7 +11,8 @@ and on (PPC_NATIVE_VMX; PPC_NATIVE_VNMSUB=0 leaves vnmsubfp on the helper),
 comparing results and VSCR bit for bit.
 --spdiff runs single-precision chains within one TB on the helper and with
 PPC_SP_PROV=0, 1 and 2 (single-precision provenance; 1 also without
-forwarding, PPC_SP_FWD=0), comparing results and FPSCR bit for bit.
+forwarding, PPC_SP_FWD=0; 2 also with lfs on the helper, PPC_NATIVE_LFS=0),
+comparing results and FPSCR bit for bit.
 
 Needs Homebrew llvm (clang with the PowerPC target) and lld.
 """
@@ -235,11 +236,12 @@ def spdiff(img, out):
     # every switch set explicitly, so the caller's environment cannot
     # turn off the path a run is meant to take
     base = {'PPC_NATIVE_FP': '1', 'PPC_STRICT_FP': '0', 'PPC_NATIVE_FRSP': '1',
-            'PPC_SP_PROV': '1', 'PPC_SP_FWD': '1'}
+            'PPC_SP_PROV': '1', 'PPC_SP_FWD': '1', 'PPC_NATIVE_LFS': '1'}
     runs = [('helper', {'PPC_NATIVE_FP': '0', 'PPC_SP_PROV': '0'}),
             ('prov0', {'PPC_SP_PROV': '0'}),
             ('prov1', {}), ('prov2', {'PPC_SP_PROV': '2'}),
-            ('prov1-nofwd', {'PPC_SP_FWD': '0'})]
+            ('prov1-nofwd', {'PPC_SP_FWD': '0'}),
+            ('prov2-lfshelper', {'PPC_SP_PROV': '2', 'PPC_NATIVE_LFS': '0'})]
     dumps = {}
     for tag, extra in runs:
         d = run_dump(img, out, tag, {**os.environ, **base, **extra},

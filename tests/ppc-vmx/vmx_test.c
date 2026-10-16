@@ -1311,6 +1311,13 @@ static void sp_diff(uint32_t *seed)
         uint64_t sw = (uint64_t)rnd(seed) << 32;
         if (it & 1) {
             sw = (uint64_t)(rnd(seed) & 0x80ffffff | 0x3c000000) << 32;
+        } else if ((it & 3) == 2) {
+            /* NaNs, infinities and a denormal for the lfs/lfsx steps */
+            static const uint32_t nan[] = {
+                0x7f800001, 0xffbfffff, 0x7fa00000, 0x7fc00000, 0xffc00123,
+                0x7f800000, 0xff800000, 0x80000001,
+            };
+            sw = (uint64_t)nan[(it >> 2) % 8] << 32;
         }
         for (int o1 = 0; o1 < SPD_NOP1; o1++) {
             for (int m = 0; m < SPD_NMID; m++) {

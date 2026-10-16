@@ -171,11 +171,16 @@ static int native_sp_prov(DisasContext *ctx)
  * ctx->sp_val[], the native op's (or frsp's) own single result, so a later
  * single op in the TB uses that instead of loading the FPR and converting
  * it to single (the same value: a single converted to double and back).
- * That takes the store, reload and conversion off a dependent chain.  The
- * temps are TCG's EBB temps, which live across the slow paths' conditional
- * branches but not past a label, so an instruction that sets a label in
- * the TB's code drops them all.  Not with TCG plugins, which add their
- * code (and labels) after translation.  PPC_SP_FWD=0 turns this off.
+ * That takes the store, reload and conversion off a dependent chain.
+ * With PPC_SP_PROV=2 an lfs forwards the word it loaded.  That word can
+ * be a NaN (a signalling one too, when lfs runs on the helper and so does
+ * not leave the TB); then the consumer's result is a NaN, which takes its
+ * slow path before anything is written, and the helper there reads the
+ * FPR as lfs wrote it.  The temps are TCG's EBB temps, which live across
+ * the slow paths' conditional branches but not past a label, so an
+ * instruction that sets a label in the TB's code drops them all.  Not
+ * with TCG plugins, which add their code (and labels) after translation.
+ * PPC_SP_FWD=0 turns this off.
  */
 static bool native_sp_fwd(DisasContext *ctx)
 {
