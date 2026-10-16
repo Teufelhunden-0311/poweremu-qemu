@@ -221,12 +221,17 @@ SPD_CASES = 250 * 3 * 14 * 6    # iterations x op1 x mid x op3 (sp_diff())
 def spdiff(img, out):
     """Run the provenance chains on the helper and with PPC_SP_PROV 0-2."""
     import struct
-    runs = [('helper', {'PPC_NATIVE_FP': '0'}), ('prov0', {'PPC_SP_PROV': '0'}),
-            ('prov1', {'PPC_SP_PROV': '1'}), ('prov2', {'PPC_SP_PROV': '2'}),
-            ('prov1-nofwd', {'PPC_SP_PROV': '1', 'PPC_SP_FWD': '0'})]
+    # every switch set explicitly, so the caller's environment cannot
+    # turn off the path a run is meant to take
+    base = {'PPC_NATIVE_FP': '1', 'PPC_STRICT_FP': '0', 'PPC_NATIVE_FRSP': '1',
+            'PPC_SP_PROV': '1', 'PPC_SP_FWD': '1'}
+    runs = [('helper', {'PPC_NATIVE_FP': '0', 'PPC_SP_PROV': '0'}),
+            ('prov0', {'PPC_SP_PROV': '0'}),
+            ('prov1', {}), ('prov2', {'PPC_SP_PROV': '2'}),
+            ('prov1-nofwd', {'PPC_SP_FWD': '0'})]
     dumps = {}
     for tag, extra in runs:
-        d = run_dump(img, out, tag, dict(os.environ, **extra),
+        d = run_dump(img, out, tag, {**os.environ, **base, **extra},
                      SPD_BASE, SPD_REC, 0x285)
         if len(d) != SPD_CASES * SPD_REC:
             print(f'{tag}: {len(d) // SPD_REC} cases dumped, expected {SPD_CASES}')
