@@ -530,6 +530,81 @@ static void log_vec(volatile uint32_t *p, V v)
     }
 }
 
+/*
+ * Geekbench 2's scalar Dot Product inner loop (geekbench_ppc_32 0x22e10):
+ * one TB per element, with the accumulator from the TB before, so its
+ * single comes from the shadow (fp-impl.c.inc native_sp_shadow()).
+ */
+__attribute__((noinline, used)) float gbdot_fs(const float *a, const float *b, int n)
+{
+    float s = 0.0f; int x;
+    asm volatile("mtctr %4\n\tli %1,0\n\t.p2align 4\n"
+                 "1:\tlfsx 13,%2,%1\n\tlfsx 0,%3,%1\n\taddi %1,%1,4\n\t"
+                 "fmadds %0,13,0,%0\n\tbdnz 1b"
+                 : "+f"(s), "=&b"(x) : "b"(a), "b"(b), "r"(n)
+                 : "fr0", "fr13", "ctr", "memory");
+    return s;
+}
+/* the same with a cold accumulator: lfd (no shadow) in a TB of its own */
+__attribute__((noinline, used)) float gbdot_fsc(const float *a, const float *b, int n)
+{
+    static const double init = 1.5;
+    float s; int x;
+    asm volatile("lfd %0,0(%5)\n\tb 2f\n2:\tmtctr %4\n\tli %1,0\n\t.p2align 4\n"
+                 "1:\tlfsx 13,%2,%1\n\tlfsx 0,%3,%1\n\taddi %1,%1,4\n\t"
+                 "fmadds %0,13,0,%0\n\tbdnz 1b"
+                 : "=&f"(s), "=&b"(x) : "b"(a), "b"(b), "r"(n), "b"(&init)
+                 : "fr0", "fr13", "ctr", "memory");
+    return s;
+}
+__attribute__((noinline, used)) double gbdot_fd(const double *a, const double *b, int n)
+{
+    double s = 0.0; int x;
+    asm volatile("mtctr %4\n\tli %1,0\n\t.p2align 4\n"
+                 "1:\tlfdx 13,%2,%1\n\tlfdx 0,%3,%1\n\taddi %1,%1,8\n\t"
+                 "fmadd %0,13,0,%0\n\tbdnz 1b"
+                 : "+f"(s), "=&b"(x) : "b"(a), "b"(b), "r"(n)
+                 : "fr0", "fr13", "ctr", "memory");
+    return s;
+}
+/*
+ * Geekbench 2's Sharpen/Blur Image convolution (geekbench_ppc_32 0x220b8):
+ * per pixel, three accumulators set by lfs and fmr, then 5 taps of three
+ * fmadds each, one TB per tap after the first.
+ */
+__attribute__((noinline, used)) float gbconv(const float *k, const float *px, int npx)
+{
+    static const float zero = 0.0f;
+    float r = 0;
+    for (int p = 0; p < npx; p++, px += 3) {
+        float a, b, c; int x;
+        asm volatile("lfs %0,0(%6)\n\tfmr %1,%0\n\tfmr %2,%0\n\t"
+                     "li %3,5\n\tmtctr %3\n\tli %3,0\n"
+                     "1:\tlfsx 12,%4,%3\n\tlfs 13,0(%5)\n\tlfs 0,4(%5)\n\t"
+                     "fmadds %1,13,12,%1\n\tlfs 13,8(%5)\n\tfmadds %0,12,0,%0\n\t"
+                     "addi %3,%3,4\n\tfmadds %2,12,13,%2\n\tbdnz 1b"
+                     : "=&f"(a), "=&f"(b), "=&f"(c), "=&b"(x)
+                     : "b"(k), "b"(px), "b"(&zero)
+                     : "fr0", "fr12", "fr13", "ctr", "memory");
+        r += a + b + c;
+    }
+    return r;
+}
+/* the same unrolled x4, so three of four fmadds read the accumulator in-TB */
+__attribute__((noinline, used)) float gbdot_fs4(const float *a, const float *b, int n)
+{
+    float s = 0.0f; int x;
+    asm volatile("mtctr %4\n\tli %1,0\n\t.p2align 4\n"
+                 "1:\tlfsx 13,%2,%1\n\tlfsx 0,%3,%1\n\taddi %1,%1,4\n\tfmadds %0,13,0,%0\n\t"
+                 "lfsx 13,%2,%1\n\tlfsx 0,%3,%1\n\taddi %1,%1,4\n\tfmadds %0,13,0,%0\n\t"
+                 "lfsx 13,%2,%1\n\tlfsx 0,%3,%1\n\taddi %1,%1,4\n\tfmadds %0,13,0,%0\n\t"
+                 "lfsx 13,%2,%1\n\tlfsx 0,%3,%1\n\taddi %1,%1,4\n\tfmadds %0,13,0,%0\n\t"
+                 "bdnz 1b"
+                 : "+f"(s), "=&b"(x) : "b"(a), "b"(b), "r"(n / 4)
+                 : "fr0", "fr13", "ctr", "memory");
+    return s;
+}
+
 /* Dependent chains of the hot ops, for timing against the helper path. */
 static void bench(void)
 {
@@ -697,6 +772,34 @@ static void bench(void)
         }
         res[0x214] = tb() - t0;
         res[0x215] = (uint32_t)(x + y + z + w + v[2] + v[3]);
+    }
+
+    /* the Dot Product loops, 2000 x 1024 elements each */
+    {
+        /* in RAM: static data would be in the firmware image, read-only */
+        float *fa = (float *)0x00300000, *fb = fa + 1024;
+        double *da = (double *)(fb + 1024), *db = da + 1024;
+        float fs = 0; double fd = 0;
+        for (i = 0; i < 1024; i++) {
+            fa[i] = da[i] = (i % 17) * 0.25f;
+            fb[i] = db[i] = (i % 13) * 0.5f - 1;
+        }
+        t0 = tb();
+        for (i = 0; i < 2000; i++) fs += gbdot_fs(fa, fb, 1024);
+        res[0x217] = tb() - t0;
+        t0 = tb();
+        for (i = 0; i < 2000; i++) fd += gbdot_fd(da, db, 1024);
+        res[0x218] = tb() - t0;
+        t0 = tb();
+        for (i = 0; i < 2000; i++) fs += gbdot_fs4(fa, fb, 1024);
+        res[0x219] = tb() - t0;
+        t0 = tb();
+        for (i = 0; i < 2000; i++) fs += gbdot_fsc(fa, fb, 1024);
+        res[0x21b] = tb() - t0;
+        t0 = tb();
+        for (i = 0; i < 1300; i++) fs += gbconv(fa, fb, 300);
+        res[0x21c] = tb() - t0;
+        res[0x21a] = (uint32_t)(fs + fd);
     }
 
     /* Mandelbrot escape loop, as compiled C: fcmpu decides every exit */
@@ -1340,11 +1443,203 @@ static void sp_diff(uint32_t *seed)
     asm volatile("mtfsfi 7,0");
 }
 
+/*
+ * Differential test for the single shadows (fp-impl.c.inc
+ * native_sp_shadow()), which carry a native single op's result across
+ * TBs: op1 writes f1 (or lfd leaves its shadow stale), then, each in its
+ * own TB (a branch to the next instruction ends one), another instruction
+ * maybe rewrites f1, op3 reads f1, and two more ops read f1, f3, f5 and
+ * f7.  The middle instructions include writers of the same value, of the
+ * double next to the single, of the other zero, and helper-path writers
+ * and a rounding-mode change, so a shadow that passed its check wrongly
+ * would show as a result or FPSCR that differs from the helper's.  The
+ * inputs include singles that are denormal, zeros, infinities and NaNs.
+ * Each case stores the inputs, f1, f5, f6, f7, FPSCR and a case id at
+ * XTD_BASE; run.py --xtdiff runs it on the helper and inline, and compares.
+ */
+#define XTD_BASE    0x03600000u
+#define XTD_REC     12          /* a c b d e s f1 f7 fpscr f6 f5, case id */
+
+/* buf: a c b d e s(word at 40) - f1 48, f7 56, fpscr 64 out; fpscr in 72;
+ * f6 80 out; 88 scratch; f5 96 out */
+#define XTD_ASM(op1, mid, op3) \
+    asm volatile("lfd 2,0(%0)\n\tlfd 3,8(%0)\n\tlfd 4,16(%0)\n\t"             \
+                 "lfd 5,24(%0)\n\tlfd 6,32(%0)\n\tlfd 7,72(%0)\n\t"           \
+                 "mtfsf 0xff,7\n\t" op1 "\n\tb 91f\n91:\t" mid                \
+                 "\n\tb 92f\n92:\t" op3 "\n\tb 93f\n93:\tmtfsfi 7,0\n\t"      \
+                 "fmadds 6,1,3,5\n\tb 94f\n94:\tfadds 6,6,7\n\t"              \
+                 "stfd 1,48(%0)\n\tstfd 7,56(%0)\n\tstfd 6,80(%0)\n\t"        \
+                 "stfd 5,96(%0)\n\tmffs 0\n\tstfd 0,64(%0)"                   \
+                 : : "b"(buf), "b"(40)                                        \
+                 : "fr0", "fr1", "fr2", "fr3", "fr4", "fr5", "fr6", "fr7",    \
+                   "r0", "cr0", "memory")
+#define XTD_OP3(op1, mid) switch (c3) { \
+    case 0: XTD_ASM(op1, mid, "fmadds 7,1,3,4"); break; \
+    case 1: XTD_ASM(op1, mid, "fmadds 7,2,1,4"); break; \
+    case 2: XTD_ASM(op1, mid, "fmadds 7,2,3,1"); break; \
+    case 3: XTD_ASM(op1, mid, "fmadds 1,1,3,1\n\tfmr 7,1"); break; \
+    case 4: XTD_ASM(op1, mid, "fadds 7,1,1"); break; \
+    case 5: XTD_ASM(op1, mid, "fmuls 5,5,1\n\tfmr 7,5"); break; \
+    case 6: XTD_ASM(op1, mid, "fmadds 1,1,1,1\n\tfmadds 7,1,2,1"); break; }
+#define XTD_MID(op1) switch (m) { \
+    case 0:  XTD_OP3(op1, ""); break; \
+    case 1:  XTD_OP3(op1, "fadd 1,5,6"); break;            /* a double */ \
+    case 2:  XTD_OP3(op1, "lfd 1,24(%0)"); break; \
+    case 3:  XTD_OP3(op1, "fmr 1,5"); break; \
+    case 4:  XTD_OP3(op1, "lfs 1,40(%0)"); break; \
+    case 5:  XTD_OP3(op1, "frsp 1,5"); break; \
+    case 6:  XTD_OP3(op1, "fneg 1,1"); break;              /* the other zero */ \
+    case 7:  XTD_OP3(op1, "fadds 1,5,6"); break; \
+    case 8:  XTD_OP3(op1, "fmul 1,1,5"); break; \
+    case 9:  XTD_OP3(op1, "stfd 1,88(%0)\n\tlfd 1,88(%0)"); break; /* same */ \
+    case 10: XTD_OP3(op1, "stfd 1,88(%0)\n\tlwz 0,92(%0)\n\taddi 0,0,1\n\t" \
+                          "stw 0,92(%0)\n\tlfd 1,88(%0)"); break; /* next double */ \
+    case 11: XTD_OP3(op1, "fres 1,5"); break;              /* helpers */ \
+    case 12: XTD_OP3(op1, "fctiwz 1,5"); break; \
+    case 13: XTD_OP3(op1, "fsel 1,5,1,6"); break; \
+    case 14: XTD_OP3(op1, "mtfsfi 7,1"); break;            /* round to zero */ \
+    case 15: XTD_OP3(op1, "fabs 1,1"); break; \
+    case 16: XTD_OP3(op1, "fnabs 1,1"); break; }
+#define XTD_NOP1 6
+#define XTD_NMID 17
+#define XTD_NOP3 7
+
+static void xtd_one(volatile uint64_t *buf, int o1, int m, int c3)
+{
+    switch (o1) {
+    case 0: XTD_MID("fmadds 1,2,3,4"); break;
+    case 1: XTD_MID("fadds 1,2,4"); break;
+    case 2: XTD_MID("frsp 1,4"); break;
+    case 3: XTD_MID("fsubs 1,2,2"); break;                      /* +0 */
+    case 4: XTD_MID("fsubs 1,2,2\n\tfneg 1,1\n\tfadds 1,1,1"); break; /* -0 */
+    case 5: XTD_MID("lfd 1,24(%0)"); break;     /* f1's shadow left as it was */
+    }
+}
+
+/* singles (denormal ones too), with the pool's specials and doubles */
+static uint64_t xtd_val(uint32_t *seed)
+{
+    uint32_t r = rnd(seed);
+
+    switch (r & 7) {
+    case 0: {
+        /* a denormal single, either sign, widened by integer arithmetic */
+        uint32_t m = rnd(seed) >> (9 + (r >> 8) % 23);
+        int p = 31;
+
+        if (!m) {
+            m = 1;
+        }
+        while (!(m >> p)) {
+            p--;
+        }
+        return (uint64_t)(r >> 31) << 63 | (uint64_t)(p + 874) << 52
+               | ((uint64_t)m << (52 - p) & 0xfffffffffffffull);
+    }
+    case 1: case 2: case 3:
+        return spd_single(seed);
+    default:
+        return fpd_pool(seed);
+    }
+}
+
+static void xt_diff(uint32_t *seed)
+{
+    volatile uint64_t *buf = (volatile uint64_t *)FPD_BUF;
+    volatile uint64_t *out = (volatile uint64_t *)XTD_BASE;
+    uint32_t n = 0;
+
+    for (int it = 0; it < 120; it++) {
+        uint64_t a = xtd_val(seed), c = xtd_val(seed), b = xtd_val(seed);
+        uint64_t d = xtd_val(seed), e = xtd_val(seed);
+        uint64_t sw = (uint64_t)rnd(seed) << 32;
+        if (it & 1) {
+            sw = (uint64_t)(rnd(seed) & 0x80ffffff | 0x3c000000) << 32;
+        } else if ((it & 3) == 2) {
+            static const uint32_t nan[] = {
+                0x7f800001, 0xffbfffff, 0x7fa00000, 0x7fc00000, 0xffc00123,
+                0x7f800000, 0xff800000, 0x80000001,
+            };
+            sw = (uint64_t)nan[(it >> 2) % 8] << 32;
+        }
+        for (int o1 = 0; o1 < XTD_NOP1; o1++) {
+            for (int m = 0; m < XTD_NMID; m++) {
+                for (int c3 = 0; c3 < XTD_NOP3; c3++) {
+                    buf[0] = a; buf[1] = c; buf[2] = b; buf[3] = d; buf[4] = e;
+                    buf[5] = sw; buf[6] = buf[7] = buf[10] = buf[12] =
+                        0x7ff8dead0000beefull;
+                    buf[8] = 0x7ff8dead0000beefull; buf[9] = 0;
+                    xtd_one(buf, o1, m, c3);
+                    out[0] = a; out[1] = c; out[2] = b; out[3] = d;
+                    out[4] = e; out[5] = sw;
+                    out[6] = buf[6]; out[7] = buf[7]; out[8] = buf[8];
+                    out[9] = buf[10]; out[10] = buf[12];
+                    out[11] = o1 << 16 | m << 8 | c3;
+                    out += XTD_REC;
+                    n++;
+                }
+            }
+        }
+    }
+    res[0x286] = n;
+    asm volatile("mtfsfi 7,0");
+}
+
+/*
+ * Built with -DRESTORE_TEST (run.py --restore): the Dot Product loops,
+ * whose accumulator crosses TBs (and so comes from the single shadow),
+ * over and over while run.py saves the VM, lets it run on and loads the
+ * saved state again, more than once.  The shadows are not migrated, so
+ * after a load they hold a later point's values; each result must still
+ * be the first one's.  res[0x287] progress, [0x288] results that differ,
+ * [0x289] the first result's bits, [0x28a] the cold loop's.
+ */
+#define RESTORE_ITERS 1500000
+static void restore_test(void)
+{
+    float *fa = (float *)0x00300000, *fb = fa + 1024;
+    uint32_t ref, refc, bad = 0;
+    float r;
+    int i;
+
+    for (i = 0; i < 1024; i++) {
+        fa[i] = (i % 17) * 0.25f + 0.0625f;
+        fb[i] = (i % 13) * 0.5f - 1;
+    }
+    r = gbdot_fs(fa, fb, 1024);
+    memcpy(&ref, &r, 4);
+    r = gbdot_fsc(fa, fb, 1024);
+    memcpy(&refc, &r, 4);
+    res[0x289] = ref;
+    res[0x28a] = refc;
+    for (i = 0; i < RESTORE_ITERS; i++) {
+        uint32_t w;
+
+        r = gbdot_fs(fa, fb, 1024);
+        memcpy(&w, &r, 4);
+        bad += w != ref;
+        r = gbdot_fsc(fa, fb, 1024);
+        memcpy(&w, &r, 4);
+        bad += w != refc;
+        res[0x288] = bad;
+        res[0x287] = i + 1;
+    }
+}
+
 int main(void)
 {
     uint32_t seed = 0x2545f491;
     uint32_t checks = 0, fails = 0, logged = 0;
     int op, it, i;
+
+#ifdef RESTORE_TEST
+    for (i = 0; i < 0x300; i++) {
+        res[i] = 0;
+    }
+    restore_test();
+    res[0] = 0x564d5854;
+    return 0;
+#endif
 
     for (i = 0; i < 0x300; i++) {
         res[i] = 0;
@@ -1394,6 +1689,7 @@ int main(void)
     fp_diff(&seed);
     vfp_diff(&seed);
     sp_diff(&seed);
+    xt_diff(&seed);
     bench();
     res[0] = 0x564d5854; /* 'VMXT' */
     return 0;

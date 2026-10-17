@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Build vmx_test.c as a raw mac99 firmware image, run it, report results.
 
-usage: run.py [--fpdiff | --fpdiff-strict | --vfpdiff | --spdiff] [path/to/qemu-system-ppc]
+usage: run.py [--fpdiff | --fpdiff-strict | --vfpdiff | --spdiff | --xtdiff |
+               --restore] [path/to/qemu-system-ppc]
 
 --fpdiff runs the scalar FP cases with the inline FP ops off and on and
 compares results and FPSCR; --fpdiff-strict compares the inline results
@@ -13,6 +14,12 @@ comparing results and VSCR bit for bit.
 PPC_SP_PROV=0, 1 and 2 (single-precision provenance; 1 also without
 forwarding, PPC_SP_FWD=0; 2 also with lfs on the helper, PPC_NATIVE_LFS=0),
 comparing results and FPSCR bit for bit.
+--restore runs the Dot Product loops (single shadows) while saving the VM,
+letting it run on and loading the saved state again; every result must
+match the first, which must match the helper's (PPC_NATIVE_FP=0).
+--xtdiff runs single-precision chains across TBs on the helper and with the
+single shadows on (PPC_SP_SHADOW=2 and 1) and off (PPC_SP_BRANCH=0, PPC_SP_INPUTS=0,
+PPC_SP_SHADOW_DSE=0 too), comparing results and FPSCR bit for bit.
 
 Needs Homebrew llvm (clang with the PowerPC target) and lld.
 """
@@ -56,10 +63,10 @@ def tool(name):
     return p
 
 
-def build(out):
+def build(out, defs=()):
     cc = [tool('clang'), '--target=powerpc-unknown-none-elf', '-mcpu=7450',
           '-maltivec', '-O2', '-ffreestanding', '-fno-builtin', '-nostdlib',
-          '-fno-pic', '-c']
+          '-fno-pic', '-c'] + list(defs)
     objs = []
     for src in ('start.S', 'vmx_test.c'):
         o = os.path.join(out, src + '.o')
@@ -278,9 +285,142 @@ def spdiff(img, out):
     return bad
 
 
+XTD_BASE = 0x03600000
+XTD_REC = 12 * 8
+XTD_CASES = 120 * 6 * 17 * 7    # iterations x op1 x mid x op3 (xt_diff())
+
+
+def xtdiff(img, out):
+    """Run the cross-TB chains on the helper and with the shadows on and off."""
+    import struct
+    # every switch set explicitly, so the caller's environment cannot
+    # turn off the path a run is meant to take
+    base = {'PPC_NATIVE_FP': '1', 'PPC_STRICT_FP': '0', 'PPC_NATIVE_FRSP': '1',
+            'PPC_SP_PROV': '2', 'PPC_SP_FWD': '1', 'PPC_NATIVE_LFS': '1',
+            'PPC_SP_BRANCH': '1', 'PPC_SP_SHADOW': '2', 'PPC_SP_INPUTS': '1',
+            'PPC_SP_SHADOW_DSE': '1', 'PPC_SP_SHADOW_STATS': '0'}
+    runs = [('helper', {'PPC_NATIVE_FP': '0', 'PPC_SP_PROV': '0'}),
+            ('shadow', {}),
+            ('shadow-all', {'PPC_SP_SHADOW': '1'}),
+            ('shadow-all-nodse', {'PPC_SP_SHADOW': '1', 'PPC_SP_SHADOW_DSE': '0'}),
+            ('shadow-nodse', {'PPC_SP_SHADOW_DSE': '0'}),
+            ('shadow-noinputs', {'PPC_SP_INPUTS': '0'}),
+            ('shadow-prov1', {'PPC_SP_PROV': '1'}),
+            ('shadow-lfshelper', {'PPC_NATIVE_LFS': '0'}),
+            ('noshadow', {'PPC_SP_SHADOW': '0'}),
+            ('orn', {'PPC_SP_BRANCH': '0', 'PPC_SP_INPUTS': '0'})]
+    dumps = {}
+    for tag, extra in runs:
+        d = run_dump(img, out, 'x' + tag, {**os.environ, **base, **extra},
+                     XTD_BASE, XTD_REC, 0x286)
+        if len(d) != XTD_CASES * XTD_REC:
+            print(f'{tag}: {len(d) // XTD_REC} cases dumped, expected {XTD_CASES}')
+            return 1
+        dumps[tag] = d
+    o1s = ('fmadds', 'fadds', 'frsp', 'fsubs +0', 'fsubs/fneg/fadds -0', 'lfd')
+    mids = ('-', 'fadd', 'lfd', 'fmr', 'lfs', 'frsp', 'fneg', 'fadds', 'fmul',
+            'same value', 'next double', 'fres', 'fctiwz', 'fsel', 'mtfsfi RZ',
+            'fabs', 'fnabs')
+    op3s = ('fmadds A', 'fmadds C', 'fmadds B', 'fmadds in place', 'fadds 1,1',
+            'fmuls 5,5,1', 'fmadds 1,1,1,1')
+    bad = 0
+    for tag, _ in runs[1:]:
+        nb = 0
+        by_mid = {}
+        for i in range(XTD_CASES):
+            r0 = struct.unpack_from('>12Q', dumps['helper'], i * XTD_REC)
+            r1 = struct.unpack_from('>12Q', dumps[tag], i * XTD_REC)
+            if r0 != r1:
+                nb += 1
+                k = r0[11]
+                mid = mids[(k >> 8) & 0xff]
+                by_mid[mid] = by_mid.get(mid, 0) + 1
+                if nb <= 5:
+                    print(f'MISMATCH {tag}: {o1s[k >> 16]} / {mid} / '
+                          f'{op3s[k & 0xff]}: ' +
+                          ' '.join(f'{x:016x}' for x in r0[:6]))
+                    print(f'   helper: f1 {r0[6]:016x} f7 {r0[7]:016x} f6 {r0[9]:016x} '
+                          f'f5 {r0[10]:016x} fpscr {r0[8] & 0xffffffff:08x}')
+                    print(f'   {tag}: f1 {r1[6]:016x} f7 {r1[7]:016x} f6 {r1[9]:016x} '
+                          f'f5 {r1[10]:016x} fpscr {r1[8] & 0xffffffff:08x}')
+        print(f'{XTD_CASES} cross-TB chains compared ({tag} vs helper), {nb} mismatches'
+              + (f' (by middle instruction: {by_mid})' if nb else ''))
+        bad += nb
+    return bad
+
+
+def restore(out):
+    """Save, run on, load: results across TBs must not change (--restore)."""
+    img = build(out, ['-DRESTORE_TEST'])
+    disk = os.path.join(out, 'snap.qcow2')
+    qimg = os.path.join(os.path.dirname(QEMU), 'qemu-img')
+    subprocess.check_call([qimg if os.path.exists(qimg) else 'qemu-img',
+                           'create', '-q', '-f', 'qcow2', disk, '16M'])
+
+    def start(tag, env):
+        sock = os.path.join(out, f'mon{tag}.sock')
+        q = subprocess.Popen([QEMU, '-M', 'mac99', '-cpu', '7450', '-m', '64',
+                              '-bios', img, '-display', 'none',
+                              '-serial', 'none', '-drive',
+                              f'if=none,id=snap,format=qcow2,file={disk}',
+                              '-monitor', f'unix:{sock},server=on,wait=off'],
+                             stdout=subprocess.DEVNULL, env=env)
+        return q, Monitor(sock)
+
+    def wait(mon, cond, what):
+        for _ in range(2400):
+            w = mon.words(RESULTS + 0x287 * 4, 1)[0]
+            if cond(w):
+                return w
+            time.sleep(0.05)
+        sys.exit(f'restore: timed out waiting for {what}')
+
+    env = {**os.environ, 'PPC_NATIVE_FP': '0', 'PPC_SP_PROV': '0'}
+    q, mon = start('h', env)
+    try:
+        wait(mon, lambda w: w > 0, 'the helper run')
+        href = mon.words(RESULTS + 0x289 * 4, 2)
+    finally:
+        q.kill()
+    env = {**os.environ, 'PPC_NATIVE_FP': '1', 'PPC_STRICT_FP': '0',
+           'PPC_SP_PROV': '2', 'PPC_SP_SHADOW': '1', 'PPC_SP_BRANCH': '1'}
+    q, mon = start('n', env)
+    try:
+        wait(mon, lambda w: w > 20000, 'the first iterations')
+        mon.cmd('stop')
+        said = mon.cmd('savevm s1')
+        saved = mon.words(RESULTS + 0x287 * 4, 1)[0]
+        mon.cmd('cont')
+        loads = []
+        for k in range(4):
+            far = wait(mon, lambda w: w > saved + 30000 * (k + 1), 'running on')
+            mon.cmd('stop')
+            mon.cmd('loadvm s1')
+            loads.append((far, mon.words(RESULTS + 0x287 * 4, 1)[0]))
+            mon.cmd('cont')
+        done = wait(mon, lambda w: w >= 1500000, 'the end')
+        bad = mon.words(RESULTS + 0x288 * 4, 1)[0]
+        nref = mon.words(RESULTS + 0x289 * 4, 2)
+    finally:
+        q.kill()
+    print(f'saved at iteration {saved}; loaded 4 times, at iterations ' +
+          ', '.join(f'{a} (back to {b})' for a, b in loads) +
+          (f'; savevm said {said.strip()!r}' if 'rror' in said else ''))
+    print(f'first results {nref[0]:08x} {nref[1]:08x}, helper {href[0]:08x} '
+          f'{href[1]:08x}; {done} iterations, {bad} results differ')
+    ok = (bad == 0 and nref == href and all(b == saved for _, b in loads)
+          and saved > 0)
+    print('restore test', 'passed' if ok else 'FAILED')
+    return not ok
+
+
 def main():
     out = tempfile.mkdtemp(prefix='ppc-vmx-')
+    if '--restore' in sys.argv:
+        sys.exit(1 if restore(out) else 0)
     img = build(out)
+    if '--xtdiff' in sys.argv:
+        sys.exit(1 if xtdiff(img, out) else 0)
     if '--spdiff' in sys.argv:
         sys.exit(1 if spdiff(img, out) else 0)
     if '--vfpdiff' in sys.argv:
@@ -328,6 +468,15 @@ def main():
             print(f'bench {name:36s} {t / tbfreq * 1e3:8.1f} ms')
         t = mon.words(RESULTS + 0x216 * 4, 1)[0]
         print(f'bench {"vnmsubfp x4 (float)":36s} {t / tbfreq * 1e3:8.1f} ms')
+        for k, name in enumerate(('GB dot fs (lfsx/lfsx/addi/fmadds/bdnz)',
+                                  'GB dot shape, double (lfdx/fmadd)',
+                                  'GB dot fs unrolled x4 (one TB)')):
+            t = mon.words(RESULTS + (0x217 + k) * 4, 1)[0]
+            print(f'bench {name:36s} {t / tbfreq * 1e3:8.1f} ms')
+        t = mon.words(RESULTS + 0x21b * 4, 1)[0]
+        print(f'bench {"GB dot fs, cold accumulator (lfd)":36s} {t / tbfreq * 1e3:8.1f} ms')
+        t = mon.words(RESULTS + 0x21c * 4, 1)[0]
+        print(f'bench {"GB convolution (lfs/fmr, 5x3 fmadds)":36s} {t / tbfreq * 1e3:8.1f} ms')
         ft, ff = mon.words(RESULTS + 0x210 * 4, 2)
         print(f'bench {"GB mandel: whole routine x4":36s} {ft / tbfreq * 1e3:8.1f} ms'
               f'  ({ff // 14} iterations)')
