@@ -245,10 +245,10 @@ static bool native_sp_branch(void)
  * next.  PPC_SP_SHADOW=1 uses them for every unknown single input and
  * stores every native single result.  Either way an FPR that an
  * instruction earlier in the TB wrote without storing its shadow
- * (ctx->sp_stale) is converted instead.  They are off by default (0):
- * mode 2 made Geekbench 2's Dot Product 40% faster, but its image filters
- * 3% and the Quake 3 and Doom 3 timedemos 1.4-1.7% slower (Doom 3 misses
- * 55% of its shadow reads).
+ * (ctx->sp_stale) is converted instead.  Mode 2 is the default;
+ * PPC_SP_SHADOW=0 turns them off.  The trade, measured against 0: Geekbench
+ * 2's Dot Product 40% faster, but its image filters 3% and the Quake 3 and
+ * Doom 3 timedemos 1.4-1.7% slower (Doom 3 misses 55% of its shadow reads).
  * PPC_SP_SHADOW_STATS=1 counts (with a helper call per op, so not for
  * timing).
  */
@@ -257,7 +257,7 @@ static int native_sp_shadow_mode(void)
     static int mode = -1;
     if (mode < 0) {
         const char *e = getenv("PPC_SP_SHADOW");
-        mode = e && e[0] >= '0' && e[0] <= '2' ? e[0] - '0' : 0;
+        mode = e && e[0] >= '0' && e[0] <= '2' ? e[0] - '0' : 2;
     }
     return mode;
 }
