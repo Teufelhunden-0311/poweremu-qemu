@@ -399,11 +399,12 @@ void helper_sp_shadow_stat(CPUPPCState *env, uint32_t code)
             uint32_t s;
             float f;
             double d;
-            uint64_t w, v = *cpu_fpr_ptr(env, r);
+            uint64_t w, v;
 
-            if (r == 0xff) {
+            if (r >= 32) {          /* 0xff: no input */
                 continue;
             }
+            v = *cpu_fpr_ptr(env, r);
             memcpy(&s, &env->fpr_sp[r], 4);
             memcpy(&f, &s, 4);
             d = f;
@@ -427,7 +428,7 @@ void helper_sp_shadow_stat(CPUPPCState *env, uint32_t code)
     if (!((hit + slow) & 0xffff)) {
         fprintf(stderr, "sp-shadow: %" PRIu64 " kept, %" PRIu64 " slow: %"
                 PRIu64 " stale shadow, %" PRIu64 " not a single, %" PRIu64
-                " other (NaN result)\n", hit, slow, miss, dbl,
+                " other slow path\n", hit, slow, miss, dbl,
                 slow - miss - dbl);
     }
 }

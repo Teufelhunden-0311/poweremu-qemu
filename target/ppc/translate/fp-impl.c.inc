@@ -308,19 +308,28 @@ static int fpr_sp_offset(int i)
 }
 
 /*
+ * Shadow stores that cannot be used are removed (here and in
+ * native_sp_tb_end()); PPC_SP_SHADOW_DSE=0 keeps them all.
+ */
+static bool native_sp_dse(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPC_SP_SHADOW_DSE");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/*
  * Store single s to the shadow of frt.  A store that a later one in the
  * TB replaces is removed: if the TB leaves before that one (a slow path,
  * an exception), the shadow is left stale, which is safe and costs one
- * slow path.  PPC_SP_SHADOW_DSE=0 keeps them all.
+ * slow path.
  */
 static void native_sp_shadow_st(DisasContext *ctx, TCGv_vec s, int frt)
 {
-    static int dse = -1;
-    if (dse < 0) {
-        const char *e = getenv("PPC_SP_SHADOW_DSE");
-        dse = !(e && e[0] == '0');
-    }
-    if (dse && ctx->sp_st[frt]) {
+    if (native_sp_dse() && ctx->sp_st[frt]) {
         tcg_op_remove(tcg_ctx, ctx->sp_st[frt]);
     }
     tcg_gen_st_vec(s, tcg_env, fpr_sp_offset(frt));
@@ -355,7 +364,7 @@ static void native_sp_tb_end(DisasContext *ctx)
     uint32_t insn = ctx->opcode, w = ctx->sp_wfirst;
     target_ulong t;
 
-    if (!w || insn & 1) {           /* LK: a call */
+    if (!w || insn & 1 || !native_sp_dse()) {      /* LK: a call */
         return;
     }
     switch (insn >> 26) {
