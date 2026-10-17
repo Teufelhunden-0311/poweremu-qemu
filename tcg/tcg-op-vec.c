@@ -820,9 +820,10 @@ void tcg_gen_vfma_vec(TCGv_vec r, TCGv_vec a, TCGv_vec c, TCGv_vec b)
 void tcg_gen_vany_vec(TCGv_i64 r, TCGv_vec a)
 {
     TCGTemp *at = tcgv_vec_temp(a);
+    bool v64 = at->base_type == TCG_TYPE_V64;
 
-    tcg_debug_assert(at->base_type == TCG_TYPE_V128);
-    vec_gen_2(INDEX_op_vany_vec, TCG_TYPE_V128, MO_32,
+    tcg_debug_assert(v64 || at->base_type == TCG_TYPE_V128);
+    vec_gen_2(INDEX_op_vany_vec, at->base_type, v64 ? MO_64 : MO_32,
               tcgv_i64_arg(r), temp_arg(at));
 }
 

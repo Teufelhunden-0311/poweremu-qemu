@@ -2877,6 +2877,11 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
                   | (a0 & 0x1f));
         break;
     case INDEX_op_vany_vec:
+        if (!is_q) {
+            /* FMOV Xd, Dn */
+            tcg_out32(s, 0x9e660000 | (a1 & 0x1f) << 5 | (a0 & 0x1f));
+            break;
+        }
         /* UMAXV S(tmp), Vn.4S; FMOV Wd, S(tmp) */
         tcg_out32(s, 0x6eb0a800 | (a1 & 0x1f) << 5 | (TCG_VEC_TMP0 & 0x1f));
         tcg_out32(s, 0x1e260000 | (TCG_VEC_TMP0 & 0x1f) << 5 | (a0 & 0x1f));
@@ -2954,8 +2959,9 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
     case INDEX_op_fcvt_vec:
         return type == TCG_TYPE_V64 && (vece == MO_32 || vece == MO_64);
     case INDEX_op_vfma_vec:
-    case INDEX_op_vany_vec:
         return type == TCG_TYPE_V128 && vece == MO_32;
+    case INDEX_op_vany_vec:
+        return type == TCG_TYPE_V128 ? vece == MO_32 : vece == MO_64;
 
     default:
         return 0;
