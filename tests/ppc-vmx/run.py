@@ -2,7 +2,7 @@
 """Build vmx_test.c as a raw mac99 firmware image, run it, report results.
 
 usage: run.py [--fpdiff | --fpdiff-strict | --vfpdiff | --spdiff | --xtdiff |
-               --restore] [path/to/qemu-system-ppc]
+               --restore | --dsectl] [path/to/qemu-system-ppc]
 
 --fpdiff runs the scalar FP cases with the inline FP ops off and on and
 compares results and FPSCR; --fpdiff-strict compares the inline results
@@ -17,6 +17,10 @@ comparing results and FPSCR bit for bit.
 --restore runs the Dot Product loops (single shadows) while saving the VM,
 letting it run on and loading the saved state again; every result must
 match the first, which must match the helper's (PPC_NATIVE_FP=0).
+--dsectl checks that PPC_SP_SHADOW_DSE=0 keeps the shadow stores that a
+TB looping to itself would drop: the read after such a loop then hits
+(PPC_SP_SHADOW_STATS), and misses once per call with the removal on; the
+results must match the helper's either way.
 --xtdiff runs single-precision chains across TBs on the helper and with the
 single shadows on (PPC_SP_SHADOW=2 and 1) and off (PPC_SP_BRANCH=0, PPC_SP_INPUTS=0,
 PPC_SP_SHADOW_DSE=0 too), comparing results and FPSCR bit for bit.
@@ -375,42 +379,99 @@ def restore(out):
             time.sleep(0.05)
         sys.exit(f'restore: timed out waiting for {what}')
 
-    env = {**os.environ, 'PPC_NATIVE_FP': '0', 'PPC_SP_PROV': '0'}
-    q, mon = start('h', env)
+    # every switch set explicitly, so the caller's environment cannot
+    # turn off the path a run is meant to take
+    base = {'PPC_NATIVE_FP': '1', 'PPC_STRICT_FP': '0', 'PPC_NATIVE_FRSP': '1',
+            'PPC_SP_PROV': '2', 'PPC_SP_FWD': '1', 'PPC_NATIVE_LFS': '1',
+            'PPC_SP_BRANCH': '1', 'PPC_SP_INPUTS': '1',
+            'PPC_SP_SHADOW_DSE': '1', 'PPC_SP_SHADOW_STATS': '0'}
+    q, mon = start('h', {**os.environ, **base, 'PPC_NATIVE_FP': '0',
+                         'PPC_SP_PROV': '0', 'PPC_SP_SHADOW': '0'})
     try:
         wait(mon, lambda w: w > 0, 'the helper run')
         href = mon.words(RESULTS + 0x289 * 4, 2)
     finally:
         q.kill()
-    env = {**os.environ, 'PPC_NATIVE_FP': '1', 'PPC_STRICT_FP': '0',
-           'PPC_SP_PROV': '2', 'PPC_SP_SHADOW': '1', 'PPC_SP_BRANCH': '1'}
-    q, mon = start('n', env)
-    try:
-        wait(mon, lambda w: w > 20000, 'the first iterations')
-        mon.cmd('stop')
-        said = mon.cmd('savevm s1')
-        saved = mon.words(RESULTS + 0x287 * 4, 1)[0]
-        mon.cmd('cont')
-        loads = []
-        for k in range(4):
-            far = wait(mon, lambda w: w > saved + 30000 * (k + 1), 'running on')
+    failed = 0
+    for mode in ('2', '1'):
+        q, mon = start('n' + mode, {**os.environ, **base, 'PPC_SP_SHADOW': mode})
+        try:
+            wait(mon, lambda w: w > 20000, 'the first iterations')
             mon.cmd('stop')
-            mon.cmd('loadvm s1')
-            loads.append((far, mon.words(RESULTS + 0x287 * 4, 1)[0]))
+            said = mon.cmd('savevm s1')
+            saved = mon.words(RESULTS + 0x287 * 4, 1)[0]
             mon.cmd('cont')
-        done = wait(mon, lambda w: w >= 1500000, 'the end')
-        bad = mon.words(RESULTS + 0x288 * 4, 1)[0]
-        nref = mon.words(RESULTS + 0x289 * 4, 2)
-    finally:
-        q.kill()
-    print(f'saved at iteration {saved}; loaded 4 times, at iterations ' +
-          ', '.join(f'{a} (back to {b})' for a, b in loads) +
-          (f'; savevm said {said.strip()!r}' if 'rror' in said else ''))
-    print(f'first results {nref[0]:08x} {nref[1]:08x}, helper {href[0]:08x} '
-          f'{href[1]:08x}; {done} iterations, {bad} results differ')
-    ok = (bad == 0 and nref == href and all(b == saved for _, b in loads)
-          and saved > 0)
-    print('restore test', 'passed' if ok else 'FAILED')
+            loads = []
+            for k in range(4):
+                far = wait(mon, lambda w: w > saved + 30000 * (k + 1), 'running on')
+                mon.cmd('stop')
+                mon.cmd('loadvm s1')
+                loads.append((far, mon.words(RESULTS + 0x287 * 4, 1)[0]))
+                mon.cmd('cont')
+            done = wait(mon, lambda w: w >= 1500000, 'the end')
+            bad = mon.words(RESULTS + 0x288 * 4, 1)[0]
+            nref = mon.words(RESULTS + 0x289 * 4, 2)
+        finally:
+            q.kill()
+        print(f'PPC_SP_SHADOW={mode}: saved at iteration {saved}; loaded 4 times, '
+              'at iterations ' +
+              ', '.join(f'{a} (back to {b})' for a, b in loads) +
+              (f'; savevm said {said.strip()!r}' if 'rror' in said else ''))
+        print(f'  first results {nref[0]:08x} {nref[1]:08x}, helper {href[0]:08x} '
+              f'{href[1]:08x}; {done} iterations, {bad} results differ')
+        ok = (bad == 0 and nref == href and all(b == saved for _, b in loads)
+              and saved > 0)
+        print(f'  restore test (PPC_SP_SHADOW={mode})', 'passed' if ok else 'FAILED')
+        failed += not ok
+    return failed
+
+
+def dsectl(img, out):
+    """Self-loop shadow-store removal: on, off, and the helper (--dsectl)."""
+    nm = subprocess.check_output([tool('llvm-nm'),
+                                  os.path.join(out, 'vmx_test.elf')], text=True)
+    sym = {l.split()[2]: int(l.split()[0], 16) for l in nm.splitlines()
+           if len(l.split()) == 3}
+    rng = f"{sym['sp_selfloop']:#x}-{sym['sp_selfloop_end'] - 1:#x}"
+    base = {'PPC_NATIVE_FP': '1', 'PPC_STRICT_FP': '0', 'PPC_NATIVE_FRSP': '1',
+            'PPC_SP_PROV': '2', 'PPC_SP_FWD': '1', 'PPC_NATIVE_LFS': '1',
+            'PPC_SP_BRANCH': '1', 'PPC_SP_INPUTS': '1', 'PPC_SP_SHADOW': '2',
+            'PPC_SP_SHADOW_STATS': rng}
+    runs = [('helper', {'PPC_NATIVE_FP': '0', 'PPC_SP_PROV': '0',
+                        'PPC_SP_SHADOW': '0', 'PPC_SP_SHADOW_STATS': '0'}),
+            ('removal on', {'PPC_SP_SHADOW_DSE': '1'}),
+            ('PPC_SP_SHADOW_DSE=0', {'PPC_SP_SHADOW_DSE': '0'})]
+    got = {}
+    for k, (tag, extra) in enumerate(runs):
+        sock = os.path.join(out, f'mond{k}.sock')
+        errf = os.path.join(out, f'dsectl{k}.err')
+        with open(errf, 'w') as err:
+            q = subprocess.Popen([QEMU, '-M', 'mac99', '-cpu', '7450', '-m', '64',
+                                  '-bios', img, '-display', 'none',
+                                  '-serial', 'none', '-monitor',
+                                  f'unix:{sock},server=on,wait=off'],
+                                 stdout=subprocess.DEVNULL, stderr=err,
+                                 env={**os.environ, **base, **extra})
+            try:
+                mon = Monitor(sock)
+                for _ in range(2400):
+                    if mon.words(RESULTS, 1) == [0x564d5854]:
+                        break
+                    time.sleep(0.25)
+                else:
+                    sys.exit('test did not finish')
+                ref, bad = mon.words(RESULTS + 0x28b * 4, 2)
+            finally:
+                q.kill()
+        stat = [l for l in open(errf) if l.startswith('sp-shadow:') and 'kept' in l]
+        m = re.search(r'(\d+) kept, (\d+) slow: (\d+) stale', stat[-1]) if stat else None
+        got[tag] = (ref, bad, tuple(int(x) for x in m.groups()) if m else None)
+        print(f'{tag}: first result {ref:08x}, {bad} results differ'
+              + (f'; shadow reads {m.group(1)} kept, {m.group(3)} stale' if m else ''))
+    h, on, off = (got[t] for t, _ in runs)
+    ok = (on[:2] == h[:2] and off[:2] == h[:2] and h[1] == 0
+          and on[2] == (0, 65536, 65536) and off[2] == (65536, 0, 0))
+    print('dsectl test', 'passed' if ok else 'FAILED')
     return not ok
 
 
@@ -419,6 +480,8 @@ def main():
     if '--restore' in sys.argv:
         sys.exit(1 if restore(out) else 0)
     img = build(out)
+    if '--dsectl' in sys.argv:
+        sys.exit(1 if dsectl(img, out) else 0)
     if '--xtdiff' in sys.argv:
         sys.exit(1 if xtdiff(img, out) else 0)
     if '--spdiff' in sys.argv:

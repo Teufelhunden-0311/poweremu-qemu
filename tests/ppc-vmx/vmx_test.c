@@ -1626,6 +1626,52 @@ static void restore_test(void)
     }
 }
 
+/*
+ * Dead shadow-store removal at the end of a TB that loops to itself
+ * (fp-impl.c.inc native_sp_tb_end()): the loop TB writes f0 with lfsx
+ * before fmuls f0,f0,k, so its shadow store of f0 is removed; the fadds
+ * after the loop, in a TB of its own, then reads f0's shadow.  run.py
+ * --dsectl counts that read's misses: one per call with removal, none
+ * with PPC_SP_SHADOW_DSE=0, and the results the helper's either way.
+ * res[0x28b] the first result's bits, [0x28c] results that differ.
+ */
+__attribute__((noinline, used)) float sp_selfloop(const float *a, float *b, int n,
+                                                  float k, float c)
+{
+    float s; int x;
+    asm volatile("mtctr %4\n\tli %1,0\n\t.p2align 4\n"
+                 "1:\tlfsx %0,%2,%1\n\tfmuls %0,%0,%5\n\tstfsx %0,%3,%1\n\t"
+                 "addi %1,%1,4\n\tbdnz 1b\n\tb 2f\n2:\tfadds %0,%0,%6"
+                 : "=&f"(s), "=&b"(x) : "b"(a), "b"(b), "r"(n), "f"(k), "f"(c)
+                 : "ctr", "memory");
+    return s;
+}
+__attribute__((noinline, used)) void sp_selfloop_end(void)
+{
+}
+
+static void selfloop_test(void)
+{
+    float *a = (float *)0x00380000, *b = a + 64;
+    uint32_t ref, w, bad = 0;
+    float r;
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        a[i] = i * 0.75f - 2;
+    }
+    r = sp_selfloop(a, b, 4, 1.25f, 0.5f);
+    memcpy(&ref, &r, 4);
+    for (i = 1; i < 65536; i++) {
+        r = sp_selfloop(a, b, 4, 1.25f, 0.5f);
+        memcpy(&w, &r, 4);
+        bad += w != ref;
+    }
+    res[0x28b] = ref;
+    res[0x28c] = bad;
+    sp_selfloop_end();
+}
+
 int main(void)
 {
     uint32_t seed = 0x2545f491;
@@ -1690,6 +1736,7 @@ int main(void)
     vfp_diff(&seed);
     sp_diff(&seed);
     xt_diff(&seed);
+    selfloop_test();
     bench();
     res[0] = 0x564d5854; /* 'VMXT' */
     return 0;
