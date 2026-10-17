@@ -172,6 +172,7 @@ typedef struct NativeFPSlow {
     target_ulong next;      /* address of the following instruction */
     int op, frt, x, y, z;
     TCGv_i32 w;             /* NATIVE_LFS: the loaded word */
+    uint32_t stat;          /* for helper_sp_shadow_stat, or 0 */
 } NativeFPSlow;
 
 struct DisasContext {
@@ -189,6 +190,19 @@ struct DisasContext {
      */
     uint32_t fpr_single, sp_set, fpr_sval, sval_set;
     TCGv_vec sp_val[32];
+    TCGOp *sp_st[32];   /* each FPR's last shadow store in this TB, or NULL */
+    uint32_t sp_rec;    /* FPRs an op in this TB read from their shadow */
+    /*
+     * sp_stale: FPRs written earlier in this TB by an instruction that did
+     * not store their shadow (so it does not match); sp_shst: those whose
+     * shadow the current instruction stored.
+     */
+    uint32_t sp_stale, sp_shst;
+    /*
+     * sp_written: FPRs written in this TB; sp_wfirst: of them, those
+     * written before any op read them from their shadow
+     */
+    uint32_t sp_written, sp_wfirst;
     target_ulong cia;  /* current instruction address */
     uint32_t opcode;
     /* Routine used to access memory */
@@ -6569,6 +6583,10 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->n_nfp = 0;
     ctx->fpr_single = 0;
     ctx->fpr_sval = 0;
+    memset(ctx->sp_st, 0, sizeof(ctx->sp_st));
+    ctx->sp_rec = 0;
+    ctx->sp_stale = 0;
+    ctx->sp_written = ctx->sp_wfirst = 0;
     ctx->pr = (hflags >> HFLAGS_PR) & 1;
     ctx->mem_idx = (hflags >> HFLAGS_DMMU_IDX) & 7;
     if (!(ctx->mem_idx & 2)) {
@@ -6653,6 +6671,7 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     keep = native_sp_keep(ctx, insn);
     ctx->sp_set = 0;
     ctx->sval_set = 0;
+    ctx->sp_shst = 0;
     last = tcg_last_op();
     if (!is_prefix_insn(ctx, insn)) {
         ctx->opcode = insn;
@@ -6676,6 +6695,9 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
         gen_invalid(ctx);
     }
     ctx->fpr_single = (ctx->fpr_single & keep) | ctx->sp_set;
+    ctx->sp_stale = (ctx->sp_stale | ~keep) & ~ctx->sp_shst;
+    ctx->sp_wfirst |= ~keep & ~ctx->sp_written & ~ctx->sp_rec;
+    ctx->sp_written |= ~keep;
     if (ctx->fpr_sval && native_sp_label_since(last)) {
         ctx->fpr_sval = 0;
     }
@@ -6769,6 +6791,7 @@ static void ppc_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
     DisasContext *ctx = container_of(dcbase, DisasContext, base);
 
     ppc_tr_tb_exit(dcbase, cs);
+    native_sp_tb_end(ctx);
     /* out of line, after the TB's exit, so the fast paths never branch */
     native_fp_emit_slow_paths(ctx);
 }

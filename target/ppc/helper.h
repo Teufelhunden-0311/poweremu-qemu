@@ -92,6 +92,7 @@ DEF_HELPER_3(store_fpscr, void, env, i64, i32)
 DEF_HELPER_2(fpscr_clrbit, void, env, i32)
 DEF_HELPER_2(fpscr_setbit, void, env, i32)
 DEF_HELPER_1(fprf_sync, void, env)
+DEF_HELPER_FLAGS_2(sp_shadow_stat, TCG_CALL_NO_WG, void, env, i32)
 DEF_HELPER_FLAGS_1(todouble, TCG_CALL_NO_RWG_SE, i64, i32)
 DEF_HELPER_FLAGS_1(tosingle, TCG_CALL_NO_RWG_SE, i32, i64)
 

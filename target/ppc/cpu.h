@@ -1239,6 +1239,13 @@ struct CPUArchState {
      * so translated code reaches it with a single store.
      */
     uint64_t fprf_res;
+    /*
+     * Single-precision shadows of the FPRs for the inline FP ops (see
+     * native_sp_shadow() in fp-impl.c.inc): each slot's low 32 bits as a
+     * host vector register holds them.  Derived state, usable only while
+     * converting it to double gives the FPR's bits; never migrated.
+     */
+    uint64_t fpr_sp[32];
 
     target_ulong reserve_addr;   /* Reservation address */
     target_ulong reserve_length; /* Reservation larx op size (bytes) */

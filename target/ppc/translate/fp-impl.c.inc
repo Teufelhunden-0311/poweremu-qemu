@@ -193,6 +193,205 @@ static bool native_sp_fwd(DisasContext *ctx)
     return on && !ctx->base.plugin_enabled && native_sp_prov(ctx);
 }
 
+/*
+ * A single input that is not known to be one is checked by converting it
+ * to single and back: the bits must not change.  PPC_SP_BRANCH=1 (the
+ * default) branches to the slow path if they do; 0 instead makes the
+ * result a NaN (ORN with the check's mask), which takes the slow path
+ * further on, but puts the check on the result's dependency chain.
+ */
+static bool native_sp_branch(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPC_SP_BRANCH");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/*
+ * Single shadows, across TBs.  A loop's single-precision accumulator
+ * crosses a TB boundary every iteration, so the facts above never cover
+ * it, and each iteration loads the double, converts it to single for the
+ * op, back to double for the check, and the result to double for the FPR.
+ * A native single op (or frsp) that keeps its result can also store its
+ * single to env->fpr_sp[frt] (see below for which do).  An unknown single
+ * input can then come from there, and the check is that the shadow
+ * converted to double has the FPR's bits; only the slow-path branch
+ * depends on that.
+ *
+ * Nothing invalidates a shadow, as none is needed.  Converting a single to
+ * double is exact and one-to-one for every value but NaNs (with gradual
+ * underflow, which the native ops assume anyway), so equal bits mean the
+ * shadow is the FPR's value, whichever instruction wrote the FPR last; any
+ * other bits, and the op takes the slow path as for a double.  A NaN
+ * shadow that passes makes the result a NaN, which takes the slow path
+ * before anything is written, as above; the helper there reads the FPRs.
+ * A slow path refreshes the shadows of its single op's FPRs, inputs and
+ * result, from the FPRs, so a stale shadow costs one slow path, not one
+ * per iteration.  The FPRs stay the architected state; the shadows are
+ * not migrated, and any bits there are safe.
+ *
+ * A shadow that a later TB does not read only costs its store, and one
+ * that is read but not written (by lfs, fmr, a double op) costs a slow
+ * path each time, where the conversion would have passed.  So by default
+ * (PPC_SP_SHADOW=2) only recurrences use them, x = f(x, ...) carried from
+ * one TB to the next as a loop's accumulator is: an op reads an unknown
+ * input from its shadow only if it is also the op's target, and an op
+ * stores its result's shadow if its target is one of its inputs, or an op
+ * earlier in the TB read that FPR from its shadow.  So a TB that sets an
+ * accumulator (lfs, fmr) and starts the loop leaves its shadow for the
+ * next.  PPC_SP_SHADOW=1 uses them for every unknown single input and
+ * stores every native single result; 0 turns them off.  Either way an
+ * FPR that an instruction earlier in the TB wrote without storing its
+ * shadow (ctx->sp_stale) is converted instead.
+ * PPC_SP_SHADOW_STATS=1 counts (with a helper call per op, so not for
+ * timing).
+ */
+static int native_sp_shadow_mode(void)
+{
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("PPC_SP_SHADOW");
+        mode = e && e[0] >= '0' && e[0] <= '2' ? e[0] - '0' : 2;
+    }
+    return mode;
+}
+
+static bool native_sp_shadow(DisasContext *ctx)
+{
+    return native_sp_shadow_mode() && native_sp_branch()
+           && native_sp_prov(ctx);
+}
+
+/* Whether a single op writing frt reads unknown input regno's shadow */
+static bool native_sp_shadow_in(DisasContext *ctx, int regno, int frt)
+{
+    return native_sp_shadow(ctx) && !(ctx->sp_stale & (1u << regno))
+           && (native_sp_shadow_mode() == 1 || regno == frt);
+}
+
+/*
+ * Whether a native single op (or frsp) stores frt's shadow; in is the op's
+ * input FPRs (0 for frsp)
+ */
+static bool native_sp_shadow_out(DisasContext *ctx, int frt, uint32_t in)
+{
+    return native_sp_shadow(ctx)
+           && (native_sp_shadow_mode() == 1
+               || (ctx->sp_rec | in) & (1u << frt));
+}
+
+/* PPC_SP_SHADOW_STATS=1, or =lo-hi to count only guest code from lo to hi */
+static bool native_sp_shadow_stats(DisasContext *ctx)
+{
+    static int on = -1;
+    static target_ulong lo, hi;
+    if (on < 0) {
+        const char *e = getenv("PPC_SP_SHADOW_STATS");
+        char *end;
+
+        on = e && e[0] && strcmp(e, "0");
+        hi = -1;
+        if (on && e[0] != '1') {
+            lo = strtoul(e, &end, 0);
+            hi = *end == '-' ? strtoul(end + 1, NULL, 0) : lo;
+        }
+    }
+    return on && ctx->cia >= lo && ctx->cia <= hi;
+}
+
+static int fpr_sp_offset(int i)
+{
+    return offsetof(CPUPPCState, fpr_sp[i]);
+}
+
+/*
+ * Store single s to the shadow of frt.  A store that a later one in the
+ * TB replaces is removed: if the TB leaves before that one (a slow path,
+ * an exception), the shadow is left stale, which is safe and costs one
+ * slow path.  PPC_SP_SHADOW_DSE=0 keeps them all.
+ */
+static void native_sp_shadow_st(DisasContext *ctx, TCGv_vec s, int frt)
+{
+    static int dse = -1;
+    if (dse < 0) {
+        const char *e = getenv("PPC_SP_SHADOW_DSE");
+        dse = !(e && e[0] == '0');
+    }
+    if (dse && ctx->sp_st[frt]) {
+        tcg_op_remove(tcg_ctx, ctx->sp_st[frt]);
+    }
+    tcg_gen_st_vec(s, tcg_env, fpr_sp_offset(frt));
+    ctx->sp_st[frt] = tcg_last_op();
+    ctx->sp_shst |= 1u << frt;
+}
+
+/*
+ * The inputs of a native single op that it checked are singles after it,
+ * as the op takes its slow path otherwise: they become facts too, and
+ * forwarded.  PPC_SP_INPUTS=0 turns this off.
+ */
+static bool native_sp_inputs(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPC_SP_INPUTS");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/*
+ * At the end of a TB that branches back to its own start (a loop of one
+ * TB): a shadow stored for an FPR that the TB writes before reading it
+ * from its shadow is overwritten before the next iteration can use it
+ * (lfsx f0 / fmuls f0,f0,f1 / stfsx f0), so the store is removed.  After
+ * the loop's last iteration the shadow is then stale, which is safe.
+ */
+static void native_sp_tb_end(DisasContext *ctx)
+{
+    uint32_t insn = ctx->opcode, w = ctx->sp_wfirst;
+    target_ulong t;
+
+    if (!w || insn & 1) {           /* LK: a call */
+        return;
+    }
+    switch (insn >> 26) {
+    case 18:                        /* b */
+        t = sextract32(insn, 0, 26) & ~3;
+        break;
+    case 16:                        /* bc */
+        t = sextract32(insn, 0, 16) & ~3;
+        break;
+    default:
+        return;
+    }
+    if (!(insn & 2)) {              /* not AA */
+        t += ctx->cia;
+    }
+    if (t != ctx->base.pc_first) {
+        return;
+    }
+    for (int r = 0; r < 32; r++) {
+        if (w & (1u << r) && ctx->sp_st[r]) {
+            tcg_op_remove(tcg_ctx, ctx->sp_st[r]);
+            ctx->sp_st[r] = NULL;
+        }
+    }
+}
+
+/* Set the shadow of FPR regno from the FPR (in a slow path) */
+static void native_sp_refresh(int regno)
+{
+    TCGv_vec v = tcg_temp_new_vec(TCG_TYPE_V64);
+
+    tcg_gen_ld_vec(v, tcg_env, fpr_offset(regno));
+    tcg_gen_fcvt_vec(false, v, v);
+    tcg_gen_st_vec(v, tcg_env, fpr_sp_offset(regno));
+}
+
 /* Whether an op after last (NULL: from the start) sets a label */
 static bool native_sp_label_since(TCGOp *last)
 {
@@ -257,9 +456,12 @@ static void native_sp_stats(bool known)
  * Load FPR regno, as a single if single; then ok is cleared (from all
  * ones) if it does not convert to single and back unchanged, unless it
  * is known to hold a single (ok NULL, or regno in ctx->fpr_single).
+ * With its shadow (native_sp_shadow_in() for an op writing frt), the
+ * single is the shadow's, and ok is cleared unless it converts to the
+ * FPR's double.
  */
 static TCGv_vec native_load(DisasContext *ctx, int regno, bool single,
-                            TCGv_vec ok)
+                            TCGv_vec ok, int frt)
 {
     TCGv_vec v;
 
@@ -281,7 +483,12 @@ static TCGv_vec native_load(DisasContext *ctx, int regno, bool single,
         TCGv_vec s = tcg_temp_new_vec(TCG_TYPE_V64);
         TCGv_vec d = tcg_temp_new_vec(TCG_TYPE_V64);
 
-        tcg_gen_fcvt_vec(false, s, v);
+        if (native_sp_shadow_in(ctx, regno, frt)) {
+            tcg_gen_ld_vec(s, tcg_env, fpr_sp_offset(regno));
+            ctx->sp_rec |= 1u << regno;
+        } else {
+            tcg_gen_fcvt_vec(false, s, v);
+        }
         tcg_gen_fcvt_vec(true, d, s);
         tcg_gen_cmp_vec(TCG_COND_EQ, MO_64, d, d, v);
         tcg_gen_and_vec(MO_64, ok, ok, d);
@@ -304,6 +511,7 @@ static void native_fp_op(DisasContext *ctx, int op, int frt,
     TCGv_vec r = tcg_temp_new_vec(TCG_TYPE_V64), rs = r;
     TCGv_vec ok = NULL, vx, vy, vz = NULL;
     TCGv_i64 res = tcg_temp_new_i64();
+    uint32_t unknown = 0;
 
     *sp = (NativeFPSlow) {
         .slow = gen_new_label(), .next = ctx->base.pc_next,
@@ -315,10 +523,25 @@ static void native_fp_op(DisasContext *ctx, int op, int frt,
         ok = tcg_temp_new_vec(TCG_TYPE_V64);
         tcg_gen_dupi_vec(MO_64, ok, -1);
     }
-    vx = native_load(ctx, x, single, ok);
-    vy = native_load(ctx, y, single, ok);
+    if (ok && native_sp_shadow(ctx) && native_sp_shadow_stats(ctx)) {
+        /* the inputs that take the shadow, for helper_sp_shadow_stat */
+        int in[3] = { x, y, fma ? z : -1 };
+
+        unknown = 0xffffff00;
+        for (int i = 0; i < 3; i++) {
+            if (in[i] >= 0 && !(ctx->fpr_single & (1u << in[i]))
+                && native_sp_shadow_in(ctx, in[i], frt)) {
+                unknown &= ~(0xffu << (8 + 8 * i));
+                unknown |= (uint32_t)in[i] << (8 + 8 * i);
+            }
+        }
+        sp->stat = unknown != 0xffffff00 ? unknown : 0;
+    }
+    /* an FPR read twice is loaded (and checked) once */
+    vx = native_load(ctx, x, single, ok, frt);
+    vy = y == x ? vx : native_load(ctx, y, single, ok, frt);
     if (fma) {
-        vz = native_load(ctx, z, single, ok);
+        vz = z == x ? vx : z == y ? vy : native_load(ctx, z, single, ok, frt);
         tcg_gen_ffma_vec(vece, (op - 16) >> 1, r, vx, vy, vz);
     } else {
         tcg_gen_fop_vec(vece, op >> 1, r, vx, vy);
@@ -328,7 +551,13 @@ static void native_fp_op(DisasContext *ctx, int op, int frt,
         r = tcg_temp_new_vec(TCG_TYPE_V64);
         tcg_gen_fcvt_vec(true, r, rs);
     }
-    if (ok) {
+    if (ok && native_sp_branch()) {
+        TCGv_i64 t = tcg_temp_new_i64();
+
+        /* every input a single, or the slow path */
+        tcg_gen_vany_vec(t, ok);
+        tcg_gen_brcondi_i64(TCG_COND_NE, t, -1, sp->slow);
+    } else if (ok) {
         /* all ones, a NaN, unless every input was a single */
         tcg_gen_orc_vec(MO_64, r, r, ok);
     }
@@ -346,6 +575,29 @@ static void native_fp_op(DisasContext *ctx, int op, int frt,
     if (ctx->insns_flags2 & PPC2_VSX) {
         /* as set_fpr(); without VSX nothing else writes doubleword 1 */
         tcg_gen_st_i64(tcg_constant_i64(0), tcg_env, vsr64_offset(frt, false));
+    }
+    if (single && native_sp_shadow_out(ctx, frt, (1u << x) | (1u << y) |
+                                       (fma ? 1u << z : 0))) {
+        native_sp_shadow_st(ctx, rs, frt);
+    }
+    if (single && native_sp_shadow(ctx)) {
+        if (unknown != 0 && unknown != 0xffffff00) {
+            gen_helper_sp_shadow_stat(tcg_env, tcg_constant_i32(unknown));
+        }
+    }
+    if (ok && native_sp_prov(ctx) && native_sp_inputs()) {
+        int in[3] = { x, y, fma ? z : -1 };
+        TCGv_vec v[3] = { vx, vy, vz };
+
+        for (int i = 0; i < 3; i++) {
+            if (in[i] >= 0 && !(ctx->fpr_single & (1u << in[i]))) {
+                ctx->sp_set |= 1u << in[i];
+                if (native_sp_fwd(ctx)) {
+                    ctx->sp_val[in[i]] = v[i];
+                    ctx->sval_set |= 1u << in[i];
+                }
+            }
+        }
     }
     if (single && native_sp_prov(ctx)) {
         ctx->sp_set |= 1u << frt;
@@ -548,6 +800,9 @@ static void native_frsp(DisasContext *ctx, int frt, int frb)
     if (ctx->insns_flags2 & PPC2_VSX) {
         tcg_gen_st_i64(tcg_constant_i64(0), tcg_env, vsr64_offset(frt, false));
     }
+    if (native_sp_shadow_out(ctx, frt, 0)) {
+        native_sp_shadow_st(ctx, s, frt);
+    }
     if (native_sp_prov(ctx)) {
         ctx->sp_set |= 1u << frt;
         if (native_sp_fwd(ctx)) {
@@ -616,6 +871,9 @@ static void native_fp_emit_slow_paths(DisasContext *ctx)
             tcg_gen_lookup_and_goto_ptr();
             continue;
         }
+        if (sp->stat) {
+            gen_helper_sp_shadow_stat(tcg_env, tcg_constant_i32(sp->stat | 1));
+        }
         if (sp->z >= 0) {
             TCGv_i64 t2 = tcg_temp_new_i64();
             get_fpr(t2, sp->z);
@@ -624,6 +882,17 @@ static void native_fp_emit_slow_paths(DisasContext *ctx)
             gen_helper_fastfp_ab(t3, tcg_env, t0, t1, op);
         }
         set_fpr(sp->frt, t3);
+        if (native_single(sp->op) && native_sp_shadow(ctx)) {
+            /* each from its FPR as it is now, frt's the result */
+            native_sp_refresh(sp->x);
+            native_sp_refresh(sp->y);
+            if (sp->z >= 0) {
+                native_sp_refresh(sp->z);
+            }
+            if (sp->frt != sp->x && sp->frt != sp->y && sp->frt != sp->z) {
+                native_sp_refresh(sp->frt);
+            }
+        }
         gen_update_nip(ctx, sp->next);
         tcg_gen_lookup_and_goto_ptr();
     }

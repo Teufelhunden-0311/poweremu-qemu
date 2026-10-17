@@ -370,6 +370,68 @@ void helper_fprf_sync(CPUPPCState *env)
     ppc_fprf_sync(env);
 }
 
+/*
+ * PPC_SP_SHADOW_STATS=1 (fp-impl.c.inc): code is a native single op's
+ * FPR inputs, 8 bits each from bit 8 (0xff for none), that took their
+ * single from the shadow; bit 0 set on its slow path.  Diagnostic only.
+ */
+void helper_sp_shadow_stat(CPUPPCState *env, uint32_t code)
+{
+    static uint64_t hit, slow, miss, dbl;
+    bool shadow_miss = false, not_single = false;
+
+#ifdef __aarch64__
+    if (!(hit + slow)) {
+        uint64_t fpcr;
+
+        /* the native ops assume gradual underflow: FZ (bit 24) clear */
+        asm volatile("mrs %0, fpcr" : "=r"(fpcr));
+        fprintf(stderr, "sp-shadow: vCPU thread FPCR %#" PRIx64 "\n", fpcr);
+    }
+#endif
+
+    if (!(code & 1)) {
+        hit++;
+    } else {
+        slow++;
+        for (int i = 8; i < 32; i += 8) {
+            int r = (code >> i) & 0xff;
+            uint32_t s;
+            float f;
+            double d;
+            uint64_t w, v = *cpu_fpr_ptr(env, r);
+
+            if (r == 0xff) {
+                continue;
+            }
+            memcpy(&s, &env->fpr_sp[r], 4);
+            memcpy(&f, &s, 4);
+            d = f;
+            memcpy(&w, &d, 8);
+            if (w != v) {
+                float g;
+                double e;
+                uint64_t u;
+
+                memcpy(&e, &v, 8);
+                g = e;
+                e = g;
+                memcpy(&u, &e, 8);
+                shadow_miss |= u == v;      /* a single, not the shadow's */
+                not_single |= u != v;
+            }
+        }
+        miss += shadow_miss;
+        dbl += not_single && !shadow_miss;
+    }
+    if (!((hit + slow) & 0xffff)) {
+        fprintf(stderr, "sp-shadow: %" PRIu64 " kept, %" PRIu64 " slow: %"
+                PRIu64 " stale shadow, %" PRIu64 " not a single, %" PRIu64
+                " other (NaN result)\n", hit, slow, miss, dbl,
+                slow - miss - dbl);
+    }
+}
+
 void helper_fpscr_clrbit(CPUPPCState *env, uint32_t bit)
 {
     uint32_t mask = 1u << bit;
