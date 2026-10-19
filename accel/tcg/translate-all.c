@@ -288,6 +288,65 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
     return tcg_gen_code(tcg_ctx, tb, pc);
 }
 
+/*
+ * Debug only (tbmap branch, not for merging): QEMU_TBMAP=FILE logs each
+ * generated translation so host profiler addresses can be mapped back to
+ * guest code.  Lines:
+ *   B <code_gen_buffer> <size>                      once, at the first TB
+ *   T <us> <host rx> <size> <guest pc> <tb flags> <icount> <phys page0> <end offsets,...>
+ *   X <us> <host rx>     the TB just logged was discarded (code space reused)
+ *   F <us> <flush count> code cache flushed; earlier T lines are void
+ */
+static FILE *tbmap;
+
+static void tbmap_close(void)
+{
+    if (tbmap) {
+        fclose(tbmap);
+        tbmap = NULL;
+    }
+}
+
+static bool tbmap_on(void)
+{
+    static int state;   /* 0 unknown, 1 on, -1 off */
+    if (state == 0) {
+        const char *f = getenv("QEMU_TBMAP");
+        tbmap = f ? fopen(f, "w") : NULL;
+        state = tbmap ? 1 : -1;
+        if (tbmap) {
+            setvbuf(tbmap, NULL, _IOFBF, 1 << 20);
+            fprintf(tbmap, "B %p %zu\n",
+                    tcg_splitwx_to_rx(tcg_ctx->code_gen_buffer),
+                    tcg_ctx->code_gen_buffer_size);
+            atexit(tbmap_close);
+        }
+    }
+    return state > 0;
+}
+
+void tbmap_flush_event(unsigned count)
+{
+    if (tbmap_on()) {
+        fprintf(tbmap, "F %" PRId64 " %u\n", g_get_real_time(), count);
+        fflush(tbmap);
+    }
+}
+
+static void tbmap_report(TranslationBlock *tb, vaddr pc, const void *rx)
+{
+    if (!tbmap_on()) {
+        return;
+    }
+    fprintf(tbmap, "T %" PRId64 " %p %zu %" VADDR_PRIx " %x %u %" PRIx64 " ",
+            g_get_real_time(), rx, tb->tc.size, pc, tb->flags, tb->icount,
+            (uint64_t)tb_page_addr0(tb));
+    for (unsigned i = 0; i < tb->icount; i++) {
+        fprintf(tbmap, i ? ",%u" : "%u", tcg_ctx->gen_insn_end_off[i]);
+    }
+    fputc('\n', tbmap);
+}
+
 /* Called with mmap_lock held for user mode emulation.  */
 TranslationBlock *tb_gen_code(CPUState *cpu,
                               vaddr pc, uint64_t cs_base,
@@ -440,6 +499,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
      * to its first mapping.
      */
     perf_report_code(pc, tb, tcg_splitwx_to_rx(gen_code_buf));
+    tbmap_report(tb, pc, tcg_splitwx_to_rx(gen_code_buf));
 
     if (qemu_loglevel_mask(CPU_LOG_TB_OUT_ASM) &&
         qemu_log_in_addr_range(pc)) {
@@ -573,6 +633,9 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
 
         orig_aligned -= ROUND_UP(sizeof(*tb), qemu_icache_linesize);
         qatomic_set(&tcg_ctx->code_gen_ptr, (void *)orig_aligned);
+        if (tbmap) {
+            fprintf(tbmap, "X %" PRId64 " %p\n", g_get_real_time(), tb->tc.ptr);
+        }
         tcg_tb_remove(tb);
         return existing_tb;
     }

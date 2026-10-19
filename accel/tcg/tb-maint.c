@@ -784,6 +784,7 @@ static void do_tb_flush(CPUState *cpu, run_on_cpu_data tb_flush_count)
     tcg_region_reset_all();
     /* XXX: flush processor icache at this point if cache flush is expensive */
     qatomic_inc(&tb_ctx.tb_flush_count);
+    tbmap_flush_event(tb_ctx.tb_flush_count);
 
 done:
     mmap_unlock();
