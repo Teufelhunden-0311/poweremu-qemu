@@ -1320,7 +1320,6 @@ struct CPUArchState {
 
     /* Other registers */
     target_ulong spr[1024]; /* special purpose registers */
-    ppc_spr_t spr_cb[1024];
     /* Composite status for PMC[1-6] enabled and counting insns or cycles. */
     uint8_t pmc_ins_cnt;
     uint8_t pmc_cyc_cnt;
@@ -1455,6 +1454,13 @@ struct CPUArchState {
      * running cycles.
      */
     uint64_t pmu_base_time;
+
+    /*
+     * Last: at 64 KB it would otherwise put vsr[], fpscr and fp_status
+     * beyond the reach of one host load from env (32 KB for 8 bytes on
+     * AArch64), costing two extra instructions per FPR or AVR access.
+     */
+    ppc_spr_t spr_cb[1024];
 };
 
 #define THREAD_SIBLING_FOREACH(cs, cs_sibling)                  \
