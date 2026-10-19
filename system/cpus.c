@@ -711,7 +711,8 @@ typedef struct {
     const char *file;
     int line;
     char thread[16];
-    uint64_t n, wait, wait_max, hist[WP_NHIST], hold;
+    uint64_t n, wait, wait_max, hist[WP_NHIST], hold, hhist[WP_NHIST];
+    uint64_t out, out_n;    /* this thread's time without the BQL before this acquire */
 } WPSite;
 #define WP_NSITES 256
 static WPSite wp_site[WP_NSITES];
@@ -725,7 +726,9 @@ typedef struct { uint16_t site; int64_t t0, t1; } WPHold;
 static WPHold wp_ring[WP_RING];
 static uint64_t wp_ring_head;
 static __thread int wp_cur = -1;
-static __thread int64_t wp_hold_t0;
+static __thread int64_t wp_hold_t0, wp_last_rel;
+/* Accounting checks: waits >= 1 us (total, attributed to holds, free), lost records. */
+static uint64_t wp_w1, wp_w1_owned, wp_w1_free, wp_ring_trunc, wp_pair_drop, wp_site_drop;
 static __thread char wp_tname[16];
 static int64_t wp_last_dump;
 #define WP_FREE 0xffff
@@ -746,6 +749,7 @@ static int wp_site_find(const char *file, int line)
         }
     }
     if (wp_nsites == WP_NSITES) {
+        wp_site_drop++;
         return -1;
     }
     WPSite *s = &wp_site[wp_nsites];
@@ -766,6 +770,8 @@ static void wp_pair_add(int w, int o, int64_t ns)
     }
     if (wp_npairs < WP_NPAIRS) {
         wp_pair[wp_npairs++] = (WPPair){ w, o, ns, 1 };
+    } else {
+        wp_pair_drop++;
     }
 }
 
@@ -784,12 +790,17 @@ static void wp_acquired(const char *file, int line, int64_t t_req)
     s->wait += wait;
     s->wait_max = MAX(s->wait_max, wait);
     s->hist[wp_bucket(wait)]++;
+    if (wp_last_rel) {
+        s->out += now - wp_last_rel;
+        s->out_n++;
+    }
     if (wait < 1000) {
         return;
     }
     /* Split the wait among the holds that overlapped it (newest first). */
     int64_t owned = 0;
-    for (uint64_t k = 0; k < WP_RING && k < wp_ring_head; k++) {
+    uint64_t k;
+    for (k = 0; k < WP_RING && k < wp_ring_head; k++) {
         WPHold *h = &wp_ring[(wp_ring_head - 1 - k) % WP_RING];
         if (h->t1 <= t_req) {
             break;
@@ -800,8 +811,14 @@ static void wp_acquired(const char *file, int line, int64_t t_req)
             owned += ov;
         }
     }
+    if (k == WP_RING) {
+        wp_ring_trunc++;        /* older holds overwritten: attribution incomplete */
+    }
+    wp_w1 += wait;
+    wp_w1_owned += owned;
     if (wait > owned) {
         wp_pair_add(w, WP_FREE, wait - owned);
+        wp_w1_free += wait - owned;
     }
 }
 
@@ -811,8 +828,10 @@ static bool wp_release(void)
     int64_t now = get_clock();
     if (wp_cur >= 0) {
         wp_site[wp_cur].hold += now - wp_hold_t0;
+        wp_site[wp_cur].hhist[wp_bucket(now - wp_hold_t0)]++;
         wp_ring[wp_ring_head++ % WP_RING] = (WPHold){ wp_cur, wp_hold_t0, now };
     }
+    wp_last_rel = now;
     return wp_last_dump && now - wp_last_dump >= 10 * NANOSECONDS_PER_SECOND;
 }
 
@@ -825,6 +844,7 @@ static struct {
     WPIdle idle[WP_NIDLE];
     int nidle;
     uint64_t execlat, execlat_n, kicks;
+    uint64_t w1, w1_owned, w1_free, ring_trunc, pair_drop, site_drop;
 } wp_snap;
 
 /* Under the BQL: copy and reset. */
@@ -844,9 +864,17 @@ static void wp_snapshot(void)
     wp_snap.kicks = qatomic_xchg(&wp_kicks, 0);
     for (int i = 0; i < wp_nsites; i++) {
         WPSite *s = &wp_site[i];
-        s->n = s->wait = s->wait_max = s->hold = 0;
+        s->n = s->wait = s->wait_max = s->hold = s->out = s->out_n = 0;
         memset(s->hist, 0, sizeof(s->hist));
+        memset(s->hhist, 0, sizeof(s->hhist));
     }
+    wp_snap.w1 = wp_w1;
+    wp_snap.w1_owned = wp_w1_owned;
+    wp_snap.w1_free = wp_w1_free;
+    wp_snap.ring_trunc = wp_ring_trunc;
+    wp_snap.pair_drop = wp_pair_drop;
+    wp_snap.site_drop = wp_site_drop;
+    wp_w1 = wp_w1_owned = wp_w1_free = wp_ring_trunc = wp_pair_drop = wp_site_drop = 0;
     wp_npairs = 0;
     wp_nidle = 0;
     wp_execlat = wp_execlat_n = 0;
@@ -887,12 +915,20 @@ static void wp_print(void)
         }
         fprintf(stderr, "wp-site %-44s n=%" PRIu64 " wait_ms=%.2f wait_pct=%.2f "
                 "max_us=%.0f h=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%"
-                PRIu64 "/%" PRIu64 " hold_pct=%.2f\n",
+                PRIu64 "/%" PRIu64 " hold_pct=%.2f hh=%" PRIu64 "/%" PRIu64 "/%"
+                PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 " out_ms=%.2f out_n=%"
+                PRIu64 "\n",
                 wp_sname(s, a, sizeof(a)), s->n, s->wait / 1e6,
                 100.0 * s->wait / wp_snap.dt, s->wait_max / 1e3, s->hist[0],
                 s->hist[1], s->hist[2], s->hist[3], s->hist[4], s->hist[5],
-                100.0 * s->hold / wp_snap.dt);
+                100.0 * s->hold / wp_snap.dt, s->hhist[0], s->hhist[1],
+                s->hhist[2], s->hhist[3], s->hhist[4], s->hhist[5], s->out / 1e6,
+                s->out_n);
     }
+    fprintf(stderr, "wp-check w1_ms=%.2f owned_ms=%.2f free_ms=%.2f ring_trunc=%"
+            PRIu64 " pair_drop=%" PRIu64 " site_drop=%" PRIu64 "\n",
+            wp_snap.w1 / 1e6, wp_snap.w1_owned / 1e6, wp_snap.w1_free / 1e6,
+            wp_snap.ring_trunc, wp_snap.pair_drop, wp_snap.site_drop);
     for (int i = 0; i < wp_snap.npairs; i++) {
         WPPair *p = &wp_snap.pair[i];
         if (p->ns < wp_snap.dt / 2000) {
