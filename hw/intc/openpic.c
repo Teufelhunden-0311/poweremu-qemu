@@ -44,6 +44,7 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "qemu/error-report.h"
+#include "system/waitprof.h"
 
 /* #define DEBUG_OPENPIC */
 
@@ -396,6 +397,9 @@ static void openpic_set_irq(void *opaque, int n_IRQ, int level)
     }
 
     src = &opp->src[n_IRQ];
+    if (waitprof_on) {
+        waitprof_irq(n_IRQ, level);
+    }
     DPRINTF("openpic: set irq %d = %d ivpr=0x%08x",
             n_IRQ, level, src->ivpr);
     if (src->level) {
