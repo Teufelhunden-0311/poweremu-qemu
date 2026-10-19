@@ -126,7 +126,12 @@ typedef struct TCGPool {
 
 #define TCG_POOL_CHUNK_SIZE 32768
 
-#define TCG_MAX_TEMPS 512
+/*
+ * A TB that runs out of temps is translated again with half as many
+ * insns.  At 512, the inline PPC floating point (several temps per insn)
+ * cut FP loops into pieces, each exit losing what the TB knew.
+ */
+#define TCG_MAX_TEMPS 2048
 #define TCG_MAX_INSNS 512
 
 /* when the size of the arguments of a called function is smaller than
