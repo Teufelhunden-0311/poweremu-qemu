@@ -38,6 +38,9 @@
 #include "qemu/main-loop.h"
 #include "qemu/plugin.h"
 #include "system/cpus.h"
+#include "system/waitprof.h"
+#include "qemu/cutils.h"
+#include "qemu/timer.h"
 #include "qemu/guest-random.h"
 #include "hw/nmi.h"
 #include "system/replay.h"
@@ -489,6 +492,9 @@ void cpus_kick_thread(CPUState *cpu)
 
 void qemu_cpu_kick(CPUState *cpu)
 {
+    if (waitprof_on) {
+        waitprof_kick();
+    }
     qemu_cond_broadcast(cpu->halt_cond);
     if (cpus_accel->kick_vcpu_thread) {
         cpus_accel->kick_vcpu_thread(cpu);
@@ -545,6 +551,360 @@ void rust_bql_mock_lock(void)
     abort();
 }
 
+
+/*
+ * Debug only (waitprof branch, not for merging): PPC_WAIT_PROF=1.
+ *
+ * Idle: an episode starts when the RR vCPU thread finds every CPU idle and
+ * ends when it leaves rr_wait_io_event.  It is classified by the CPU's
+ * pending interrupt bits at the end and by the interrupt sources that rose
+ * during it (OpenPIC source numbers; "gpu" = the GPU device's own line).
+ * Condition waits that returned without ending the episode are counted
+ * (spurious or not-yet-runnable wakes).  The condition wait includes the
+ * BQL reacquisition; it is NOT also counted as a BQL wait.
+ *
+ * BQL: per acquisition, the wait from the request to the acquisition.
+ * Every hold (lock..unlock, and the holds around condition waits) is
+ * appended to a ring when it ends, so a waiter can split its wait among
+ * all owners whose holds overlapped it; the rest is "(free)": lock free
+ * but not yet acquired (hand-off / scheduling).
+ *
+ * All tables are updated with the BQL held, except the atomic IRQ/kick
+ * marks.  Every 10 s the releasing thread copies and resets them under the
+ * BQL and prints the copy after unlocking.
+ */
+bool waitprof_on;
+const char *(*waitprof_pending)(CPUState *cpu);
+
+static void __attribute__((constructor)) waitprof_init(void)
+{
+    const char *e = getenv("PPC_WAIT_PROF");
+    waitprof_on = e && e[0] == '1';
+}
+
+#define WP_NHIST 6
+static const int64_t wp_lim[WP_NHIST - 1] = {
+    1000, 10000, 100000, 1000000, 4000000 };     /* ns: 1us 10us 100us 1ms 4ms */
+static int wp_bucket(int64_t ns)
+{
+    int i = 0;
+    while (i < WP_NHIST - 1 && ns >= wp_lim[i]) {
+        i++;
+    }
+    return i;
+}
+
+/* --- interrupt / kick marks (any thread) --- */
+static uint64_t wp_raised[4];
+static uint8_t wp_level[256];
+static uint64_t wp_kicks;
+static int64_t wp_last_kick;
+
+void waitprof_irq(int src, int level)
+{
+    src &= 255;
+    if (level && !wp_level[src]) {
+        qatomic_or(&wp_raised[src >> 6], 1ull << (src & 63));
+    }
+    wp_level[src] = !!level;
+}
+
+void waitprof_kick(void)
+{
+    qatomic_inc(&wp_kicks);
+    qatomic_set(&wp_last_kick, get_clock());
+}
+
+/* --- idle episodes (vCPU thread, BQL held) --- */
+typedef struct {
+    char key[48];
+    uint64_t n, tot, hist[WP_NHIST], waits, multi, kick2ret, kick2ret_n, ret2exit;
+} WPIdle;
+#define WP_NIDLE 48
+static WPIdle wp_idle[WP_NIDLE];
+static int wp_nidle;
+static int64_t wp_t0, wp_wait_t0, wp_last_ret, wp_resume;
+static unsigned wp_nwaits;
+static uint64_t wp_execlat, wp_execlat_n;
+
+void waitprof_idle_enter(void)
+{
+    for (int i = 0; i < 4; i++) {
+        qatomic_set(&wp_raised[i], 0);
+    }
+    wp_t0 = get_clock();
+    wp_nwaits = 0;
+    wp_last_ret = 0;
+}
+
+void waitprof_idle_wait(bool begin)
+{
+    if (begin) {
+        wp_wait_t0 = get_clock();
+    } else {
+        wp_last_ret = get_clock();
+        wp_nwaits++;
+    }
+}
+
+void waitprof_idle_exit(CPUState *cpu)
+{
+    int64_t now = get_clock(), lk = qatomic_read(&wp_last_kick);
+    char key[48];
+    int n = 0, k = 0;
+
+    n = snprintf(key, sizeof(key), "%s |",
+                 waitprof_pending ? waitprof_pending(cpu) : "?");
+    for (int src = 0; src < 256; src++) {
+        if (qatomic_read(&wp_raised[src >> 6]) & (1ull << (src & 63))) {
+            if (++k > 4) {
+                n += snprintf(key + n, sizeof(key) - n, " +");
+                break;
+            }
+            n += snprintf(key + n, sizeof(key) - n, src == WAITPROF_SRC_GPU ?
+                          " gpu" : " %02x", src);
+        }
+    }
+    if (!k) {
+        snprintf(key + n, sizeof(key) - n, " none");
+    }
+    WPIdle *e = NULL;
+    for (int i = 0; i < wp_nidle; i++) {
+        if (!strcmp(wp_idle[i].key, key)) {
+            e = &wp_idle[i];
+            break;
+        }
+    }
+    if (!e && wp_nidle < WP_NIDLE) {
+        e = &wp_idle[wp_nidle++];
+        memset(e, 0, sizeof(*e));
+        pstrcpy(e->key, sizeof(e->key), key);
+    }
+    if (e) {
+        e->n++;
+        e->tot += now - wp_t0;
+        e->hist[wp_bucket(now - wp_t0)]++;
+        e->waits += wp_nwaits;
+        e->multi += wp_nwaits > 1;
+        if (wp_last_ret) {
+            e->ret2exit += now - wp_last_ret;
+            if (lk >= wp_wait_t0 && lk <= wp_last_ret) {
+                e->kick2ret += wp_last_ret - lk;
+                e->kick2ret_n++;
+            }
+        }
+    }
+    wp_resume = now;
+}
+
+void waitprof_exec(void)
+{
+    if (wp_resume) {
+        wp_execlat += get_clock() - wp_resume;
+        wp_execlat_n++;
+        wp_resume = 0;
+    }
+}
+
+/* --- BQL (tables touched with the BQL held) --- */
+typedef struct {
+    const char *file;
+    int line;
+    char thread[16];
+    uint64_t n, wait, wait_max, hist[WP_NHIST], hold;
+} WPSite;
+#define WP_NSITES 256
+static WPSite wp_site[WP_NSITES];
+static int wp_nsites;
+typedef struct { uint16_t w, o; uint64_t ns, n; } WPPair;
+#define WP_NPAIRS 512
+static WPPair wp_pair[WP_NPAIRS];
+static int wp_npairs;
+typedef struct { uint16_t site; int64_t t0, t1; } WPHold;
+#define WP_RING 8192
+static WPHold wp_ring[WP_RING];
+static uint64_t wp_ring_head;
+static __thread int wp_cur = -1;
+static __thread int64_t wp_hold_t0;
+static __thread char wp_tname[16];
+static int64_t wp_last_dump;
+#define WP_FREE 0xffff
+
+static int wp_site_find(const char *file, int line)
+{
+    if (!wp_tname[0]) {
+        pthread_getname_np(pthread_self(), wp_tname, sizeof(wp_tname));
+        if (!wp_tname[0]) {
+            snprintf(wp_tname, sizeof(wp_tname), "t%x",
+                     (unsigned)pthread_mach_thread_np(pthread_self()));
+        }
+    }
+    for (int i = 0; i < wp_nsites; i++) {
+        WPSite *s = &wp_site[i];
+        if (s->line == line && s->file == file && !strcmp(s->thread, wp_tname)) {
+            return i;
+        }
+    }
+    if (wp_nsites == WP_NSITES) {
+        return -1;
+    }
+    WPSite *s = &wp_site[wp_nsites];
+    s->file = file;
+    s->line = line;
+    memcpy(s->thread, wp_tname, sizeof(wp_tname));
+    return wp_nsites++;
+}
+
+static void wp_pair_add(int w, int o, int64_t ns)
+{
+    for (int i = 0; i < wp_npairs; i++) {
+        if (wp_pair[i].w == w && wp_pair[i].o == o) {
+            wp_pair[i].ns += ns;
+            wp_pair[i].n++;
+            return;
+        }
+    }
+    if (wp_npairs < WP_NPAIRS) {
+        wp_pair[wp_npairs++] = (WPPair){ w, o, ns, 1 };
+    }
+}
+
+static void wp_acquired(const char *file, int line, int64_t t_req)
+{
+    int64_t now = get_clock(), wait = now - t_req;
+    int w = wp_site_find(file, line);
+
+    wp_cur = w;
+    wp_hold_t0 = now;
+    if (w < 0) {
+        return;
+    }
+    WPSite *s = &wp_site[w];
+    s->n++;
+    s->wait += wait;
+    s->wait_max = MAX(s->wait_max, wait);
+    s->hist[wp_bucket(wait)]++;
+    if (wait < 1000) {
+        return;
+    }
+    /* Split the wait among the holds that overlapped it (newest first). */
+    int64_t owned = 0;
+    for (uint64_t k = 0; k < WP_RING && k < wp_ring_head; k++) {
+        WPHold *h = &wp_ring[(wp_ring_head - 1 - k) % WP_RING];
+        if (h->t1 <= t_req) {
+            break;
+        }
+        int64_t ov = MIN(h->t1, now) - MAX(h->t0, t_req);
+        if (ov > 0) {
+            wp_pair_add(w, h->site, ov);
+            owned += ov;
+        }
+    }
+    if (wait > owned) {
+        wp_pair_add(w, WP_FREE, wait - owned);
+    }
+}
+
+/* About to release (still held): record the hold. */
+static bool wp_release(void)
+{
+    int64_t now = get_clock();
+    if (wp_cur >= 0) {
+        wp_site[wp_cur].hold += now - wp_hold_t0;
+        wp_ring[wp_ring_head++ % WP_RING] = (WPHold){ wp_cur, wp_hold_t0, now };
+    }
+    return wp_last_dump && now - wp_last_dump >= 10 * NANOSECONDS_PER_SECOND;
+}
+
+static struct {
+    int64_t now, dt;
+    WPSite site[WP_NSITES];
+    int nsites;
+    WPPair pair[WP_NPAIRS];
+    int npairs;
+    WPIdle idle[WP_NIDLE];
+    int nidle;
+    uint64_t execlat, execlat_n, kicks;
+} wp_snap;
+
+/* Under the BQL: copy and reset. */
+static void wp_snapshot(void)
+{
+    int64_t now = get_clock();
+    wp_snap.now = now;
+    wp_snap.dt = now - wp_last_dump;
+    memcpy(wp_snap.site, wp_site, sizeof(wp_site));
+    wp_snap.nsites = wp_nsites;
+    memcpy(wp_snap.pair, wp_pair, sizeof(wp_pair));
+    wp_snap.npairs = wp_npairs;
+    memcpy(wp_snap.idle, wp_idle, sizeof(wp_idle));
+    wp_snap.nidle = wp_nidle;
+    wp_snap.execlat = wp_execlat;
+    wp_snap.execlat_n = wp_execlat_n;
+    wp_snap.kicks = qatomic_xchg(&wp_kicks, 0);
+    for (int i = 0; i < wp_nsites; i++) {
+        WPSite *s = &wp_site[i];
+        s->n = s->wait = s->wait_max = s->hold = 0;
+        memset(s->hist, 0, sizeof(s->hist));
+    }
+    wp_npairs = 0;
+    wp_nidle = 0;
+    wp_execlat = wp_execlat_n = 0;
+    wp_last_dump = now;
+}
+
+static const char *wp_sname(WPSite *s, char *buf, size_t n)
+{
+    const char *f = strrchr(s->file, '/');
+    snprintf(buf, n, "%s:%d[%s]", f ? f + 1 : s->file, s->line, s->thread);
+    return buf;
+}
+
+/* After unlocking: print the copy. */
+static void wp_print(void)
+{
+    double ms = wp_snap.dt / 1e6;
+    char a[96], b[96];
+    fprintf(stderr, "waitprof T=%.3f dt_ms=%.0f kicks=%" PRIu64
+            " exec_after_idle n=%" PRIu64 " avg_us=%.1f\n",
+            g_get_real_time() / 1e6, ms, wp_snap.kicks, wp_snap.execlat_n,
+            wp_snap.execlat_n ? wp_snap.execlat / 1e3 / wp_snap.execlat_n : 0);
+    for (int i = 0; i < wp_snap.nidle; i++) {
+        WPIdle *e = &wp_snap.idle[i];
+        fprintf(stderr, "wp-idle %-40s n=%" PRIu64 " ms=%.1f pct=%.2f h=%" PRIu64
+                "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+                " waits=%" PRIu64 " multi=%" PRIu64 " kick2ret_us=%.1f(n=%" PRIu64
+                ") ret2exit_us=%.1f\n", e->key, e->n, e->tot / 1e6,
+                100.0 * e->tot / wp_snap.dt, e->hist[0], e->hist[1], e->hist[2],
+                e->hist[3], e->hist[4], e->hist[5], e->waits, e->multi,
+                e->kick2ret_n ? e->kick2ret / 1e3 / e->kick2ret_n : 0,
+                e->kick2ret_n, e->n ? e->ret2exit / 1e3 / e->n : 0);
+    }
+    for (int i = 0; i < wp_snap.nsites; i++) {
+        WPSite *s = &wp_snap.site[i];
+        if (!s->n || (s->wait < wp_snap.dt / 2000 && s->hold < wp_snap.dt / 2000)) {
+            continue;           /* under 0.05% both ways */
+        }
+        fprintf(stderr, "wp-site %-44s n=%" PRIu64 " wait_ms=%.2f wait_pct=%.2f "
+                "max_us=%.0f h=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%"
+                PRIu64 "/%" PRIu64 " hold_pct=%.2f\n",
+                wp_sname(s, a, sizeof(a)), s->n, s->wait / 1e6,
+                100.0 * s->wait / wp_snap.dt, s->wait_max / 1e3, s->hist[0],
+                s->hist[1], s->hist[2], s->hist[3], s->hist[4], s->hist[5],
+                100.0 * s->hold / wp_snap.dt);
+    }
+    for (int i = 0; i < wp_snap.npairs; i++) {
+        WPPair *p = &wp_snap.pair[i];
+        if (p->ns < wp_snap.dt / 2000) {
+            continue;
+        }
+        fprintf(stderr, "wp-pair %-44s <- %-44s ms=%.2f pct=%.2f n=%" PRIu64 "\n",
+                wp_sname(&wp_snap.site[p->w], a, sizeof(a)),
+                p->o == WP_FREE ? "(free)" : wp_sname(&wp_snap.site[p->o], b, sizeof(b)),
+                p->ns / 1e6, 100.0 * p->ns / wp_snap.dt, p->n);
+    }
+}
+
 /*
  * The BQL is taken from so many places that it is worth profiling the
  * callers directly, instead of funneling them all through a single function.
@@ -552,28 +912,56 @@ void rust_bql_mock_lock(void)
 void bql_lock_impl(const char *file, int line)
 {
     QemuMutexLockFunc bql_lock_fn = qatomic_read(&bql_mutex_lock_func);
+    int64_t t_req = waitprof_on ? get_clock() : 0;
 
     g_assert(!bql_locked());
     bql_lock_fn(&bql, file, line);
     set_bql_locked(true);
+    if (t_req) {
+        if (!wp_last_dump) {
+            wp_last_dump = get_clock();
+        }
+        wp_acquired(file, line, t_req);
+    }
 }
 
 void bql_unlock(void)
 {
+    bool dump = false;
+
     g_assert(bql_locked());
     g_assert(!bql_unlock_blocked);
+    if (waitprof_on && wp_release()) {
+        wp_snapshot();
+        dump = true;
+    }
     set_bql_locked(false);
     qemu_mutex_unlock(&bql);
+    if (dump) {
+        wp_print();
+    }
 }
 
 void qemu_cond_wait_bql(QemuCond *cond)
 {
+    if (waitprof_on) {
+        wp_release();
+    }
     qemu_cond_wait(cond, &bql);
+    if (waitprof_on) {
+        wp_hold_t0 = get_clock();     /* same site holds again */
+    }
 }
 
 void qemu_cond_timedwait_bql(QemuCond *cond, int ms)
 {
+    if (waitprof_on) {
+        wp_release();
+    }
     qemu_cond_timedwait(cond, &bql, ms);
+    if (waitprof_on) {
+        wp_hold_t0 = get_clock();
+    }
 }
 
 /* signal CPU creation */
