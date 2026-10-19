@@ -50,6 +50,7 @@
 #include "ui/qemu-pixman.h"
 #include "system/system.h"
 #include "system/runstate.h"
+#include "system/waitprof.h"
 #include "hw/display/ppc_mac_gpu_vp.h"
 #include "trace.h"
 
@@ -1444,6 +1445,9 @@ static inline void ppc_mac_gpu_reg_write_offs(uint32_t *reg, int offs,
 static void ppc_mac_gpu_update_irq(PPCMacGPUState *s)
 {
     bool level = !!(s->regs.gen_int_status & s->regs.gen_int_cntl);
+    if (waitprof_on) {
+        waitprof_irq(WAITPROF_SRC_GPU, level);
+    }
     pci_set_irq(&s->pci, level);
     trace_ppc_mac_gpu_irq(s->regs.gen_int_status, s->regs.gen_int_cntl,
                           level);

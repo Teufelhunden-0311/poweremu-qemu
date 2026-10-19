@@ -20,6 +20,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "system/waitprof.h"
 #include "disas/dis-asm.h"
 #include "gdbstub/helpers.h"
 #include "system/cpus.h"
@@ -6918,6 +6919,28 @@ static void init_ppc_proc(PowerPCCPU *cpu)
 }
 
 
+/* waitprof debug hook: label the pending interrupt bits. */
+static const char *ppc_waitprof_pending(CPUState *cs)
+{
+    uint32_t p = cpu_env(cs)->pending_interrupts;
+    static char buf[8];
+    int n = 0;
+    if (p & PPC_INTERRUPT_DECR) {
+        buf[n++] = 'D';
+    }
+    if (p & PPC_INTERRUPT_EXT) {
+        buf[n++] = 'E';
+    }
+    if (p & ~(PPC_INTERRUPT_DECR | PPC_INTERRUPT_EXT)) {
+        buf[n++] = 'O';
+    }
+    if (!n) {
+        buf[n++] = '-';
+    }
+    buf[n] = 0;
+    return buf;
+}
+
 static void ppc_cpu_realize(DeviceState *dev, Error **errp)
 {
     CPUState *cs = CPU(dev);
@@ -6926,6 +6949,7 @@ static void ppc_cpu_realize(DeviceState *dev, Error **errp)
     PowerPCCPUClass *pcc = POWERPC_CPU_GET_CLASS(cpu);
     Error *local_err = NULL;
 
+    waitprof_pending = ppc_waitprof_pending;
     cpu_exec_realizefn(cs, &local_err);
     if (local_err != NULL) {
         error_propagate(errp, local_err);

@@ -831,6 +831,9 @@ int qemu_main_loop(void)
 {
     int status = EXIT_SUCCESS;
 
+    if (getenv("PPC_WAIT_PROF")) {
+        pthread_setname_np("qemu-main");    /* waitprof debug label */
+    }
     while (!main_loop_should_exit(&status)) {
         main_loop_wait(false);
     }

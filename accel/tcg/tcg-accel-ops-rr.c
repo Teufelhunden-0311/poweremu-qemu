@@ -31,6 +31,7 @@
 #include "system/tcg.h"
 #include "system/replay.h"
 #include "system/cpu-timers.h"
+#include "system/waitprof.h"
 #include "qemu/main-loop.h"
 #include "qemu/notify.h"
 #include "qemu/guest-random.h"
@@ -111,10 +112,23 @@ static void rr_stop_kick_timer(void)
 static void rr_wait_io_event(void)
 {
     CPUState *cpu;
+    bool wp_idle = waitprof_on && all_cpu_threads_idle();
 
+    if (wp_idle) {
+        waitprof_idle_enter();
+    }
     while (all_cpu_threads_idle()) {
         rr_stop_kick_timer();
+        if (wp_idle) {
+            waitprof_idle_wait(true);
+        }
         qemu_cond_wait_bql(first_cpu->halt_cond);
+        if (wp_idle) {
+            waitprof_idle_wait(false);
+        }
+    }
+    if (wp_idle) {
+        waitprof_idle_exit(first_cpu);
     }
 
     rr_start_kick_timer();
@@ -266,6 +280,9 @@ static void *rr_cpu_thread_fn(void *arg)
                 bql_unlock();
                 if (icount_enabled()) {
                     icount_prepare_for_run(cpu, cpu_budget);
+                }
+                if (waitprof_on) {
+                    waitprof_exec();
                 }
                 r = tcg_cpu_exec(cpu);
                 if (icount_enabled()) {
