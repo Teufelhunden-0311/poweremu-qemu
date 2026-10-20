@@ -2951,8 +2951,9 @@ static bool r300_read_raw(void *opaque, uint32_t gpu_addr, void *dst,
     uint8_t *out = dst;
 
     if (r300_in_fb(s, gpu_addr, len)) {
-        memcpy(dst, (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
-                    (gpu_addr - fb_base), len);
+        /* Vertex fetch comes here for every element: the cached pointer,
+         * not memory_region_get_ram_ptr's RCU lookup each time. */
+        memcpy(dst, s->vram_host + (gpu_addr - fb_base), len);
         return true;
     }
     if (!len || (uint64_t)gpu_addr + len > 0x100000000ull) {
@@ -14239,6 +14240,7 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         memory_region_init_ram(&s->vram, obj, "ppc-mac-gpu-vram",
                                s->vram_size, &error_fatal);
     }
+    s->vram_host = memory_region_get_ram_ptr(&s->vram);
     if (s->r300) {
         /* Two apertures onto VRAM, as on a real Radeon (see r300_ap1_ops). */
         memory_region_init(&s->vram_bar, obj, "ppc-mac-gpu-vram-bar",
