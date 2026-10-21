@@ -22,6 +22,15 @@ void waitprof_exec(void);
 
 /* Target hook: the CPU's pending interrupt bits, labelled (D)ECR/(E)XT/(O)ther. */
 extern const char *(*waitprof_pending)(CPUState *cpu);
+/*
+ * First return to user mode after idle: the target calls this from its
+ * return-from-interrupt path (vCPU thread, BQL not necessarily held) when
+ * waitprof_ret_pending is set and the new MSR is user mode.  asid is the
+ * target's address-space id (PPC: VSID of SR0).
+ */
+extern bool waitprof_ret_pending;
+void waitprof_user_return(CPUState *cpu, uint32_t nip, uint32_t lr, uint32_t asid);
+
 /* Target hook: the halted CPU's context at idle entry: NIP, LR, r1, MSR. */
 extern void (*waitprof_ctx)(CPUState *cpu, uint32_t ctx[4]);
 

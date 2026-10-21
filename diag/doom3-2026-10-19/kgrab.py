@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""kgrab.py OUT ADDR:LEN ... : attach to QEMU's gdb stub (port 1234) until the vCPU is stopped
-in supervisor mode (MSR PR clear), then dump the given guest virtual ranges (kernel space) as
+"""kgrab.py [-u] OUT ADDR:LEN ... : attach to QEMU's gdb stub (port 1234) until the vCPU is stopped
+in supervisor mode (MSR PR clear; -u: user mode), then dump the given guest virtual ranges (kernel space) as
 hex words to OUT.  Prints the stop PC/LR/MSR.  Detach resumes the VM."""
 import socket, sys, time, random
+USER = sys.argv[1] == "-u"
+if USER: sys.argv.pop(1)
 out = sys.argv[1]
 ranges = [(int(a, 16), int(l, 16)) for a, l in (x.split(':') for x in sys.argv[2:])]
 for tries in range(400):
@@ -15,7 +17,7 @@ for tries in range(400):
                 s.sendall(b'+'); return buf[i + 1:buf.index(b'#', i)].decode()
     pkt('?')
     msr = int(pkt('p41'), 16); pc = int(pkt('p40'), 16); lr = int(pkt('p43'), 16)
-    if not msr & 0x4000:
+    if bool(msr & 0x4000) == USER:
         with open(out, 'w') as f:
             f.write(f'# try {tries} pc {pc:08x} lr {lr:08x} msr {msr:08x}\n')
             for a, l in ranges:
@@ -24,4 +26,4 @@ for tries in range(400):
         s.sendall(b'$D#44'); s.close(); print('got it on try %d pc %08x lr %08x msr %08x' % (tries, pc, lr, msr)); break
     s.sendall(b'$D#44'); s.close(); time.sleep(0.05 + random.random() * 0.1)
 else:
-    print('no supervisor-mode stop')
+    print('no stop in the wanted mode')

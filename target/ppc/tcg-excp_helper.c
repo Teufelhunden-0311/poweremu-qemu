@@ -29,6 +29,7 @@
 #include "internal.h"
 #include "cpu.h"
 #include "trace.h"
+#include "system/waitprof.h"
 
 /*****************************************************************************/
 /* Exceptions processing helpers */
@@ -518,6 +519,10 @@ static void do_rfi(CPUPPCState *env, target_ulong nip, target_ulong msr)
 
     /* Context synchronizing: check if TCG TLB needs flush */
     check_tlb_flush(env, false);
+    if (waitprof_ret_pending && (env->msr >> MSR_PR) & 1) {
+        waitprof_user_return(env_cpu(env), env->nip, env->lr,
+                             env->sr[0] & 0x00ffffff);
+    }
 }
 
 void helper_rfi(CPUPPCState *env)
