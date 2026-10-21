@@ -6941,6 +6941,17 @@ static const char *ppc_waitprof_pending(CPUState *cs)
     return buf;
 }
 
+/* waitprof debug hook: where the CPU halted (NIP is past the halting mtmsr). */
+static void ppc_waitprof_ctx(CPUState *cs, uint32_t ctx[4])
+{
+    CPUPPCState *env = cpu_env(cs);
+
+    ctx[0] = env->nip;
+    ctx[1] = env->lr;
+    ctx[2] = env->gpr[1];
+    ctx[3] = env->msr;
+}
+
 static void ppc_cpu_realize(DeviceState *dev, Error **errp)
 {
     CPUState *cs = CPU(dev);
@@ -6950,6 +6961,7 @@ static void ppc_cpu_realize(DeviceState *dev, Error **errp)
     Error *local_err = NULL;
 
     waitprof_pending = ppc_waitprof_pending;
+    waitprof_ctx = ppc_waitprof_ctx;
     cpu_exec_realizefn(cs, &local_err);
     if (local_err != NULL) {
         error_propagate(errp, local_err);

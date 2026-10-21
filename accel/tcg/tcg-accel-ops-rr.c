@@ -115,7 +115,7 @@ static void rr_wait_io_event(void)
     bool wp_idle = waitprof_on && all_cpu_threads_idle();
 
     if (wp_idle) {
-        waitprof_idle_enter();
+        waitprof_idle_enter(first_cpu);
     }
     while (all_cpu_threads_idle()) {
         rr_stop_kick_timer();

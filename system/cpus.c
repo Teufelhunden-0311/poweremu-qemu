@@ -575,6 +575,7 @@ void rust_bql_mock_lock(void)
  */
 bool waitprof_on;
 const char *(*waitprof_pending)(CPUState *cpu);
+void (*waitprof_ctx)(CPUState *cpu, uint32_t ctx[4]);
 
 static void __attribute__((constructor)) waitprof_init(void)
 {
@@ -627,8 +628,70 @@ static int64_t wp_t0, wp_wait_t0, wp_last_ret, wp_resume;
 static unsigned wp_nwaits;
 static uint64_t wp_execlat, wp_execlat_n;
 
-void waitprof_idle_enter(void)
+/*
+ * Idle episodes by the halted CPU's context at entry (NIP, LR, privilege).
+ * This is where the CPU went idle, not which guest thread is blocked.
+ * cls splits the time by wake: 0 = only DECR pending and no source rose,
+ * 1 = EXT pending or a source rose, 2 = anything else.
+ */
+typedef struct {
+    uint32_t nip, lr, msr, r1min, r1max;
+    bool used;
+    uint64_t n, tot, hist[WP_NHIST], cls[3];
+} WPCtx;
+#define WP_NCTX 512
+static WPCtx wp_ctx[WP_NCTX];
+static int wp_nctx;
+static uint64_t wp_ctx_drop, wp_ctx_drop_ns;
+static uint32_t wp_ctx_cur[4];
+
+static void wp_ctx_add(int64_t ns, int cls)
 {
+    uint32_t nip = wp_ctx_cur[0], lr = wp_ctx_cur[1], r1 = wp_ctx_cur[2];
+    uint32_t msr = wp_ctx_cur[3], pr = (msr >> 14) & 1;
+    unsigned h = ((nip >> 2) * 0x9e3779b1u ^ (lr >> 2) * 0x85ebca6bu ^ pr) % WP_NCTX;
+    WPCtx *c = NULL;
+
+    for (int i = 0; i < WP_NCTX; i++, h = (h + 1) % WP_NCTX) {
+        WPCtx *t = &wp_ctx[h];
+        if (!t->used) {
+            if (wp_nctx >= WP_NCTX * 3 / 4) {
+                break;
+            }
+            memset(t, 0, sizeof(*t));
+            t->used = true;
+            t->nip = nip;
+            t->lr = lr;
+            t->msr = msr;
+            t->r1min = t->r1max = r1;
+            wp_nctx++;
+            c = t;
+            break;
+        }
+        if (t->nip == nip && t->lr == lr && ((t->msr >> 14) & 1) == pr) {
+            c = t;
+            break;
+        }
+    }
+    if (!c) {
+        wp_ctx_drop++;
+        wp_ctx_drop_ns += ns;
+        return;
+    }
+    c->n++;
+    c->tot += ns;
+    c->hist[wp_bucket(ns)]++;
+    c->cls[cls] += ns;
+    c->msr = msr;
+    c->r1min = MIN(c->r1min, r1);
+    c->r1max = MAX(c->r1max, r1);
+}
+
+void waitprof_idle_enter(CPUState *cpu)
+{
+    if (waitprof_ctx) {
+        waitprof_ctx(cpu, wp_ctx_cur);
+    }
     for (int i = 0; i < 4; i++) {
         qatomic_set(&wp_raised[i], 0);
     }
@@ -652,9 +715,9 @@ void waitprof_idle_exit(CPUState *cpu)
     int64_t now = get_clock(), lk = qatomic_read(&wp_last_kick);
     char key[48];
     int n = 0, k = 0;
+    const char *pend = waitprof_pending ? waitprof_pending(cpu) : "?";
 
-    n = snprintf(key, sizeof(key), "%s |",
-                 waitprof_pending ? waitprof_pending(cpu) : "?");
+    n = snprintf(key, sizeof(key), "%s |", pend);
     for (int src = 0; src < 256; src++) {
         if (qatomic_read(&wp_raised[src >> 6]) & (1ull << (src & 63))) {
             if (++k > 4) {
@@ -668,6 +731,7 @@ void waitprof_idle_exit(CPUState *cpu)
     if (!k) {
         snprintf(key + n, sizeof(key) - n, " none");
     }
+    wp_ctx_add(now - wp_t0, !k && !strcmp(pend, "D") ? 0 : (k || strchr(pend, 'E')) ? 1 : 2);
     WPIdle *e = NULL;
     for (int i = 0; i < wp_nidle; i++) {
         if (!strcmp(wp_idle[i].key, key)) {
@@ -843,6 +907,9 @@ static struct {
     int npairs;
     WPIdle idle[WP_NIDLE];
     int nidle;
+    WPCtx ctx[WP_NCTX];
+    int nctx;
+    uint64_t ctx_drop, ctx_drop_ns;
     uint64_t execlat, execlat_n, kicks;
     uint64_t w1, w1_owned, w1_free, ring_trunc, pair_drop, site_drop;
 } wp_snap;
@@ -859,6 +926,13 @@ static void wp_snapshot(void)
     wp_snap.npairs = wp_npairs;
     memcpy(wp_snap.idle, wp_idle, sizeof(wp_idle));
     wp_snap.nidle = wp_nidle;
+    memcpy(wp_snap.ctx, wp_ctx, sizeof(wp_ctx));
+    wp_snap.nctx = wp_nctx;
+    wp_snap.ctx_drop = wp_ctx_drop;
+    wp_snap.ctx_drop_ns = wp_ctx_drop_ns;
+    memset(wp_ctx, 0, sizeof(wp_ctx));
+    wp_nctx = 0;
+    wp_ctx_drop = wp_ctx_drop_ns = 0;
     wp_snap.execlat = wp_execlat;
     wp_snap.execlat_n = wp_execlat_n;
     wp_snap.kicks = qatomic_xchg(&wp_kicks, 0);
@@ -907,6 +981,20 @@ static void wp_print(void)
                 e->hist[3], e->hist[4], e->hist[5], e->waits, e->multi,
                 e->kick2ret_n ? e->kick2ret / 1e3 / e->kick2ret_n : 0,
                 e->kick2ret_n, e->n ? e->ret2exit / 1e3 / e->n : 0);
+    }
+    fprintf(stderr, "wp-ctxsum entries=%d drop_n=%" PRIu64 " drop_ms=%.2f\n",
+            wp_snap.nctx, wp_snap.ctx_drop, wp_snap.ctx_drop_ns / 1e6);
+    for (int i = 0; i < WP_NCTX; i++) {
+        WPCtx *c = &wp_snap.ctx[i];
+        if (!c->used) {
+            continue;
+        }
+        fprintf(stderr, "wp-ctx nip=%08x lr=%08x pr=%u msr=%08x r1=%08x-%08x n=%" PRIu64
+                " ms=%.3f h=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+                "/%" PRIu64 " cls_ms=%.3f/%.3f/%.3f\n", c->nip, c->lr,
+                (c->msr >> 14) & 1, c->msr, c->r1min, c->r1max, c->n, c->tot / 1e6,
+                c->hist[0], c->hist[1], c->hist[2], c->hist[3], c->hist[4], c->hist[5],
+                c->cls[0] / 1e6, c->cls[1] / 1e6, c->cls[2] / 1e6);
     }
     for (int i = 0; i < wp_snap.nsites; i++) {
         WPSite *s = &wp_snap.site[i];

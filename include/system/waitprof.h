@@ -14,7 +14,7 @@ void waitprof_irq(int src, int level);
 void waitprof_kick(void);
 
 /* RR vCPU thread, BQL held. */
-void waitprof_idle_enter(void);
+void waitprof_idle_enter(CPUState *cpu);
 void waitprof_idle_wait(bool begin);
 void waitprof_idle_exit(CPUState *cpu);
 /* RR vCPU thread, just before guest execution (BQL not held). */
@@ -22,5 +22,7 @@ void waitprof_exec(void);
 
 /* Target hook: the CPU's pending interrupt bits, labelled (D)ECR/(E)XT/(O)ther. */
 extern const char *(*waitprof_pending)(CPUState *cpu);
+/* Target hook: the halted CPU's context at idle entry: NIP, LR, r1, MSR. */
+extern void (*waitprof_ctx)(CPUState *cpu, uint32_t ctx[4]);
 
 #endif
