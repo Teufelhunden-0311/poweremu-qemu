@@ -39,6 +39,7 @@
 #include "qemu/plugin.h"
 #include "system/cpus.h"
 #include "system/waitprof.h"
+#include "exec/memory.h"
 #include "qemu/cutils.h"
 #include "qemu/timer.h"
 #include "qemu/guest-random.h"
@@ -576,6 +577,7 @@ void rust_bql_mock_lock(void)
 bool waitprof_on;
 const char *(*waitprof_pending)(CPUState *cpu);
 void (*waitprof_ctx)(CPUState *cpu, uint32_t ctx[4]);
+static uint32_t wp_stk_nip;      /* stack capture site, see wp_walk */
 static QemuSpin wp_ret_lock;     /* user-return tables vs. the snapshot */
 
 static void __attribute__((constructor)) waitprof_init(void)
@@ -583,6 +585,8 @@ static void __attribute__((constructor)) waitprof_init(void)
     const char *e = getenv("PPC_WAIT_PROF");
     waitprof_on = e && e[0] == '1';
     qemu_spin_init(&wp_ret_lock);
+    e = getenv("PPC_WP_STACK_NIP");
+    wp_stk_nip = e ? strtoul(e, NULL, 16) : 0x900411f8u;
 }
 
 #define WP_NHIST 6
@@ -714,20 +718,59 @@ static uint64_t wp_ret_drop, wp_ret_drop_eps, wp_ret_drop_ns;
 /* Address spaces seen: SR0 VSID -> main executable __TEXT vmsize, last string at the stack top. */
 typedef struct {
     uint32_t asid, text;
+    uint64_t hdr;                        /* FNV-1a of the 4 KB at 0x1000, 0 = unread */
     char path[96];
 } WPAs;
 #define WP_NAS 128
 static WPAs wp_as[WP_NAS];
 static int wp_nas;
 
+/*
+ * Debug read of guest virtual memory through the current translation, RAM
+ * only: unlike cpu_memory_rw_debug, never dispatches to a device region.
+ */
+static bool wp_ram_read(CPUState *cpu, uint32_t va, void *buf, unsigned len)
+{
+    uint8_t *p = buf;
+
+    RCU_READ_LOCK_GUARD();
+    while (len) {
+        MemTxAttrs attrs;
+        hwaddr pa = cpu_get_phys_page_attrs_debug(cpu, va & ~0xfffu, &attrs);
+        unsigned l = MIN(len, 0x1000 - (va & 0xfff));
+        hwaddr xlat, ml = l;
+        MemoryRegion *mr;
+
+        if (pa == -1) {
+            return false;
+        }
+        AddressSpace *as = cpu_get_address_space(cpu, cpu_asidx_from_attrs(cpu, attrs));
+
+        mr = address_space_translate(as, pa + (va & 0xfff), &xlat, &ml, false, attrs);
+        if (!memory_region_is_ram(mr) || memory_region_is_ram_device(mr) || ml < l) {
+            return false;
+        }
+        memcpy(p, (uint8_t *)memory_region_get_ram_ptr(mr) + xlat, l);
+        p += l;
+        va += l;
+        len -= l;
+    }
+    return true;
+}
+
 static void wp_as_ident(CPUState *cpu, WPAs *a)
 {
-    uint8_t b[1024];
+    static uint8_t b[4096];
 
     a->text = 0;
+    a->hdr = 0;
     pstrcpy(a->path, sizeof(a->path), "?");
-    if (!cpu_memory_rw_debug(cpu, 0x1000, b, sizeof(b), false) &&
-        ldl_be_p(b) == 0xfeedface) {
+    if (wp_ram_read(cpu, 0x1000, b, sizeof(b)) && ldl_be_p(b) == 0xfeedface) {
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (unsigned i = 0; i < sizeof(b); i++) {
+            h = (h ^ b[i]) * 0x100000001b3ull;
+        }
+        a->hdr = h;
         uint32_t ncmds = ldl_be_p(b + 16), o = 28;
         for (uint32_t i = 0; i < ncmds && o + 32 <= sizeof(b); i++) {
             uint32_t cmd = ldl_be_p(b + o), size = ldl_be_p(b + o + 4);
@@ -750,11 +793,10 @@ static void wp_as_ident(CPUState *cpu, WPAs *a)
     static uint8_t t[8192];
     const uint32_t base = 0xc0000000u - sizeof(t);
     uint32_t lo = 0;
-    if (cpu_memory_rw_debug(cpu, base, t, sizeof(t) / 2, false)) {
+    if (!wp_ram_read(cpu, base, t, sizeof(t) / 2)) {
         memset(t, 0, sizeof(t) / 2);      /* lower page unmapped: top page only */
     }
-    if (!cpu_memory_rw_debug(cpu, base + sizeof(t) / 2, t + sizeof(t) / 2,
-                             sizeof(t) / 2, false)) {
+    if (wp_ram_read(cpu, base + sizeof(t) / 2, t + sizeof(t) / 2, sizeof(t) / 2)) {
         for (uint32_t o = 0; o < sizeof(t); o += 4) {
             uint32_t v = ldl_be_p(t + o);
             if (v > base + o && v < 0xc0000000u && (!lo || v < lo) &&
@@ -772,8 +814,147 @@ static void wp_as_ident(CPUState *cpu, WPAs *a)
     }
 }
 
-void waitprof_user_return(CPUState *cpu, uint32_t nip, uint32_t lr, uint32_t asid)
+/*
+ * At returns to one NIP (PPC_WP_STACK_NIP, default the mach_wait_until
+ * return inside nanosleep): r1 and up to four back-chain frames, Darwin PPC
+ * ABI (back chain at 0(sp), a callee saves its LR at 8 of its caller's sp).
+ * f[0] is LR, f[k] the return address saved for the k-th frame's function.
+ * why: 0 four frames read, 1 null back chain, 2 invalid link (alignment,
+ * bounds, no forward progress, step over 1 MB), 3 read failed or not RAM.
+ */
+#define WP_NF 5
+typedef struct {
+    uint32_t asid, reg, f[WP_NF], r1min, r1max;
+    uint8_t depth, why;
+    bool used;
+    uint64_t rets, eps, ns, cls[3];
+} WPStk;
+#define WP_NSTK 256
+static WPStk wp_stk[WP_NSTK];
+static int wp_nstk;
+static uint64_t wp_stk_drop, wp_stk_drop_ns;
+/* Same-run code bytes around each distinct frame address, printed once. */
+typedef struct {
+    uint32_t asid, addr;
+    bool ok;
+    uint8_t b[64];
+} WPCode;
+#define WP_NCODE 160
+static WPCode wp_code[WP_NCODE];
+static int wp_ncode, wp_ncode_out;
+static uint64_t wp_code_drop;
+
+static int wp_walk(CPUState *cpu, uint32_t r1, uint32_t f[WP_NF], int *why)
 {
+    uint32_t sp = r1;
+
+    for (int k = 1; k < WP_NF; k++) {
+        uint8_t w[4];
+        uint32_t next;
+
+        if ((sp & 3) || sp < 0x1000 || sp > 0xfffff000u) {
+            *why = 2;
+            return k - 1;
+        }
+        if (!wp_ram_read(cpu, sp, w, 4)) {
+            *why = 3;
+            return k - 1;
+        }
+        next = ldl_be_p(w);
+        if (!next) {
+            *why = 1;
+            return k - 1;
+        }
+        if ((next & 3) || next <= sp || next - sp > 0x100000 || next > 0xfffff000u) {
+            *why = 2;
+            return k - 1;
+        }
+        if (!wp_ram_read(cpu, next + 8, w, 4)) {
+            *why = 3;
+            return k - 1;
+        }
+        f[k] = ldl_be_p(w);
+        sp = next;
+    }
+    *why = 0;
+    return WP_NF - 1;
+}
+
+/* vCPU thread only writes wp_code, so it may scan without the lock. */
+static void wp_code_note(CPUState *cpu, uint32_t asid, uint32_t addr)
+{
+    WPCode c = { .asid = asid, .addr = addr };
+
+    for (int i = 0; i < wp_ncode; i++) {
+        if (wp_code[i].asid == asid && wp_code[i].addr == addr) {
+            return;
+        }
+    }
+    if (wp_ncode >= WP_NCODE) {
+        wp_code_drop++;
+        return;
+    }
+    c.ok = addr >= 0x1020 && addr < 0xffffffe0u &&
+           wp_ram_read(cpu, (addr & ~3u) - 32, c.b, sizeof(c.b));
+    qemu_spin_lock(&wp_ret_lock);
+    wp_code[wp_ncode++] = c;
+    qemu_spin_unlock(&wp_ret_lock);
+}
+
+static void wp_stk_add(uint32_t asid, uint32_t r1, uint32_t f[WP_NF], int depth, int why)
+{
+    uint32_t reg = r1 >> 19;
+    unsigned h = asid * 0x85ebca6bu ^ reg * 0x27d4eb2fu ^ depth ^ why << 4;
+    WPStk *s = NULL;
+
+    for (int i = 0; i < WP_NF; i++) {
+        h = h * 0x9e3779b1u ^ f[i];
+    }
+    h %= WP_NSTK;
+    for (int i = 0; i < WP_NSTK; i++, h = (h + 1) % WP_NSTK) {
+        WPStk *t = &wp_stk[h];
+        if (!t->used) {
+            if (wp_nstk >= WP_NSTK * 3 / 4) {
+                break;
+            }
+            memset(t, 0, sizeof(*t));
+            t->used = true;
+            t->asid = asid;
+            t->reg = reg;
+            memcpy(t->f, f, sizeof(t->f));
+            t->depth = depth;
+            t->why = why;
+            t->r1min = t->r1max = r1;
+            wp_nstk++;
+            s = t;
+            break;
+        }
+        if (t->asid == asid && t->reg == reg && t->depth == depth && t->why == why &&
+            !memcmp(t->f, f, sizeof(t->f))) {
+            s = t;
+            break;
+        }
+    }
+    if (!s) {
+        wp_stk_drop++;
+        wp_stk_drop_ns += wp_pend.ns;
+        return;
+    }
+    s->rets++;
+    s->eps += wp_pend.n;
+    s->ns += wp_pend.ns;
+    for (int i = 0; i < 3; i++) {
+        s->cls[i] += wp_pend.cls[i];
+    }
+    s->r1min = MIN(s->r1min, r1);
+    s->r1max = MAX(s->r1max, r1);
+}
+
+void waitprof_user_return(CPUState *cpu, uint32_t nip, uint32_t lr, uint32_t r1,
+                          uint32_t asid)
+{
+    uint32_t f[WP_NF] = { lr };
+    int depth = -1, why = 0;
     int64_t now = get_clock();
     unsigned h = ((nip >> 2) * 0x9e3779b1u ^ asid * 0x85ebca6bu) % WP_NRET;
     uint64_t n = wp_pend.n;
@@ -793,7 +974,16 @@ void waitprof_user_return(CPUState *cpu, uint32_t nip, uint32_t lr, uint32_t asi
         wp_as[wp_nas++] = a;
         qemu_spin_unlock(&wp_ret_lock);
     }
+    if (nip == wp_stk_nip) {
+        depth = wp_walk(cpu, r1, f, &why);           /* reads outside the lock */
+        for (int i = 0; i <= depth; i++) {
+            wp_code_note(cpu, asid, f[i]);
+        }
+    }
     qemu_spin_lock(&wp_ret_lock);
+    if (depth >= 0) {
+        wp_stk_add(asid, r1, f, depth, why);
+    }
     for (int i = 0; i < WP_NRET; i++, h = (h + 1) % WP_NRET) {
         WPRet *t = &wp_ret[h];
         if (!t->used) {
@@ -1069,6 +1259,12 @@ static struct {
     uint64_t ret_drop, ret_drop_eps, ret_drop_ns, pend_n, pend_ns;
     WPAs as[WP_NAS];
     int nas;
+    WPStk stk[WP_NSTK];
+    int nstk;
+    uint64_t stk_drop, stk_drop_ns;
+    WPCode code[WP_NCODE];
+    int ncode;
+    uint64_t code_drop;
     uint64_t execlat, execlat_n, kicks;
     uint64_t w1, w1_owned, w1_free, ring_trunc, pair_drop, site_drop;
 } wp_snap;
@@ -1102,6 +1298,17 @@ static void wp_snapshot(void)
     wp_snap.nas = wp_nas;
     memset(wp_ret, 0, sizeof(wp_ret));
     wp_nret = 0;
+    memcpy(wp_snap.stk, wp_stk, sizeof(wp_stk));
+    wp_snap.nstk = wp_nstk;
+    wp_snap.stk_drop = wp_stk_drop;
+    wp_snap.stk_drop_ns = wp_stk_drop_ns;
+    memset(wp_stk, 0, sizeof(wp_stk));
+    wp_nstk = 0;
+    wp_stk_drop = wp_stk_drop_ns = 0;
+    wp_snap.ncode = wp_ncode - wp_ncode_out;
+    memcpy(wp_snap.code, wp_code + wp_ncode_out, wp_snap.ncode * sizeof(WPCode));
+    wp_ncode_out = wp_ncode;
+    wp_snap.code_drop = wp_code_drop;
     wp_ret_drop = wp_ret_drop_eps = wp_ret_drop_ns = 0;
     qemu_spin_unlock(&wp_ret_lock);
     wp_snap.pend_n = qatomic_read(&wp_pend.n);      /* vCPU-thread fields: approximate */
@@ -1197,8 +1404,46 @@ static void wp_print(void)
                 r->dhist[5], r->batch[0], r->batch[1], r->batch[2], r->batch[3]);
     }
     for (int i = 0; i < wp_snap.nas; i++) {
-        fprintf(stderr, "wp-as asid=%06x text=%x path=%s\n", wp_snap.as[i].asid,
-                wp_snap.as[i].text, wp_snap.as[i].path);
+        fprintf(stderr, "wp-as asid=%06x text=%x hdr=%016" PRIx64 " path=%s\n",
+                wp_snap.as[i].asid, wp_snap.as[i].text, wp_snap.as[i].hdr,
+                wp_snap.as[i].path);
+    }
+    {
+        uint64_t rets = 0, eps = 0, ns = 0, why[4] = { 0 };
+        for (int i = 0; i < WP_NSTK; i++) {
+            WPStk *s = &wp_snap.stk[i];
+            rets += s->rets;
+            eps += s->eps;
+            ns += s->ns;
+            if (s->used) {
+                why[s->why] += s->rets;
+            }
+        }
+        fprintf(stderr, "wp-stksum nip=%08x entries=%d rets=%" PRIu64 " eps=%" PRIu64
+                " ms=%.3f why=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+                " drop_rets=%" PRIu64 " drop_ms=%.3f code_drop=%" PRIu64 "\n",
+                wp_stk_nip, wp_snap.nstk, rets, eps, ns / 1e6, why[0], why[1], why[2],
+                why[3], wp_snap.stk_drop, wp_snap.stk_drop_ns / 1e6, wp_snap.code_drop);
+    }
+    for (int i = 0; i < WP_NSTK; i++) {
+        WPStk *s = &wp_snap.stk[i];
+        if (!s->used) {
+            continue;
+        }
+        fprintf(stderr, "wp-stk asid=%06x r1=%08x-%08x depth=%u why=%u f=%08x,%08x,%08x,"
+                "%08x,%08x rets=%" PRIu64 " eps=%" PRIu64 " ms=%.3f cls_ms=%.3f/%.3f/%.3f\n",
+                s->asid, s->r1min, s->r1max, s->depth, s->why, s->f[0], s->f[1],
+                s->f[2], s->f[3], s->f[4], s->rets, s->eps, s->ns / 1e6,
+                s->cls[0] / 1e6, s->cls[1] / 1e6, s->cls[2] / 1e6);
+    }
+    for (int i = 0; i < wp_snap.ncode; i++) {
+        WPCode *c = &wp_snap.code[i];
+        char hex[sizeof(c->b) * 2 + 1];
+        for (unsigned j = 0; j < sizeof(c->b); j++) {
+            snprintf(hex + 2 * j, 3, "%02x", c->b[j]);
+        }
+        fprintf(stderr, "wp-code asid=%06x addr=%08x ok=%d b=%s\n", c->asid, c->addr,
+                c->ok, c->ok ? hex : "-");
     }
     for (int i = 0; i < wp_snap.nsites; i++) {
         WPSite *s = &wp_snap.site[i];

@@ -29,7 +29,8 @@ extern const char *(*waitprof_pending)(CPUState *cpu);
  * target's address-space id (PPC: VSID of SR0).
  */
 extern bool waitprof_ret_pending;
-void waitprof_user_return(CPUState *cpu, uint32_t nip, uint32_t lr, uint32_t asid);
+void waitprof_user_return(CPUState *cpu, uint32_t nip, uint32_t lr, uint32_t r1,
+                          uint32_t asid);
 
 /* Target hook: the halted CPU's context at idle entry: NIP, LR, r1, MSR. */
 extern void (*waitprof_ctx)(CPUState *cpu, uint32_t ctx[4]);
