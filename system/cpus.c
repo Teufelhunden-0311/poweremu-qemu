@@ -702,10 +702,111 @@ static void wp_ctx_add(int64_t ns, int cls)
  * thread that waited.
  */
 bool waitprof_ret_pending;
+/*
+ * Most recent user-to-kernel entry, per vCPU.  A user-mode exception
+ * replaces it (syscall or not), a kernel-mode one only counts as nested,
+ * a return to user mode invalidates it.  The first idle episode of a kernel
+ * interval freezes it into the pending batch with its age.
+ */
+#define WP_NVCPU 8
+typedef struct {
+    bool valid;
+    uint8_t excp;
+    uint32_t asid, nip, lr, r0, r1, nested;
+    int64_t t;
+} WPKEnt;
+static WPKEnt wp_kent[WP_NVCPU];
+static uint64_t wp_kent_user, wp_kent_nested, wp_kent_user_seen, wp_kent_nested_seen;
 static struct {
     uint64_t n, ns, cls[3];
     int64_t last_exit;
+    bool ent_set;
+    WPKEnt ent;
+    int64_t ent_age;
 } wp_pend;
+typedef struct {
+    uint32_t asid, nip, lr, r0, reg;
+    uint8_t excp, valid;
+    bool used;
+    uint64_t rets, eps, ns, cls[3], age, ahist[WP_NHIST], nested, batch[4], same, same_ns;
+} WPEnt;
+#define WP_NENT 1024
+static WPEnt wp_ent[WP_NENT];
+static int wp_nent;
+static uint64_t wp_ent_drop, wp_ent_drop_ns;
+
+void waitprof_kentry(CPUState *cpu, int excp, bool pr, uint32_t nip, uint32_t lr,
+                     uint32_t r0, uint32_t r1, uint32_t asid)
+{
+    WPKEnt *k = &wp_kent[cpu->cpu_index % WP_NVCPU];
+
+    if (pr) {
+        *k = (WPKEnt){ .valid = true, .excp = excp, .asid = asid, .nip = nip,
+                       .lr = lr, .r0 = r0, .r1 = r1, .t = get_clock() };
+        wp_kent_user++;
+    } else {
+        k->nested += k->valid;
+        wp_kent_nested++;
+    }
+}
+
+void waitprof_kexit(CPUState *cpu)
+{
+    wp_kent[cpu->cpu_index % WP_NVCPU].valid = false;
+}
+
+/* Under wp_ret_lock: charge the pending batch to its frozen entry. */
+static void wp_ent_add(uint32_t r1, uint32_t asid)
+{
+    WPKEnt *k = &wp_pend.ent;
+    uint32_t reg = k->r1 >> 19;
+    unsigned h = ((k->nip >> 2) * 0x9e3779b1u ^ k->asid * 0x85ebca6bu ^ (k->lr >> 2) * 0x27d4eb2fu ^
+                  k->r0 * 0x165667b1u ^ reg ^ k->excp << 8 ^ k->valid << 16) % WP_NENT;
+    WPEnt *e = NULL;
+
+    if (!k->valid) {
+        k->asid = k->nip = k->lr = k->r0 = k->r1 = k->nested = k->excp = 0;
+        reg = 0;
+    }
+    for (int i = 0; i < WP_NENT; i++, h = (h + 1) % WP_NENT) {
+        WPEnt *t = &wp_ent[h];
+        if (!t->used) {
+            if (wp_nent >= WP_NENT * 3 / 4) {
+                break;
+            }
+            memset(t, 0, sizeof(*t));
+            *t = (WPEnt){ .asid = k->asid, .nip = k->nip, .lr = k->lr, .r0 = k->r0,
+                          .reg = reg, .excp = k->excp, .valid = k->valid, .used = true };
+            wp_nent++;
+            e = t;
+            break;
+        }
+        if (t->asid == k->asid && t->nip == k->nip && t->lr == k->lr && t->r0 == k->r0 &&
+            t->reg == reg && t->excp == k->excp && t->valid == k->valid) {
+            e = t;
+            break;
+        }
+    }
+    if (!e) {
+        wp_ent_drop++;
+        wp_ent_drop_ns += wp_pend.ns;
+        return;
+    }
+    e->rets++;
+    e->eps += wp_pend.n;
+    e->ns += wp_pend.ns;
+    for (int i = 0; i < 3; i++) {
+        e->cls[i] += wp_pend.cls[i];
+    }
+    e->age += wp_pend.ent_age;
+    e->ahist[wp_bucket(wp_pend.ent_age)]++;
+    e->nested += k->nested;
+    e->batch[wp_pend.n <= 1 ? 0 : wp_pend.n == 2 ? 1 : wp_pend.n <= 4 ? 2 : 3]++;
+    if (k->valid && asid == k->asid && r1 == k->r1) {      /* the entering thread resumed */
+        e->same++;
+        e->same_ns += wp_pend.ns;
+    }
+}
 typedef struct {
     uint32_t nip, asid, lr, lr_other;    /* lr_other: returns whose LR != lr */
     bool used;
@@ -984,6 +1085,7 @@ void waitprof_user_return(CPUState *cpu, uint32_t nip, uint32_t lr, uint32_t r1,
     if (depth >= 0) {
         wp_stk_add(asid, r1, f, depth, why);
     }
+    wp_ent_add(r1, asid);
     for (int i = 0; i < WP_NRET; i++, h = (h + 1) % WP_NRET) {
         WPRet *t = &wp_ret[h];
         if (!t->used) {
@@ -1036,6 +1138,12 @@ void waitprof_idle_enter(CPUState *cpu)
     wp_t0 = get_clock();
     wp_nwaits = 0;
     wp_last_ret = 0;
+    if (!wp_pend.ent_set) {                 /* first idle of this kernel interval */
+        WPKEnt *k = &wp_kent[cpu->cpu_index % WP_NVCPU];
+        wp_pend.ent = *k;
+        wp_pend.ent_age = k->valid ? wp_t0 - k->t : 0;
+        wp_pend.ent_set = true;
+    }
 }
 
 void waitprof_idle_wait(bool begin)
@@ -1261,6 +1369,9 @@ static struct {
     int nas;
     WPStk stk[WP_NSTK];
     int nstk;
+    WPEnt ent[WP_NENT];
+    int nent;
+    uint64_t ent_drop, ent_drop_ns, kent_user, kent_nested;
     uint64_t stk_drop, stk_drop_ns;
     WPCode code[WP_NCODE];
     int ncode;
@@ -1298,6 +1409,20 @@ static void wp_snapshot(void)
     wp_snap.nas = wp_nas;
     memset(wp_ret, 0, sizeof(wp_ret));
     wp_nret = 0;
+    memcpy(wp_snap.ent, wp_ent, sizeof(wp_ent));
+    wp_snap.nent = wp_nent;
+    wp_snap.ent_drop = wp_ent_drop;
+    wp_snap.ent_drop_ns = wp_ent_drop_ns;
+    memset(wp_ent, 0, sizeof(wp_ent));
+    wp_nent = 0;
+    wp_ent_drop = wp_ent_drop_ns = 0;
+    {
+        uint64_t u = qatomic_read(&wp_kent_user), n = qatomic_read(&wp_kent_nested);
+        wp_snap.kent_user = u - wp_kent_user_seen;        /* vCPU-thread counters */
+        wp_snap.kent_nested = n - wp_kent_nested_seen;
+        wp_kent_user_seen = u;
+        wp_kent_nested_seen = n;
+    }
     memcpy(wp_snap.stk, wp_stk, sizeof(wp_stk));
     wp_snap.nstk = wp_nstk;
     wp_snap.stk_drop = wp_stk_drop;
@@ -1435,6 +1560,40 @@ static void wp_print(void)
                 s->asid, s->r1min, s->r1max, s->depth, s->why, s->f[0], s->f[1],
                 s->f[2], s->f[3], s->f[4], s->rets, s->eps, s->ns / 1e6,
                 s->cls[0] / 1e6, s->cls[1] / 1e6, s->cls[2] / 1e6);
+    }
+    {
+        uint64_t rets = 0, eps = 0, ns = 0, inv = 0, inv_ns = 0;
+        for (int i = 0; i < WP_NENT; i++) {
+            WPEnt *e = &wp_snap.ent[i];
+            rets += e->rets;
+            eps += e->eps;
+            ns += e->ns;
+            if (e->used && !e->valid) {
+                inv += e->rets;
+                inv_ns += e->ns;
+            }
+        }
+        fprintf(stderr, "wp-entsum entries=%d rets=%" PRIu64 " eps=%" PRIu64 " ms=%.3f"
+                " invalid_rets=%" PRIu64 " invalid_ms=%.3f drop_rets=%" PRIu64
+                " drop_ms=%.3f user_entries=%" PRIu64 " nested_entries=%" PRIu64 "\n",
+                wp_snap.nent, rets, eps, ns / 1e6, inv, inv_ns / 1e6, wp_snap.ent_drop,
+                wp_snap.ent_drop_ns / 1e6, wp_snap.kent_user, wp_snap.kent_nested);
+    }
+    for (int i = 0; i < WP_NENT; i++) {
+        WPEnt *e = &wp_snap.ent[i];
+        if (!e->used) {
+            continue;
+        }
+        fprintf(stderr, "wp-ent valid=%u excp=%u asid=%06x nip=%08x lr=%08x r0=%d reg=%03x"
+                " rets=%" PRIu64 " eps=%" PRIu64 " ms=%.3f cls_ms=%.3f/%.3f/%.3f"
+                " age_ms=%.3f ah=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+                "/%" PRIu64 " nested=%" PRIu64 " batch=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+                "/%" PRIu64 " same=%" PRIu64 " same_ms=%.3f\n",
+                e->valid, e->excp, e->asid, e->nip, e->lr, (int32_t)e->r0, e->reg, e->rets,
+                e->eps, e->ns / 1e6, e->cls[0] / 1e6, e->cls[1] / 1e6, e->cls[2] / 1e6,
+                e->age / 1e6, e->ahist[0], e->ahist[1], e->ahist[2], e->ahist[3],
+                e->ahist[4], e->ahist[5], e->nested, e->batch[0], e->batch[1],
+                e->batch[2], e->batch[3], e->same, e->same_ns / 1e6);
     }
     for (int i = 0; i < wp_snap.ncode; i++) {
         WPCode *c = &wp_snap.code[i];

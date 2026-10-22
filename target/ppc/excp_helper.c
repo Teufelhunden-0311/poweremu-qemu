@@ -29,6 +29,7 @@
 #include "hw/ppc/ppc.h"
 
 #include "trace.h"
+#include "system/waitprof.h"
 
 /*****************************************************************************/
 /* Exception processing */
@@ -1629,6 +1630,11 @@ void powerpc_excp(PowerPCCPU *cpu, int excp)
                   " => %s (%d) error=%02x\n", env->nip, powerpc_excp_name(excp),
                   excp, env->error_code);
     env->excp_stats[excp]++;
+    if (waitprof_on) {
+        waitprof_kentry(env_cpu(env), excp, (env->msr >> MSR_PR) & 1, env->nip,
+                        env->lr, excp == POWERPC_EXCP_SYSCALL ? env->gpr[0] : 0,
+                        env->gpr[1], env->sr[0] & 0x00ffffff);
+    }
 
     switch (env->excp_model) {
     case POWERPC_EXCP_40x:

@@ -32,6 +32,16 @@ extern bool waitprof_ret_pending;
 void waitprof_user_return(CPUState *cpu, uint32_t nip, uint32_t lr, uint32_t r1,
                           uint32_t asid);
 
+/*
+ * Most recent user-to-kernel entry before idle.  The target calls
+ * waitprof_kentry for every delivered exception (pr: the interrupted context
+ * was user mode; r0 only for system calls, else 0) and waitprof_kexit for
+ * every return to user mode, which ends that kernel interval.
+ */
+void waitprof_kentry(CPUState *cpu, int excp, bool pr, uint32_t nip, uint32_t lr,
+                     uint32_t r0, uint32_t r1, uint32_t asid);
+void waitprof_kexit(CPUState *cpu);
+
 /* Target hook: the halted CPU's context at idle entry: NIP, LR, r1, MSR. */
 extern void (*waitprof_ctx)(CPUState *cpu, uint32_t ctx[4]);
 

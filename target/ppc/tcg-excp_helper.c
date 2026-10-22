@@ -519,9 +519,12 @@ static void do_rfi(CPUPPCState *env, target_ulong nip, target_ulong msr)
 
     /* Context synchronizing: check if TCG TLB needs flush */
     check_tlb_flush(env, false);
-    if (waitprof_ret_pending && (env->msr >> MSR_PR) & 1) {
-        waitprof_user_return(env_cpu(env), env->nip, env->lr, env->gpr[1],
-                             env->sr[0] & 0x00ffffff);
+    if (waitprof_on && (env->msr >> MSR_PR) & 1) {
+        if (waitprof_ret_pending) {
+            waitprof_user_return(env_cpu(env), env->nip, env->lr, env->gpr[1],
+                                 env->sr[0] & 0x00ffffff);
+        }
+        waitprof_kexit(env_cpu(env));
     }
 }
 
