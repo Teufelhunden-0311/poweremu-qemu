@@ -18,10 +18,83 @@
 
 #include "r300_us.h"
 
+/*
+ * What shapes the MSL besides the GLSL and the two libraries, in one place
+ * so that r300_msl_translation_id() names all of it for the MSL disk
+ * cache's key.
+ */
+#define R300_VULKAN_ENV     shaderc_env_version_vulkan_1_1
+#define R300_SPIRV_VERSION  shaderc_spirv_version_1_3
+#define R300_MSL_MAJOR      2
+#define R300_MSL_MINOR      4
+
+/* Each stage's macro; R300_FS_Z also defines R300_FS. */
+static const char *const r300_stage_macro[] = { "R300_VS", "R300_FS", "R300_FS_Z" };
+
+/* SPIR-V binding -> MSL buffer index; texture unit k is texture and
+ * sampler k (binding R300_BIND_TEX0 + k). */
+static const unsigned r300_vs_buffers[][2] = {
+    { R300_BIND_VERTS, 0 }, { R300_BIND_MS, 1 }, { R300_BIND_VSU, 2 },
+};
+static const unsigned r300_fs_buffers[][2] = {
+    { R300_BIND_UNIFORMS, 0 }, { R300_BIND_ZPASS, 1 }, { R300_BIND_VRAM, 2 },
+    { R300_BIND_AUX, 3 },
+};
+
 const char *r300_stage_entry(R300Stage stage)
 {
     static const char *names[] = { "r300_vs", "r300_fs", "r300_fs_z" };
     return names[stage];
+}
+
+char *r300_msl_translation_id(void)
+{
+    char buf[1024];
+    unsigned v, r;
+    size_t n;
+
+    n = (size_t)snprintf(buf, sizeof(buf),
+                         "GLSL -> SPIR-V: Vulkan env 0x%x, SPIR-V 0x%x, entry main, "
+                         "macros %s %s %s+%s; SPIR-V -> MSL: macOS, MSL %u.%u.0, "
+                         "framebuffer fetch for input attachments, entries %s %s %s; "
+                         "VS buffers",
+                         (unsigned)R300_VULKAN_ENV, (unsigned)R300_SPIRV_VERSION,
+                         r300_stage_macro[0], r300_stage_macro[1], r300_stage_macro[2],
+                         r300_stage_macro[1], R300_MSL_MAJOR, R300_MSL_MINOR,
+                         r300_stage_entry(R300_STAGE_VS), r300_stage_entry(R300_STAGE_FS),
+                         r300_stage_entry(R300_STAGE_FS_Z));
+    for (size_t i = 0; i < sizeof(r300_vs_buffers) / sizeof(r300_vs_buffers[0]); i++) {
+        n += (size_t)snprintf(buf + n, sizeof(buf) - n, " %u>%u",
+                              r300_vs_buffers[i][0], r300_vs_buffers[i][1]);
+    }
+    n += (size_t)snprintf(buf + n, sizeof(buf) - n, "; FS buffers");
+    for (size_t i = 0; i < sizeof(r300_fs_buffers) / sizeof(r300_fs_buffers[0]); i++) {
+        n += (size_t)snprintf(buf + n, sizeof(buf) - n, " %u>%u",
+                              r300_fs_buffers[i][0], r300_fs_buffers[i][1]);
+    }
+    n += (size_t)snprintf(buf + n, sizeof(buf) - n, "; FS textures %u+k>k, k < %u",
+                          (unsigned)R300_BIND_TEX0, (unsigned)R300_NUM_TEX_UNITS);
+    shaderc_get_spv_version(&v, &r);
+    n += (size_t)snprintf(buf + n, sizeof(buf) - n, "\nshaderc: SPIR-V 0x%x rev %u", v, r);
+#ifdef R300_HAVE_SPIRV_CROSS
+    {
+        unsigned p;
+        spvc_get_version(&v, &r, &p);
+        snprintf(buf + n, sizeof(buf) - n, "\nSPIRV-Cross: C API %u.%u.%u, %s", v, r, p,
+                 spvc_get_commit_revision_and_timestamp());
+    }
+#endif
+    return strdup(buf);
+}
+
+void r300_converter_functions(const void **shaderc, const void **spirv_cross)
+{
+    *shaderc = (const void *)shaderc_compile_into_spv;
+#ifdef R300_HAVE_SPIRV_CROSS
+    *spirv_cross = (const void *)spvc_compiler_compile;
+#else
+    *spirv_cross = NULL;
+#endif
 }
 
 static char *r300_strdup_err(const char *what, const char *msg)
@@ -36,7 +109,7 @@ uint32_t *r300_glsl_to_spirv(const char *glsl, R300Stage stage,
                              size_t *nwords, char **err)
 {
     static shaderc_compiler_t compiler;
-    static const char *macro[] = { "R300_VS", "R300_FS", "R300_FS_Z" };
+    const char *macro = r300_stage_macro[stage];
     shaderc_compile_options_t opts;
     shaderc_compilation_result_t res;
     uint32_t *words = NULL;
@@ -51,12 +124,12 @@ uint32_t *r300_glsl_to_spirv(const char *glsl, R300Stage stage,
     }
     opts = shaderc_compile_options_initialize();
     shaderc_compile_options_set_target_env(opts, shaderc_target_env_vulkan,
-                                           shaderc_env_version_vulkan_1_1);
-    shaderc_compile_options_set_target_spirv(opts, shaderc_spirv_version_1_3);
-    shaderc_compile_options_add_macro_definition(opts, macro[stage],
-                                                 strlen(macro[stage]), "1", 1);
+                                           R300_VULKAN_ENV);
+    shaderc_compile_options_set_target_spirv(opts, R300_SPIRV_VERSION);
+    shaderc_compile_options_add_macro_definition(opts, macro, strlen(macro), "1", 1);
     if (stage == R300_STAGE_FS_Z) {
-        shaderc_compile_options_add_macro_definition(opts, "R300_FS", 7, "1", 1);
+        macro = r300_stage_macro[R300_STAGE_FS];
+        shaderc_compile_options_add_macro_definition(opts, macro, strlen(macro), "1", 1);
     }
     res = shaderc_compile_into_spv(compiler, glsl, strlen(glsl),
                                    stage == R300_STAGE_VS ? shaderc_glsl_vertex_shader
@@ -118,7 +191,7 @@ char *r300_spirv_to_msl(const uint32_t *spv, size_t nwords, R300Stage stage,
     spvc_compiler_options_set_uint(o, SPVC_COMPILER_OPTION_MSL_PLATFORM,
                                    SPVC_MSL_PLATFORM_MACOS);
     spvc_compiler_options_set_uint(o, SPVC_COMPILER_OPTION_MSL_VERSION,
-                                   SPVC_MAKE_MSL_VERSION(2, 4, 0));
+                                   SPVC_MAKE_MSL_VERSION(R300_MSL_MAJOR, R300_MSL_MINOR, 0));
     /* input attachment k -> [[color(k)]] */
     spvc_compiler_options_set_bool(o, SPVC_COMPILER_OPTION_MSL_IOS_FRAMEBUFFER_FETCH_SUBPASS,
                                    SPVC_TRUE);
@@ -126,14 +199,13 @@ char *r300_spirv_to_msl(const uint32_t *spv, size_t nwords, R300Stage stage,
         goto fail;
     }
     if (stage == R300_STAGE_VS) {
-        msl_bind(c, model, R300_BIND_VERTS, 0, 0, 0);
-        msl_bind(c, model, R300_BIND_MS, 1, 0, 0);
-        msl_bind(c, model, R300_BIND_VSU, 2, 0, 0);
+        for (size_t i = 0; i < sizeof(r300_vs_buffers) / sizeof(r300_vs_buffers[0]); i++) {
+            msl_bind(c, model, r300_vs_buffers[i][0], r300_vs_buffers[i][1], 0, 0);
+        }
     } else {
-        msl_bind(c, model, R300_BIND_UNIFORMS, 0, 0, 0);
-        msl_bind(c, model, R300_BIND_ZPASS, 1, 0, 0);
-        msl_bind(c, model, R300_BIND_VRAM, 2, 0, 0);
-        msl_bind(c, model, R300_BIND_AUX, 3, 0, 0);
+        for (size_t i = 0; i < sizeof(r300_fs_buffers) / sizeof(r300_fs_buffers[0]); i++) {
+            msl_bind(c, model, r300_fs_buffers[i][0], r300_fs_buffers[i][1], 0, 0);
+        }
         for (unsigned k = 0; k < R300_NUM_TEX_UNITS; k++) {
             msl_bind(c, model, R300_BIND_TEX0 + k, 0, k, k);
         }
