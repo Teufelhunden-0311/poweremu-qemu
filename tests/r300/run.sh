@@ -19,6 +19,7 @@ for t in test_pvs test_us test_draw test_features; do
 done
 cc -O1 -Wall -o "$B/test_aperture" test_aperture.c
 cc -O1 -Wall -o "$B/glsl2msl" glsl2msl.c $SPV
+cc -O1 -Wall -o "$B/test_mslcache" test_mslcache.c $SPV -lz
 clang -fobjc-arc -framework Metal -framework Foundation mslcheck.m -o "$B/mslcheck"
 for t in test_zs test_fmt test_raster test_gpuvs; do
     clang -O1 -fobjc-arc -framework Metal -framework Foundation $t.m $SRC $SPV -o "$B/$t"
@@ -41,6 +42,7 @@ for flags in 0 1; do
         "$B/mslcheck" "$B/qe$flags.$s.metal"
     done
 done
+"$B/test_mslcache" "$B/qe0.glsl" "$B"
 "$B/test_features"
 "$B/test_zs"
 "$B/test_fmt"
