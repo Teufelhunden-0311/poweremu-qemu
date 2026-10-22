@@ -578,6 +578,7 @@ bool waitprof_on;
 const char *(*waitprof_pending)(CPUState *cpu);
 void (*waitprof_ctx)(CPUState *cpu, uint32_t ctx[4]);
 static uint32_t wp_stk_nip;      /* stack capture site, see wp_walk */
+static uint32_t wp_ent_nip, wp_ent_reg;    /* see wp_shape_capture */
 static QemuSpin wp_ret_lock;     /* user-return tables vs. the snapshot */
 
 static void __attribute__((constructor)) waitprof_init(void)
@@ -587,6 +588,10 @@ static void __attribute__((constructor)) waitprof_init(void)
     qemu_spin_init(&wp_ret_lock);
     e = getenv("PPC_WP_STACK_NIP");
     wp_stk_nip = e ? strtoul(e, NULL, 16) : 0x900411f8u;
+    e = getenv("PPC_WP_ENT_NIP");
+    wp_ent_nip = e ? strtoul(e, NULL, 16) : 0x9000b344u;
+    e = getenv("PPC_WP_ENT_REG");
+    wp_ent_reg = e ? strtoul(e, NULL, 16) : 0x17ffu;
 }
 
 #define WP_NHIST 6
@@ -712,9 +717,11 @@ bool waitprof_ret_pending;
 typedef struct {
     bool valid;
     uint8_t excp;
+    uint16_t shape;                 /* wp_shape id, WP_NOSHAPE if not captured */
     uint32_t asid, nip, lr, r0, r1, nested;
     int64_t t;
 } WPKEnt;
+#define WP_NOSHAPE 0xffff
 static WPKEnt wp_kent[WP_NVCPU];
 static uint64_t wp_kent_user, wp_kent_nested, wp_kent_user_seen, wp_kent_nested_seen;
 static struct {
@@ -726,6 +733,7 @@ static struct {
 } wp_pend;
 typedef struct {
     uint32_t asid, nip, lr, r0, reg;
+    uint16_t shape;
     uint8_t excp, valid;
     bool used;
     uint64_t rets, eps, ns, cls[3], age, ahist[WP_NHIST], nested, batch[4], same, same_ns;
@@ -735,6 +743,8 @@ static WPEnt wp_ent[WP_NENT];
 static int wp_nent;
 static uint64_t wp_ent_drop, wp_ent_drop_ns;
 
+static int wp_shape_capture(CPUState *cpu, uint32_t asid, uint32_t r1, uint32_t lr);
+
 void waitprof_kentry(CPUState *cpu, int excp, bool pr, uint32_t nip, uint32_t lr,
                      uint32_t r0, uint32_t r1, uint32_t asid)
 {
@@ -742,7 +752,11 @@ void waitprof_kentry(CPUState *cpu, int excp, bool pr, uint32_t nip, uint32_t lr
 
     if (pr) {
         *k = (WPKEnt){ .valid = true, .excp = excp, .asid = asid, .nip = nip,
-                       .lr = lr, .r0 = r0, .r1 = r1, .t = get_clock() };
+                       .lr = lr, .r0 = r0, .r1 = r1, .t = get_clock(),
+                       .shape = WP_NOSHAPE };
+        if (nip == wp_ent_nip && r1 >> 19 == wp_ent_reg) {
+            k->shape = wp_shape_capture(cpu, asid, r1, lr);
+        }
         wp_kent_user++;
     } else {
         k->nested += k->valid;
@@ -761,11 +775,13 @@ static void wp_ent_add(uint32_t r1, uint32_t asid)
     WPKEnt *k = &wp_pend.ent;
     uint32_t reg = k->r1 >> 19;
     unsigned h = ((k->nip >> 2) * 0x9e3779b1u ^ k->asid * 0x85ebca6bu ^ (k->lr >> 2) * 0x27d4eb2fu ^
-                  k->r0 * 0x165667b1u ^ reg ^ k->excp << 8 ^ k->valid << 16) % WP_NENT;
+                  k->r0 * 0x165667b1u ^ reg ^ k->excp << 8 ^ k->valid << 16 ^
+                  (unsigned)k->shape * 0xd3a2646cu) % WP_NENT;
     WPEnt *e = NULL;
 
     if (!k->valid) {
         k->asid = k->nip = k->lr = k->r0 = k->r1 = k->nested = k->excp = 0;
+        k->shape = WP_NOSHAPE;
         reg = 0;
     }
     for (int i = 0; i < WP_NENT; i++, h = (h + 1) % WP_NENT) {
@@ -776,13 +792,15 @@ static void wp_ent_add(uint32_t r1, uint32_t asid)
             }
             memset(t, 0, sizeof(*t));
             *t = (WPEnt){ .asid = k->asid, .nip = k->nip, .lr = k->lr, .r0 = k->r0,
-                          .reg = reg, .excp = k->excp, .valid = k->valid, .used = true };
+                          .reg = reg, .excp = k->excp, .valid = k->valid,
+                          .shape = k->shape, .used = true };
             wp_nent++;
             e = t;
             break;
         }
         if (t->asid == k->asid && t->nip == k->nip && t->lr == k->lr && t->r0 == k->r0 &&
-            t->reg == reg && t->excp == k->excp && t->valid == k->valid) {
+            t->reg == reg && t->excp == k->excp && t->valid == k->valid &&
+            t->shape == k->shape) {
             e = t;
             break;
         }
@@ -940,16 +958,16 @@ typedef struct {
     bool ok;
     uint8_t b[64];
 } WPCode;
-#define WP_NCODE 160
+#define WP_NCODE 4096
 static WPCode wp_code[WP_NCODE];
 static int wp_ncode, wp_ncode_out;
 static uint64_t wp_code_drop;
 
-static int wp_walk(CPUState *cpu, uint32_t r1, uint32_t f[WP_NF], int *why)
+static int wp_walk(CPUState *cpu, uint32_t r1, uint32_t *f, int nf, int *why)
 {
     uint32_t sp = r1;
 
-    for (int k = 1; k < WP_NF; k++) {
+    for (int k = 1; k < nf; k++) {
         uint8_t w[4];
         uint32_t next;
 
@@ -978,7 +996,7 @@ static int wp_walk(CPUState *cpu, uint32_t r1, uint32_t f[WP_NF], int *why)
         sp = next;
     }
     *why = 0;
-    return WP_NF - 1;
+    return nf - 1;
 }
 
 /* vCPU thread only writes wp_code, so it may scan without the lock. */
@@ -1051,6 +1069,94 @@ static void wp_stk_add(uint32_t asid, uint32_t r1, uint32_t f[WP_NF], int depth,
     s->r1max = MAX(s->r1max, r1);
 }
 
+/*
+ * Stack shapes at one user-mode syscall entry (PPC_WP_ENT_NIP, default the
+ * mach_msg_trap sc) on one r1 512 KB region (PPC_WP_ENT_REG, default 0x17ff,
+ * 0xbff80000-0xbfffffff) when the current address space's first 128 bytes at
+ * 0x1000 (Mach-O header, __PAGEZERO and __TEXT commands) equal wp_ent_hdr (the
+ * PB Doom 3 PPC slice), read at every candidate entry: a VSID survives exec,
+ * so a per-VSID label from first sight can be stale.  Taken in the entering
+ * context, same bounded RAM-only walk as wp_walk, up to WP_NF2 frames.  Ids
+ * are stable for the run; each new shape is printed once, counts per window.
+ */
+#define WP_NF2 12
+typedef struct {
+    uint32_t asid, f[WP_NF2];
+    uint8_t depth, why;
+} WPShape;
+#define WP_NSHAPE 4096
+static WPShape wp_shape[WP_NSHAPE];
+static uint16_t wp_shape_idx[2 * WP_NSHAPE];        /* hash -> id + 1, 0 = empty */
+static uint64_t wp_shape_n[WP_NSHAPE];
+static int wp_nshape, wp_nshape_out;
+static uint64_t wp_shape_drop, wp_shape_caps;
+static uint32_t wp_ent_target = UINT32_MAX;          /* VSID last matched */
+static uint64_t wp_ent_cand, wp_ent_nomatch;
+static const char wp_ent_hdr_hex[] =
+    "feedface00000012000000000000000200000013000010b40001a08500000001000000385f5f504147455a45524f000000000000000000000000100000000000000000000000000000000000000000000000000400000001000004345f5f544558540000000000000000000000001000004a300000000000004a300000000007";
+static uint8_t wp_ent_hdr[128];
+
+static int wp_shape_capture(CPUState *cpu, uint32_t asid, uint32_t r1, uint32_t lr)
+{
+    uint32_t f[WP_NF2] = { lr };
+    int depth, why, id;
+
+    uint8_t hdr[sizeof(wp_ent_hdr)];
+    static bool hdr_init;
+
+    if (!hdr_init) {
+        for (int i = 0; i < (int)sizeof(wp_ent_hdr); i++) {
+            unsigned v;
+            sscanf(wp_ent_hdr_hex + 2 * i, "%2x", &v);
+            wp_ent_hdr[i] = v;
+        }
+        hdr_init = true;
+    }
+    wp_ent_cand++;
+    if (!wp_ram_read(cpu, 0x1000, hdr, sizeof(hdr)) ||
+        memcmp(hdr, wp_ent_hdr, sizeof(hdr))) {
+        wp_ent_nomatch++;
+        return WP_NOSHAPE;
+    }
+    wp_ent_target = asid;
+    depth = wp_walk(cpu, r1, f, WP_NF2, &why);
+    unsigned h = asid * 0x85ebca6bu ^ depth ^ why << 4, slot;
+    for (int i = 0; i < WP_NF2; i++) {
+        h = h * 0x9e3779b1u ^ f[i];
+    }
+    for (slot = h % (2 * WP_NSHAPE); wp_shape_idx[slot];
+         slot = (slot + 1) % (2 * WP_NSHAPE)) {
+        WPShape *s = &wp_shape[wp_shape_idx[slot] - 1];
+        if (s->asid == asid && s->depth == depth && s->why == why &&
+            !memcmp(s->f, f, sizeof(f))) {
+            break;
+        }
+    }
+    id = wp_shape_idx[slot] ? wp_shape_idx[slot] - 1 : wp_nshape;
+    if (id == wp_nshape) {
+        if (wp_nshape >= WP_NSHAPE) {
+            qemu_spin_lock(&wp_ret_lock);
+            wp_shape_drop++;
+            qemu_spin_unlock(&wp_ret_lock);
+            return WP_NOSHAPE;
+        }
+        for (int i = 0; i <= depth; i++) {
+            wp_code_note(cpu, asid, f[i]);
+        }
+        qemu_spin_lock(&wp_ret_lock);
+        wp_shape[id] = (WPShape){ .asid = asid, .depth = depth, .why = why };
+        memcpy(wp_shape[id].f, f, sizeof(f));
+        wp_shape_idx[slot] = id + 1;
+        wp_nshape++;
+        qemu_spin_unlock(&wp_ret_lock);
+    }
+    qemu_spin_lock(&wp_ret_lock);
+    wp_shape_n[id]++;
+    wp_shape_caps++;
+    qemu_spin_unlock(&wp_ret_lock);
+    return id;
+}
+
 void waitprof_user_return(CPUState *cpu, uint32_t nip, uint32_t lr, uint32_t r1,
                           uint32_t asid)
 {
@@ -1076,7 +1182,7 @@ void waitprof_user_return(CPUState *cpu, uint32_t nip, uint32_t lr, uint32_t r1,
         qemu_spin_unlock(&wp_ret_lock);
     }
     if (nip == wp_stk_nip) {
-        depth = wp_walk(cpu, r1, f, &why);           /* reads outside the lock */
+        depth = wp_walk(cpu, r1, f, WP_NF, &why);           /* reads outside the lock */
         for (int i = 0; i <= depth; i++) {
             wp_code_note(cpu, asid, f[i]);
         }
@@ -1371,6 +1477,10 @@ static struct {
     int nstk;
     WPEnt ent[WP_NENT];
     int nent;
+    WPShape shape[WP_NSHAPE];
+    uint64_t shape_n[WP_NSHAPE];
+    int nshape, nshape_new;
+    uint64_t shape_drop, shape_caps;
     uint64_t ent_drop, ent_drop_ns, kent_user, kent_nested;
     uint64_t stk_drop, stk_drop_ns;
     WPCode code[WP_NCODE];
@@ -1409,6 +1519,15 @@ static void wp_snapshot(void)
     wp_snap.nas = wp_nas;
     memset(wp_ret, 0, sizeof(wp_ret));
     wp_nret = 0;
+    wp_snap.nshape_new = wp_nshape_out;
+    wp_snap.nshape = wp_nshape;
+    memcpy(wp_snap.shape, wp_shape, sizeof(wp_shape));
+    memcpy(wp_snap.shape_n, wp_shape_n, sizeof(wp_shape_n));
+    memset(wp_shape_n, 0, sizeof(wp_shape_n));
+    wp_nshape_out = wp_nshape;
+    wp_snap.shape_drop = wp_shape_drop;
+    wp_snap.shape_caps = wp_shape_caps;
+    wp_shape_drop = wp_shape_caps = 0;
     memcpy(wp_snap.ent, wp_ent, sizeof(wp_ent));
     wp_snap.nent = wp_nent;
     wp_snap.ent_drop = wp_ent_drop;
@@ -1585,15 +1704,42 @@ static void wp_print(void)
             continue;
         }
         fprintf(stderr, "wp-ent valid=%u excp=%u asid=%06x nip=%08x lr=%08x r0=%d reg=%03x"
+                " shape=%d"
                 " rets=%" PRIu64 " eps=%" PRIu64 " ms=%.3f cls_ms=%.3f/%.3f/%.3f"
                 " age_ms=%.3f ah=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
                 "/%" PRIu64 " nested=%" PRIu64 " batch=%" PRIu64 "/%" PRIu64 "/%" PRIu64
                 "/%" PRIu64 " same=%" PRIu64 " same_ms=%.3f\n",
-                e->valid, e->excp, e->asid, e->nip, e->lr, (int32_t)e->r0, e->reg, e->rets,
+                e->valid, e->excp, e->asid, e->nip, e->lr, (int32_t)e->r0, e->reg,
+                e->shape == WP_NOSHAPE ? -1 : e->shape, e->rets,
                 e->eps, e->ns / 1e6, e->cls[0] / 1e6, e->cls[1] / 1e6, e->cls[2] / 1e6,
                 e->age / 1e6, e->ahist[0], e->ahist[1], e->ahist[2], e->ahist[3],
                 e->ahist[4], e->ahist[5], e->nested, e->batch[0], e->batch[1],
                 e->batch[2], e->batch[3], e->same, e->same_ns / 1e6);
+    }
+    for (int i = wp_snap.nshape_new; i < wp_snap.nshape; i++) {
+        WPShape *s = &wp_snap.shape[i];
+        char fr[WP_NF2 * 9 + 1];
+        for (int j = 0; j < WP_NF2; j++) {
+            snprintf(fr + 9 * j, 10, "%08x,", s->f[j]);
+        }
+        fr[WP_NF2 * 9 - 1] = 0;
+        fprintf(stderr, "wp-shape id=%d asid=%06x depth=%u why=%u f=%s\n", i, s->asid,
+                s->depth, s->why, fr);
+    }
+    {
+        GString *g = g_string_new(NULL);
+        for (int i = 0; i < wp_snap.nshape; i++) {
+            if (wp_snap.shape_n[i]) {
+                g_string_append_printf(g, "%s%d:%" PRIu64, g->len ? "," : "", i,
+                                       wp_snap.shape_n[i]);
+            }
+        }
+        fprintf(stderr, "wp-shapecnt nip=%08x reg=%03x target=%06x cand=%" PRIu64
+                " nomatch=%" PRIu64 " caps=%" PRIu64 " drop=%" PRIu64 " n=%s\n",
+                wp_ent_nip, wp_ent_reg, wp_ent_target == UINT32_MAX ? 0 : wp_ent_target,
+                qatomic_read(&wp_ent_cand), qatomic_read(&wp_ent_nomatch),
+                wp_snap.shape_caps, wp_snap.shape_drop, g->len ? g->str : "-");
+        g_string_free(g, true);
     }
     for (int i = 0; i < wp_snap.ncode; i++) {
         WPCode *c = &wp_snap.code[i];
