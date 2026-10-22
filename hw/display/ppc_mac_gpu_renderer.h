@@ -478,6 +478,12 @@ typedef struct PPCMacGPURenderer {
      */
     void (*flush_drag_paste)(void *opaque, uint8_t *vram);
 
+    /*
+     * Debug: print buffered diagnostic records.  Called from the display
+     * update path about once a second.  Optional — may be NULL.
+     */
+    void (*debug_log)(void *opaque);
+
 } PPCMacGPURenderer;
 
 /* Renderer capability flags */

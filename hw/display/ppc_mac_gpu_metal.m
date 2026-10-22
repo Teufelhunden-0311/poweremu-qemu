@@ -25,6 +25,8 @@
 #include "qemu/osdep.h"
 #include "qemu/atomic.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
+#include "qemu/main-loop.h"
 
 #ifdef CONFIG_DARWIN
 
@@ -1255,6 +1257,48 @@ static void rqueue_drain(void);
  * compile step (the MSL source compile itself still runs once per program).
  * Stale or missing entries are harmless misses.
  */
+/*
+ * Debug (PPCGPU_SHTIME=1; AI-generated, not for merging): the wall time of
+ * each R300 pipeline-cache miss and of its stages, in a fixed table that
+ * metal_debug_log prints from the display timer about once a second.
+ * Times are get_clock() ns, the clock the device stamps flips with.
+ */
+typedef struct R300ShtEv {
+    int64_t t0, t1;                 /* the whole miss, outer */
+    int64_t spv[2], msl[2], lib[2]; /* [0] VS, [1] FS; all 0 = function hit */
+    int64_t pso, add;               /* newRenderPipelineState; archive add */
+    uint8_t fs_stage, ok, bql, rq;  /* rq: on the render queue thread */
+    int ready;
+} R300ShtEv;
+#define R300_SHT_N 16384
+static R300ShtEv g_sht[R300_SHT_N];
+static unsigned g_sht_next, g_sht_shown;
+static uint64_t g_sht_fhit[3], g_sht_fmiss[3], g_sht_phit, g_sht_slot, g_sht_drop;
+static __thread R300ShtEv *g_sht_cur;
+
+static bool r300_sht_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("PPCGPU_SHTIME") != NULL;
+    }
+    return on;
+}
+
+static void r300_sht_put(const R300ShtEv *ev)
+{
+    unsigned i = qatomic_fetch_inc(&g_sht_next);
+
+    if (i >= R300_SHT_N) {
+        qatomic_inc(&g_sht_drop);
+        return;
+    }
+    g_sht[i] = *ev;
+    g_sht[i].ready = 0;
+    qatomic_store_release(&g_sht[i].ready, 1);
+}
+
 static id<MTLBinaryArchive> g_bin_archive;
 static NSString *g_bin_archive_path;
 static bool g_bin_archive_dirty;
@@ -1342,13 +1386,21 @@ static id<MTLRenderPipelineState> bin_pso(id<MTLDevice> dev,
             pd.binaryArchives = @[ a ];
         }
     }
+    int64_t t0 = g_sht_cur ? get_clock() : 0;
     p = [dev newRenderPipelineStateWithDescriptor:pd error:err];
+    if (g_sht_cur) {
+        g_sht_cur->pso = get_clock() - t0;
+    }
     if (a && p) {
+        t0 = g_sht_cur ? get_clock() : 0;
         pthread_mutex_lock(&g_bin_lock);
         if ([a addRenderPipelineFunctionsWithDescriptor:pd error:NULL]) {
             g_bin_archive_dirty = true;
         }
         pthread_mutex_unlock(&g_bin_lock);
+        if (g_sht_cur) {
+            g_sht_cur->add = get_clock() - t0;
+        }
     }
     return p;
 }
@@ -8848,10 +8900,24 @@ static id<MTLFunction> r300_function(id<MTLDevice> dev, NSString *glsl,
         g_r300_fns = [[NSMutableDictionary alloc] init];
     }
     fn = g_r300_fns[key];
+    if (r300_sht_on()) {
+        qatomic_inc(fn ? &g_sht_fhit[stage] : &g_sht_fmiss[stage]);
+    }
     if (fn) {
         return fn;
     }
-    char *msl = r300_glsl_to_msl(glsl.UTF8String, stage, &msg);
+    /* r300_glsl_to_msl's two steps, timed apart */
+    int sx = stage == R300_STAGE_VS ? 0 : 1;
+    int64_t t0 = get_clock();
+    size_t nw;
+    uint32_t *spv = r300_glsl_to_spirv(glsl.UTF8String, stage, &nw, &msg);
+    int64_t t1 = get_clock();
+    char *msl = spv ? r300_spirv_to_msl(spv, nw, stage, &msg) : NULL;
+    free(spv);
+    if (g_sht_cur) {
+        g_sht_cur->spv[sx] = t1 - t0;
+        g_sht_cur->msl[sx] = get_clock() - t1;
+    }
     if (!msl) {
         qemu_log("ppc-mac-gpu r300: %s: %s\n%s\n", r300_stage_entry(stage), msg,
                  glsl.UTF8String);
@@ -8864,6 +8930,7 @@ static id<MTLFunction> r300_function(id<MTLDevice> dev, NSString *glsl,
     if (stage == R300_STAGE_VS) {
         opt.mathMode = MTLMathModeSafe;
     }
+    t0 = get_clock();
     id<MTLLibrary> lib = [dev newLibraryWithSource:@(msl) options:opt error:&err];
     [opt release];
     if (!lib) {
@@ -8874,6 +8941,9 @@ static id<MTLFunction> r300_function(id<MTLDevice> dev, NSString *glsl,
     }
     free(msl);
     fn = [lib newFunctionWithName:@(r300_stage_entry(stage))];
+    if (g_sht_cur) {
+        g_sht_cur->lib[sx] = get_clock() - t0;
+    }
     [lib release];
     if (fn) {
         g_r300_fns[key] = fn;
@@ -8925,6 +8995,9 @@ static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
     if (sl->pipe && sl->id == prog_id && sl->vs_id == vs_id && sl->ncb == ncb &&
         sl->zfmt == zfmt &&
         memcmp(sl->cfmt, cfmt, ncb * sizeof(*cfmt)) == 0) {
+        if (r300_sht_on()) {
+            qatomic_inc(&g_sht_slot);
+        }
         return sl->pipe;
     }
     id<MTLRenderPipelineState> p = r300_pipeline_by_text(dev, glsl, vs_glsl, cfmt, ncb, zfmt);
@@ -8964,12 +9037,28 @@ static id<MTLRenderPipelineState> r300_pipeline_by_text(id<MTLDevice> dev,
     }
     p = g_r300_pipes[key];
     if (p) {
+        if (r300_sht_on()) {
+            qatomic_inc(&g_sht_phit);
+        }
         return p;
+    }
+    R300ShtEv ev = { 0 };
+    if (r300_sht_on()) {
+        ev.t0 = get_clock();
+        ev.fs_stage = zfmt == MTLPixelFormatInvalid ? R300_STAGE_FS : R300_STAGE_FS_Z;
+        ev.bql = bql_locked();
+        ev.rq = g_rq_thread_started && pthread_equal(pthread_self(), g_rq_thread);
+        g_sht_cur = &ev;
     }
     id<MTLFunction> vs = r300_function(dev, vsrc, R300_STAGE_VS);
     id<MTLFunction> fs = r300_function(dev, src, zfmt == MTLPixelFormatInvalid ?
                                        R300_STAGE_FS : R300_STAGE_FS_Z);
     if (!vs || !fs) {
+        if (g_sht_cur) {
+            g_sht_cur = NULL;
+            ev.t1 = get_clock();
+            r300_sht_put(&ev);
+        }
         return nil;
     }
     MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
@@ -8980,6 +9069,12 @@ static id<MTLRenderPipelineState> r300_pipeline_by_text(id<MTLDevice> dev,
     }
     pd.colorAttachments[ncb].pixelFormat = zfmt;
     p = bin_pso(dev, pd, &err);
+    if (g_sht_cur) {
+        g_sht_cur = NULL;
+        ev.t1 = get_clock();
+        ev.ok = p != nil;
+        r300_sht_put(&ev);
+    }
     [pd release];
     if (!p) {
         qemu_log("ppc-mac-gpu r300: pipeline failed: %s\n",
@@ -9966,6 +10061,8 @@ static uint64_t metal_gpu_failures(void *opaque)
     return qatomic_read(&g_metal_gpu_failures);
 }
 
+static void metal_debug_log(void *opaque);
+
 static PPCMacGPURenderer metal_renderer = {
     .name              = "metal",
     .init              = metal_init,
@@ -9989,7 +10086,38 @@ static PPCMacGPURenderer metal_renderer = {
     .get_drag_state    = metal_get_drag_state,
     .get_drag_snap     = NULL,
     .flush_drag_paste  = metal_flush_drag_paste,
+    .debug_log         = metal_debug_log,
 };
+
+/* PPCGPU_SHTIME: counters, then the misses finished since the last call. */
+static void metal_debug_log(void *opaque)
+{
+    if (!r300_sht_on()) {
+        return;
+    }
+    qemu_log("sht-sec mono=%lld wall_us=%lld fhit=%llu/%llu/%llu fmiss=%llu/%llu/%llu "
+             "phit=%llu slot=%llu drop=%llu\n",
+             (long long)get_clock(), (long long)g_get_real_time(),
+             (unsigned long long)qatomic_read(&g_sht_fhit[0]),
+             (unsigned long long)qatomic_read(&g_sht_fhit[1]),
+             (unsigned long long)qatomic_read(&g_sht_fhit[2]),
+             (unsigned long long)qatomic_read(&g_sht_fmiss[0]),
+             (unsigned long long)qatomic_read(&g_sht_fmiss[1]),
+             (unsigned long long)qatomic_read(&g_sht_fmiss[2]),
+             (unsigned long long)qatomic_read(&g_sht_phit),
+             (unsigned long long)qatomic_read(&g_sht_slot),
+             (unsigned long long)qatomic_read(&g_sht_drop));
+    while (g_sht_shown < R300_SHT_N &&
+           qatomic_load_acquire(&g_sht[g_sht_shown].ready)) {
+        R300ShtEv *e = &g_sht[g_sht_shown++];
+        qemu_log("sht-ev t0=%lld t1=%lld st=%u ok=%u bql=%u rq=%u "
+                 "vs=%lld/%lld/%lld fs=%lld/%lld/%lld pso=%lld add=%lld\n",
+                 (long long)e->t0, (long long)e->t1, e->fs_stage, e->ok, e->bql, e->rq,
+                 (long long)e->spv[0], (long long)e->msl[0], (long long)e->lib[0],
+                 (long long)e->spv[1], (long long)e->msl[1], (long long)e->lib[1],
+                 (long long)e->pso, (long long)e->add);
+    }
+}
 
 PPCMacGPURenderer *ppc_mac_gpu_renderer_metal(void)
 {

@@ -288,6 +288,16 @@ static struct {
 static uint64_t disp_last_sample;
 
 /*
+ * Debug (PPCGPU_SHTIME=1; AI-generated, not for merging): get_clock() of
+ * each page flip, printed with the once-a-second rates.  Flips and the
+ * printing both run under the BQL.
+ */
+#define SHT_FLIP_N 4096
+static int64_t sht_flip[SHT_FLIP_N];
+static unsigned sht_flip_n, sht_flip_drop;
+static int sht_flip_on = -1;
+
+/*
  * Scanout-path switches, all default-on, each settable to 0 to get the
  * pre-optimisation behaviour back for A/B testing:
  *   PPCGPU_DIRTY_SCANOUT  consume the VRAM dirty log to copy and publish
@@ -1957,6 +1967,20 @@ static void ppc_mac_gpu_display_update(void *opaque)
                          r200_rate.disp_wait / sec, r200_rate.disp_distinct / sec);
             }
             ppc_mac_gpu_cp_rate_log((now - r200_rate.since) / 1e6);
+            if (sht_flip_on > 0) {
+                GString *g = g_string_new(NULL);
+                for (unsigned i = 0; i < sht_flip_n; i++) {
+                    g_string_append_printf(g, "%s%lld", i ? "," : "",
+                                           (long long)sht_flip[i]);
+                }
+                qemu_log("sht-flip n=%u drop=%u t=%s\n", sht_flip_n, sht_flip_drop,
+                         sht_flip_n ? g->str : "-");
+                g_string_free(g, true);
+                sht_flip_n = sht_flip_drop = 0;
+            }
+            if (s->renderer && s->renderer->debug_log) {
+                s->renderer->debug_log(s->renderer_opaque);
+            }
             memset(&r200_rate, 0, sizeof(r200_rate));
             r200_rate.since = now;
         }
@@ -12481,6 +12505,16 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
             blit_path_log("CRTC", "OFFSET changed 0x%x -> 0x%x",
                           s->regs.crtc_offset, val);
             r200_rate.flips++;             /* page flip: one frame */
+            if (sht_flip_on < 0) {
+                sht_flip_on = getenv("PPCGPU_SHTIME") != NULL;
+            }
+            if (sht_flip_on) {
+                if (sht_flip_n < SHT_FLIP_N) {
+                    sht_flip[sht_flip_n++] = get_clock();
+                } else {
+                    sht_flip_drop++;
+                }
+            }
             r200_perf_present();
             /*
              * A flip is the frame boundary the guest itself defines: go
