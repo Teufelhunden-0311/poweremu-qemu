@@ -51,6 +51,11 @@
 #include "system/system.h"
 #include "system/runstate.h"
 #include "system/waitprof.h"
+#include "system/block-backend.h"
+#include "hw/core/cpu.h"
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 #include "hw/display/ppc_mac_gpu_vp.h"
 #include "trace.h"
 
@@ -296,6 +301,54 @@ static uint64_t disp_last_sample;
 static int64_t sht_flip[SHT_FLIP_N];
 static unsigned sht_flip_n, sht_flip_drop;
 static int sht_flip_on = -1;
+
+/*
+ * With the flips, every 250 ms: each block device's read/write bytes and
+ * ops (cumulative) and each vCPU thread's CPU time (macOS), to tell guest
+ * disk I/O from guest CPU work from idle in a gap between flips.
+ */
+static void sht_io_sample(void)
+{
+    static int64_t last;
+    int64_t now = get_clock();
+    BlockBackend *blk = NULL;
+    GString *g;
+    CPUState *cpu;
+
+    if (now - last < 250000000) {
+        return;
+    }
+    last = now;
+    g = g_string_new(NULL);
+    while ((blk = blk_next(blk))) {
+        BlockAcctStats *a = blk_get_stats(blk);
+        g_string_append_printf(g, "%s%s:%llu:%llu:%llu:%llu", g->len ? "," : "",
+                               blk_name(blk)[0] ? blk_name(blk) : "-",
+                               (unsigned long long)a->nr_bytes[BLOCK_ACCT_READ],
+                               (unsigned long long)a->nr_ops[BLOCK_ACCT_READ],
+                               (unsigned long long)a->nr_bytes[BLOCK_ACCT_WRITE],
+                               (unsigned long long)a->nr_ops[BLOCK_ACCT_WRITE]);
+    }
+    g_string_prepend(g, g->len ? "" : "-");
+    g_string_append(g, " cpu=");
+    CPU_FOREACH(cpu) {
+        long long us = -1;
+#ifdef __APPLE__
+        if (cpu->thread) {
+            thread_basic_info_data_t bi;
+            mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
+            mach_port_t mt = pthread_mach_thread_np(cpu->thread->thread);
+            if (thread_info(mt, THREAD_BASIC_INFO, (thread_info_t)&bi, &n) == KERN_SUCCESS) {
+                us = (bi.user_time.seconds + bi.system_time.seconds) * 1000000LL +
+                     bi.user_time.microseconds + bi.system_time.microseconds;
+            }
+        }
+#endif
+        g_string_append_printf(g, "%s%d:%lld", cpu->cpu_index ? "," : "", cpu->cpu_index, us);
+    }
+    qemu_log("sht-io mono=%lld blk=%s\n", (long long)now, g->str);
+    g_string_free(g, true);
+}
 
 /*
  * Scanout-path switches, all default-on, each settable to 0 to get the
@@ -1920,6 +1973,12 @@ static void ppc_mac_gpu_display_update(void *opaque)
 
     /* A machine that has just been woken: give the window the pointer the
      * sleeping one had (see ppc_mac_gpu_post_load). */
+    if (sht_flip_on < 0) {
+        sht_flip_on = getenv("PPCGPU_SHTIME") != NULL;
+    }
+    if (sht_flip_on > 0) {
+        sht_io_sample();
+    }
     if (s->hwc_announce && s->con) {
         s->hwc_announce = false;
         if (s->hwc_w && s->hwc_h) {
