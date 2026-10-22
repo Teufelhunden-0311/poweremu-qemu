@@ -32,6 +32,7 @@
 #import <QuartzCore/QuartzCore.h>
 #include <dlfcn.h>
 #include <mach-o/loader.h>
+#include <sys/sysctl.h>
 #include <uuid/uuid.h>
 
 #include "ppc_mac_gpu_renderer.h"
@@ -8842,10 +8843,13 @@ static int r300_metal_cb_unusable(const R300DrawPacket *pkt, uint32_t addr,
  * and the build of every binary the conversion runs in, by Mach-O UUID:
  * this executable (r300_spirv.c; SPIRV-Cross when linked statically),
  * shaderc's library, SPIRV-Cross's.  So a rebuilt QEMU or an updated
- * library starts a new directory; the old ones stay until deleted
- * (rm -r ~/Library/Caches/ppcosxkvm/msl loses nothing but time).
- * Only MSL that Metal compiled is written.  Entries are read and written
- * on the thread that converts, under g_render_lock.
+ * library with another UUID uses another directory (the same build can
+ * reuse its own); the old ones stay until deleted (rm -r
+ * ~/Library/Caches/ppcosxkvm/msl loses nothing but time).  The macOS
+ * build is named too: the converters use the system's libc++ and
+ * libSystem.  Only MSL that gave a usable function is written.
+ * Entries are read and written on the thread that converts, under
+ * g_render_lock.
  */
 static bool r300_image_uuid(const void *addr, char out[37])
 {
@@ -8882,7 +8886,8 @@ static R300MslCache *r300_msl_cache(void)
         const char *env = getenv("PPCGPU_MSL_CACHE");
         const void *fn[3] = { (const void *)r300_spirv_to_msl };
         static const char *const what[3] = { "QEMU", "shaderc", "SPIRV-Cross" };
-        char uuid[37], *tid, *err = NULL;
+        char uuid[37], osb[64], *tid, *err = NULL;
+        size_t osn = sizeof(osb);
         NSString *root;
         GString *id;
 
@@ -8915,7 +8920,12 @@ static R300MslCache *r300_msl_cache(void)
             }
             g_string_append_printf(id, "\n%s binary %s", what[i], uuid);
         }
-        g_string_append_c(id, '\n');
+        if (sysctlbyname("kern.osversion", osb, &osn, NULL, 0) < 0) {
+            qemu_log("ppc-mac-gpu r300: MSL disk cache off: no macOS build\n");
+            g_string_free(id, true);
+            return;
+        }
+        g_string_append_printf(id, "\nmacOS build %s\n", osb);
         cache = r300_msl_cache_open(root.fileSystemRepresentation, id->str, &err);
         g_string_free(id, true);
         if (cache) {
@@ -8970,20 +8980,43 @@ static char *r300_convert(NSString *glsl, R300Stage stage)
     return msl;
 }
 
-/* Vertex programs keep IEEE infinities and NaNs, as the interpreter
- * does (fast math broke the specials the _DX/_FF opcodes produce). */
-static id<MTLLibrary> r300_msl_library(id<MTLDevice> dev, const char *msl,
-                                       R300Stage stage, NSError **err)
+/*
+ * MSL as the stage's Metal function: compiled, with an entry point named
+ * r300_stage_entry(stage) of the stage's kind.  nil with *why otherwise.
+ * Vertex programs keep IEEE infinities and NaNs, as the interpreter does
+ * (fast math broke the specials the _DX/_FF opcodes produce).
+ */
+static id<MTLFunction> r300_msl_function(id<MTLDevice> dev, const char *msl,
+                                         R300Stage stage, NSString **why)
 {
+    MTLFunctionType kind = stage == R300_STAGE_VS ? MTLFunctionTypeVertex
+                                                  : MTLFunctionTypeFragment;
+    const char *entry = r300_stage_entry(stage);
     MTLCompileOptions *opt = [[MTLCompileOptions alloc] init];
+    NSError *err = nil;
     id<MTLLibrary> lib;
+    id<MTLFunction> fn;
 
     if (stage == R300_STAGE_VS) {
         opt.mathMode = MTLMathModeSafe;
     }
-    lib = [dev newLibraryWithSource:@(msl) options:opt error:err];
+    lib = [dev newLibraryWithSource:@(msl) options:opt error:&err];
     [opt release];
-    return lib;
+    if (!lib) {
+        *why = err ? err.localizedDescription : @"no library and no error";
+        return nil;
+    }
+    fn = [lib newFunctionWithName:@(entry)];
+    [lib release];
+    if (!fn) {
+        *why = [NSString stringWithFormat:@"no function %s", entry];
+    } else if (fn.functionType != kind) {
+        *why = [NSString stringWithFormat:@"%s is not a %s function", entry,
+                kind == MTLFunctionTypeVertex ? "vertex" : "fragment"];
+        [fn release];
+        fn = nil;
+    }
+    return fn;
 }
 
 /*
@@ -8999,8 +9032,8 @@ static id<MTLFunction> r300_function(id<MTLDevice> dev, NSString *glsl,
     NSString *key = [glsl stringByAppendingFormat:@"\n// stage %d\n", stage];
     R300MslCache *cache = r300_msl_cache();
     const char *why = NULL;
+    NSString *bad = nil;
     id<MTLFunction> fn;
-    NSError *err = nil;
     char *msl = NULL;
     bool cached;
 
@@ -9021,37 +9054,32 @@ static id<MTLFunction> r300_function(id<MTLDevice> dev, NSString *glsl,
     if (!msl && !(msl = r300_convert(glsl, stage))) {
         return nil;
     }
-    id<MTLLibrary> lib = r300_msl_library(dev, msl, stage, &err);
-    if (!lib && cached) {
-        /* An entry Metal refuses (a newer Metal, or damage the checks
-         * missed): drop it and convert, once. */
-        r300_msl_cache_warn("cached MSL failed to compile, converting again",
-                            err.localizedDescription.UTF8String);
+    fn = r300_msl_function(dev, msl, stage, &bad);
+    if (!fn && cached) {
+        /* Cached MSL that gives no usable function (a newer Metal, or
+         * damage the checks missed): drop it and convert, once. */
+        r300_msl_cache_warn("cached MSL unusable, converting again", bad.UTF8String);
         r300_msl_cache_drop(cache, glsl.UTF8String, stage);
         free(msl);
         cached = false;
-        err = nil;
         if (!(msl = r300_convert(glsl, stage))) {
             return nil;
         }
-        lib = r300_msl_library(dev, msl, stage, &err);
+        fn = r300_msl_function(dev, msl, stage, &bad);
     }
-    if (!lib) {
+    if (!fn) {
         qemu_log("ppc-mac-gpu r300: shader compile failed: %s\n%s\n",
-                 err.localizedDescription.UTF8String, msl);
+                 bad.UTF8String, msl);
         free(msl);
         return nil;
     }
+    /* published only now: a usable function of the right kind */
     if (cache && !cached && !r300_msl_cache_put(cache, glsl.UTF8String, stage, msl, &why)) {
         r300_msl_cache_warn("entry not written", why);
     }
     free(msl);
-    fn = [lib newFunctionWithName:@(r300_stage_entry(stage))];
-    [lib release];
-    if (fn) {
-        g_r300_fns[key] = fn;
-        [fn release];
-    }
+    g_r300_fns[key] = fn;
+    [fn release];
     return fn;
 }
 
