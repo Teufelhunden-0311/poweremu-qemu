@@ -30,10 +30,14 @@
 
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#include <dlfcn.h>
+#include <mach-o/loader.h>
+#include <uuid/uuid.h>
 
 #include "ppc_mac_gpu_renderer.h"
 #include "r300/r300_draw.h"
 #include "r300/r300_spirv.h"
+#include "r300/r300_msl_cache.h"
 #include "ppc_mac_gpu_3d_regs.h"
 #include "ppc_mac_gpu_surface.h"
 
@@ -8831,8 +8835,161 @@ static int r300_metal_cb_unusable(const R300DrawPacket *pkt, uint32_t addr,
 }
 
 /*
+ * The MSL disk cache (r300/r300_msl_cache.c), opt-in: PPCGPU_MSL_CACHE=1
+ * keeps it under ~/Library/Caches/ppcosxkvm/msl, PPCGPU_MSL_CACHE=/dir
+ * under /dir.  Its key, besides each shader's GLSL and stage, names the
+ * conversion's settings and library versions (r300_msl_translation_id)
+ * and the build of every binary the conversion runs in, by Mach-O UUID:
+ * this executable (r300_spirv.c; SPIRV-Cross when linked statically),
+ * shaderc's library, SPIRV-Cross's.  So a rebuilt QEMU or an updated
+ * library starts a new directory; the old ones stay until deleted
+ * (rm -r ~/Library/Caches/ppcosxkvm/msl loses nothing but time).
+ * Only MSL that Metal compiled is written.  Entries are read and written
+ * on the thread that converts, under g_render_lock.
+ */
+static bool r300_image_uuid(const void *addr, char out[37])
+{
+    const struct mach_header_64 *mh;
+    const struct load_command *lc;
+    Dl_info info;
+
+    if (!addr || !dladdr(addr, &info) || !info.dli_fbase) {
+        return false;
+    }
+    mh = info.dli_fbase;
+    if (mh->magic != MH_MAGIC_64) {
+        return false;
+    }
+    lc = (const struct load_command *)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        if (lc->cmd == LC_UUID) {
+            uuid_unparse_upper(((const struct uuid_command *)lc)->uuid, out);
+            return true;
+        }
+        lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+    }
+    return false;
+}
+
+static void r300_msl_cache_log(void);
+
+static R300MslCache *r300_msl_cache(void)
+{
+    static R300MslCache *cache;
+    static dispatch_once_t once;
+
+    dispatch_once(&once, ^{ @autoreleasepool {
+        const char *env = getenv("PPCGPU_MSL_CACHE");
+        const void *fn[3] = { (const void *)r300_spirv_to_msl };
+        static const char *const what[3] = { "QEMU", "shaderc", "SPIRV-Cross" };
+        char uuid[37], *tid, *err = NULL;
+        NSString *root;
+        GString *id;
+
+        if (!env || !*env || !strcmp(env, "0")) {
+            return;
+        }
+        if (!strcmp(env, "1")) {
+            root = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory,
+                                                        NSUserDomainMask, YES).firstObject
+                    stringByAppendingPathComponent:@"ppcosxkvm/msl"];
+        } else if (env[0] == '/') {
+            root = @(env);
+        } else {
+            qemu_log("ppc-mac-gpu r300: MSL disk cache off: PPCGPU_MSL_CACHE=%s "
+                     "is neither 1 nor an absolute directory\n", env);
+            return;
+        }
+        [[NSFileManager defaultManager] createDirectoryAtPath:root.stringByDeletingLastPathComponent
+                                  withIntermediateDirectories:YES attributes:nil error:NULL];
+        r300_converter_functions(&fn[1], &fn[2]);
+        tid = r300_msl_translation_id();
+        id = g_string_new(tid);
+        free(tid);
+        for (int i = 0; i < 3; i++) {
+            if (!r300_image_uuid(fn[i], uuid)) {
+                qemu_log("ppc-mac-gpu r300: MSL disk cache off: no build UUID "
+                         "for %s\n", what[i]);
+                g_string_free(id, true);
+                return;
+            }
+            g_string_append_printf(id, "\n%s binary %s", what[i], uuid);
+        }
+        g_string_append_c(id, '\n');
+        cache = r300_msl_cache_open(root.fileSystemRepresentation, id->str, &err);
+        g_string_free(id, true);
+        if (cache) {
+            qemu_log("ppc-mac-gpu r300: MSL disk cache %s\n", r300_msl_cache_dir(cache));
+            atexit(r300_msl_cache_log);     /* the session's counts */
+        } else {
+            qemu_log("ppc-mac-gpu r300: MSL disk cache off: %s\n", err);
+            free(err);
+        }
+    } });
+    return cache;
+}
+
+/* The first few cache troubles; the counts say the rest. */
+static void r300_msl_cache_warn(const char *what, const char *why)
+{
+    static int shown;
+
+    if (shown < 8) {
+        shown++;
+        qemu_log("ppc-mac-gpu r300: MSL disk cache: %s: %s\n", what, why);
+    }
+}
+
+static void r300_msl_cache_log(void)
+{
+    R300MslCache *c = r300_msl_cache();
+    R300MslCacheStats s;
+
+    if (c) {
+        r300_msl_cache_stats(c, &s);
+        qemu_log("ppc-mac-gpu r300: MSL disk cache: %llu hits, %llu misses, "
+                 "%llu rejected, %llu new (%llu KB), %llu write failures, "
+                 "%llu dropped\n", (unsigned long long)s.hits,
+                 (unsigned long long)s.misses, (unsigned long long)s.rejected,
+                 (unsigned long long)s.writes,
+                 (unsigned long long)(s.bytes_written >> 10),
+                 (unsigned long long)s.write_failures, (unsigned long long)s.dropped);
+    }
+}
+
+static char *r300_convert(NSString *glsl, R300Stage stage)
+{
+    char *msg = NULL;
+    char *msl = r300_glsl_to_msl(glsl.UTF8String, stage, &msg);
+
+    if (!msl) {
+        qemu_log("ppc-mac-gpu r300: %s: %s\n%s\n", r300_stage_entry(stage), msg,
+                 glsl.UTF8String);
+        free(msg);
+    }
+    return msl;
+}
+
+/* Vertex programs keep IEEE infinities and NaNs, as the interpreter
+ * does (fast math broke the specials the _DX/_FF opcodes produce). */
+static id<MTLLibrary> r300_msl_library(id<MTLDevice> dev, const char *msl,
+                                       R300Stage stage, NSError **err)
+{
+    MTLCompileOptions *opt = [[MTLCompileOptions alloc] init];
+    id<MTLLibrary> lib;
+
+    if (stage == R300_STAGE_VS) {
+        opt.mathMode = MTLMathModeSafe;
+    }
+    lib = [dev newLibraryWithSource:@(msl) options:opt error:err];
+    [opt release];
+    return lib;
+}
+
+/*
  * A stage of a r300_us_to_glsl() source as a Metal function: GLSL ->
- * SPIR-V -> MSL (r300_spirv.c), compiled once per source and stage.
+ * SPIR-V -> MSL (r300_spirv.c), or the MSL from the disk cache, compiled
+ * once per source and stage.
  */
 static NSMutableDictionary<NSString *, id<MTLFunction>> *g_r300_fns;
 
@@ -8840,9 +8997,12 @@ static id<MTLFunction> r300_function(id<MTLDevice> dev, NSString *glsl,
                                      R300Stage stage)
 {
     NSString *key = [glsl stringByAppendingFormat:@"\n// stage %d\n", stage];
+    R300MslCache *cache = r300_msl_cache();
+    const char *why = NULL;
     id<MTLFunction> fn;
     NSError *err = nil;
-    char *msg = NULL;
+    char *msl = NULL;
+    bool cached;
 
     if (!g_r300_fns) {
         g_r300_fns = [[NSMutableDictionary alloc] init];
@@ -8851,26 +9011,39 @@ static id<MTLFunction> r300_function(id<MTLDevice> dev, NSString *glsl,
     if (fn) {
         return fn;
     }
-    char *msl = r300_glsl_to_msl(glsl.UTF8String, stage, &msg);
-    if (!msl) {
-        qemu_log("ppc-mac-gpu r300: %s: %s\n%s\n", r300_stage_entry(stage), msg,
-                 glsl.UTF8String);
-        free(msg);
+    if (cache) {
+        msl = r300_msl_cache_get(cache, glsl.UTF8String, stage, &why);
+        if (why) {
+            r300_msl_cache_warn("entry not used", why);
+        }
+    }
+    cached = msl != NULL;
+    if (!msl && !(msl = r300_convert(glsl, stage))) {
         return nil;
     }
-    /* Vertex programs keep IEEE infinities and NaNs, as the interpreter
-     * does (fast math broke the specials the _DX/_FF opcodes produce). */
-    MTLCompileOptions *opt = [[MTLCompileOptions alloc] init];
-    if (stage == R300_STAGE_VS) {
-        opt.mathMode = MTLMathModeSafe;
+    id<MTLLibrary> lib = r300_msl_library(dev, msl, stage, &err);
+    if (!lib && cached) {
+        /* An entry Metal refuses (a newer Metal, or damage the checks
+         * missed): drop it and convert, once. */
+        r300_msl_cache_warn("cached MSL failed to compile, converting again",
+                            err.localizedDescription.UTF8String);
+        r300_msl_cache_drop(cache, glsl.UTF8String, stage);
+        free(msl);
+        cached = false;
+        err = nil;
+        if (!(msl = r300_convert(glsl, stage))) {
+            return nil;
+        }
+        lib = r300_msl_library(dev, msl, stage, &err);
     }
-    id<MTLLibrary> lib = [dev newLibraryWithSource:@(msl) options:opt error:&err];
-    [opt release];
     if (!lib) {
         qemu_log("ppc-mac-gpu r300: shader compile failed: %s\n%s\n",
                  err.localizedDescription.UTF8String, msl);
         free(msl);
         return nil;
+    }
+    if (cache && !cached && !r300_msl_cache_put(cache, glsl.UTF8String, stage, msl, &why)) {
+        r300_msl_cache_warn("entry not written", why);
     }
     free(msl);
     fn = [lib newFunctionWithName:@(r300_stage_entry(stage))];
@@ -8991,6 +9164,7 @@ static id<MTLRenderPipelineState> r300_pipeline_by_text(id<MTLDevice> dev,
     if (g_r300_pipes.count % 16 == 1) {
         qemu_log("ppc-mac-gpu r300: %lu fragment pipelines\n",
                  (unsigned long)g_r300_pipes.count);
+        r300_msl_cache_log();
     }
     return p;
 }
