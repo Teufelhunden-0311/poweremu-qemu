@@ -3,7 +3,8 @@
  * r300_glsl_to_msl() for each stage of one program:
  *   test_mslcache PROGRAM.glsl SCRATCHDIR
  * miss, write, hit (same handle, a new one, another identity); damaged,
- * foreign and odd entries refused and then replaced; unwritable storage;
+ * foreign and odd entries (FIFOs within a time limit) refused and then
+ * replaced; unwritable storage;
  * drop; writers and readers in several processes at once.
  * Includes the cache's source, to write entries in its own format.
  *
@@ -13,9 +14,21 @@
 #include "../../hw/display/r300/r300_msl_cache.c"
 
 #include <dirent.h>
+#include <signal.h>
 #include <sys/wait.h>
 
 static int fails;
+
+/* A get or open that blocks (a FIFO opened for reading waits for a
+ * writer) fails the test instead of hanging it. */
+static void blocked(int sig)
+{
+    static const char m[] = "FAIL: blocked for 5 s (a FIFO opened without O_NONBLOCK?)\n";
+
+    (void)sig;
+    write(1, m, sizeof(m) - 1);
+    _exit(1);
+}
 
 #define CHECK(c, ...) do {                                              \
         if (!(c)) {                                                     \
@@ -253,6 +266,23 @@ int main(int argc, char **argv)
         n = forge(buf, sizeof(buf), fs, key, msl[2], strlen(msl[2]), msl[1], strlen(msl[1]));
         spit(path, buf, n);
         refused(c, glsl, fs, msl[1], path, "header does not match the data", "MSL hash mismatch");
+        {
+            /* a whole zlib stream with bytes after it, all counted in the
+             * header's length: uncompress alone would accept it */
+            uLongf zl = compressBound(strlen(msl[1]));
+            Bytef *z = malloc(zl + 8);
+            char mh[HEX_LEN + 1];
+            int k;
+
+            compress2(z, &zl, (const Bytef *)msl[1], strlen(msl[1]), Z_DEFAULT_COMPRESSION);
+            memcpy(z + zl, "trailing", 8);
+            bytes_hex(msl[1], strlen(msl[1]), mh);
+            k = header(buf, sizeof(buf), fs, strlen(msl[1]), zl + 8, key, mh);
+            memcpy(buf + k, z, zl + 8);
+            free(z);
+            spit(path, buf, (size_t)k + zl + 8);
+        }
+        refused(c, glsl, fs, msl[1], path, "bad compressed data", "bytes after the zlib stream");
         nm = strdup(msl[1]);
         nm[5] = 0;                          /* hashed and compressed with the NUL */
         n = forge(buf, sizeof(buf), fs, key, nm, strlen(msl[1]), nm, strlen(msl[1]));
@@ -289,6 +319,16 @@ int main(int argc, char **argv)
         refused(c, glsl, fs, msl[1], path, "not a regular file", "directory in the way");
         CHECK(!r300_msl_cache_put(c, glsl, fs, msl[1], &why), "put over a directory");
         rmdir(path);
+        mkfifo(path, 0600);
+        signal(SIGALRM, blocked);
+        alarm(5);
+        refused(c, glsl, fs, msl[1], path, "not a regular file", "FIFO in the way");
+        CHECK(r300_msl_cache_put(c, glsl, fs, msl[1], &why), "put over a FIFO: %s", why);
+        alarm(0);
+        m = r300_msl_cache_get(c, glsl, fs, &why);
+        CHECK(m && !strcmp(m, msl[1]), "FIFO not replaced");
+        free(m);
+        unlink(path);
         CHECK(files_in(r300_msl_cache_dir(c), ".msl", &tmp) >= 2 && !tmp, "temporaries left");
         unlink(path);
         {
@@ -359,6 +399,17 @@ int main(int argc, char **argv)
     CHECK(!c2 && err && strstr(err, "content differs"), "damaged identity.txt accepted");
     printf("  damaged identity.txt: %s\n", err ? err : "(opened)");
     free(err);
+    /* ... or that is a FIFO */
+    unlink(idp);
+    mkfifo(idp, 0600);
+    err = NULL;
+    alarm(5);
+    c2 = r300_msl_cache_open(root, "identity A", &err);
+    alarm(0);
+    CHECK(!c2 && err && strstr(err, "not a regular file"), "FIFO identity.txt accepted");
+    printf("  FIFO as identity.txt: %s\n", err ? err : "(opened)");
+    free(err);
+    unlink(idp);
     spit(idp, m, n);
     free(m);
 

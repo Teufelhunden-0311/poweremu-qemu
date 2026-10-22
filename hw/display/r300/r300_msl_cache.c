@@ -165,7 +165,9 @@ static int read_file(const char *path, size_t max, char **buf, size_t *size,
 {
     struct stat sb;
     size_t got = 0;
-    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    /* O_NONBLOCK: a FIFO in the way must not block the open; the type
+     * check below refuses it (regular files ignore the flag) */
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
 
     if (fd < 0) {
         if (errno == ENOENT) {
@@ -292,6 +294,7 @@ char *r300_msl_cache_get(R300MslCache *c, const char *glsl, R300Stage stage,
     unsigned schema, st;
     size_t size = 0, hl, mlen, zlen;
     uLongf dlen;
+    uLong slen;
     int r;
 
     key_hex(glsl, stage, key);
@@ -339,8 +342,10 @@ char *r300_msl_cache_get(R300MslCache *c, const char *glsl, R300Stage stage,
     }
     msl = malloc(mlen + 1);
     dlen = mlen;
-    if (uncompress((Bytef *)msl, &dlen, (const Bytef *)buf + hl, zlen) != Z_OK ||
-        dlen != mlen) {
+    slen = zlen;
+    /* exactly mlen bytes out, from exactly the stored zlen bytes */
+    if (uncompress2((Bytef *)msl, &dlen, (const Bytef *)buf + hl, &slen) != Z_OK ||
+        dlen != mlen || slen != zlen) {
         bad = "bad compressed data";
         goto reject;
     }
