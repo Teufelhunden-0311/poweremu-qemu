@@ -1266,6 +1266,7 @@ static void rqueue_drain(void);
 typedef struct R300ShtEv {
     int64_t t0, t1;                 /* the whole miss, outer */
     int64_t spv[2], msl[2], lib[2]; /* [0] VS, [1] FS; all 0 = function hit */
+    int64_t dsk[2];                 /* MSL cache lookup (PPCGPU_MSL_CACHE) */
     int64_t pso, add;               /* newRenderPipelineState; archive add */
     uint8_t fs_stage, ok, bql, rq;  /* rq: on the render queue thread */
     int ready;
@@ -8888,6 +8889,60 @@ static int r300_metal_cb_unusable(const R300DrawPacket *pkt, uint32_t addr,
  */
 static NSMutableDictionary<NSString *, id<MTLFunction>> *g_r300_fns;
 
+/*
+ * Experiment (PPCGPU_MSL_CACHE=1; AI-generated): GLSL -> MSL results on
+ * disk, one file per source and stage, so a later session skips shaderc
+ * and SPIRV-Cross (nearly all of a function's cost; Metal's own compile
+ * is cached by the OS).  The directory is named after this executable's
+ * size and modification time, so a rebuilt QEMU (another converter)
+ * starts a new one.  Returns nil when off.
+ */
+static NSString *r300_msl_cache_dir(void)
+{
+    static NSString *dir;
+    static dispatch_once_t once;
+
+    dispatch_once(&once, ^{
+        if (!getenv("PPCGPU_MSL_CACHE")) {
+            return;
+        }
+        @autoreleasepool {
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSString *exe = [[NSBundle mainBundle] executablePath];
+            NSDictionary *at = exe ? [fm attributesOfItemAtPath:exe error:NULL] : nil;
+            if (!at) {
+                qemu_log("ppc-mac-gpu r300: MSL cache off (no executable attributes)\n");
+                return;
+            }
+            NSString *d = [NSSearchPathForDirectoriesInDomains(
+                               NSCachesDirectory, NSUserDomainMask, YES).firstObject
+                           stringByAppendingPathComponent:
+                           [NSString stringWithFormat:@"ppcosxkvm/msl-%llu-%.0f",
+                            (unsigned long long)at.fileSize,
+                            at.fileModificationDate.timeIntervalSince1970]];
+            if ([fm createDirectoryAtPath:d withIntermediateDirectories:YES
+                               attributes:nil error:NULL]) {
+                dir = [d copy];
+                qemu_log("ppc-mac-gpu r300: MSL cache %s\n", dir.UTF8String);
+            }
+        }
+    });
+    return dir;
+}
+
+static NSString *r300_msl_cache_path(NSString *key)
+{
+    NSString *dir = r300_msl_cache_dir();
+    if (!dir) {
+        return nil;
+    }
+    gchar *h = g_compute_checksum_for_string(G_CHECKSUM_SHA256, key.UTF8String, -1);
+    NSString *p = [dir stringByAppendingPathComponent:
+                   [NSString stringWithFormat:@"%s.metal", h]];
+    g_free(h);
+    return p;
+}
+
 static id<MTLFunction> r300_function(id<MTLDevice> dev, NSString *glsl,
                                      R300Stage stage)
 {
@@ -8906,17 +8961,36 @@ static id<MTLFunction> r300_function(id<MTLDevice> dev, NSString *glsl,
     if (fn) {
         return fn;
     }
-    /* r300_glsl_to_msl's two steps, timed apart */
     int sx = stage == R300_STAGE_VS ? 0 : 1;
     int64_t t0 = get_clock();
-    size_t nw;
-    uint32_t *spv = r300_glsl_to_spirv(glsl.UTF8String, stage, &nw, &msg);
-    int64_t t1 = get_clock();
-    char *msl = spv ? r300_spirv_to_msl(spv, nw, stage, &msg) : NULL;
-    free(spv);
-    if (g_sht_cur) {
-        g_sht_cur->spv[sx] = t1 - t0;
-        g_sht_cur->msl[sx] = get_clock() - t1;
+    NSString *cpath = r300_msl_cache_path(key);
+    char *msl = NULL;
+    if (cpath) {
+        NSString *m = [NSString stringWithContentsOfFile:cpath
+                                                encoding:NSUTF8StringEncoding error:NULL];
+        if (m.length) {
+            msl = strdup(m.UTF8String);
+        }
+        if (g_sht_cur) {
+            g_sht_cur->dsk[sx] = get_clock() - t0;
+        }
+    }
+    if (!msl) {
+        /* r300_glsl_to_msl's two steps, timed apart */
+        t0 = get_clock();
+        size_t nw;
+        uint32_t *spv = r300_glsl_to_spirv(glsl.UTF8String, stage, &nw, &msg);
+        int64_t t1 = get_clock();
+        msl = spv ? r300_spirv_to_msl(spv, nw, stage, &msg) : NULL;
+        free(spv);
+        if (g_sht_cur) {
+            g_sht_cur->spv[sx] = t1 - t0;
+            g_sht_cur->msl[sx] = get_clock() - t1;
+        }
+        if (msl && cpath) {
+            [@(msl) writeToFile:cpath atomically:YES encoding:NSUTF8StringEncoding
+                          error:NULL];
+        }
     }
     if (!msl) {
         qemu_log("ppc-mac-gpu r300: %s: %s\n%s\n", r300_stage_entry(stage), msg,
@@ -10111,11 +10185,13 @@ static void metal_debug_log(void *opaque)
            qatomic_load_acquire(&g_sht[g_sht_shown].ready)) {
         R300ShtEv *e = &g_sht[g_sht_shown++];
         qemu_log("sht-ev t0=%lld t1=%lld st=%u ok=%u bql=%u rq=%u "
-                 "vs=%lld/%lld/%lld fs=%lld/%lld/%lld pso=%lld add=%lld\n",
+                 "vs=%lld/%lld/%lld fs=%lld/%lld/%lld pso=%lld add=%lld "
+                 "dsk=%lld/%lld\n",
                  (long long)e->t0, (long long)e->t1, e->fs_stage, e->ok, e->bql, e->rq,
                  (long long)e->spv[0], (long long)e->msl[0], (long long)e->lib[0],
                  (long long)e->spv[1], (long long)e->msl[1], (long long)e->lib[1],
-                 (long long)e->pso, (long long)e->add);
+                 (long long)e->pso, (long long)e->add,
+                 (long long)e->dsk[0], (long long)e->dsk[1]);
     }
 }
 
