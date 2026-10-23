@@ -25,6 +25,8 @@
 #include "qemu/osdep.h"
 #include "qemu/atomic.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
+#include "qemu/main-loop.h"
 
 #ifdef CONFIG_DARWIN
 
@@ -6781,6 +6783,118 @@ static id<MTLSharedEvent> g_r200_event;
 static uint64_t g_r200_event_val;
 static uint64_t g_r200_stat_splits;
 
+/*
+ * Debug (diag-hazard, PPCGPU_HAZDIAG=1; AI-generated, not for merging).
+ * A. Why r300_draw_encode flushes: the FIRST condition of its hazard
+ *    predicate that holds, re-evaluated in the predicate's own order only
+ *    after the predicate (unchanged) said "conflict".
+ * B. Inside r200_flush_locked, host wall time of the commit, of the
+ *    waitUntilCompleted call itself, and of the settle that follows, by
+ *    the reason the flush was asked for (HZ_R_OTHER: not an R300 hazard).
+ *    Host wait time, not GPU execution time.
+ * C. Waits to take g_render_lock (and the render-queue drains before
+ *    them) in metal_range_busy_r200 and metal_flush_r200, by caller
+ *    (ppc_gpu_hz_who), by whether the calling thread held the BQL just
+ *    before (bql_locked()), and by whether the caller's unlock wrapper
+ *    released it (ppc_gpu_hz_unlocked).
+ * Cumulative counters, atomics only; printed once a second (hz-sec).
+ */
+enum { HZ_R_CAP, HZ_R_DS_WAW, HZ_R_DS_WAR, HZ_R_DS_OVF, HZ_R_CB_WAW, HZ_R_CB_WAR,
+       HZ_R_CB_OVF, HZ_R_TEX_RAW, HZ_R_OTHER, HZ_R_N };
+static const char *const hz_rname[HZ_R_N] = {
+    "cap", "ds_waw", "ds_war", "ds_ovf", "cb_waw", "cb_war", "cb_ovf", "tex_raw", "other" };
+enum { HZ_SITE_RANGE, HZ_SITE_FLUSH, HZ_SITE_N };
+static const char *const hz_sname[HZ_SITE_N] = { "range", "flush" };
+static const char *const hz_wname[PPC_GPU_HZ_WHO_N] = {
+    "other", "2d_cp", "2d_other", "disp_q", "disp_f", "flush_at" };
+typedef struct HzT { uint64_t n, ns, max; } HzT;
+static HzT hz_conf[HZ_R_N];                 /* A: count only */
+static HzT hz_commit[HZ_R_N], hz_wait[HZ_R_N], hz_settle[HZ_R_N];
+static HzT hz_lock[HZ_SITE_N][PPC_GPU_HZ_WHO_N][2][2];   /* [site][who][bql held][unlocked] */
+static HzT hz_drain[HZ_SITE_N][PPC_GPU_HZ_WHO_N][2][2];
+static int hz_reason = HZ_R_OTHER;          /* set under g_render_lock */
+
+static void hz_add(HzT *t, int64_t ns)
+{
+    uint64_t m;
+    qatomic_inc(&t->n);
+    qatomic_add(&t->ns, (uint64_t)ns);
+    m = qatomic_read(&t->max);
+    while ((uint64_t)ns > m) {
+        uint64_t prev = qatomic_cmpxchg(&t->max, m, (uint64_t)ns);
+        if (prev == m) {
+            break;
+        }
+        m = prev;
+    }
+}
+
+static void hz_out(GString *g, const char *tag, const HzT *t)
+{
+    if (qatomic_read(&t->n)) {
+        g_string_append_printf(g, " %s=%llu/%llu/%llu", tag,
+                               (unsigned long long)qatomic_read(&t->n),
+                               (unsigned long long)(qatomic_read(&t->ns) / 1000),
+                               (unsigned long long)(qatomic_read(&t->max) / 1000));
+    }
+}
+
+/* One line, cumulative: name=count/total_us/max_us. */
+static void metal_debug_log(void *opaque)
+{
+    GString *g = g_string_new("hz-sec");
+    char tag[64];
+
+    g_string_append_printf(g, " mono=%lld wall_us=%lld", (long long)get_clock(),
+                           (long long)g_get_real_time());
+    for (int r = 0; r < HZ_R_N; r++) {
+        snprintf(tag, sizeof(tag), "conf.%s", hz_rname[r]);   hz_out(g, tag, &hz_conf[r]);
+        snprintf(tag, sizeof(tag), "commit.%s", hz_rname[r]); hz_out(g, tag, &hz_commit[r]);
+        snprintf(tag, sizeof(tag), "wait.%s", hz_rname[r]);   hz_out(g, tag, &hz_wait[r]);
+        snprintf(tag, sizeof(tag), "settle.%s", hz_rname[r]); hz_out(g, tag, &hz_settle[r]);
+    }
+    for (int si = 0; si < HZ_SITE_N; si++) {
+        for (int w = 0; w < PPC_GPU_HZ_WHO_N; w++) {
+            for (int h = 0; h < 2; h++) {
+                for (int u = 0; u < 2; u++) {
+                    snprintf(tag, sizeof(tag), "lock.%s.%s.bql%d.unl%d", hz_sname[si], hz_wname[w], h, u);
+                    hz_out(g, tag, &hz_lock[si][w][h][u]);
+                    snprintf(tag, sizeof(tag), "drain.%s.%s.bql%d.unl%d", hz_sname[si], hz_wname[w], h, u);
+                    hz_out(g, tag, &hz_drain[si][w][h][u]);
+                }
+            }
+        }
+    }
+    qemu_log("%s\n", g->str);
+    g_string_free(g, true);
+}
+
+/* C: take g_render_lock at a site, timing the wait when on. */
+static void hz_render_lock(int site)
+{
+    if (!ppc_gpu_hz_on()) {
+        pthread_mutex_lock(&g_render_lock);
+        return;
+    }
+    int held = bql_locked(), who = ppc_gpu_hz_who, unl = ppc_gpu_hz_unlocked ? 1 : 0;
+    int64_t t0 = get_clock();
+    pthread_mutex_lock(&g_render_lock);
+    hz_add(&hz_lock[site][who][held][unl], get_clock() - t0);
+}
+
+/* C: rqueue_drain at a site, timed when on. */
+static void hz_drain_at(int site)
+{
+    if (!ppc_gpu_hz_on()) {
+        rqueue_drain();
+        return;
+    }
+    int held = bql_locked(), who = ppc_gpu_hz_who, unl = ppc_gpu_hz_unlocked ? 1 : 0;
+    int64_t t0 = get_clock();
+    rqueue_drain();
+    hz_add(&hz_drain[site][who][held][unl], get_clock() - t0);
+}
+
 static bool r200_split_enabled(void)
 {
     static int on = -1;
@@ -7525,10 +7639,10 @@ static bool metal_range_busy_r200(void *opaque, uint64_t lo, uint64_t hi,
             if (!r200_2d_drain_on() || !write_access || written) {
                 return true;            /* the caller's flush waits for them */
             }
-            rqueue_drain();
+            hz_drain_at(HZ_SITE_RANGE);
         }
     }
-    pthread_mutex_lock(&g_render_lock);
+    hz_render_lock(HZ_SITE_RANGE);
     bool busy = metal_range_busy_r200_locked(lo, hi, write_access);
     pthread_mutex_unlock(&g_render_lock);
     return busy;
@@ -7909,9 +8023,23 @@ static bool r200_flush_locked(PPCMacGPUMetalState *st)
         return false;
     }
     int64_t t0 = g_get_monotonic_time();
+    int hz = ppc_gpu_hz_on(), hzr = hz_reason;
+    int64_t h0 = hz ? get_clock() : 0, h1 = 0, h2 = 0;
+    hz_reason = HZ_R_OTHER;
     r200_commit(NULL, NULL);
+    if (hz) {
+        h1 = get_clock();
+    }
     [g_r200_inflight waitUntilCompleted];
+    if (hz) {
+        h2 = get_clock();
+    }
     r200_settle_unchecked();               /* everything committed before it */
+    if (hz) {
+        hz_add(&hz_commit[hzr], h1 - h0);
+        hz_add(&hz_wait[hzr], h2 - h1);
+        hz_add(&hz_settle[hzr], get_clock() - h2);
+    }
     if (r200_cb_failed(g_r200_inflight)) {
         qatomic_inc(&g_metal_gpu_failures);
         r200_metal_warn(32, "command buffer failed", 0, 0);
@@ -7935,9 +8063,9 @@ static bool metal_flush_r200(void *opaque)
      * them; drain first, then take the lock (never in the other order:
      * the render thread is what drains). */
     if (rqueue_enabled()) {
-        rqueue_drain();
+        hz_drain_at(HZ_SITE_FLUSH);
     }
-    pthread_mutex_lock(&g_render_lock);
+    hz_render_lock(HZ_SITE_FLUSH);
     did = r200_flush_locked(st);
     pthread_mutex_unlock(&g_render_lock);
     return did;
@@ -9920,7 +10048,40 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
         }
         if (conflict) {
             g_r200_stat_conflicts++;
+            if (ppc_gpu_hz_on()) {
+                /* The predicate above, again in its order (its parts only
+                 * read state), to name the first part that holds. */
+                int why = -1;
+                if (g_r200_nwritten >= R200_MAX_WRITTEN - 1 - (int)ncb) {
+                    why = HZ_R_CAP;
+                } else if (want_ds && r200_batch_conflict(dlo, dhi, &dk)) {
+                    why = HZ_R_DS_WAW;
+                } else if (want_ds && r300_read_conflict(dlo, dhi, &dk)) {
+                    why = g_r200_read_overflow ? HZ_R_DS_OVF : HZ_R_DS_WAR;
+                }
+                for (uint32_t k = 0; k < ncb && why < 0; k++) {
+                    uint64_t lo = ck[k].offset, hi = lo + (uint64_t)ck[k].pitch * ck[k].height;
+                    if (r200_batch_conflict(lo, hi, &ck[k])) {
+                        why = HZ_R_CB_WAW;
+                    } else if (r300_read_conflict(lo, hi, &ck[k])) {
+                        why = g_r200_read_overflow ? HZ_R_CB_OVF : HZ_R_CB_WAR;
+                    }
+                }
+                for (int t = 0; t < R300_NUM_TEX_UNITS && why < 0; t++) {
+                    if (u.tex_info[t][0] && !pkt->tex[t].host_data &&
+                        r200_batch_conflict(pkt->tex[t].gpu_addr,
+                            (uint64_t)pkt->tex[t].gpu_addr + pkt->tex[t].size_bytes, NULL)) {
+                        why = HZ_R_TEX_RAW;
+                    }
+                }
+                if (why < 0) {
+                    why = HZ_R_OTHER;   /* should not happen: logged as other */
+                }
+                hz_add(&hz_conf[why], 0);
+                hz_reason = why;        /* for r200_flush_locked's timing */
+            }
             r200_flush_locked(st);
+            hz_reason = HZ_R_OTHER;     /* also when there was nothing to flush */
         }
         if (!g_r200_cb) {
             g_r200_cb = r200_new_cb(st);
@@ -10191,6 +10352,7 @@ static PPCMacGPURenderer metal_renderer = {
     .get_drag_state    = metal_get_drag_state,
     .get_drag_snap     = NULL,
     .flush_drag_paste  = metal_flush_drag_paste,
+    .debug_log         = metal_debug_log,
 };
 
 PPCMacGPURenderer *ppc_mac_gpu_renderer_metal(void)

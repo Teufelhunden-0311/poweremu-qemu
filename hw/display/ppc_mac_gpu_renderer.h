@@ -478,7 +478,29 @@ typedef struct PPCMacGPURenderer {
      */
     void (*flush_drag_paste)(void *opaque, uint8_t *vram);
 
+    /* Debug (diag-hazard, not for merging): print diagnostic counters,
+     * called about once a second from the display update.  May be NULL. */
+    void (*debug_log)(void *opaque);
+
 } PPCMacGPURenderer;
+
+/*
+ * Debug (diag-hazard, PPCGPU_HAZDIAG=1; AI-generated, not for merging):
+ * who is asking the renderer a question that takes the render lock, set
+ * by the device around the call on the calling thread.
+ */
+enum {
+    PPC_GPU_HZ_WHO_OTHER,       /* not set by a known caller */
+    PPC_GPU_HZ_WHO_2D_CP,       /* r200_vram_access on the CP thread */
+    PPC_GPU_HZ_WHO_2D_OTHER,    /* r200_vram_access on another thread */
+    PPC_GPU_HZ_WHO_DISP_QUERY,  /* display_range_busy */
+    PPC_GPU_HZ_WHO_DISP_FLUSH,  /* r200_flush_display */
+    PPC_GPU_HZ_WHO_FLUSH_AT,    /* r200_flush_at (register/tag flushes) */
+    PPC_GPU_HZ_WHO_N
+};
+extern __thread uint8_t ppc_gpu_hz_who;       /* PPC_GPU_HZ_WHO_* */
+extern __thread uint8_t ppc_gpu_hz_unlocked;  /* the caller's unlock wrapper released the BQL */
+bool ppc_gpu_hz_on(void);
 
 /* Renderer capability flags */
 #define PPC_MAC_GPU_RENDERER_CAP_2D_BLIT   (1 << 0)

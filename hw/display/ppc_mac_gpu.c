@@ -51,6 +51,23 @@
 #include "system/system.h"
 #include "system/runstate.h"
 #include "hw/display/ppc_mac_gpu_vp.h"
+
+/* Debug (diag-hazard, PPCGPU_HAZDIAG=1; AI-generated, not for merging):
+ * see ppc_mac_gpu_renderer.h. */
+__thread uint8_t ppc_gpu_hz_who;
+__thread uint8_t ppc_gpu_hz_unlocked;
+bool ppc_gpu_hz_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_HAZDIAG");
+        on = e && e[0] == '1';
+    }
+    return on;
+}
+#define HZ_SET(who, unl) uint8_t hz_who0 = ppc_gpu_hz_who, hz_unl0 = ppc_gpu_hz_unlocked; \
+    ppc_gpu_hz_who = (who); ppc_gpu_hz_unlocked = (unl)
+#define HZ_RESTORE() (ppc_gpu_hz_who = hz_who0, ppc_gpu_hz_unlocked = hz_unl0)
 #include "trace.h"
 
 /* UniNorth AGP bridge GART base — defined in hw/pci-host/uninorth.c */
@@ -649,7 +666,9 @@ static void r200_flush_at(PPCMacGPUState *s, uint32_t why)
     r200_async_drain();
     if (s->renderer && s->renderer->flush_r200) {
         int64_t t0 = g_get_monotonic_time();
+        HZ_SET(PPC_GPU_HZ_WHO_FLUSH_AT, 0);
         bool did = s->renderer->flush_r200(s->renderer_opaque);
+        HZ_RESTORE();
         r200_flush_done(s, why, did, t0);
     }
 }
@@ -662,6 +681,7 @@ enum { R200_WHY_2D = 0x40 };
 
 static int cp_wait_unlock(void);
 static void cp_wait_relock(int saved);
+static bool ppc_mac_gpu_cp_on_thread(void);
 
 /*
  * A CPU-side 2D operation is about to read (write_access=false) or write
@@ -699,6 +719,7 @@ static void r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
      * batch under the lock meanwhile): for it the lock is kept throughout.
      */
     int w = s->renderer->draw_queue_async ? cp_wait_unlock() : 0;
+    HZ_SET(ppc_mac_gpu_cp_on_thread() ? PPC_GPU_HZ_WHO_2D_CP : PPC_GPU_HZ_WHO_2D_OTHER, w != 0);
     bool busy = s->renderer->range_busy_r200(s->renderer_opaque, lo, hi,
                                              write_access);
     bool flushed = false, did = false;
@@ -709,6 +730,7 @@ static void r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
         did = s->renderer->flush_r200(s->renderer_opaque);
         flushed = true;
     }
+    HZ_RESTORE();
     cp_wait_relock(w);
     if (flushed) {
         r200_flush_done(s, R200_WHY_TAG(R200_WHY_2D + tag), did, t0);
@@ -1791,9 +1813,11 @@ static void r200_flush_display(PPCMacGPUState *s)
     }
     r200_async_drain();
     int64_t t0 = g_get_monotonic_time();
+    HZ_SET(PPC_GPU_HZ_WHO_DISP_FLUSH, 1);
     bql_unlock();
     bool did = s->renderer->flush_r200(s->renderer_opaque);
     bql_lock();
+    HZ_RESTORE();
     if (did) {
         r200_rate.flushes++;
         r200_rate.flush_us += g_get_monotonic_time() - t0;
@@ -1812,13 +1836,18 @@ static void r200_flush_display(PPCMacGPUState *s)
 static bool display_range_busy(PPCMacGPUState *s, uint64_t lo, uint64_t hi)
 {
     bool busy;
+    bool unl = display_unlock_ok(s);
+    HZ_SET(PPC_GPU_HZ_WHO_DISP_QUERY, unl);
 
-    if (!display_unlock_ok(s)) {
-        return s->renderer->range_busy_r200(s->renderer_opaque, lo, hi, false);
+    if (!unl) {
+        busy = s->renderer->range_busy_r200(s->renderer_opaque, lo, hi, false);
+        HZ_RESTORE();
+        return busy;
     }
     bql_unlock();
     busy = s->renderer->range_busy_r200(s->renderer_opaque, lo, hi, false);
     bql_lock();
+    HZ_RESTORE();
     return busy;
 }
 
@@ -1903,6 +1932,15 @@ static uint8_t r200_dac_port_read(PPCMacGPUState *s, uint8_t idx, unsigned sub)
 static void ppc_mac_gpu_display_update(void *opaque)
 {
     PPCMacGPUState *s = opaque;
+
+    if (ppc_gpu_hz_on() && s->renderer && s->renderer->debug_log) {
+        static int64_t hz_last;
+        int64_t hz_now = get_clock();
+        if (hz_now - hz_last >= NANOSECONDS_PER_SECOND) {
+            hz_last = hz_now;
+            s->renderer->debug_log(s->renderer_opaque);
+        }
+    }
 
     /* A machine that has just been woken: give the window the pointer the
      * sleeping one had (see ppc_mac_gpu_post_load). */
