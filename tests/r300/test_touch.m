@@ -30,15 +30,27 @@ int main(void)
     @autoreleasepool {
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
         NSError *err = nil;
+        if (!dev) {
+            printf("FAIL: no Metal device\n");
+            return 1;
+        }
         id<MTLLibrary> lib = [dev newLibraryWithSource:@(src) options:nil error:&err];
+        if (!lib) {
+            printf("FAIL: library: %s\n", err.localizedDescription.UTF8String);
+            return 1;
+        }
         MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
         pd.vertexFunction = [lib newFunctionWithName:@"vs"];
         pd.fragmentFunction = [lib newFunctionWithName:@"fs"];
         pd.colorAttachments[0].pixelFormat = MTLPixelFormatR8Unorm;
         id<MTLRenderPipelineState> ps = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
         id<MTLCommandQueue> q = [dev newCommandQueue];
+        if (!ps || !q) {
+            printf("FAIL: pipeline or queue: %s\n", err ? err.localizedDescription.UTF8String : "no queue");
+            return 1;
+        }
         static const uint32_t heights[] = { 32, 33, 129, 300, 480, 481 };
-        unsigned checked = 0, exact = 0, slack = 0, unknown = 0, fails = 0;
+        unsigned checked = 0, exact = 0, slack = 0, unknown = 0, fails = 0, drawn = 0;
 
         for (unsigned hi = 0; hi < sizeof(heights) / sizeof(heights[0]); hi++) {
             uint32_t H = heights[hi];
@@ -52,6 +64,10 @@ int main(void)
             td.storageMode = MTLStorageModeShared;
             id<MTLTexture> t = [dev newTextureWithDescriptor:td];
             uint8_t *px = malloc((size_t)pkt.rt_width * H);
+            if (!t || !px) {
+                printf("FAIL: render target %ux%u\n", pkt.rt_width, H);
+                return 1;
+            }
 
             for (int round = 0; round < 40; round++) {
                 R300Vertex sq[BANDS][6];
@@ -94,11 +110,20 @@ int main(void)
                 [e setViewport:(MTLViewport){ 0, 0, pkt.rt_width, H, 0, 1 }];
                 id<MTLBuffer> vb = [dev newBufferWithBytes:pos length:sizeof(pos)
                                                    options:MTLResourceStorageModeShared];
+                if (!vb) {
+                    printf("FAIL: vertex buffer\n");
+                    return 1;
+                }
                 [e setVertexBuffer:vb offset:0 atIndex:0];
                 [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:BANDS * 6];
                 [e endEncoding];
                 [cb commit];
                 [cb waitUntilCompleted];
+                if (cb.status != MTLCommandBufferStatusCompleted) {
+                    printf("FAIL: command buffer status %ld: %s\n", (long)cb.status,
+                           cb.error ? cb.error.localizedDescription.UTF8String : "");
+                    return 1;
+                }
                 [t getBytes:px bytesPerRow:pkt.rt_width
                  fromRegion:MTLRegionMake2D(0, 0, pkt.rt_width, H) mipmapLevel:0];
                 for (int k = 0; k < BANDS; k++) {
@@ -112,6 +137,7 @@ int main(void)
                         }
                     }
                     checked++;
+                    drawn += got != 0;
                     if (!want[k]) {
                         unknown++;              /* 0: not known, so rt_height */
                     } else if (got > want[k]) {
@@ -128,8 +154,13 @@ int main(void)
             }
             free(px);
         }
-        printf("touch_y1: %u squares, bound exact %u, above %u, not known %u, below (FAIL) %u\n",
-               checked, exact, slack, unknown, fails);
+        printf("touch_y1: %u squares (%u drew pixels), bound exact %u, above %u, not known %u, below (FAIL) %u\n",
+               checked, drawn, exact, slack, unknown, fails);
+        /* a draw that silently did nothing would leave every bound looking safe */
+        if (drawn < checked / 2) {
+            printf("FAIL: only %u of %u squares drew anything\n", drawn, checked);
+            return 1;
+        }
         return fails != 0;
     }
 }
