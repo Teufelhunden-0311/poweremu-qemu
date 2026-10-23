@@ -6814,6 +6814,27 @@ static HzT hz_lock[HZ_SITE_N][PPC_GPU_HZ_WHO_N][2][2];   /* [site][who][bql held
 static HzT hz_drain[HZ_SITE_N][PPC_GPU_HZ_WHO_N][2][2];
 static int hz_reason = HZ_R_OTHER;          /* set under g_render_lock */
 
+/*
+ * D (key-difference diagnostic).  Provenance of written-tracker entries,
+ * kept beside g_r200_written (not in R200TexKey, whose memcmp identity is
+ * unchanged): which r200_note_written call sites wrote the entry in its
+ * current epoch, a bit mask.  For each ds_waw conflict, every offending
+ * entry -- current epoch, overlapping, key unequal, exactly the
+ * conditions of r200_batch_conflict -- is classified by which key fields
+ * differ, how the ranges relate and its provenance; the first offending
+ * entry (tracker order) and all of them are counted separately.  The
+ * other predicate parts are also evaluated read-only on these draws.
+ */
+enum { HZ_P_R200_DS = 1, HZ_P_R200_CB = 2, HZ_P_R300_DS = 4, HZ_P_R300_CB = 8 };
+static uint8_t hz_note_role;                /* set around r200_note_written */
+static uint8_t hz_prov[R200_MAX_WRITTEN];
+enum { HZ_REL_EQUAL, HZ_REL_ENTRY_CONTAINS, HZ_REL_TARGET_CONTAINS, HZ_REL_PARTIAL };
+static uint64_t hz_dsw_first[1 << 11], hz_dsw_all[1 << 11];   /* mask | rel << 5 | prov << 7 */
+static uint64_t hz_dsw_nent[4];             /* conflicts with 1, 2, 3, 4+ offending entries */
+/* other predicate parts holding on ds_waw draws (bit 0 ds_war, 1 colour waw, 2 colour war,
+ * 3 texture raw), split by whether every offending entry differs in width/height only */
+static uint64_t hz_dsw_other[2][16];
+
 static void hz_add(HzT *t, int64_t ns)
 {
     uint64_t m;
@@ -6862,6 +6883,26 @@ static void metal_debug_log(void *opaque)
                     snprintf(tag, sizeof(tag), "drain.%s.%s.bql%d.unl%d", hz_sname[si], hz_wname[w], h, u);
                     hz_out(g, tag, &hz_drain[si][w][h][u]);
                 }
+            }
+        }
+    }
+    for (int i = 0; i < (1 << 11); i++) {
+        if (qatomic_read(&hz_dsw_first[i]) || qatomic_read(&hz_dsw_all[i])) {
+            g_string_append_printf(g, " dsw.%d=%llu/%llu", i,
+                                   (unsigned long long)qatomic_read(&hz_dsw_first[i]),
+                                   (unsigned long long)qatomic_read(&hz_dsw_all[i]));
+        }
+    }
+    g_string_append_printf(g, " dsw.nent=%llu/%llu/%llu/%llu",
+                           (unsigned long long)qatomic_read(&hz_dsw_nent[0]),
+                           (unsigned long long)qatomic_read(&hz_dsw_nent[1]),
+                           (unsigned long long)qatomic_read(&hz_dsw_nent[2]),
+                           (unsigned long long)qatomic_read(&hz_dsw_nent[3]));
+    for (int d = 0; d < 2; d++) {
+        for (int o = 0; o < 16; o++) {
+            if (qatomic_read(&hz_dsw_other[d][o])) {
+                g_string_append_printf(g, " dswo.%d.%d=%llu", d, o,
+                                       (unsigned long long)qatomic_read(&hz_dsw_other[d][o]));
             }
         }
     }
@@ -7531,6 +7572,9 @@ static void r200_note_written(uint64_t lo, uint64_t hi, const R200TexKey *key)
         w++;
     }
     if (w < g_r200_nwritten) {
+        /* D: an entry from an earlier epoch starts its provenance afresh */
+        hz_prov[w] = g_r200_written[w].epoch == g_r200_epoch ? hz_prov[w] | hz_note_role
+                                                             : hz_note_role;
         g_r200_written[w].epoch = g_r200_epoch;       /* written again in this batch */
         return;
     }
@@ -7541,6 +7585,7 @@ static void r200_note_written(uint64_t lo, uint64_t hi, const R200TexKey *key)
     g_r200_written[w].hi = hi;
     g_r200_written[w].key = *key;
     g_r200_written[w].epoch = g_r200_epoch;
+    hz_prov[w] = hz_note_role;
     g_r200_nwritten++;
 }
 
@@ -8595,7 +8640,9 @@ static int r200_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                 }
                 if (dtex) {
                     uint64_t dlo = dk.offset, dhi = dlo + (uint64_t)dk.pitch * dk.height;
+                    hz_note_role = HZ_P_R200_DS;
                     r200_note_written(dlo, dhi, &dk);
+                    hz_note_role = 0;
                 }
             }
             if (dtex) {
@@ -8621,7 +8668,9 @@ static int r200_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                                                   pkt->rt_height, 0, 1 }];
             g_r200_enc_key = rk;
             g_r200_stat_passes++;
+            hz_note_role = HZ_P_R200_CB;
             r200_note_written(rlo, rhi, &rk);
+            hz_note_role = 0;
         }
         id<MTLRenderCommandEncoder> enc = g_r200_enc;
         [enc setScissorRect:(MTLScissorRect){ sx0, sy0, sx1 - sx0, sy1 - sy0 }];
@@ -10077,6 +10126,48 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                 if (why < 0) {
                     why = HZ_R_OTHER;   /* should not happen: logged as other */
                 }
+                if (why == HZ_R_DS_WAW) {
+                    /* D: every offending entry, by r200_batch_conflict's conditions */
+                    int n = 0;
+                    bool dims_only = true;
+                    for (int i = 0; i < g_r200_nwritten; i++) {
+                        const R200TexKey *e = &g_r200_written[i].key;
+                        uint64_t elo = g_r200_written[i].lo, ehi = g_r200_written[i].hi;
+                        if (g_r200_written[i].epoch != g_r200_epoch || !(dlo < ehi && elo < dhi) ||
+                            !memcmp(&dk, e, sizeof(dk))) {
+                            continue;
+                        }
+                        int mask = (e->offset != dk.offset) | (e->width != dk.width) << 1 |
+                                   (e->height != dk.height) << 2 | (e->pitch != dk.pitch) << 3 |
+                                   (e->format != dk.format) << 4;
+                        int rel = elo == dlo && ehi == dhi ? HZ_REL_EQUAL :
+                                  elo <= dlo && ehi >= dhi ? HZ_REL_ENTRY_CONTAINS :
+                                  dlo <= elo && dhi >= ehi ? HZ_REL_TARGET_CONTAINS : HZ_REL_PARTIAL;
+                        int idx = mask | rel << 5 | (hz_prov[i] & 15) << 7;
+                        if (n == 0) {
+                            qatomic_inc(&hz_dsw_first[idx]);
+                        }
+                        qatomic_inc(&hz_dsw_all[idx]);
+                        dims_only &= !(mask & ~6);
+                        n++;
+                    }
+                    qatomic_inc(&hz_dsw_nent[MIN(MAX(n, 1), 4) - 1]);
+                    /* the predicate's other parts, read-only, on this draw */
+                    int other = r300_read_conflict(dlo, dhi, &dk) ? 1 : 0;
+                    for (uint32_t k = 0; k < ncb; k++) {
+                        uint64_t lo = ck[k].offset, hi = lo + (uint64_t)ck[k].pitch * ck[k].height;
+                        other |= r200_batch_conflict(lo, hi, &ck[k]) ? 2 : 0;
+                        other |= r300_read_conflict(lo, hi, &ck[k]) ? 4 : 0;
+                    }
+                    for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
+                        if (u.tex_info[t][0] && !pkt->tex[t].host_data &&
+                            r200_batch_conflict(pkt->tex[t].gpu_addr,
+                                (uint64_t)pkt->tex[t].gpu_addr + pkt->tex[t].size_bytes, NULL)) {
+                            other |= 8;
+                        }
+                    }
+                    qatomic_inc(&hz_dsw_other[dims_only][other]);
+                }
                 hz_add(&hz_conf[why], 0);
                 hz_reason = why;        /* for r200_flush_locked's timing */
             }
@@ -10125,7 +10216,9 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                 g_r200_enc_depth_off = dk.offset;
                 g_r200_enc_depth_pitch = zd->pitch;
                 g_r200_enc_depth_z16 = zd->bpp == 2;
+                hz_note_role = HZ_P_R300_DS;
                 r200_note_written(dlo, dhi, &dk);
+                hz_note_role = 0;
             } else {
                 g_r200_enc_depth_off = ~0u;
             }
@@ -10138,10 +10231,12 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             memcpy(g_r300_enc_cb, ck, sizeof(ck[0]) * ncb);
             g_r300_enc_mine = true;
             g_r200_stat_passes++;
+            hz_note_role = HZ_P_R300_CB;
             for (uint32_t k = 0; k < ncb; k++) {
                 r200_note_written(ck[k].offset,
                                   ck[k].offset + (uint64_t)ck[k].pitch * ck[k].height, &ck[k]);
             }
+            hz_note_role = 0;
         }
         enc_ds = g_r200_enc_depth_off != ~0u;
         MTLPixelFormat pass_zpf = !enc_ds ? MTLPixelFormatInvalid :
