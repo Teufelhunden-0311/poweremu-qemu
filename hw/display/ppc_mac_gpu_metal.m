@@ -6810,10 +6810,11 @@ static bool r300_extent_on(void)
 }
 /* Plan outcomes (printed by PPCGPU_HAZDIAG's hz-sec as ext.*). */
 enum { EXT_OFF, EXT_NOBQL, EXT_VRAM, EXT_MSAA, EXT_NCB, EXT_PITCH, EXT_BEYOND, EXT_ATT_OVL,
-       EXT_TEX_OVL, EXT_OK, EXT_ENC_FALLBACK, EXT_PIN_FLUSH, EXT_REG_OVL, EXT_SHRUNK, EXT_N };
+       EXT_TEX_OVL, EXT_OK, EXT_ENC_FALLBACK, EXT_PIN_FLUSH, EXT_REG_OVL, EXT_SHRUNK,
+       EXT_REG_CLAMP, EXT_N };
 static const char *const ext_name[EXT_N] = { "off", "nobql", "staging_or_vram", "msaa", "ncb",
     "pitch0", "beyond_vram", "attach_overlap", "tex_overlap", "ok", "encode_fallback", "pin_flush",
-    "registry_overlap", "shrunk" };
+    "registry_overlap", "shrunk", "neighbour_clamped" };
 static uint64_t g_ext_stat[EXT_N];
 #define EXT_COUNT(r) qatomic_inc(&g_ext_stat[r])
 
@@ -7269,6 +7270,9 @@ typedef struct R300ExtEntry {
     uint64_t used;
 } R300ExtEntry;
 #define R300_EXT_N 32
+/* A registered surface not planned for this many plans is stale: its
+ * extent may be clamped by a draw that now uses its memory. */
+#define R300_EXT_STALE 4096
 static R300ExtEntry g_r300_ext[R300_EXT_N];
 static uint64_t g_r300_ext_clock;
 
@@ -7335,11 +7339,14 @@ static void r300_extent_plan(PPCMacGPUMetalState *st, RQJob *job)
     }
     /*
      * Heights E = max(T, registry), else (when E collides) the draw's own T
-     * for every attachment, which shrinks the registry: an extent must not
-     * reach the other attachments of the draw, a texture it reads, or the
-     * extent of another surface in the registry (so it cannot grow into a
-     * neighbour that is in use, and a growth published before the
-     * neighbour was seen is taken back).  If even T collides, today's path.
+     * for every attachment, which shrinks the registry.  E must not reach
+     * the other attachments of the draw, a texture it reads, or another
+     * surface's registered extent (no growth into a neighbour).  At T the
+     * same, except that a registered surface not planned for
+     * R300_EXT_STALE plans no longer counts: its memory is being drawn as
+     * this surface now, so its extent is clamped below this draw's ranges
+     * or dropped -- the tracker still orders the actual writes, whatever
+     * the registry says.  If T collides, today's path.
      */
     int why = EXT_OK;
     for (int pass = 0; pass < 2; pass++) {
@@ -7375,8 +7382,9 @@ static void r300_extent_plan(PPCMacGPUMetalState *st, RQJob *job)
                     mine |= a[m].slot == j;
                 }
                 if (g->used && !mine && lo < (uint64_t)g->off + (uint64_t)g->pitch * g->e &&
-                    g->off < hi) {
-                    why = EXT_REG_OVL;          /* another registered surface */
+                    g->off < hi &&
+                    (!pass || g_r300_ext_clock - g->used < R300_EXT_STALE)) {
+                    why = EXT_REG_OVL;          /* another registered surface (in use) */
                 }
             }
         }
@@ -7387,6 +7395,26 @@ static void r300_extent_plan(PPCMacGPUMetalState *st, RQJob *job)
     if (why != EXT_OK) {
         EXT_COUNT(why);
         return;
+    }
+    /* other surfaces' registered extents that this draw's ranges reach */
+    for (int j = 0; j < R300_EXT_N; j++) {
+        R300ExtEntry *g = &g_r300_ext[j];
+        bool mine = false;
+        for (uint32_t m = 0; m < na; m++) {
+            mine |= a[m].slot == j;
+        }
+        for (uint32_t i = 0; i < na && g->used && !mine; i++) {
+            uint64_t lo = a[i].off, hi = lo + (uint64_t)a[i].pitch * a[i].e;
+            if (lo < (uint64_t)g->off + (uint64_t)g->pitch * g->e && g->off < hi) {
+                uint64_t rows = g->off < lo ? (lo - g->off) / g->pitch : 0;
+                EXT_COUNT(EXT_REG_CLAMP);
+                if (rows) {
+                    g->e = (uint32_t)MIN((uint64_t)g->e, rows);
+                } else {
+                    g->used = 0;        /* dropped */
+                }
+            }
+        }
     }
     for (uint32_t i = 0; i < na; i++) {
         R300ExtEntry *g;
