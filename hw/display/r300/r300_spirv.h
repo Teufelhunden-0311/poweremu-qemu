@@ -41,4 +41,17 @@ char *r300_spirv_to_msl(const uint32_t *spv, size_t nwords, R300Stage stage,
 /* Both steps. */
 char *r300_glsl_to_msl(const char *glsl, R300Stage stage, char **err);
 
+/*
+ * The conversion's settings in words (target versions, macros, entry
+ * points, bindings) and the libraries' own version reports, for the MSL
+ * disk cache's key.  Malloc'd.
+ */
+char *r300_msl_translation_id(void);
+
+/*
+ * A function of shaderc and of SPIRV-Cross (NULL when not built in), so
+ * that the caller can identify the binaries the conversion runs in.
+ */
+void r300_converter_functions(const void **shaderc, const void **spirv_cross);
+
 #endif

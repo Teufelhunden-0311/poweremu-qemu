@@ -116,7 +116,10 @@ system_ss.add(when: 'CONFIG_POWEREMU_GPU', if_true: [files('poweremu-gpu.c'), pi
 if host_os == 'darwin'
   metal_fw = dependency('appleframeworks', modules: ['Metal', 'QuartzCore'], required: false)
   if metal_fw.found()
-    system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [files('ppc_mac_gpu_metal.m'), metal_fw])
+    # r300_msl_cache.c: the Metal backend's MSL disk cache (PPCGPU_MSL_CACHE)
+    system_ss.add(when: 'CONFIG_PPC_MAC_GPU', if_true: [files('ppc_mac_gpu_metal.m',
+                                                              'r300/r300_msl_cache.c'),
+                                                        metal_fw, zlib])
   endif
 endif
 
