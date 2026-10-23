@@ -21,6 +21,17 @@
  * C  80 render targets (32x32 textures), cleared, then drawn round-robin
  *    twice with alternating full and half-height scissors, then each read
  *    back.
+ * D  View-cache capacity: texture T0 is drawn into, then 34 framebuffer
+ *    objects with their own colour texture and depth renderbuffer are each
+ *    cleared and drawn with the depth test on (68 views, more than the
+ *    emulator's 64-view cache), then the window gets a quad textured with
+ *    T0, without a read-back in between.  T0's view must still be had.
+ * E  A depth buffer kept for a later draw: colour texture C (fully drawn
+ *    first, depth test off), then a depth-tested quad under a 16-row
+ *    scissor with a fresh depth renderbuffer, then the whole of C drawn
+ *    again with the depth test off.  Twice: scissor at the bottom and at
+ *    the top rows (the hardware row order of a framebuffer object is not
+ *    assumed).
  * Render targets are power-of-two (the R300 renders into no other
  * GL_TEXTURE_2D) and get their first contents by glClear through their
  * framebuffer object: the Tiger ATI driver did not keep glTexImage2D
@@ -235,6 +246,24 @@ static int fbo_bind(GLuint fbo, GLuint t, int w, int h)
     return 1;
 }
 
+/* fbo_bind with a depth renderbuffer as well */
+static int fbo_bind_d(GLuint fbo, GLuint t, GLuint rb, int w, int h)
+{
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, fbo);
+    glFramebufferRenderbufferEXT(GL_FRAMEBUFFER_EXT, GL_DEPTH_ATTACHMENT_EXT,
+                                 GL_RENDERBUFFER_EXT, rb);
+    return fbo_bind(fbo, t, w, h);
+}
+
+static GLuint depth_rb(int w, int h)
+{
+    GLuint rb;
+    glGenRenderbuffersEXT(1, &rb);
+    glBindRenderbufferEXT(GL_RENDERBUFFER_EXT, rb);
+    glRenderbufferStorageEXT(GL_RENDERBUFFER_EXT, GL_DEPTH_COMPONENT24, w, h);
+    return rb;
+}
+
 static void fill(uint8_t *p, int w, int h, const uint8_t c[4])
 {
     for (int i = 0; i < w * h; i++) {
@@ -375,6 +404,166 @@ static void test_c(void)
     glDeleteTextures(N, tex);
 }
 
+/* ---- D: more pinned render-target views than the cache holds ---- */
+static void test_d(void)
+{
+    enum { N = 34, S = 64, T = 64 };
+    static GLuint tex[N], rb[N], fbo[N + 1];
+    static uint8_t want[N][S * S * 4], got[WW * WH * 4], t0want[T * T * 4];
+    uint8_t c0[4] = { 0, 0, 0, 255 }, ct[4] = { 17, 199, 83, 255 };
+    Rect full = { 0, 0, S, S }, tfull = { 0, 0, T, T };
+    GLuint t0;
+
+    glGenFramebuffersEXT(N + 1, fbo);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_DITHER);
+    /* T0: cleared, then a quad in its middle */
+    fill(t0want, T, T, c0);
+    t0 = tex_new(T, T, t0want);
+    if (!fbo_bind(fbo[N], t0, T, T)) {
+        glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, 0);
+        return;
+    }
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    {
+        Rect q = { 8, 8, 56, 56 };
+        quad(&tfull, &q, 0.0f, ct);
+        for (int y = 0; y < T; y++) {
+            for (int x = 0; x < T; x++) {
+                if (in_rect(&q, x, y)) {
+                    memcpy(t0want + 4 * (y * T + x), ct, 4);
+                }
+            }
+        }
+    }
+    /* 34 colour + depth targets, depth test on */
+    for (int k = 0; k < N; k++) {
+        uint8_t c[4];
+        Rect q = { k % 7, k % 5, S - 3, S - 1 - k % 3 };
+        fill(want[k], S, S, c0);
+        tex[k] = tex_new(S, S, want[k]);
+        rb[k] = depth_rb(S, S);
+        if (!fbo_bind_d(fbo[k], tex[k], rb[k], S, S)) {
+            continue;
+        }
+        glDisable(GL_DEPTH_TEST);
+        glClearColor(0, 0, 0, 1);
+        glClearDepth(1.0);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LESS);
+        colour(100 + k, c);
+        quad(&full, &q, 0.0f, c);
+        for (int y = 0; y < S; y++) {
+            for (int x = 0; x < S; x++) {
+                if (in_rect(&q, x, y)) {
+                    memcpy(want[k] + 4 * (y * S + x), c, 4);
+                }
+            }
+        }
+    }
+    glDisable(GL_DEPTH_TEST);
+    gl_check("D targets");
+    /* the window: cleared, then T0 sampled over a 64x64 quad at (100,100) */
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, 0);
+    glViewport(0, 0, WW, WH);
+    glClearColor(3 / 255.0f, 5 / 255.0f, 7 / 255.0f, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    {
+        Rect v = { 0, 0, WW, WH };
+        glViewport(0, 0, WW, WH);
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        glOrtho(0, WW, 0, WH, -1, 1);
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, t0);
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+        glBegin(GL_QUADS);
+        glTexCoord2f(0, 0); glVertex2f(100, 100);
+        glTexCoord2f(1, 0); glVertex2f(100 + T, 100);
+        glTexCoord2f(1, 1); glVertex2f(100 + T, 100 + T);
+        glTexCoord2f(0, 1); glVertex2f(100, 100 + T);
+        glEnd();
+        glDisable(GL_TEXTURE_2D);
+        (void)v;
+    }
+    gl_check("D window");
+    {
+        static uint8_t wgot[T * T * 4];
+        glReadPixels(100, 100, T, T, GL_RGBA, GL_UNSIGNED_BYTE, wgot);
+        gl_check("D readback window");
+        check("D window textured with T0", wgot, t0want, T, T);
+    }
+    for (int k = 0; k < N; k++) {
+        char name[32];
+        if (!fbo_bind_d(fbo[k], tex[k], rb[k], S, S)) {
+            continue;
+        }
+        glReadPixels(0, 0, S, S, GL_RGBA, GL_UNSIGNED_BYTE, got);
+        snprintf(name, sizeof(name), "D target %02d", k);
+        check(name, got, want[k], S, S);
+    }
+    gl_check("D");
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, 0);
+    glDeleteFramebuffersEXT(N + 1, fbo);
+    glDeleteRenderbuffersEXT(N, rb);
+    glDeleteTextures(N, tex);
+    glDeleteTextures(1, &t0);
+}
+
+/* ---- E: a kept depth buffer shorter than a later draw ---- */
+static void test_e(void)
+{
+    enum { S = 128, H = 16 };
+    static uint8_t want[S * S * 4], got[S * S * 4];
+    Rect full = { 0, 0, S, S };
+
+    for (int v = 0; v < 2; v++) {
+        GLuint fbo, t, rb;
+        uint8_t c1[4], c2[4], c3[4], c0[4] = { 0, 0, 0, 255 };
+        Rect s = v ? (Rect){ 0, S - H, S, S } : (Rect){ 0, 0, S, H };
+        colour(150 + 3 * v, c1);
+        colour(151 + 3 * v, c2);
+        colour(152 + 3 * v, c3);
+        fill(want, S, S, c0);
+        t = tex_new(S, S, want);
+        rb = depth_rb(S, S);
+        glGenFramebuffersEXT(1, &fbo);
+        if (!fbo_bind_d(fbo, t, rb, S, S)) {
+            glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, 0);
+            continue;
+        }
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_DEPTH_TEST);
+        glClearColor(0, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        quad(&full, &full, 0.0f, c1);           /* all rows, no depth */
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(s.x0, s.y0, s.x1 - s.x0, s.y1 - s.y0);
+        glClearDepth(1.0);
+        glClear(GL_DEPTH_BUFFER_BIT);
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LESS);
+        quad(&full, &full, 0.0f, c2);           /* 16 rows, depth */
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_SCISSOR_TEST);
+        quad(&full, &full, 0.0f, c3);           /* all rows again, no depth */
+        fill(want, S, S, c3);
+        gl_check("E drawing");
+        glReadPixels(0, 0, S, S, GL_RGBA, GL_UNSIGNED_BYTE, got);
+        gl_check("E readback");
+        check(v ? "E depth kept, top rows" : "E depth kept, bottom rows", got, want, S, S);
+        glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, 0);
+        glDeleteFramebuffersEXT(1, &fbo);
+        glDeleteRenderbuffersEXT(1, &rb);
+        glDeleteTextures(1, &t);
+    }
+}
+
 static void display(void)
 {
     static int done;
@@ -387,6 +576,8 @@ static void display(void)
     glutSwapBuffers();
     test_b();
     test_c();
+    test_d();
+    test_e();
     gl_check("end");
     say("TOTAL checks %d failed %d\n", nchecks, nfail);
     say("CONTROLS framebuffer objects incomplete %d, GL errors %d\n", nfbo_bad, ngl_err);
