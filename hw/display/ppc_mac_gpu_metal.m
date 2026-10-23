@@ -6810,9 +6810,10 @@ static bool r300_extent_on(void)
 }
 /* Plan outcomes (printed by PPCGPU_HAZDIAG's hz-sec as ext.*). */
 enum { EXT_OFF, EXT_NOBQL, EXT_VRAM, EXT_MSAA, EXT_NCB, EXT_PITCH, EXT_BEYOND, EXT_ATT_OVL,
-       EXT_TEX_OVL, EXT_OK, EXT_ENC_FALLBACK, EXT_PIN_FLUSH, EXT_N };
+       EXT_TEX_OVL, EXT_OK, EXT_ENC_FALLBACK, EXT_PIN_FLUSH, EXT_REG_OVL, EXT_SHRUNK, EXT_N };
 static const char *const ext_name[EXT_N] = { "off", "nobql", "staging_or_vram", "msaa", "ncb",
-    "pitch0", "beyond_vram", "attach_overlap", "tex_overlap", "ok", "encode_fallback", "pin_flush" };
+    "pitch0", "beyond_vram", "attach_overlap", "tex_overlap", "ok", "encode_fallback", "pin_flush",
+    "registry_overlap", "shrunk" };
 static uint64_t g_ext_stat[EXT_N];
 #define EXT_COUNT(r) qatomic_inc(&g_ext_stat[r])
 
@@ -7331,33 +7332,69 @@ static void r300_extent_plan(PPCMacGPUMetalState *st, RQJob *job)
                 break;
             }
         }
-        if ((uint64_t)a[i].off + (uint64_t)a[i].pitch * a[i].e > st->vram_size) {
-            EXT_COUNT(EXT_BEYOND);
-            return;
+    }
+    /*
+     * Heights E = max(T, registry), else (when E collides) the draw's own T
+     * for every attachment, which shrinks the registry: an extent must not
+     * reach the other attachments of the draw, a texture it reads, or the
+     * extent of another surface in the registry (so it cannot grow into a
+     * neighbour that is in use, and a growth published before the
+     * neighbour was seen is taken back).  If even T collides, today's path.
+     */
+    int why = EXT_OK;
+    for (int pass = 0; pass < 2; pass++) {
+        why = EXT_OK;
+        if (pass) {
+            for (uint32_t i = 0; i < na; i++) {
+                a[i].e = T;
+            }
+        }
+        for (uint32_t i = 0; i < na && why == EXT_OK; i++) {
+            uint64_t lo = a[i].off, hi = lo + (uint64_t)a[i].pitch * a[i].e;
+            if (hi > st->vram_size) {
+                why = EXT_BEYOND;
+                break;
+            }
+            for (uint32_t j = i + 1; j < na && why == EXT_OK; j++) {
+                uint64_t lo2 = a[j].off, hi2 = lo2 + (uint64_t)a[j].pitch * a[j].e;
+                if (lo < hi2 && lo2 < hi) {
+                    why = EXT_ATT_OVL;          /* attachments overlapping */
+                }
+            }
+            for (int t = 0; t < R300_NUM_TEX_UNITS && why == EXT_OK; t++) {
+                const R300TexDesc *td = &p->tex[t];
+                if (td->bound && !td->host_data && lo < (uint64_t)td->gpu_addr + td->size_bytes &&
+                    td->gpu_addr < hi) {
+                    why = EXT_TEX_OVL;          /* a texture it reads inside an attachment */
+                }
+            }
+            for (int j = 0; j < R300_EXT_N && why == EXT_OK; j++) {
+                const R300ExtEntry *g = &g_r300_ext[j];
+                bool mine = false;
+                for (uint32_t m = 0; m < na; m++) {
+                    mine |= a[m].slot == j;
+                }
+                if (g->used && !mine && lo < (uint64_t)g->off + (uint64_t)g->pitch * g->e &&
+                    g->off < hi) {
+                    why = EXT_REG_OVL;          /* another registered surface */
+                }
+            }
+        }
+        if (why == EXT_OK) {
+            break;
         }
     }
-    for (uint32_t i = 0; i < na; i++) {
-        uint64_t lo = a[i].off, hi = lo + (uint64_t)a[i].pitch * a[i].e;
-        for (uint32_t j = i + 1; j < na; j++) {
-            uint64_t lo2 = a[j].off, hi2 = lo2 + (uint64_t)a[j].pitch * a[j].e;
-            if (lo < hi2 && lo2 < hi) {
-                EXT_COUNT(EXT_ATT_OVL);
-                return;                 /* attachments overlapping at E */
-            }
-        }
-        for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
-            const R300TexDesc *td = &p->tex[t];
-            if (td->bound && !td->host_data && lo < (uint64_t)td->gpu_addr + td->size_bytes &&
-                td->gpu_addr < hi) {
-                EXT_COUNT(EXT_TEX_OVL);
-                return;                 /* a texture it reads inside an attachment at E */
-            }
-        }
+    if (why != EXT_OK) {
+        EXT_COUNT(why);
+        return;
     }
     for (uint32_t i = 0; i < na; i++) {
         R300ExtEntry *g;
         if (a[i].slot >= 0) {
             g = &g_r300_ext[a[i].slot];
+            if (a[i].e < g->e) {
+                EXT_COUNT(EXT_SHRUNK);
+            }
         } else {
             int v = 0;
             for (int j = 1; j < R300_EXT_N; j++) {
