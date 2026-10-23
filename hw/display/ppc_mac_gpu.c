@@ -56,14 +56,17 @@
  * see ppc_mac_gpu_renderer.h. */
 __thread uint8_t ppc_gpu_hz_who;
 __thread uint8_t ppc_gpu_hz_unlocked;
+static bool hz_on_val;
+static void hz_on_init(void)
+{
+    const char *e = getenv("PPCGPU_HAZDIAG");
+    hz_on_val = e && e[0] == '1';
+}
 bool ppc_gpu_hz_on(void)
 {
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("PPCGPU_HAZDIAG");
-        on = e && e[0] == '1';
-    }
-    return on;
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, hz_on_init);    /* read once, thread-safely */
+    return hz_on_val;
 }
 #define HZ_SET(who, unl) uint8_t hz_who0 = ppc_gpu_hz_who, hz_unl0 = ppc_gpu_hz_unlocked; \
     ppc_gpu_hz_who = (who); ppc_gpu_hz_unlocked = (unl)

@@ -6827,7 +6827,32 @@ static int hz_reason = HZ_R_OTHER;          /* set under g_render_lock */
  */
 enum { HZ_P_R200_DS = 1, HZ_P_R200_CB = 2, HZ_P_R300_DS = 4, HZ_P_R300_CB = 8 };
 static uint8_t hz_note_role;                /* set around r200_note_written */
+static uint8_t hz_note_ns = 1;              /* the writer's sample count, likewise */
 static uint8_t hz_prov[R200_MAX_WRITTEN];
+static uint8_t hz_ns_of[R200_MAX_WRITTEN];  /* sample count; 0xff: mixed in this epoch */
+
+/*
+ * E (2nd extension).  Surface signatures of offending entries, for the
+ * depth check and for every colour target's check on the same draw:
+ * old (the entry's key and writer's sample count) and new (this draw's),
+ * with role, range relation and differing fields.  Bounded table, first
+ * and all counts; records that do not fit are counted as dropped.  And per
+ * draw, by first reason (ds_waw, cb_waw): the depth check's and the colour
+ * checks' class -- none (no offending entry), dims (every offending entry
+ * written by the same attachment kind, same sample count, differing in
+ * width/height only), other.
+ */
+typedef struct HzSig {
+    int used;                                   /* published with a release store */
+    uint8_t att, prov, rel, mask, ns_old, ns_new;
+    R200TexKey old_key, new_key;
+    uint64_t n_first, n_all;
+} HzSig;
+#define HZ_SIG_N 256
+static HzSig hz_sig[HZ_SIG_N];
+static uint64_t hz_sig_drop;
+static uint64_t hz_cls[2][3][3];             /* [ds_waw, cb_waw][depth cls][colour cls] */
+enum { HZ_CLS_NONE, HZ_CLS_DIMS, HZ_CLS_OTHER };
 enum { HZ_REL_EQUAL, HZ_REL_ENTRY_CONTAINS, HZ_REL_TARGET_CONTAINS, HZ_REL_PARTIAL };
 static uint64_t hz_dsw_first[1 << 11], hz_dsw_all[1 << 11];   /* mask | rel << 5 | prov << 7 */
 static uint64_t hz_dsw_nent[4];             /* conflicts with 1, 2, 3, 4+ offending entries */
@@ -6858,6 +6883,60 @@ static void hz_out(GString *g, const char *tag, const HzT *t)
                                (unsigned long long)(qatomic_read(&t->ns) / 1000),
                                (unsigned long long)(qatomic_read(&t->max) / 1000));
     }
+}
+
+/* E: one offending entry's signature into the bounded table (under g_render_lock). */
+static void hz_sig_add(int att, int i, const R200TexKey *key, int ns, int mask, int rel, bool first)
+{
+    HzSig want = { 0, (uint8_t)att, (uint8_t)(hz_prov[i] & 15), (uint8_t)rel, (uint8_t)mask,
+                   hz_ns_of[i], (uint8_t)ns, g_r200_written[i].key, *key, 0, 0 };
+    for (int j = 0; j < HZ_SIG_N; j++) {
+        HzSig *g = &hz_sig[j];
+        if (!g->used) {                 /* only the encoding thread adds */
+            *g = want;                  /* used still 0: the reader stops here */
+            qatomic_store_release(&g->used, 1);
+        } else if (g->att != want.att || g->prov != want.prov || g->rel != want.rel ||
+                   g->mask != want.mask || g->ns_old != want.ns_old || g->ns_new != want.ns_new ||
+                   memcmp(&g->old_key, &want.old_key, sizeof(want.old_key)) ||
+                   memcmp(&g->new_key, &want.new_key, sizeof(want.new_key))) {
+            continue;
+        }
+        if (first) {
+            qatomic_inc(&g->n_first);
+        }
+        qatomic_inc(&g->n_all);
+        return;
+    }
+    qatomic_inc(&hz_sig_drop);
+}
+
+/*
+ * E: every offending entry of one check (r200_batch_conflict's conditions,
+ * read-only) -> signatures; returns the check's class.  att 0 depth, 1 colour.
+ */
+static int hz_classify(int att, uint64_t lo, uint64_t hi, const R200TexKey *key, int ns)
+{
+    int n = 0, cls = HZ_CLS_NONE;
+    int role = att ? HZ_P_R300_CB : HZ_P_R300_DS;
+    for (int i = 0; i < g_r200_nwritten; i++) {
+        const R200TexKey *e = &g_r200_written[i].key;
+        uint64_t elo = g_r200_written[i].lo, ehi = g_r200_written[i].hi;
+        if (g_r200_written[i].epoch != g_r200_epoch || !(lo < ehi && elo < hi) ||
+            !memcmp(key, e, sizeof(*key))) {
+            continue;
+        }
+        int mask = (e->offset != key->offset) | (e->width != key->width) << 1 |
+                   (e->height != key->height) << 2 | (e->pitch != key->pitch) << 3 |
+                   (e->format != key->format) << 4;
+        int rel = elo == lo && ehi == hi ? HZ_REL_EQUAL :
+                  elo <= lo && ehi >= hi ? HZ_REL_ENTRY_CONTAINS :
+                  lo <= elo && hi >= ehi ? HZ_REL_TARGET_CONTAINS : HZ_REL_PARTIAL;
+        hz_sig_add(att, i, key, ns, mask, rel, n == 0);
+        bool dims = !(mask & ~6) && (hz_prov[i] & 15) == role && hz_ns_of[i] == ns;
+        cls = cls == HZ_CLS_OTHER || !dims ? HZ_CLS_OTHER : HZ_CLS_DIMS;
+        n++;
+    }
+    return cls;
 }
 
 /* One line, cumulative: name=count/total_us/max_us. */
@@ -6898,6 +6977,17 @@ static void metal_debug_log(void *opaque)
                            (unsigned long long)qatomic_read(&hz_dsw_nent[1]),
                            (unsigned long long)qatomic_read(&hz_dsw_nent[2]),
                            (unsigned long long)qatomic_read(&hz_dsw_nent[3]));
+    for (int f = 0; f < 2; f++) {
+        for (int dc = 0; dc < 3; dc++) {
+            for (int cc = 0; cc < 3; cc++) {
+                if (qatomic_read(&hz_cls[f][dc][cc])) {
+                    g_string_append_printf(g, " cls.%s.%d.%d=%llu", f ? "cb_waw" : "ds_waw", dc, cc,
+                                           (unsigned long long)qatomic_read(&hz_cls[f][dc][cc]));
+                }
+            }
+        }
+    }
+    g_string_append_printf(g, " sigdrop=%llu", (unsigned long long)qatomic_read(&hz_sig_drop));
     for (int d = 0; d < 2; d++) {
         for (int o = 0; o < 16; o++) {
             if (qatomic_read(&hz_dsw_other[d][o])) {
@@ -6905,6 +6995,31 @@ static void metal_debug_log(void *opaque)
                                        (unsigned long long)qatomic_read(&hz_dsw_other[d][o]));
             }
         }
+    }
+    qemu_log("%s\n", g->str);
+    g_string_free(g, true);
+
+    /* E: the signature table every 5 s, cumulative: one entry per slot,
+     * att,prov,rel,mask,ns_old,ns_new,old off/w/h/pitch/fmt,new off/w/h/pitch/fmt=first/all */
+    static int tick;
+    if (++tick % 5) {
+        return;
+    }
+    g = g_string_new("hz-sig");
+    g_string_append_printf(g, " wall_us=%lld", (long long)g_get_real_time());
+    for (int j = 0; j < HZ_SIG_N; j++) {
+        HzSig *s = &hz_sig[j];
+        if (!qatomic_load_acquire(&s->used)) {
+            break;
+        }
+        g_string_append_printf(g, " %d:%u,%u,%u,%u,%u,%u,%x/%u/%u/%u/%u,%x/%u/%u/%u/%u=%llu/%llu", j,
+                               s->att, s->prov, s->rel, s->mask, s->ns_old, s->ns_new,
+                               s->old_key.offset, s->old_key.width, s->old_key.height,
+                               s->old_key.pitch, s->old_key.format,
+                               s->new_key.offset, s->new_key.width, s->new_key.height,
+                               s->new_key.pitch, s->new_key.format,
+                               (unsigned long long)qatomic_read(&s->n_first),
+                               (unsigned long long)qatomic_read(&s->n_all));
     }
     qemu_log("%s\n", g->str);
     g_string_free(g, true);
@@ -7573,8 +7688,13 @@ static void r200_note_written(uint64_t lo, uint64_t hi, const R200TexKey *key)
     }
     if (w < g_r200_nwritten) {
         /* D: an entry from an earlier epoch starts its provenance afresh */
-        hz_prov[w] = g_r200_written[w].epoch == g_r200_epoch ? hz_prov[w] | hz_note_role
-                                                             : hz_note_role;
+        if (g_r200_written[w].epoch == g_r200_epoch) {
+            hz_prov[w] |= hz_note_role;
+            hz_ns_of[w] = hz_ns_of[w] == hz_note_ns ? hz_ns_of[w] : 0xff;
+        } else {
+            hz_prov[w] = hz_note_role;
+            hz_ns_of[w] = hz_note_ns;
+        }
         g_r200_written[w].epoch = g_r200_epoch;       /* written again in this batch */
         return;
     }
@@ -7586,6 +7706,7 @@ static void r200_note_written(uint64_t lo, uint64_t hi, const R200TexKey *key)
     g_r200_written[w].key = *key;
     g_r200_written[w].epoch = g_r200_epoch;
     hz_prov[w] = hz_note_role;
+    hz_ns_of[w] = hz_note_ns;
     g_r200_nwritten++;
 }
 
@@ -10126,6 +10247,17 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                 if (why < 0) {
                     why = HZ_R_OTHER;   /* should not happen: logged as other */
                 }
+                if (why == HZ_R_DS_WAW || why == HZ_R_CB_WAW) {
+                    /* E: both checks of this draw, classified together */
+                    int dc = want_ds ? hz_classify(0, dlo, dhi, &dk, ns) : HZ_CLS_NONE;
+                    int cc = HZ_CLS_NONE;
+                    for (uint32_t k = 0; k < ncb; k++) {
+                        int c = hz_classify(1, ck[k].offset,
+                                            ck[k].offset + (uint64_t)ck[k].pitch * ck[k].height, &ck[k], ns);
+                        cc = MAX(cc, c);
+                    }
+                    qatomic_inc(&hz_cls[why == HZ_R_CB_WAW][dc][cc]);
+                }
                 if (why == HZ_R_DS_WAW) {
                     /* D: every offending entry, by r200_batch_conflict's conditions */
                     int n = 0;
@@ -10217,8 +10349,10 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                 g_r200_enc_depth_pitch = zd->pitch;
                 g_r200_enc_depth_z16 = zd->bpp == 2;
                 hz_note_role = HZ_P_R300_DS;
+                hz_note_ns = ns;
                 r200_note_written(dlo, dhi, &dk);
                 hz_note_role = 0;
+                hz_note_ns = 1;
             } else {
                 g_r200_enc_depth_off = ~0u;
             }
@@ -10232,11 +10366,13 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             g_r300_enc_mine = true;
             g_r200_stat_passes++;
             hz_note_role = HZ_P_R300_CB;
+            hz_note_ns = ns;
             for (uint32_t k = 0; k < ncb; k++) {
                 r200_note_written(ck[k].offset,
                                   ck[k].offset + (uint64_t)ck[k].pitch * ck[k].height, &ck[k]);
             }
             hz_note_role = 0;
+            hz_note_ns = 1;
         }
         enc_ds = g_r200_enc_depth_off != ~0u;
         MTLPixelFormat pass_zpf = !enc_ds ? MTLPixelFormatInvalid :
