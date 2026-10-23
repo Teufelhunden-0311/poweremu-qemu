@@ -6761,6 +6761,7 @@ static uint32_t g_r200_enc_variant;                 /* g_r200_pipes_gen index */
 static id<MTLRenderPipelineState> g_r200_enc_pipe;  /* last set on the pass */
 static uint32_t g_r200_enc_depth_off = ~0u, g_r200_enc_depth_pitch; /* ~0: none */
 static bool g_r200_enc_depth_z16;
+static uint32_t g_r300_enc_depth_h;  /* PPCGPU_R300_EXTENT: rows of the pass's depth view */
 static uint64_t g_r200_stat_draws, g_r200_stat_passes, g_r200_stat_flushes,
                 g_r200_stat_conflicts, g_r200_stat_view_hit, g_r200_stat_view_new;
 
@@ -8340,6 +8341,22 @@ static void aux_tex_store(uint64_t hash, const uint32_t k[6], id<MTLTexture> t)
 /* Finish pending GPU writes to VRAM [lo, hi) before the CPU reads it. */
 static bool r200_flush_locked(PPCMacGPUMetalState *st);
 
+/*
+ * PPCGPU_R300_EXTENT: pinned views are never evicted, so a full cache of
+ * pinned views would make r200_view fail.  Before a draw asks the cache for
+ * anything, make sure every view it may ask for (n: its textures and render
+ * targets) can be had while evicting neither a pinned view nor one this
+ * draw already holds (those are the most recently used); else end the
+ * batch, which expires every pin.
+ */
+static void r200_views_reserve(PPCMacGPUMetalState *st, int n)
+{
+    if (r300_extent_on() && r200_views_unpinned() < n) {
+        EXT_COUNT(EXT_PIN_FLUSH);
+        r200_flush_locked(st);
+    }
+}
+
 static void aux_tex_sync_vram(PPCMacGPUMetalState *st, uint64_t lo, uint64_t hi)
 {
     if (metal_range_busy_r200_locked(lo, hi, false)) {
@@ -8674,6 +8691,7 @@ static int r200_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             u.tfactor[i][3] = (v >> 24) / 255.0f;
         }
 
+        r200_views_reserve(st, R200_MAX_TEX + 2);  /* textures, colour, depth */
         id<MTLTexture> tex[R200_MAX_TEX];
         id<MTLSamplerState> smp[R200_MAX_TEX];
         for (int t = 0; t < R200_MAX_TEX; t++) {
@@ -10474,6 +10492,7 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
         }
         uint64_t dlo = dk.offset, dhi = dlo + (uint64_t)dk.pitch * dk.height;
 
+        r200_views_reserve(st, R300_NUM_TEX_UNITS + (int)ncb + 1);
         id<MTLTexture> tex[R300_NUM_TEX_UNITS];
         id<MTLSamplerState> smp[R300_NUM_TEX_UNITS];
         bool tex_view[R300_NUM_TEX_UNITS] = { false };
@@ -10604,12 +10623,6 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             r200_flush_locked(st);
             hz_reason = HZ_R_OTHER;     /* also when there was nothing to flush */
         }
-        /* PPCGPU_R300_EXTENT: room for this pass's views without evicting a
-         * pinned one (whose key the tracker may rely on): else end the batch */
-        if (r300_extent_on() && r200_views_unpinned() < (int)ncb + 1) {
-            EXT_COUNT(EXT_PIN_FLUSH);
-            r200_flush_locked(st);
-        }
         if (!g_r200_cb) {
             g_r200_cb = r200_new_cb(st);
         }
@@ -10622,7 +10635,14 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                     (ncb == 1 || !memcmp(&g_r300_enc_cb[1], &ck[1], sizeof(ck[0]) * (ncb - 1))) &&
                     !(want_ds && (!enc_ds || g_r200_enc_depth_off != dk.offset ||
                                   g_r200_enc_depth_pitch != zd->pitch ||
-                                  g_r200_enc_depth_z16 != (zd->bpp == 2)));
+                                  g_r200_enc_depth_z16 != (zd->bpp == 2) ||
+                                  g_r300_enc_depth_h != dk.height));
+        /* A depth view kept for a depth-less draw must still cover every
+         * colour attachment's rows (the pass's area is its smallest
+         * attachment).  Without PPCGPU_R300_EXTENT the heights are equal. */
+        for (uint32_t k = 0; k < ncb && same && enc_ds && !want_ds; k++) {
+            same = g_r300_enc_depth_h >= ck[k].height;
+        }
         if (g_r200_enc && !same) {
             [g_r200_enc endEncoding];
             [g_r200_enc release];
@@ -10652,6 +10672,7 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                 g_r200_enc_depth_off = dk.offset;
                 g_r200_enc_depth_pitch = zd->pitch;
                 g_r200_enc_depth_z16 = zd->bpp == 2;
+                g_r300_enc_depth_h = dk.height;
                 hz_note_role = HZ_P_R300_DS;
                 hz_note_ns = ns;
                 r200_note_written(dlo, dhi, &dk);
