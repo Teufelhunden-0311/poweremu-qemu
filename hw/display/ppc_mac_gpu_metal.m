@@ -6812,10 +6812,10 @@ static bool r300_extent_on(void)
 /* Plan outcomes (printed by PPCGPU_HAZDIAG's hz-sec as ext.*). */
 enum { EXT_OFF, EXT_NOBQL, EXT_VRAM, EXT_MSAA, EXT_NCB, EXT_PITCH, EXT_BEYOND, EXT_ATT_OVL,
        EXT_TEX_OVL, EXT_OK, EXT_ENC_FALLBACK, EXT_PIN_FLUSH, EXT_REG_OVL, EXT_SHRUNK,
-       EXT_REG_CLAMP, EXT_DEPTH_SHORT, EXT_N };
+       EXT_REG_CLAMP, EXT_DEPTH_SHORT, EXT_TOUCH, EXT_N };
 static const char *const ext_name[EXT_N] = { "off", "nobql", "staging_or_vram", "msaa", "ncb",
     "pitch0", "beyond_vram", "attach_overlap", "tex_overlap", "ok", "encode_fallback", "pin_flush",
-    "registry_overlap", "shrunk", "neighbour_clamped", "depth_short" };
+    "registry_overlap", "shrunk", "neighbour_clamped", "depth_short", "touch_below_rt" };
 static uint64_t g_ext_stat[EXT_N];
 #define EXT_COUNT(r) qatomic_inc(&g_ext_stat[r])
 
@@ -7312,6 +7312,17 @@ static uint64_t g_r300_ext_clock;
 static MTLPixelFormat r300_rt_pf(uint32_t view);
 
 /*
+ * The rows a draw can write (R300DrawPacket.touch_y1), at most the
+ * mapping height.  An extent backing needs only these rows: the viewport
+ * keeps rt_height (Metal maps a viewport taller than the attachment the
+ * same way) and the scissor is clipped to the backing.
+ */
+static uint32_t r300_touch_h(const R300DrawPacket *p)
+{
+    return p->touch_y1 ? MIN(p->touch_y1, p->rt_height) : p->rt_height;
+}
+
+/*
  * Choose the job's attachment heights, or leave job->ext off (today's path).
  * Eligible: the extent prototype on, the BQL held, a direct-VRAM draw (not
  * the staging call, whose vram_size includes the private staging),
@@ -7325,7 +7336,7 @@ static void r300_extent_plan(PPCMacGPUMetalState *st, RQJob *job)
     const R300DrawPacket *p = &job->r300;
     R300Ext *x = &job->ext;
     struct { uint32_t off, w, pitch, fmt, e; uint8_t role; int slot; } a[R300_US_MAX_TARGETS + 1];
-    uint32_t ncb = MAX(p->num_cb, 1u), na = 0, T = p->rt_height;
+    uint32_t ncb = MAX(p->num_cb, 1u), na = 0, T = r300_touch_h(p);
 
     memset(x, 0, sizeof(*x));
     if (!r300_extent_on()) {
@@ -7496,8 +7507,12 @@ static void r300_job_ranges(RQJob *job)
             r->all = true;
             return;
         }
+        /* With the extent on, the planned height or, if the encode falls
+         * back, the packet's: either is stored whole by the pass, touched
+         * or not (r300_touch_h lets the plan go below rt_height) */
         r->wr[r->nwr][0] = addr;
-        r->wr[r->nwr++][1] = addr + bpr * (job->ext.on ? job->ext.h[k] : p->rt_height);
+        r->wr[r->nwr++][1] = addr + bpr * (job->ext.on ? MAX(job->ext.h[k], p->rt_height)
+                                                       : p->rt_height);
     }
     if (p->depth.attach) {
         if (r->nwr == RQ_MAX_WR) {
@@ -7506,7 +7521,8 @@ static void r300_job_ranges(RQJob *job)
         }
         r->wr[r->nwr][0] = p->depth.gpu_addr;
         r->wr[r->nwr++][1] = p->depth.gpu_addr + (uint64_t)ns * p->depth.pitch *
-                             p->depth.bpp * (job->ext.on ? job->ext.h[R300_EXT_DS] : p->rt_height);
+                             p->depth.bpp * (job->ext.on ? MAX(job->ext.h[R300_EXT_DS], p->rt_height)
+                                                         : p->rt_height);
     }
     for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
         const R300TexDesc *td = &p->tex[t];
@@ -10458,8 +10474,9 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
     /*
      * PPCGPU_R300_EXTENT: the job's heights, rechecked against what the
      * producer assumed (the same backing, the guest VRAM bound, single
-     * sample, never below the packet's height); anything off takes today's
-     * path.  The encode never raises a height beyond what the job declared.
+     * sample, never below the rows the packet can write -- its height, or
+     * its touched bound); anything off takes today's path.  The encode
+     * never raises a height beyond what the job declared.
      */
     const struct R300Ext *xe = ext && ext->on && ext->backing == (const void *)st->vramBuffer &&
                                vram_size == st->vram_size && ns == 1 ? ext : NULL;
@@ -10467,18 +10484,32 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
         uint64_t bpr = k ? (uint64_t)pkt->cb[k].pitch * pkt->cb[k].bpp
                          : (uint64_t)pkt->rt_pitch * pkt->rt_bpp;
         uint32_t addr = k ? pkt->cb[k].gpu_addr : pkt->rt_gpu_addr;
-        if (xe->h[k] < pkt->rt_height || addr + bpr * xe->h[k] > st->vram_size) {
+        if (xe->h[k] < r300_touch_h(pkt) || addr + bpr * xe->h[k] > st->vram_size) {
             xe = NULL;
         }
     }
     if (xe && pkt->depth.attach &&
-        (xe->h[R300_EXT_DS] < pkt->rt_height ||
+        (xe->h[R300_EXT_DS] < r300_touch_h(pkt) ||
          pkt->depth.gpu_addr + (uint64_t)pkt->depth.pitch * pkt->depth.bpp *
              xe->h[R300_EXT_DS] > st->vram_size)) {
         xe = NULL;
     }
     if (ext && ext->on && !xe) {
         EXT_COUNT(EXT_ENC_FALLBACK);
+    }
+    /* A backing below the mapping height: the scissor stays inside it (it
+     * cuts nothing the geometry reaches) */
+    for (uint32_t k = 0; xe && k < ncb; k++) {
+        sy1 = MIN(sy1, xe->h[k]);
+    }
+    if (xe && pkt->depth.attach) {
+        sy1 = MIN(sy1, xe->h[R300_EXT_DS]);
+    }
+    if (xe && sy1 < pkt->rt_height) {
+        EXT_COUNT(EXT_TOUCH);
+    }
+    if (sy0 >= sy1) {
+        return 0;
     }
 
     /* Colour buffers: A from the packet's rt_*, B-D from cb[]. */
