@@ -21,11 +21,12 @@
  * C  80 render targets (32x32 textures), cleared, then drawn round-robin
  *    twice with alternating full and half-height scissors, then each read
  *    back.
- * D  View-cache capacity: texture T0 is drawn into, then 34 framebuffer
+ * D  View-cache capacity: the window gets a quad textured with TC (an
+ *    ordinary texture) and texture T0 is drawn into; then 34 framebuffer
  *    objects with their own colour texture and depth renderbuffer are each
  *    cleared and drawn with the depth test on (68 views, more than the
- *    emulator's 64-view cache), then the window gets a quad textured with
- *    T0, without a read-back in between.  T0's view must still be had.
+ *    emulator's 64-view cache); then the window gets quads textured with TC
+ *    again and with T0, without a read-back in between.
  * E  A depth buffer kept for a later draw: colour texture C (fully drawn
  *    first, depth test off), then a depth-tested quad under a 16-row
  *    scissor with a fresh depth renderbuffer, then the whole of C drawn
@@ -404,6 +405,28 @@ static void test_c(void)
     glDeleteTextures(N, tex);
 }
 
+/* A texture-replaced quad in the window at (x, y), size w x h */
+static void tex_quad(GLuint t, int x, int y, int w, int h)
+{
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, 0);
+    glViewport(0, 0, WW, WH);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0, WW, 0, WH, -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, t);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+    glBegin(GL_QUADS);
+    glTexCoord2f(0, 0); glVertex2f(x, y);
+    glTexCoord2f(1, 0); glVertex2f(x + w, y);
+    glTexCoord2f(1, 1); glVertex2f(x + w, y + h);
+    glTexCoord2f(0, 1); glVertex2f(x, y + h);
+    glEnd();
+    glDisable(GL_TEXTURE_2D);
+}
+
 /* ---- D: more pinned render-target views than the cache holds ---- */
 static void test_d(void)
 {
@@ -412,12 +435,26 @@ static void test_d(void)
     static uint8_t want[N][S * S * 4], got[WW * WH * 4], t0want[T * T * 4];
     uint8_t c0[4] = { 0, 0, 0, 255 }, ct[4] = { 17, 199, 83, 255 };
     Rect full = { 0, 0, S, S }, tfull = { 0, 0, T, T };
-    GLuint t0;
+    static uint8_t tcwant[T * T * 4], wgot[T * T * 4];
+    GLuint t0, tc;
 
     glGenFramebuffersEXT(N + 1, fbo);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_DITHER);
+    /* TC: a pattern from the CPU, drawn once into the window (cleared) */
+    for (int y = 0; y < T; y++) {
+        for (int x = 0; x < T; x++) {
+            uint8_t *p = tcwant + 4 * (y * T + x);
+            p[0] = 4 * x; p[1] = 4 * y; p[2] = (x ^ y) & 1 ? 200 : 30; p[3] = 255;
+        }
+    }
+    tc = tex_new(T, T, tcwant);
+    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, 0);
+    glViewport(0, 0, WW, WH);
+    glClearColor(3 / 255.0f, 5 / 255.0f, 7 / 255.0f, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    tex_quad(tc, 20, 20, T, T);
     /* T0: cleared, then a quad in its middle */
     fill(t0want, T, T, c0);
     t0 = tex_new(T, T, t0want);
@@ -466,38 +503,17 @@ static void test_d(void)
     }
     glDisable(GL_DEPTH_TEST);
     gl_check("D targets");
-    /* the window: cleared, then T0 sampled over a 64x64 quad at (100,100) */
-    glBindFramebufferEXT(GL_FRAMEBUFFER_EXT, 0);
-    glViewport(0, 0, WW, WH);
-    glClearColor(3 / 255.0f, 5 / 255.0f, 7 / 255.0f, 1);
-    glClear(GL_COLOR_BUFFER_BIT);
-    {
-        Rect v = { 0, 0, WW, WH };
-        glViewport(0, 0, WW, WH);
-        glMatrixMode(GL_PROJECTION);
-        glLoadIdentity();
-        glOrtho(0, WW, 0, WH, -1, 1);
-        glMatrixMode(GL_MODELVIEW);
-        glLoadIdentity();
-        glEnable(GL_TEXTURE_2D);
-        glBindTexture(GL_TEXTURE_2D, t0);
-        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-        glBegin(GL_QUADS);
-        glTexCoord2f(0, 0); glVertex2f(100, 100);
-        glTexCoord2f(1, 0); glVertex2f(100 + T, 100);
-        glTexCoord2f(1, 1); glVertex2f(100 + T, 100 + T);
-        glTexCoord2f(0, 1); glVertex2f(100, 100 + T);
-        glEnd();
-        glDisable(GL_TEXTURE_2D);
-        (void)v;
-    }
+    /* the window again: TC (its view no longer cached) and T0 */
+    tex_quad(tc, 200, 20, T, T);
+    tex_quad(t0, 100, 100, T, T);
     gl_check("D window");
-    {
-        static uint8_t wgot[T * T * 4];
-        glReadPixels(100, 100, T, T, GL_RGBA, GL_UNSIGNED_BYTE, wgot);
-        gl_check("D readback window");
-        check("D window textured with T0", wgot, t0want, T, T);
-    }
+    glReadPixels(20, 20, T, T, GL_RGBA, GL_UNSIGNED_BYTE, wgot);
+    check("D window TC before targets", wgot, tcwant, T, T);
+    glReadPixels(200, 20, T, T, GL_RGBA, GL_UNSIGNED_BYTE, wgot);
+    check("D window TC after targets", wgot, tcwant, T, T);
+    glReadPixels(100, 100, T, T, GL_RGBA, GL_UNSIGNED_BYTE, wgot);
+    gl_check("D readback window");
+    check("D window textured with rendered T0", wgot, t0want, T, T);
     for (int k = 0; k < N; k++) {
         char name[32];
         if (!fbo_bind_d(fbo[k], tex[k], rb[k], S, S)) {
@@ -513,6 +529,7 @@ static void test_d(void)
     glDeleteRenderbuffersEXT(N, rb);
     glDeleteTextures(N, tex);
     glDeleteTextures(1, &t0);
+    glDeleteTextures(1, &tc);
 }
 
 /* ---- E: a kept depth buffer shorter than a later draw ---- */

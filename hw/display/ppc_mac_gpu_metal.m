@@ -6812,15 +6812,47 @@ static bool r300_extent_on(void)
 /* Plan outcomes (printed by PPCGPU_HAZDIAG's hz-sec as ext.*). */
 enum { EXT_OFF, EXT_NOBQL, EXT_VRAM, EXT_MSAA, EXT_NCB, EXT_PITCH, EXT_BEYOND, EXT_ATT_OVL,
        EXT_TEX_OVL, EXT_OK, EXT_ENC_FALLBACK, EXT_PIN_FLUSH, EXT_REG_OVL, EXT_SHRUNK,
-       EXT_REG_CLAMP, EXT_N };
+       EXT_REG_CLAMP, EXT_DEPTH_SHORT, EXT_N };
 static const char *const ext_name[EXT_N] = { "off", "nobql", "staging_or_vram", "msaa", "ncb",
     "pitch0", "beyond_vram", "attach_overlap", "tex_overlap", "ok", "encode_fallback", "pin_flush",
-    "registry_overlap", "shrunk", "neighbour_clamped" };
+    "registry_overlap", "shrunk", "neighbour_clamped", "depth_short" };
 static uint64_t g_ext_stat[EXT_N];
 #define EXT_COUNT(r) qatomic_inc(&g_ext_stat[r])
 
 /* What a view pinned now is pinned to: this flush generation and epoch,
  * the lifetime of the tracker entries that may rely on its identity. */
+/* TEST ONLY (PPCGPU_VIEWCACHE_N=4..64, default 64): use only the first N
+ * view-cache slots, so a guest test can fill the cache.  PPCGPU_EXTDEBUG:
+ * one log line per R300 pass (attachment keys), at most 400000. */
+static int r200_view_slots(void)
+{
+    static int n;
+    if (!n) {
+        const char *e = getenv("PPCGPU_VIEWCACHE_N");
+        int v = e ? atoi(e) : R200_VIEW_CACHE;
+        n = v < 4 ? 4 : v > R200_VIEW_CACHE ? R200_VIEW_CACHE : v;
+    }
+    return n;
+}
+/* TEST ONLY (PPCGPU_TEST_OLDHOLDS): the prototype before Codex holds A and B
+ * were fixed (a late room check only; pass reuse ignores depth height) */
+static bool test_oldholds(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("PPCGPU_TEST_OLDHOLDS") != NULL;
+    }
+    return on;
+}
+static bool ext_debug(void)
+{
+    static int on = -1, lines;
+    if (on < 0) {
+        on = getenv("PPCGPU_EXTDEBUG") != NULL;
+    }
+    return on && lines++ < 400000;
+}
+
 static uint64_t r200_pin_now(void)
 {
     return (g_r200_flush_gen << 32 | g_r200_epoch) + 1;    /* 0: not pinned */
@@ -6829,7 +6861,7 @@ static int r200_views_unpinned(void)
 {
     int n = 0;
     uint64_t now = r200_pin_now();
-    for (int i = 0; i < R200_VIEW_CACHE; i++) {
+    for (int i = 0; i < r200_view_slots(); i++) {
         n += g_r200_views[i].pin != now;
     }
     return n;
@@ -8157,7 +8189,7 @@ static id<MTLTexture> r200_view(PPCMacGPUMetalState *st, R200TexKey k,
     int lru = -1;
     bool pin = render_target && r300_extent_on();
     uint64_t now = r200_pin_now();
-    for (int i = 0; i < R200_VIEW_CACHE; i++) {
+    for (int i = 0; i < r200_view_slots(); i++) {
         if (g_r200_views[i].tex && !memcmp(&g_r200_views[i].key, &k, sizeof(k))) {
             g_r200_views[i].used = ++g_r200_view_clock;
             g_r200_stat_view_hit++;
@@ -8351,6 +8383,9 @@ static bool r200_flush_locked(PPCMacGPUMetalState *st);
  */
 static void r200_views_reserve(PPCMacGPUMetalState *st, int n)
 {
+    if (test_oldholds()) {
+        return;
+    }
     if (r300_extent_on() && r200_views_unpinned() < n) {
         EXT_COUNT(EXT_PIN_FLUSH);
         r200_flush_locked(st);
@@ -10623,6 +10658,10 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             r200_flush_locked(st);
             hz_reason = HZ_R_OTHER;     /* also when there was nothing to flush */
         }
+        if (test_oldholds() && r300_extent_on() && r200_views_unpinned() < (int)ncb + 1) {
+            EXT_COUNT(EXT_PIN_FLUSH);
+            r200_flush_locked(st);
+        }
         if (!g_r200_cb) {
             g_r200_cb = r200_new_cb(st);
         }
@@ -10636,12 +10675,15 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                     !(want_ds && (!enc_ds || g_r200_enc_depth_off != dk.offset ||
                                   g_r200_enc_depth_pitch != zd->pitch ||
                                   g_r200_enc_depth_z16 != (zd->bpp == 2) ||
-                                  g_r300_enc_depth_h != dk.height));
+                                  (!test_oldholds() && g_r300_enc_depth_h != dk.height)));
         /* A depth view kept for a depth-less draw must still cover every
          * colour attachment's rows (the pass's area is its smallest
          * attachment).  Without PPCGPU_R300_EXTENT the heights are equal. */
-        for (uint32_t k = 0; k < ncb && same && enc_ds && !want_ds; k++) {
+        for (uint32_t k = 0; k < ncb && same && enc_ds && !want_ds && !test_oldholds(); k++) {
             same = g_r300_enc_depth_h >= ck[k].height;
+            if (!same) {
+                EXT_COUNT(EXT_DEPTH_SHORT);
+            }
         }
         if (g_r200_enc && !same) {
             [g_r200_enc endEncoding];
@@ -10691,6 +10733,11 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             memcpy(g_r300_enc_cb, ck, sizeof(ck[0]) * ncb);
             g_r300_enc_mine = true;
             g_r200_stat_passes++;
+            if (ext_debug()) {
+                qemu_log("ext-pass ncb=%u c0=%x/%u/h%u ds=%d d=%x/%u/h%u rt_h=%u xe=%d\n",
+                         ncb, ck[0].offset, ck[0].pitch, ck[0].height, ztex != nil,
+                         dk.offset, dk.pitch, dk.height, pkt->rt_height, xe != NULL);
+            }
             hz_note_role = HZ_P_R300_CB;
             hz_note_ns = ns;
             for (uint32_t k = 0; k < ncb; k++) {
