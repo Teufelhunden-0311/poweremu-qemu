@@ -6808,6 +6808,14 @@ static bool r300_extent_on(void)
     pthread_once(&once, r300_extent_init);
     return g_r300_extent;
 }
+/* Plan outcomes (printed by PPCGPU_HAZDIAG's hz-sec as ext.*). */
+enum { EXT_OFF, EXT_NOBQL, EXT_VRAM, EXT_MSAA, EXT_NCB, EXT_PITCH, EXT_BEYOND, EXT_ATT_OVL,
+       EXT_TEX_OVL, EXT_OK, EXT_ENC_FALLBACK, EXT_PIN_FLUSH, EXT_N };
+static const char *const ext_name[EXT_N] = { "off", "nobql", "staging_or_vram", "msaa", "ncb",
+    "pitch0", "beyond_vram", "attach_overlap", "tex_overlap", "ok", "encode_fallback", "pin_flush" };
+static uint64_t g_ext_stat[EXT_N];
+#define EXT_COUNT(r) qatomic_inc(&g_ext_stat[r])
+
 /* What a view pinned now is pinned to: this flush generation and epoch,
  * the lifetime of the tracker entries that may rely on its identity. */
 static uint64_t r200_pin_now(void)
@@ -7032,6 +7040,12 @@ static void metal_debug_log(void *opaque)
         }
     }
     g_string_append_printf(g, " sigdrop=%llu", (unsigned long long)qatomic_read(&hz_sig_drop));
+    for (int i = 0; i < EXT_N; i++) {
+        if (qatomic_read(&g_ext_stat[i])) {
+            g_string_append_printf(g, " ext.%s=%llu", ext_name[i],
+                                   (unsigned long long)qatomic_read(&g_ext_stat[i]));
+        }
+    }
     for (int d = 0; d < 2; d++) {
         for (int o = 0; o < 16; o++) {
             if (qatomic_read(&hz_dsw_other[d][o])) {
@@ -7276,8 +7290,13 @@ static void r300_extent_plan(PPCMacGPUMetalState *st, RQJob *job)
     uint32_t ncb = MAX(p->num_cb, 1u), na = 0, T = p->rt_height;
 
     memset(x, 0, sizeof(*x));
-    if (!r300_extent_on() || !bql_locked() || job->vram_size != st->vram_size ||
-        p->aa_samples > 1 || ncb > R300_US_MAX_TARGETS || !T) {
+    if (!r300_extent_on()) {
+        return;
+    }
+    if (!bql_locked() || job->vram_size != st->vram_size || p->aa_samples > 1 ||
+        ncb > R300_US_MAX_TARGETS || !T) {
+        EXT_COUNT(!bql_locked() ? EXT_NOBQL : job->vram_size != st->vram_size ? EXT_VRAM :
+                  p->aa_samples > 1 ? EXT_MSAA : EXT_NCB);
         return;
     }
     for (uint32_t k = 0; k < ncb; k++) {
@@ -7298,6 +7317,7 @@ static void r300_extent_plan(PPCMacGPUMetalState *st, RQJob *job)
     }
     for (uint32_t i = 0; i < na; i++) {
         if (!a[i].pitch) {
+            EXT_COUNT(EXT_PITCH);
             return;
         }
         a[i].slot = -1;
@@ -7312,6 +7332,7 @@ static void r300_extent_plan(PPCMacGPUMetalState *st, RQJob *job)
             }
         }
         if ((uint64_t)a[i].off + (uint64_t)a[i].pitch * a[i].e > st->vram_size) {
+            EXT_COUNT(EXT_BEYOND);
             return;
         }
     }
@@ -7320,6 +7341,7 @@ static void r300_extent_plan(PPCMacGPUMetalState *st, RQJob *job)
         for (uint32_t j = i + 1; j < na; j++) {
             uint64_t lo2 = a[j].off, hi2 = lo2 + (uint64_t)a[j].pitch * a[j].e;
             if (lo < hi2 && lo2 < hi) {
+                EXT_COUNT(EXT_ATT_OVL);
                 return;                 /* attachments overlapping at E */
             }
         }
@@ -7327,6 +7349,7 @@ static void r300_extent_plan(PPCMacGPUMetalState *st, RQJob *job)
             const R300TexDesc *td = &p->tex[t];
             if (td->bound && !td->host_data && lo < (uint64_t)td->gpu_addr + td->size_bytes &&
                 td->gpu_addr < hi) {
+                EXT_COUNT(EXT_TEX_OVL);
                 return;                 /* a texture it reads inside an attachment at E */
             }
         }
@@ -7351,6 +7374,7 @@ static void r300_extent_plan(PPCMacGPUMetalState *st, RQJob *job)
     }
     x->backing = (const void *)st->vramBuffer;
     x->on = true;
+    EXT_COUNT(EXT_OK);
 }
 
 static void r300_job_ranges(RQJob *job)
@@ -10335,6 +10359,9 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
              xe->h[R300_EXT_DS] > st->vram_size)) {
         xe = NULL;
     }
+    if (ext && ext->on && !xe) {
+        EXT_COUNT(EXT_ENC_FALLBACK);
+    }
 
     /* Colour buffers: A from the packet's rt_*, B-D from cb[]. */
     for (uint32_t k = 0; k < ncb; k++) {
@@ -10515,6 +10542,7 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
         /* PPCGPU_R300_EXTENT: room for this pass's views without evicting a
          * pinned one (whose key the tracker may rely on): else end the batch */
         if (r300_extent_on() && r200_views_unpinned() < (int)ncb + 1) {
+            EXT_COUNT(EXT_PIN_FLUSH);
             r200_flush_locked(st);
         }
         if (!g_r200_cb) {
