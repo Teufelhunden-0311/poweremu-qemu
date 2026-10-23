@@ -17,6 +17,9 @@ SPV="$SPV -lspirv-cross-glsl -lspirv-cross-util -lspirv-cross-core -lc++"
 for t in test_pvs test_us test_draw test_features; do
     cc -O1 -Wall -Wno-unused-function -o "$B/$t" $t.c $SRC -lm
 done
+# test_rtle includes r300_draw.c itself, for its static functions.
+cc -O1 -Wall -Wno-unused-function -o "$B/test_rtle" test_rtle.c \
+    $R/r300_state.c $R/r300_pvs.c $R/r300_us.c -lm
 cc -O1 -Wall -o "$B/test_aperture" test_aperture.c
 cc -O1 -Wall -o "$B/glsl2msl" glsl2msl.c $SPV
 cc -O1 -Wall -o "$B/test_mslcache" test_mslcache.c $SPV -lz
@@ -27,6 +30,7 @@ done
 "$B/test_pvs"
 "$B/test_draw"
 "$B/test_aperture"
+"$B/test_rtle"
 # Both shader outputs: 0 (Metal: uint texture views), 1 (Vulkan: VRAM SSBO).
 for flags in 0 1; do
     "$B/test_us" qe_state_draw1.txt $flags > "$B/qe$flags.glsl" 2>/dev/null

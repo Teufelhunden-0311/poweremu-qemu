@@ -733,15 +733,20 @@ void r300_border_color(uint32_t fmt, uint32_t v, float c[4])
  * this off.
  *
  * The record is sorted by address and its ranges never overlap (a note
- * forgets what it overlaps first), so lookups are binary searches.  It
- * used to keep the 16 most recent surfaces: a texture rendered before
- * more than 16 others and sampled after them was read reversed (black as
- * red; scissorprobe D, 34 framebuffer objects in between).  When full,
- * everything is forgotten, which reads every surface as stored.
+ * forgets what it overlaps first), so lookups are binary searches.  An
+ * entry is decoding state, not a cache: dropping one misreads that
+ * surface (it used to keep the 16 most recent, and a texture rendered
+ * before more than 16 others and sampled after them read black as red --
+ * scissorprobe D, 34 framebuffer objects in between).  So only a writer
+ * removes entries, and the array grows instead; if it cannot, abort, as
+ * QEMU does for any failed allocation.  Entries are disjoint and at least
+ * 4 bytes long, so there are at most 2^30 of them.  Every caller holds
+ * the BQL (the draw build and the 2D and upload paths on the CP thread,
+ * vram_mark from MMIO too), which is what makes the realloc safe.  Tests:
+ * tests/r300/test_rtle.c.
  */
-#define RT_LE_SLOTS 4096
-static struct { uint32_t lo, hi; } rt_le[RT_LE_SLOTS];
-static unsigned rt_le_n;
+static struct { uint32_t lo, hi; } *rt_le;
+static unsigned rt_le_n, rt_le_cap;
 
 /* The first entry that ends after addr (rt_le_n if none) */
 static unsigned rt_le_find(uint64_t addr)
@@ -860,8 +865,14 @@ static void rt_note(uint32_t lo, uint32_t hi, bool le)
     }
     r300_rt_forget(lo, hi);
     if (le) {
-        if (rt_le_n == RT_LE_SLOTS) {
-            rt_le_n = 0;
+        if (rt_le_n == rt_le_cap) {
+            unsigned cap = rt_le_cap ? rt_le_cap * 2 : 64;
+            void *p = realloc(rt_le, (size_t)cap * sizeof(rt_le[0]));
+            if (!p) {
+                abort();
+            }
+            rt_le = p;
+            rt_le_cap = cap;
         }
         i = rt_le_find(lo);             /* nothing left overlaps [lo, hi) */
         memmove(&rt_le[i + 1], &rt_le[i], (rt_le_n - i) * sizeof(rt_le[0]));
