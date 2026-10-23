@@ -27,8 +27,10 @@
  * contents of a texture first used as a render target (PowerBook,
  * 2026-10-22).
  *
- * Output: one line per check (PASS / FAIL with the first wrong pixel),
- * TOTAL, CONTROLS (incomplete framebuffer objects, GL errors), RESULT;
+ * Output: one line per check (PASS / FAIL with the first wrong pixel, and
+ * an FNV-1a hash of the read-back RGB, so two runs can be compared pixel
+ * for pixel even where a check fails), TOTAL, CONTROLS (incomplete
+ * framebuffer objects, GL errors), RESULT;
  * exit status 1 on any failure.  Colours are exact 8-bit values, no
  * blending, no dithering.
  *
@@ -90,10 +92,23 @@ static void colour(int i, uint8_t c[4])
     c[3] = 255;
 }
 
+/* FNV-1a 64 of the RGB bytes of an RGBA area. */
+static unsigned long long rgb_hash(const uint8_t *p, int n)
+{
+    unsigned long long h = 1469598103934665603ULL;
+    for (int i = 0; i < n; i++) {
+        for (int c = 0; c < 3; c++) {
+            h = (h ^ p[4 * i + c]) * 1099511628211ULL;
+        }
+    }
+    return h;
+}
+
 /* Compare a read-back RGBA area with the expected one; one result line. */
 static void check(const char *name, const uint8_t *got, const uint8_t *want, int w, int h)
 {
     nchecks++;
+    say("%-28s hash %016llx\n", name, rgb_hash(got, w * h));
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
             const uint8_t *g = got + 4 * (y * w + x), *e = want + 4 * (y * w + x);
