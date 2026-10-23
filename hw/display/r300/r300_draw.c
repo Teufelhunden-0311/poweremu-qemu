@@ -98,6 +98,159 @@ static float bits_to_float(uint32_t v)
     return f;
 }
 
+/*
+ * DEBUG (PPCGPU_CLIPDIAG, default off; AI-generated, not for merging):
+ * a bounded table of the raw clipping state per draw, to find which clipping
+ * operation decides the boundary pixel.  One row per distinct
+ * (scissor, clip rule, cliprects, viewport, VAP_CLIP_CNTL, VAP_VTE_CNTL,
+ * colour buffer, vertex path); counts, first-seen order and drops.  Written
+ * by the packet-building thread; printed to stderr at most every 5 s and at
+ * exit.
+ */
+#include <pthread.h>
+#include <stdio.h>
+#include <time.h>
+
+#define CLIPDIAG_N 512
+typedef struct ClipSig {
+    uint32_t tl, br, rule, cr[8], vp[6], clip, vte, gb[4], rt_off, rt_pitch, path;
+} ClipSig;
+typedef struct ClipRow {
+    ClipSig sig;
+    uint64_t count, first;
+    uint32_t rt_height;
+    bool used;
+} ClipRow;
+static ClipRow clipdiag_rows[CLIPDIAG_N];
+static uint64_t clipdiag_seq, clipdiag_drops, clipdiag_dumped_seq;
+static int64_t clipdiag_last_ns;
+static bool clipdiag_enabled;
+static pthread_once_t clipdiag_once = PTHREAD_ONCE_INIT;
+
+static bool r300_vpclip_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        on = getenv("PPCGPU_R300_VPCLIP") != NULL;
+    }
+    return on;
+}
+
+static int64_t clipdiag_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+static void clipdiag_dump(void)
+{
+    if (clipdiag_seq == clipdiag_dumped_seq) {
+        return;
+    }
+    clipdiag_dumped_seq = clipdiag_seq;
+    fprintf(stderr, "clip-sec draws=%llu drops=%llu\n",
+            (unsigned long long)clipdiag_seq, (unsigned long long)clipdiag_drops);
+    for (int i = 0; i < CLIPDIAG_N; i++) {
+        const ClipRow *r = &clipdiag_rows[i];
+        const ClipSig *g = &r->sig;
+        if (!r->used) {
+            continue;
+        }
+        fprintf(stderr, "clip-sig first=%llu n=%llu rt=%x/%u/h%u path=%x "
+                "tl=%x(%d,%d) br=%x(%d,%d) rule=%04x clip=%08x vte=%08x "
+                "vp=%g,%g,%g,%g,%g,%g gb=%g,%g,%g,%g cr=",
+                (unsigned long long)r->first, (unsigned long long)r->count,
+                g->rt_off, g->rt_pitch, r->rt_height, g->path,
+                g->tl, (int)(g->tl & 0x1FFF) - SC_COORD_BIAS,
+                (int)((g->tl >> 13) & 0x1FFF) - SC_COORD_BIAS,
+                g->br, (int)(g->br & 0x1FFF) - SC_COORD_BIAS,
+                (int)((g->br >> 13) & 0x1FFF) - SC_COORD_BIAS,
+                g->rule, g->clip, g->vte,
+                bits_to_float(g->vp[0]), bits_to_float(g->vp[1]),
+                bits_to_float(g->vp[2]), bits_to_float(g->vp[3]),
+                bits_to_float(g->vp[4]), bits_to_float(g->vp[5]),
+                bits_to_float(g->gb[0]), bits_to_float(g->gb[1]),
+                bits_to_float(g->gb[2]), bits_to_float(g->gb[3]));
+        for (int k = 0; k < 4; k++) {
+            uint32_t t = g->cr[2 * k], b = g->cr[2 * k + 1];
+            fprintf(stderr, "%s[%d,%d,%d,%d]", k ? "," : "",
+                    (int)(t & 0x1FFF) - SC_COORD_BIAS,
+                    (int)((t >> 13) & 0x1FFF) - SC_COORD_BIAS,
+                    (int)(b & 0x1FFF) - SC_COORD_BIAS,
+                    (int)((b >> 13) & 0x1FFF) - SC_COORD_BIAS);
+        }
+        fprintf(stderr, "\n");
+    }
+    fflush(stderr);
+}
+
+static void clipdiag_init(void)
+{
+    clipdiag_enabled = getenv("PPCGPU_CLIPDIAG") != NULL;
+    if (clipdiag_enabled) {
+        atexit(clipdiag_dump);
+    }
+}
+
+/* path: bit 0 GPU vertex shader used (else CPU transform), bit 1 rectangle
+ * list, bit 2 PVS bypass, bits 4-7 primitive type. */
+static void clipdiag_note(const R300State *st, const R300DrawPacket *pkt, uint32_t path)
+{
+    pthread_once(&clipdiag_once, clipdiag_init);
+    if (!clipdiag_enabled) {
+        return;
+    }
+    ClipSig g;
+    memset(&g, 0, sizeof(g));
+    g.tl = r300_reg(st, SC_SCISSORS_TL);
+    g.br = r300_reg(st, SC_SCISSORS_BR);
+    g.rule = r300_reg(st, SC_CLIP_RULE) & 0xFFFF;
+    for (int i = 0; i < 8; i++) {
+        g.cr[i] = r300_reg(st, SC_CLIPRECT_TL_0 + 4 * i);
+    }
+    for (int i = 0; i < 6; i++) {
+        g.vp[i] = r300_reg(st, SE_VPORT_XSCALE + 4 * i);
+    }
+    g.clip = r300_reg(st, VAP_CLIP_CNTL);
+    g.vte = r300_reg(st, VAP_VTE_CNTL);
+    for (int i = 0; i < 4; i++) {       /* VAP_GB_VERT_CLIP_ADJ, _DISC_, HORZ_CLIP_, _DISC_ */
+        g.gb[i] = r300_reg(st, 0x2220 + 4 * i);
+    }
+    g.rt_off = pkt->rt_gpu_addr;
+    g.rt_pitch = pkt->rt_pitch;
+    g.path = path;
+    uint32_t h = 2166136261u;
+    const uint8_t *b = (const uint8_t *)&g;
+    for (size_t i = 0; i < sizeof(g); i++) {
+        h = (h ^ b[i]) * 16777619u;
+    }
+    clipdiag_seq++;
+    for (int k = 0; k < CLIPDIAG_N; k++) {
+        ClipRow *r = &clipdiag_rows[(h + k) % CLIPDIAG_N];
+        if (!r->used) {
+            r->used = true;
+            r->sig = g;
+            r->first = clipdiag_seq;
+            r->rt_height = pkt->rt_height;
+            r->count = 1;
+            break;
+        }
+        if (!memcmp(&r->sig, &g, sizeof(g))) {
+            r->count++;
+            break;
+        }
+        if (k == CLIPDIAG_N - 1) {
+            clipdiag_drops++;
+        }
+    }
+    int64_t now = clipdiag_now();
+    if (now - clipdiag_last_ns >= 5000000000LL) {
+        clipdiag_last_ns = now;
+        clipdiag_dump();
+    }
+}
+
 static uint32_t vc_swap(uint32_t v, unsigned mode)
 {
     switch (mode & 3) {
@@ -1827,6 +1980,34 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
                       ((br >> 13) & 0x1FFF) - SC_COORD_BIAS + 1 : 0;
     pkt->rt_width = pkt->rt_pitch;
     pkt->rt_height = pkt->scissor[3];
+    /*
+     * EXPERIMENT (PPCGPU_R300_VPCLIP=1, default off; AI-generated, local):
+     * with clipping on (VAP_CLIP_CNTL.CLIP_DISABLE clear) the card clips
+     * to the guard band, VAP_GB_{HORZ,VERT}_CLIP_ADJ times the viewport;
+     * our vertex paths map positions to the whole render target, so only
+     * its edges clip.  Clipping to a rectangle keeps exactly the pixels
+     * whose centres lie inside it, so narrow the scissor to it.  rt_height
+     * (the NDC mapping and the attachment height) is left as it was.
+     */
+    if (r300_vpclip_on() && !(clip & (1u << 16)) &&
+        (r300_reg(st, VAP_VTE_CNTL) & 0xF) == 0xF) {
+        float xs = fabsf(bits_to_float(r300_reg(st, SE_VPORT_XSCALE)));
+        float xo = bits_to_float(r300_reg(st, SE_VPORT_XSCALE + 4));
+        float ys = fabsf(bits_to_float(r300_reg(st, SE_VPORT_XSCALE + 8)));
+        float yo = bits_to_float(r300_reg(st, SE_VPORT_XSCALE + 12));
+        float gv = bits_to_float(r300_reg(st, 0x2220));    /* VAP_GB_VERT_CLIP_ADJ */
+        float gh = bits_to_float(r300_reg(st, 0x2228));    /* VAP_GB_HORZ_CLIP_ADJ */
+        float b[4] = { xo - xs * gh, yo - ys * gv, xo + xs * gh, yo + ys * gv };
+        if (isfinite(b[0]) && isfinite(b[1]) && isfinite(b[2]) && isfinite(b[3])) {
+            for (int i = 0; i < 4; i++) {
+                float c = ceilf(b[i] - 0.5f);   /* first pixel centre at or past it */
+                uint32_t v = c <= 0.0f ? 0 : c >= 8192.0f ? 8192 : (uint32_t)c;
+                if (i < 2 ? v > pkt->scissor[i] : v < pkt->scissor[i]) {
+                    pkt->scissor[i] = v;
+                }
+            }
+        }
+    }
     if (!pkt->rt_width || !pkt->rt_height) {
         *err = "empty colour buffer";
         free(order);
@@ -1887,6 +2068,7 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
                          &failed, err)) {
             pkt->warn |= f.warn;
             free(order);
+            clipdiag_note(st, pkt, 1 | (bypass << 2) | (prim << 4));
             pkt->glsl = r300_us_glsl_cached(st, &desc, st->glsl_flags,
                                             &pkt->glsl_id, err);
             if (!pkt->glsl) {
@@ -1901,6 +2083,7 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         }
     }
 
+    clipdiag_note(st, pkt, (rects << 1) | (bypass << 2) | (prim << 4));
     /* Transform every vertex in draw order (cheap next to the GPU work). */
     R300Vertex *xv = calloc(nsrc ? nsrc : 1, sizeof(R300Vertex));
     float (*outs)[R300_PVS_NUM_OUTPUTS][4] = calloc(nsrc ? nsrc : 1, sizeof(*outs));
