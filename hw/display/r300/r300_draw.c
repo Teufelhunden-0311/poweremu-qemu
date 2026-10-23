@@ -731,10 +731,32 @@ void r300_border_color(uint32_t fmt, uint32_t v, float c[4])
  * trap, so a surface the CPU rewrites that way stays recorded -- the
  * proper fix is modelling the apertures' byte swap.  R300_RT_LE=0 turns
  * this off.
+ *
+ * The record is sorted by address and its ranges never overlap (a note
+ * forgets what it overlaps first), so lookups are binary searches.  It
+ * used to keep the 16 most recent surfaces: a texture rendered before
+ * more than 16 others and sampled after them was read reversed (black as
+ * red; scissorprobe D, 34 framebuffer objects in between).  When full,
+ * everything is forgotten, which reads every surface as stored.
  */
-#define RT_LE_SLOTS 16
+#define RT_LE_SLOTS 4096
 static struct { uint32_t lo, hi; } rt_le[RT_LE_SLOTS];
 static unsigned rt_le_n;
+
+/* The first entry that ends after addr (rt_le_n if none) */
+static unsigned rt_le_find(uint64_t addr)
+{
+    unsigned a = 0, b = rt_le_n;
+    while (a < b) {
+        unsigned m = (a + b) / 2;
+        if (rt_le[m].hi <= addr) {
+            a = m + 1;
+        } else {
+            b = m;
+        }
+    }
+    return a;
+}
 
 /*
  * The experimental byte-order model, $R300_ENDIAN_MODEL=1 (off by default;
@@ -815,12 +837,13 @@ static bool rt_le_on(void)
 
 void r300_rt_forget(uint64_t lo, uint64_t hi)
 {
-    for (unsigned i = 0; i < rt_le_n;) {
-        if (rt_le[i].lo < hi && lo < rt_le[i].hi) {
-            rt_le[i] = rt_le[--rt_le_n];
-        } else {
-            i++;
-        }
+    unsigned i = rt_le_find(lo), j = i;
+    while (j < rt_le_n && rt_le[j].lo < hi) {
+        j++;
+    }
+    if (j > i) {
+        memmove(&rt_le[i], &rt_le[j], (rt_le_n - j) * sizeof(rt_le[0]));
+        rt_le_n -= j - i;
     }
 }
 
@@ -829,34 +852,29 @@ static void rt_note(uint32_t lo, uint32_t hi, bool le)
     if (!rt_le_on() || hi <= lo) {
         return;
     }
-    for (unsigned i = 0; i < rt_le_n; i++) {
-        if (rt_le[i].lo == lo && rt_le[i].hi == hi) {
-            if (!le) {
-                rt_le[i] = rt_le[--rt_le_n];
-            }
-            return;
+    unsigned i = rt_le_find(lo);
+    if (i < rt_le_n && rt_le[i].lo == lo && rt_le[i].hi == hi) {
+        if (le) {
+            return;                     /* already recorded */
         }
     }
     r300_rt_forget(lo, hi);
     if (le) {
         if (rt_le_n == RT_LE_SLOTS) {
-            memmove(&rt_le[0], &rt_le[1], (RT_LE_SLOTS - 1) * sizeof(rt_le[0]));
-            rt_le_n--;
+            rt_le_n = 0;
         }
-        rt_le[rt_le_n].lo = lo;
-        rt_le[rt_le_n].hi = hi;
+        i = rt_le_find(lo);             /* nothing left overlaps [lo, hi) */
+        memmove(&rt_le[i + 1], &rt_le[i], (rt_le_n - i) * sizeof(rt_le[0]));
+        rt_le[i].lo = lo;
+        rt_le[i].hi = hi;
         rt_le_n++;
     }
 }
 
 static bool rt_le_holds(uint32_t addr)
 {
-    for (unsigned i = 0; i < rt_le_n; i++) {
-        if (addr >= rt_le[i].lo && addr < rt_le[i].hi) {
-            return true;
-        }
-    }
-    return false;
+    unsigned i = rt_le_find(addr);
+    return i < rt_le_n && rt_le[i].lo <= addr;
 }
 
 static void set_textures(const R300State *st, R300DrawPacket *pkt)
