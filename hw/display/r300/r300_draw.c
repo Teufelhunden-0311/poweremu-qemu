@@ -1293,6 +1293,27 @@ static void px_ndc(const Build *b, float x, float y, float *p)
 }
 
 /*
+ * The exclusive row bound of what emitted triangles can cover, from their
+ * final positions: a row is covered only if its centre (r + 0.5) is above
+ * the lowest vertex (y grows downwards), so rows < ceil(ymax - 0.5) --
+ * plus 1/16 pixel for float error and the host's subpixel snapping.
+ * 0 (not known) if any position is not finite or has w <= 0.
+ */
+static uint32_t tris_touch_y1(const R300DrawPacket *pkt, const R300Vertex *v, uint32_t n)
+{
+    float ymax = 0.0f;
+    for (uint32_t i = 0; i < n; i++) {
+        float w = v[i].pos[3];
+        if (!isfinite(v[i].pos[1]) || !isfinite(w) || w <= 0.0f) {
+            return 0;
+        }
+        ymax = fmaxf(ymax, (1.0f - v[i].pos[1] / w) * pkt->rt_height * 0.5f);
+    }
+    float t = ceilf(ymax - 0.5f + 1.0f / 16.0f);
+    return t < 1.0f ? 0 : t >= pkt->rt_height ? pkt->rt_height : (uint32_t)t;
+}
+
+/*
  * A point: a screen-aligned square GA_POINT_SIZE wide (width in the high
  * half, height in the low half, in sixths of a pixel), or the vertex's
  * point size clamped to GA_POINT_MINMAX, with texture coordinates S0..S1
@@ -2125,6 +2146,10 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         pkt->num_verts = b.ntri;
         pkt->num_line_verts = b.nline;
         pkt->prim_class = 0;
+        /* Point lists only for now (they are squares: triangles here) */
+        if (cls == 2 && !b.nline && pkt->aa_samples <= 1) {
+            pkt->touch_y1 = tris_touch_y1(pkt, b.tri, b.ntri);
+        }
     }
     free(prov);
     free(list);

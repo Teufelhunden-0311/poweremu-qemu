@@ -24,6 +24,8 @@ cc -O1 -Wall -o "$B/test_aperture" test_aperture.c
 cc -O1 -Wall -o "$B/glsl2msl" glsl2msl.c $SPV
 cc -O1 -Wall -o "$B/test_mslcache" test_mslcache.c $SPV -lz
 clang -fobjc-arc -framework Metal -framework Foundation mslcheck.m -o "$B/mslcheck"
+clang -O1 -Wall -Wno-unused-function -fobjc-arc -framework Metal -framework Foundation \
+    test_touch.m $R/r300_state.c $R/r300_pvs.c $R/r300_us.c -o "$B/test_touch"
 for t in test_zs test_fmt test_raster test_gpuvs; do
     clang -O1 -fobjc-arc -framework Metal -framework Foundation $t.m $SRC $SPV -o "$B/$t"
 done
@@ -52,4 +54,5 @@ done
 "$B/test_fmt"
 "$B/test_raster"
 "$B/test_gpuvs"
+"$B/test_touch"
 echo "all R300 tests passed"

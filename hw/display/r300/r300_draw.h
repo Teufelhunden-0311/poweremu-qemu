@@ -158,6 +158,13 @@ typedef struct R300DrawPacket {
     uint32_t rt_gpu_addr;
     uint32_t rt_pitch;          /* pixels */
     uint32_t rt_width, rt_height;
+    /*
+     * Rows [0, touch_y1) hold every pixel the emitted geometry can cover,
+     * or 0 when not known (then rt_height).  A touched-memory bound only:
+     * rt_height stays the height of the viewport/NDC mapping.  Set for
+     * single-sample point lists expanded on the CPU (tris_touch_y1).
+     */
+    uint32_t touch_y1;
     uint32_t rt_format;         /* RB3D_COLORPITCH0 format field */
     uint32_t rt_bpp;            /* bytes per pixel */
     uint32_t rt_view;           /* R300_RTV_* */
