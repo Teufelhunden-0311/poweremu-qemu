@@ -429,6 +429,8 @@ void qemu_init_cpu_loop(void)
     qemu_thread_get_self(&io_thread);
 }
 
+static void wp_raw_cond_wait(QemuCond *cond, int path);
+
 void run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data)
 {
     do_run_on_cpu(cpu, func, data, &bql);
@@ -463,7 +465,7 @@ void qemu_wait_io_event(CPUState *cpu)
             slept = true;
             qemu_plugin_vcpu_idle_cb(cpu);
         }
-        qemu_cond_wait(cpu->halt_cond, &bql);
+        wp_raw_cond_wait(cpu->halt_cond, 0);
     }
     if (slept) {
         qemu_plugin_vcpu_resume_cb(cpu);
@@ -769,6 +771,15 @@ static int wp_site_find(const char *file, int line)
     return wp_nsites++;
 }
 
+/*
+ * Condition waits that release the BQL outside qemu_cond_wait_bql (Codex
+ * 10-24): 0 qemu_wait_io_event, 1 pause_all_vcpus, 2 vCPU creation,
+ * 3 do_run_on_cpu.  Counted per window to show whether any ran.
+ */
+static uint64_t wp_rawcw[4];
+/* Recorded holds overlapping each other (impossible for one lock): ns. */
+static uint64_t wp_overlap;
+
 static void wp_pair_add(int w, int o, int a, int64_t ns)
 {
     for (int i = 0; i < wp_npairs; i++) {
@@ -838,6 +849,12 @@ static void wp_acquired(const char *file, int line, int64_t t_req)
 static void wp_seg_close(int64_t now)
 {
     if (wp_cur >= 0 && now > wp_seg_t0) {
+        if (wp_ring_head) {
+            WPHold *p = &wp_ring[(wp_ring_head - 1) % WP_RING];
+            if (p->t1 > wp_seg_t0) {
+                wp_overlap += MIN(p->t1, now) - MAX(p->t0, wp_seg_t0);
+            }
+        }
         wp_ring[wp_ring_head++ % WP_RING] =
             (WPHold){ wp_cur, wp_act_cur, wp_seg_t0, now };
         wp_occ[wp_cur][wp_act_cur] += now - wp_seg_t0;
@@ -881,6 +898,7 @@ static struct {
     int nidle;
     uint64_t execlat, execlat_n, kicks;
     uint64_t w1, w1_owned, w1_free, ring_trunc, pair_drop, site_drop;
+    uint64_t rawcw[4], overlap;
 } wp_snap;
 
 /* Under the BQL: copy and reset. */
@@ -912,6 +930,10 @@ static void wp_snapshot(void)
     wp_snap.ring_trunc = wp_ring_trunc;
     wp_snap.pair_drop = wp_pair_drop;
     wp_snap.site_drop = wp_site_drop;
+    memcpy(wp_snap.rawcw, wp_rawcw, sizeof(wp_rawcw));
+    memset(wp_rawcw, 0, sizeof(wp_rawcw));
+    wp_snap.overlap = wp_overlap;
+    wp_overlap = 0;
     wp_w1 = wp_w1_owned = wp_w1_free = wp_ring_trunc = wp_pair_drop = wp_site_drop = 0;
     wp_npairs = 0;
     wp_nidle = 0;
@@ -964,9 +986,12 @@ static void wp_print(void)
                 s->out_n);
     }
     fprintf(stderr, "wp-check w1_ms=%.2f owned_ms=%.2f free_ms=%.2f ring_trunc=%"
-            PRIu64 " pair_drop=%" PRIu64 " site_drop=%" PRIu64 "\n",
+            PRIu64 " pair_drop=%" PRIu64 " site_drop=%" PRIu64 " overlap_ms=%.2f"
+            " rawcw=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n",
             wp_snap.w1 / 1e6, wp_snap.w1_owned / 1e6, wp_snap.w1_free / 1e6,
-            wp_snap.ring_trunc, wp_snap.pair_drop, wp_snap.site_drop);
+            wp_snap.ring_trunc, wp_snap.pair_drop, wp_snap.site_drop,
+            wp_snap.overlap / 1e6, wp_snap.rawcw[0], wp_snap.rawcw[1],
+            wp_snap.rawcw[2], wp_snap.rawcw[3]);
     for (int i = 0; i < wp_snap.npairs; i++) {
         WPPair *p = &wp_snap.pair[i];
         if (p->ns < wp_snap.dt / 2000) {
@@ -1036,6 +1061,26 @@ void qemu_cond_wait_bql(QemuCond *cond)
     if (waitprof_on) {
         wp_hold_t0 = wp_seg_t0 = get_clock();     /* same site holds again */
         wp_held = true;
+    }
+}
+
+/* A BQL condition wait that bypassed qemu_cond_wait_bql: same accounting. */
+static void wp_raw_cond_wait(QemuCond *cond, int path)
+{
+    if (waitprof_on) {
+        wp_rawcw[path]++;
+    }
+    qemu_cond_wait_bql(cond);
+}
+
+/* cpu-common.c do_run_on_cpu waits on a mutex it is given: the BQL from
+ * run_on_cpu. */
+void waitprof_cond_wait_mutex(QemuCond *cond, QemuMutex *mutex)
+{
+    if (mutex == &bql) {
+        wp_raw_cond_wait(cond, 3);
+    } else {
+        qemu_cond_wait(cond, mutex);
     }
 }
 
@@ -1110,7 +1155,7 @@ void pause_all_vcpus(void)
     replay_mutex_unlock();
 
     while (!all_vcpus_paused()) {
-        qemu_cond_wait(&qemu_pause_cond, &bql);
+        wp_raw_cond_wait(&qemu_pause_cond, 1);
         CPU_FOREACH(cpu) {
             qemu_cpu_kick(cpu);
         }
@@ -1180,7 +1225,7 @@ void qemu_init_vcpu(CPUState *cpu)
     cpus_accel->create_vcpu_thread(cpu);
 
     while (!cpu->created) {
-        qemu_cond_wait(&qemu_cpu_cond, &bql);
+        wp_raw_cond_wait(&qemu_cpu_cond, 2);
     }
 }
 
