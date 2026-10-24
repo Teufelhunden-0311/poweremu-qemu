@@ -25,6 +25,7 @@
 #include "qemu/osdep.h"
 #include "qemu/atomic.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
 
 #ifdef CONFIG_DARWIN
 
@@ -6745,6 +6746,7 @@ static struct {
     R200TexKey key;
     id<MTLTexture> tex;
     uint64_t used;
+    uint64_t pin;           /* PPCGPU_R300_EXTENT: r200_pin_now() while in use */
 } g_r200_views[R200_VIEW_CACHE];
 static uint64_t g_r200_view_clock;
 
@@ -6753,10 +6755,12 @@ static id<MTLCommandBuffer> g_r200_inflight;   /* newest committed, unwaited */
 static id<MTLRenderCommandEncoder> g_r200_enc;
 static R200TexKey g_r200_enc_key;
 static bool g_r300_enc_mine;        /* open encoder belongs to draw_r300 */
+static uint32_t g_r300_enc_vp_h;    /* PPCGPU_R300_EXTENT: its viewport height */
 static uint32_t g_r200_enc_variant;                 /* g_r200_pipes_gen index */
 static id<MTLRenderPipelineState> g_r200_enc_pipe;  /* last set on the pass */
 static uint32_t g_r200_enc_depth_off = ~0u, g_r200_enc_depth_pitch; /* ~0: none */
 static bool g_r200_enc_depth_z16;
+static uint32_t g_r300_enc_depth_h;  /* PPCGPU_R300_EXTENT: rows of the pass's depth view */
 static uint64_t g_r200_stat_draws, g_r200_stat_passes, g_r200_stat_flushes,
                 g_r200_stat_conflicts, g_r200_stat_view_hit, g_r200_stat_view_new;
 
@@ -6777,6 +6781,50 @@ static int g_r200_nwritten;
  * PPCGPU_SPLIT=0 goes back to waiting.
  */
 static uint32_t g_r200_epoch;
+static uint64_t g_r200_flush_gen;   /* bumped by every r200_flush_locked that forgets the tracker */
+
+/*
+ * PPCGPU_R300_EXTENT=1 (prototype, AI-generated, default off): one stable
+ * view per R300 render target and depth buffer across scissor changes.
+ * The R300 has no colour/depth height register, so the packet's height is
+ * the scissor's bottom edge, and every scissor change gave the same memory
+ * a new R200TexKey, which the batch tracker flushed for.  The producer
+ * (r300_extent_plan, under the BQL) gives each eligible attachment a
+ * reusable tracked height E: grown as draws need more rows (the packet's
+ * height, or the rows it can touch), shrunk or dropped on conflicts.  The
+ * job carries E, and the encode builds the keys from E.  Draw coordinates
+ * (viewport, NDC, scissor) keep the packet's height.  Same-key identity:
+ * views bound as attachments are pinned in the view cache for the current
+ * tracker generation, so a key maps to one MTLTexture while the tracker
+ * relies on it.
+ */
+static bool g_r300_extent;
+static void r300_extent_init(void)
+{
+    const char *e = getenv("PPCGPU_R300_EXTENT");
+    g_r300_extent = e && e[0] == '1';
+}
+static bool r300_extent_on(void)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, r300_extent_init);
+    return g_r300_extent;
+}
+/* What a view pinned now is pinned to: this flush generation and epoch,
+ * the lifetime of the tracker entries that may rely on its identity. */
+static uint64_t r200_pin_now(void)
+{
+    return (g_r200_flush_gen << 32 | g_r200_epoch) + 1;    /* 0: not pinned */
+}
+static int r200_views_unpinned(void)
+{
+    int n = 0;
+    uint64_t now = r200_pin_now();
+    for (int i = 0; i < R200_VIEW_CACHE; i++) {
+        n += g_r200_views[i].pin != now;
+    }
+    return n;
+}
 static id<MTLSharedEvent> g_r200_event;
 static uint64_t g_r200_event_val;
 static uint64_t g_r200_stat_splits;
@@ -6840,11 +6888,20 @@ typedef struct RQRanges {
     bool all;
 } RQRanges;
 
+/* PPCGPU_R300_EXTENT: the producer's attachment heights for one R300 job. */
+#define R300_EXT_DS R300_US_MAX_TARGETS
+typedef struct R300Ext {
+    bool on;
+    uint32_t h[R300_US_MAX_TARGETS + 1];   /* colour 0..ncb-1; depth at R300_EXT_DS */
+    const void *backing;                    /* st->vramBuffer when planned */
+} R300Ext;
+
 typedef struct RQJob {
     int kind;
     R200DrawPacket r200;    /* copies of verts/indices; host_data taken over */
     R300DrawPacket r300;    /* the packet's owned buffers, taken over */
     uint64_t vram_size;     /* R300: the VRAM it may use (draw_r300's) */
+    R300Ext ext;            /* R300: PPCGPU_R300_EXTENT heights, or off */
     RQRanges ranges;
     struct {                /* RQ_SUBMIT: commit, then done(arg, seq) */
         void (*done)(void *, uint32_t);
@@ -6918,6 +6975,235 @@ static void r200_job_ranges(RQJob *job)
     }
 }
 
+/*
+ * PPCGPU_R300_EXTENT registry: per attachment signature (offset, width,
+ * byte pitch, format, role), its tracked height E (see above).  Producer
+ * side only: every R300 draw reaches metal_draw_r300 from the device's draw
+ * path with the BQL held, which serializes the producers (checked: without
+ * the BQL a draw takes today's path).
+ */
+typedef struct R300ExtEntry {
+    uint32_t off, w, pitch, fmt, e;
+    uint8_t role;               /* 0 colour, 1 depth */
+    uint64_t used;
+} R300ExtEntry;
+#define R300_EXT_N 32
+/* A registered surface not planned for this many plans is stale: its
+ * extent may be clamped by a draw that now uses its memory. */
+#define R300_EXT_STALE 4096
+static R300ExtEntry g_r300_ext[R300_EXT_N];
+static uint64_t g_r300_ext_clock;
+
+/*
+ * PPCGPU_EXT_RETIRE=1 (prototype, default off; only with the extent on):
+ * a draw the planner refuses still runs, on today's path, and stores its
+ * attachments' rows [0, rt_height) -- the ranges r300_job_ranges then
+ * publishes for it.  A registered hint of another surface overlapping
+ * those ranges is retired (dropped) before the job is published, so later
+ * draws establish their extent afresh.  The registry is planning metadata,
+ * not proof of an allocation, its owner or its contents: retiring a hint
+ * claims nothing about which bytes the draw overwrites (scissor, masks and
+ * depth tests decide that).  Same owner as the rest of the registry (the
+ * producer, BQL held).  Queued jobs keep their own heights and ranges, the
+ * write tracker its entries; alias conflicts still order the real accesses.
+ * Without it a stale hint can block every later plan, since the staleness
+ * clock only advances on successful plans (Q3 after its display-mode
+ * switch: 166,697 refusals, 464 plans).
+ */
+static bool r300_ext_retire_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_EXT_RETIRE");
+        on = e && e[0] == '1';
+    }
+    return on;
+}
+
+static MTLPixelFormat r300_rt_pf(uint32_t view);
+
+/*
+ * The rows a draw can write (R300DrawPacket.touch_y1), at most the
+ * mapping height.  An extent backing needs only these rows: the viewport
+ * keeps rt_height (Metal maps a viewport taller than the attachment the
+ * same way) and the scissor is clipped to the backing.
+ */
+static uint32_t r300_touch_h(const R300DrawPacket *p)
+{
+    return p->touch_y1 ? MIN(p->touch_y1, p->rt_height) : p->rt_height;
+}
+
+/*
+ * Choose the job's attachment heights, or leave job->ext off (today's path).
+ * Eligible: the extent prototype on, the BQL held, a direct-VRAM draw (not
+ * the staging call, whose vram_size includes the private staging),
+ * single-sample, and with every attachment's range at its stable height E:
+ * inside guest VRAM, disjoint from the other attachments of the draw and
+ * from every texture it reads.  A draw that is not eligible publishes
+ * nothing, so it cannot push a signature into an oversized extent.
+ */
+static void r300_extent_plan(PPCMacGPUMetalState *st, RQJob *job)
+{
+    const R300DrawPacket *p = &job->r300;
+    R300Ext *x = &job->ext;
+    struct { uint32_t off, w, pitch, fmt, e; uint8_t role; int slot; } a[R300_US_MAX_TARGETS + 1];
+    uint32_t ncb = MAX(p->num_cb, 1u), na = 0, T = r300_touch_h(p);
+
+    memset(x, 0, sizeof(*x));
+    if (!r300_extent_on()) {
+        return;
+    }
+    if (!bql_locked() || job->vram_size != st->vram_size || p->aa_samples > 1 ||
+        ncb > R300_US_MAX_TARGETS || !T) {
+        return;
+    }
+    for (uint32_t k = 0; k < ncb; k++) {
+        a[na].off = k ? p->cb[k].gpu_addr : p->rt_gpu_addr;
+        a[na].pitch = k ? p->cb[k].pitch * p->cb[k].bpp : p->rt_pitch * p->rt_bpp;
+        a[na].w = p->rt_width;
+        a[na].fmt = (uint32_t)r300_rt_pf(k ? p->cb[k].view : p->rt_view);
+        a[na].role = 0;
+        na++;
+    }
+    if (p->depth.attach) {
+        a[na].off = p->depth.gpu_addr;
+        a[na].pitch = p->depth.pitch * p->depth.bpp;
+        a[na].w = p->rt_width;
+        a[na].fmt = (uint32_t)(p->depth.bpp == 2 ? MTLPixelFormatR16Uint : MTLPixelFormatR32Uint);
+        a[na].role = 1;
+        na++;
+    }
+    for (uint32_t i = 0; i < na; i++) {
+        if (!a[i].pitch) {
+            return;
+        }
+        a[i].slot = -1;
+        a[i].e = T;
+        for (int j = 0; j < R300_EXT_N; j++) {
+            R300ExtEntry *g = &g_r300_ext[j];
+            if (g->used && g->off == a[i].off && g->w == a[i].w && g->pitch == a[i].pitch &&
+                g->fmt == a[i].fmt && g->role == a[i].role) {
+                a[i].slot = j;
+                a[i].e = MAX(T, g->e);
+                break;
+            }
+        }
+    }
+    /*
+     * Heights E = max(T, registry), else (when E collides) the draw's own T
+     * for every attachment, which shrinks the registry.  E must not reach
+     * the other attachments of the draw, a texture it reads, or another
+     * surface's registered extent (no growth into a neighbour).  At T the
+     * same, except that a registered surface not planned for
+     * R300_EXT_STALE plans no longer counts: its memory is being drawn as
+     * this surface now, so its extent is clamped below this draw's ranges
+     * or dropped -- the tracker still orders the actual writes, whatever
+     * the registry says.  If T collides, today's path.
+     */
+    bool ok = true;
+    for (int pass = 0; pass < 2; pass++) {
+        ok = true;
+        if (pass) {
+            for (uint32_t i = 0; i < na; i++) {
+                a[i].e = T;
+            }
+        }
+        for (uint32_t i = 0; i < na && ok; i++) {
+            uint64_t lo = a[i].off, hi = lo + (uint64_t)a[i].pitch * a[i].e;
+            if (hi > st->vram_size) {
+                ok = false;           /* beyond guest VRAM */
+                break;
+            }
+            for (uint32_t j = i + 1; j < na && ok; j++) {
+                uint64_t lo2 = a[j].off, hi2 = lo2 + (uint64_t)a[j].pitch * a[j].e;
+                if (lo < hi2 && lo2 < hi) {
+                    ok = false;             /* attachments overlapping */
+                }
+            }
+            for (int t = 0; t < R300_NUM_TEX_UNITS && ok; t++) {
+                const R300TexDesc *td = &p->tex[t];
+                if (td->bound && !td->host_data && lo < (uint64_t)td->gpu_addr + td->size_bytes &&
+                    td->gpu_addr < hi) {
+                    ok = false;             /* a texture it reads inside an attachment */
+                }
+            }
+            for (int j = 0; j < R300_EXT_N && ok; j++) {
+                const R300ExtEntry *g = &g_r300_ext[j];
+                bool mine = false;
+                for (uint32_t m = 0; m < na; m++) {
+                    mine |= a[m].slot == j;
+                }
+                if (g->used && !mine && lo < (uint64_t)g->off + (uint64_t)g->pitch * g->e &&
+                    g->off < hi &&
+                    (!pass || g_r300_ext_clock - g->used < R300_EXT_STALE)) {
+                    ok = false;             /* another registered surface (in use) */
+                }
+            }
+        }
+        if (ok) {
+            break;
+        }
+    }
+    if (!ok) {
+        if (r300_ext_retire_on()) {
+            for (int j = 0; j < R300_EXT_N; j++) {
+                R300ExtEntry *g = &g_r300_ext[j];
+                bool mine = false, hit = false;
+                for (uint32_t m = 0; m < na; m++) {
+                    mine |= a[m].slot == j;
+                }
+                for (uint32_t i = 0; i < na && g->used && !mine && !hit; i++) {
+                    uint64_t lo = a[i].off, hi = lo + (uint64_t)a[i].pitch * p->rt_height;
+                    hit = lo < (uint64_t)g->off + (uint64_t)g->pitch * g->e && g->off < hi;
+                }
+                if (hit) {
+                    g->used = 0;
+                }
+            }
+        }
+        return;
+    }
+    /* other surfaces' registered extents that this draw's ranges reach */
+    for (int j = 0; j < R300_EXT_N; j++) {
+        R300ExtEntry *g = &g_r300_ext[j];
+        bool mine = false;
+        for (uint32_t m = 0; m < na; m++) {
+            mine |= a[m].slot == j;
+        }
+        for (uint32_t i = 0; i < na && g->used && !mine; i++) {
+            uint64_t lo = a[i].off, hi = lo + (uint64_t)a[i].pitch * a[i].e;
+            if (lo < (uint64_t)g->off + (uint64_t)g->pitch * g->e && g->off < hi) {
+                uint64_t rows = g->off < lo ? (lo - g->off) / g->pitch : 0;
+                if (rows) {
+                    g->e = (uint32_t)MIN((uint64_t)g->e, rows);
+                } else {
+                    g->used = 0;        /* dropped */
+                }
+            }
+        }
+    }
+    for (uint32_t i = 0; i < na; i++) {
+        R300ExtEntry *g;
+        if (a[i].slot >= 0) {
+            g = &g_r300_ext[a[i].slot];
+        } else {
+            int v = 0;
+            for (int j = 1; j < R300_EXT_N; j++) {
+                if (g_r300_ext[j].used < g_r300_ext[v].used) {
+                    v = j;
+                }
+            }
+            g = &g_r300_ext[v];
+            *g = (R300ExtEntry){ a[i].off, a[i].w, a[i].pitch, a[i].fmt, 0, a[i].role, 0 };
+        }
+        g->e = a[i].e;
+        g->used = ++g_r300_ext_clock;
+        x->h[a[i].role ? R300_EXT_DS : i] = a[i].e;
+    }
+    x->backing = (const void *)st->vramBuffer;
+    x->on = true;
+}
+
 static void r300_job_ranges(RQJob *job)
 {
     const R300DrawPacket *p = &job->r300;
@@ -6939,8 +7225,12 @@ static void r300_job_ranges(RQJob *job)
             r->all = true;
             return;
         }
+        /* With the extent on, the planned height or, if the encode falls
+         * back, the packet's: either is stored whole by the pass, touched
+         * or not (r300_touch_h lets the plan go below rt_height) */
         r->wr[r->nwr][0] = addr;
-        r->wr[r->nwr++][1] = addr + bpr * p->rt_height;
+        r->wr[r->nwr++][1] = addr + bpr * (job->ext.on ? MAX(job->ext.h[k], p->rt_height)
+                                                       : p->rt_height);
     }
     if (p->depth.attach) {
         if (r->nwr == RQ_MAX_WR) {
@@ -6949,7 +7239,8 @@ static void r300_job_ranges(RQJob *job)
         }
         r->wr[r->nwr][0] = p->depth.gpu_addr;
         r->wr[r->nwr++][1] = p->depth.gpu_addr + (uint64_t)ns * p->depth.pitch *
-                             p->depth.bpp * p->rt_height;
+                             p->depth.bpp * (job->ext.on ? MAX(job->ext.h[R300_EXT_DS], p->rt_height)
+                                                         : p->rt_height);
     }
     for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
         const R300TexDesc *td = &p->tex[t];
@@ -7037,7 +7328,7 @@ static void r200_job_free(RQJob *job)
 
 /* The R300 packet's owned fields (r300_draw_free's list) are taken over;
  * the device's r300_draw_free then frees only what was not queued. */
-static RQJob *r300_job_new(R300DrawPacket *pkt, uint64_t vram_size)
+static RQJob *r300_job_new(PPCMacGPUMetalState *st, R300DrawPacket *pkt, uint64_t vram_size)
 {
     RQJob *job = rq_job_alloc();
     R300DrawPacket *p = &job->r300;
@@ -7054,6 +7345,7 @@ static RQJob *r300_job_new(R300DrawPacket *pkt, uint64_t vram_size)
     for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
         pkt->tex[t].host_data = NULL;
     }
+    r300_extent_plan(st, job);       /* before the ranges: they use its heights */
     r300_job_ranges(job);
     return job;
 }
@@ -7132,7 +7424,8 @@ static void rqueue_drain(void)
 static int r200_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                             uint64_t vram_size, const R200DrawPacket *pkt);
 static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
-                            uint64_t vram_size, const R300DrawPacket *pkt);
+                            uint64_t vram_size, const R300DrawPacket *pkt,
+                            const struct R300Ext *ext);
 
 /* Take the next job, or NULL when the ring is empty.  One consumer;
  * g_rq_mtx held, so a range scan never sees a job in neither the cell
@@ -7202,7 +7495,7 @@ static void *rqueue_thread(void *unused)
         if (job->kind == RQ_R200) {
             r200_draw_encode(st, st->vram_ptr, st->vram_size, &job->r200);
         } else if (job->kind == RQ_R300) {
-            r300_draw_encode(st, st->vram_ptr, job->vram_size, &job->r300);
+            r300_draw_encode(st, st->vram_ptr, job->vram_size, &job->r300, &job->ext);
         } else {
             r200_commit_fence(st, job->sub.done, job->sub.arg, job->sub.seq);
         }
@@ -7617,16 +7910,28 @@ static unsigned r200_pf_bytes(MTLPixelFormat pf)
 static id<MTLTexture> r200_view(PPCMacGPUMetalState *st, R200TexKey k,
                                 MTLPixelFormat pf, bool render_target)
 {
-    int lru = 0;
+    int lru = -1;
+    bool pin = render_target && r300_extent_on();
+    uint64_t now = r200_pin_now();
     for (int i = 0; i < R200_VIEW_CACHE; i++) {
         if (g_r200_views[i].tex && !memcmp(&g_r200_views[i].key, &k, sizeof(k))) {
             g_r200_views[i].used = ++g_r200_view_clock;
             g_r200_stat_view_hit++;
+            if (pin) {
+                g_r200_views[i].pin = now;
+            }
             return g_r200_views[i].tex;
         }
-        if (g_r200_views[i].used < g_r200_views[lru].used) {
+        /* with PPCGPU_R300_EXTENT, views pinned now are not evicted (the
+         * caller made room: r300_draw_encode flushes when none is free) */
+        if ((!r300_extent_on() || g_r200_views[i].pin != now) &&
+            (lru < 0 || g_r200_views[i].used < g_r200_views[lru].used)) {
             lru = i;
         }
+    }
+    if (lru < 0) {
+        qemu_log("ppc-mac-gpu-metal: every view pinned (PPCGPU_R300_EXTENT)\n");
+        return nil;
     }
     uint64_t w = k.width, h = k.height, bpp = r200_pf_bytes(pf);
     uint64_t align = [st->device minimumLinearTextureAlignmentForPixelFormat:pf];
@@ -7684,6 +7989,7 @@ static id<MTLTexture> r200_view(PPCMacGPUMetalState *st, R200TexKey k,
     g_r200_views[lru].key = k;
     g_r200_views[lru].tex = t;
     g_r200_views[lru].used = ++g_r200_view_clock;
+    g_r200_views[lru].pin = pin ? now : 0;
     return t;
 }
 
@@ -7790,6 +8096,21 @@ static void aux_tex_store(uint64_t hash, const uint32_t k[6], id<MTLTexture> t)
 
 /* Finish pending GPU writes to VRAM [lo, hi) before the CPU reads it. */
 static bool r200_flush_locked(PPCMacGPUMetalState *st);
+
+/*
+ * PPCGPU_R300_EXTENT: pinned views are never evicted, so a full cache of
+ * pinned views would make r200_view fail.  Before a draw asks the cache for
+ * anything, make sure every view it may ask for (n: its textures and render
+ * targets) can be had while evicting neither a pinned view nor one this
+ * draw already holds (those are the most recently used); else end the
+ * batch, which expires every pin.
+ */
+static void r200_views_reserve(PPCMacGPUMetalState *st, int n)
+{
+    if (r300_extent_on() && r200_views_unpinned() < n) {
+        r200_flush_locked(st);
+    }
+}
 
 static void aux_tex_sync_vram(PPCMacGPUMetalState *st, uint64_t lo, uint64_t hi)
 {
@@ -7921,6 +8242,7 @@ static bool r200_flush_locked(PPCMacGPUMetalState *st)
     g_r200_nwritten = 0;
     g_r200_nread = 0;
     g_r200_read_overflow = false;
+    g_r200_flush_gen++;                    /* every pin of this batch expires */
     g_r200_stat_flushes++;
     g_r200_stat_flush_us += g_get_monotonic_time() - t0;
     return true;
@@ -8110,6 +8432,7 @@ static int r200_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             u.tfactor[i][3] = (v >> 24) / 255.0f;
         }
 
+        r200_views_reserve(st, R200_MAX_TEX + 2);  /* textures, colour, depth */
         id<MTLTexture> tex[R200_MAX_TEX];
         id<MTLSamplerState> smp[R200_MAX_TEX];
         for (int t = 0; t < R200_MAX_TEX; t++) {
@@ -9798,7 +10121,8 @@ static bool r300_bind_bytes(PPCMacGPUMetalState *st, id<MTLDevice> dev,
 }
 
 static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
-                            uint64_t vram_size, const R300DrawPacket *pkt)
+                            uint64_t vram_size, const R300DrawPacket *pkt,
+                            const struct R300Ext *ext)
 {
     if (!st || !st->vramBuffer) {
         return -1;
@@ -9833,6 +10157,41 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             return -1;
         }
     }
+    /*
+     * PPCGPU_R300_EXTENT: the job's heights, rechecked against what the
+     * producer assumed (the same backing, the guest VRAM bound, single
+     * sample, never below the rows the packet can write -- its height, or
+     * its touched bound); anything off takes today's path.  The encode
+     * never raises a height beyond what the job declared.
+     */
+    const struct R300Ext *xe = ext && ext->on && ext->backing == (const void *)st->vramBuffer &&
+                               vram_size == st->vram_size && ns == 1 ? ext : NULL;
+    for (uint32_t k = 0; xe && k < ncb; k++) {
+        uint64_t bpr = k ? (uint64_t)pkt->cb[k].pitch * pkt->cb[k].bpp
+                         : (uint64_t)pkt->rt_pitch * pkt->rt_bpp;
+        uint32_t addr = k ? pkt->cb[k].gpu_addr : pkt->rt_gpu_addr;
+        if (xe->h[k] < r300_touch_h(pkt) || addr + bpr * xe->h[k] > st->vram_size) {
+            xe = NULL;
+        }
+    }
+    if (xe && pkt->depth.attach &&
+        (xe->h[R300_EXT_DS] < r300_touch_h(pkt) ||
+         pkt->depth.gpu_addr + (uint64_t)pkt->depth.pitch * pkt->depth.bpp *
+             xe->h[R300_EXT_DS] > st->vram_size)) {
+        xe = NULL;
+    }
+    /* A backing below the mapping height: the scissor stays inside it (it
+     * cuts nothing the geometry reaches) */
+    for (uint32_t k = 0; xe && k < ncb; k++) {
+        sy1 = MIN(sy1, xe->h[k]);
+    }
+    if (xe && pkt->depth.attach) {
+        sy1 = MIN(sy1, xe->h[R300_EXT_DS]);
+    }
+    if (sy0 >= sy1) {
+        return 0;
+    }
+
     /* Colour buffers: A from the packet's rt_*, B-D from cb[]. */
     for (uint32_t k = 0; k < ncb; k++) {
         uint32_t view = k ? pkt->cb[k].view : pkt->rt_view;
@@ -9851,7 +10210,7 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             break;
         }
         ck[k] = (R200TexKey){ addr, ns > 1 ? ns * pkt->rt_pitch : pkt->rt_width,
-                              pkt->rt_height, bpr, (uint32_t)cpf[k] };
+                              xe ? xe->h[k] : pkt->rt_height, bpr, (uint32_t)cpf[k] };
     }
 
     if ((pkt->cull & (R300_CULL_FRONT | R300_CULL_BACK)) ==
@@ -9866,7 +10225,8 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
         MTLPixelFormat zpf = zd->bpp == 2 ? MTLPixelFormatR16Uint
                                           : MTLPixelFormatR32Uint;
         R200TexKey dk = { zd->gpu_addr, ns > 1 ? ns * zd->pitch : pkt->rt_width,
-                          pkt->rt_height, ns * zd->pitch * zd->bpp, (uint32_t)zpf };
+                          xe ? xe->h[R300_EXT_DS] : pkt->rt_height,
+                          ns * zd->pitch * zd->bpp, (uint32_t)zpf };
         bool want_ds = zd->attach;
         if (want_ds) {
             NSUInteger za = [dev minimumLinearTextureAlignmentForPixelFormat:zpf];
@@ -9878,6 +10238,7 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
         }
         uint64_t dlo = dk.offset, dhi = dlo + (uint64_t)dk.pitch * dk.height;
 
+        r200_views_reserve(st, R300_NUM_TEX_UNITS + (int)ncb + 1);
         id<MTLTexture> tex[R300_NUM_TEX_UNITS];
         id<MTLSamplerState> smp[R300_NUM_TEX_UNITS];
         bool tex_view[R300_NUM_TEX_UNITS] = { false };
@@ -9934,7 +10295,14 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                     (ncb == 1 || !memcmp(&g_r300_enc_cb[1], &ck[1], sizeof(ck[0]) * (ncb - 1))) &&
                     !(want_ds && (!enc_ds || g_r200_enc_depth_off != dk.offset ||
                                   g_r200_enc_depth_pitch != zd->pitch ||
-                                  g_r200_enc_depth_z16 != (zd->bpp == 2)));
+                                  g_r200_enc_depth_z16 != (zd->bpp == 2) ||
+                                  g_r300_enc_depth_h != dk.height));
+        /* A depth view kept for a depth-less draw must still cover every
+         * colour attachment's rows (the pass's area is its smallest
+         * attachment).  Without PPCGPU_R300_EXTENT the heights are equal. */
+        for (uint32_t k = 0; k < ncb && same && enc_ds && !want_ds; k++) {
+            same = g_r300_enc_depth_h >= ck[k].height;
+        }
         if (g_r200_enc && !same) {
             [g_r200_enc endEncoding];
             [g_r200_enc release];
@@ -9964,6 +10332,7 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                 g_r200_enc_depth_off = dk.offset;
                 g_r200_enc_depth_pitch = zd->pitch;
                 g_r200_enc_depth_z16 = zd->bpp == 2;
+                g_r300_enc_depth_h = dk.height;
                 r200_note_written(dlo, dhi, &dk);
             } else {
                 g_r200_enc_depth_off = ~0u;
@@ -9972,6 +10341,7 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             [g_r200_enc setDepthClipMode:MTLDepthClipModeClamp];
             [g_r200_enc setViewport:(MTLViewport){ 0, 0, pkt->rt_width,
                                                   pkt->rt_height, 0, 1 }];
+            g_r300_enc_vp_h = pkt->rt_height;
             g_r200_enc_key = ck[0];
             g_r300_enc_ncb = ncb;
             memcpy(g_r300_enc_cb, ck, sizeof(ck[0]) * ncb);
@@ -10055,6 +10425,12 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                 }
                 [enc setViewport:(MTLViewport){ cx, 0, pkt->rt_width,
                                                 pkt->rt_height, 0, 1 }];
+            } else if (r300_extent_on() && g_r300_enc_vp_h != pkt->rt_height) {
+                /* PPCGPU_R300_EXTENT: the pass outlives height changes (one
+                 * view per surface); the viewport keeps the packet's height,
+                 * which the NDC mapping in r300_draw.c used */
+                [enc setViewport:(MTLViewport){ 0, 0, pkt->rt_width, pkt->rt_height, 0, 1 }];
+                g_r300_enc_vp_h = pkt->rt_height;
             }
             [enc setScissorRect:(MTLScissorRect){ cx + sx0, sy0, sx1 - sx0, sy1 - sy0 }];
             [enc setVertexBytes:ms length:sizeof(ms) atIndex:1];
@@ -10149,7 +10525,7 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
 
     if (!rqueue_enabled()) {
         pthread_mutex_lock(&g_render_lock);
-        r = r300_draw_encode(st, vram_ptr, vram_size, pkt);
+        r = r300_draw_encode(st, vram_ptr, vram_size, pkt, NULL);   /* sync: today's path */
         pthread_mutex_unlock(&g_render_lock);
         return r;
     }
@@ -10159,7 +10535,7 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     }
     /* The job takes the packet's heap buffers over (see r300_job_new);
      * the device's r300_draw_free frees what is left. */
-    rq_push(r300_job_new((R300DrawPacket *)(uintptr_t)pkt, vram_size));
+    rq_push(r300_job_new(st, (R300DrawPacket *)(uintptr_t)pkt, vram_size));
     return 0;
 }
 

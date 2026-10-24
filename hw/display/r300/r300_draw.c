@@ -150,6 +150,13 @@ void r300_load_vbpntr(R300Arrays *arr, const uint32_t *d, uint32_t ndw)
 
 /* ---- vertex fetch --------------------------------------------------- */
 
+/* One PSC element as fetch_vertex walks it, decoded once per draw. */
+typedef struct PscElem {
+    uint8_t type, skip, dst, n;
+    bool sgn, norm, reset;      /* reset: the element starts its own array */
+    uint16_t x;                 /* VAP_PROG_STREAM_CNTL_EXT half */
+} PscElem;
+
 typedef struct Fetch {
     const R300State *st;
     const R300Arrays *arr;
@@ -161,7 +168,11 @@ typedef struct Fetch {
     unsigned swap;              /* VAP_CNTL_STATUS.VC_SWAP */
     uint32_t warn;
     const char *why;            /* first fetch failure */
+    PscElem psc[16];            /* r300_vfetch: up to and including LAST_VEC */
+    unsigned npsc;              /* 0 until the draw's first vertex */
 } Fetch;
+
+bool r300_vfetch;
 
 static unsigned psc_dwords(unsigned type)
 {
@@ -279,11 +290,83 @@ static void psc_store(unsigned x, const float c[4], float *dst)
     }
 }
 
+/*
+ * r300_vfetch: the PSC registers do not change within a draw, so decode them
+ * on its first vertex instead of for every vertex.  Every element up to and
+ * including the one with LAST_VEC is kept, as fetch_vertex walks them.
+ */
+static void psc_plan(Fetch *f)
+{
+    unsigned k;
+
+    for (k = 0; k < 16; k++) {
+        uint32_t reg = r300_reg(f->st, VAP_PROG_STREAM_CNTL_0 + 4 * (k / 2));
+        uint32_t ext = r300_reg(f->st, VAP_PROG_STREAM_CNTL_EXT_0 + 4 * (k / 2));
+        unsigned e = (reg >> (16 * (k % 2))) & 0xFFFF;
+        PscElem *p = &f->psc[k];
+
+        p->type = e & 0xF;
+        p->skip = (e >> 4) & 0xF;
+        p->dst = (e >> 8) & 0x1F;
+        p->n = psc_dwords(p->type);
+        p->sgn = (e >> 14) & 1;
+        p->norm = (e >> 15) & 1;
+        p->reset = !f->immd && k < f->arr->count;   /* each array starts afresh */
+        p->x = (ext >> (16 * (k % 2))) & 0xFFFF;
+        if (e & (1u << 13)) {           /* LAST_VEC */
+            k++;
+            break;
+        }
+    }
+    f->npsc = k;
+}
+
+/* fetch_vertex from the decoded PSC (r300_vfetch). */
+static bool fetch_vertex_planned(Fetch *f, uint32_t vtx,
+                                 float in[R300_PVS_NUM_INPUTS][4])
+{
+    unsigned cursor = 0;
+
+    if (!f->npsc) {
+        psc_plan(f);
+    }
+    memset(in, 0, sizeof(float) * 4 * R300_PVS_NUM_INPUTS);
+    for (unsigned k = 0; k < f->npsc; k++) {
+        const PscElem *p = &f->psc[k];
+        uint32_t w[8];
+        float c[4];
+
+        if (p->reset) {
+            cursor = 0;
+        }
+        cursor += p->skip;
+        if (!p->n) {
+            f->warn |= R300_WARN_VTXFMT;
+        } else if (!fetch_dwords(f, k, vtx, cursor, p->n, w)) {
+            return false;
+        } else if (p->type == 10) {
+            /* FLOAT_8: two FLOAT_4 vectors at DST_VEC_LOC and the next */
+            decode_element(3, false, false, w, c);
+            psc_store(p->x, c, in[p->dst]);
+            decode_element(3, false, false, w + 4, c);
+            psc_store(p->x, c, in[(p->dst + 1) % R300_PVS_NUM_INPUTS]);
+        } else {
+            decode_element(p->type, p->sgn, p->norm, w, c);
+            psc_store(p->x, c, in[p->dst]);
+        }
+        cursor += p->n;
+    }
+    return true;
+}
+
 /* Fill the input vertex memory for one vertex through the PSC. */
 static bool fetch_vertex(Fetch *f, uint32_t vtx, float in[R300_PVS_NUM_INPUTS][4])
 {
     unsigned cursor = 0;
 
+    if (r300_vfetch) {
+        return fetch_vertex_planned(f, vtx, in);
+    }
     memset(in, 0, sizeof(float) * 4 * R300_PVS_NUM_INPUTS);
     for (unsigned k = 0; k < 16; k++) {
         uint32_t reg = r300_reg(f->st, VAP_PROG_STREAM_CNTL_0 + 4 * (k / 2));
@@ -1293,6 +1376,27 @@ static void px_ndc(const Build *b, float x, float y, float *p)
 }
 
 /*
+ * The exclusive row bound of what emitted triangles can cover, from their
+ * final positions: a row is covered only if its centre (r + 0.5) is above
+ * the lowest vertex (y grows downwards), so rows < ceil(ymax - 0.5) --
+ * plus 1/16 pixel for float error and the host's subpixel snapping.
+ * 0 (not known) if any position is not finite or has w <= 0.
+ */
+static uint32_t tris_touch_y1(const R300DrawPacket *pkt, const R300Vertex *v, uint32_t n)
+{
+    float ymax = 0.0f;
+    for (uint32_t i = 0; i < n; i++) {
+        float w = v[i].pos[3];
+        if (!isfinite(v[i].pos[1]) || !isfinite(w) || w <= 0.0f) {
+            return 0;
+        }
+        ymax = fmaxf(ymax, (1.0f - v[i].pos[1] / w) * pkt->rt_height * 0.5f);
+    }
+    float t = ceilf(ymax - 0.5f + 1.0f / 16.0f);
+    return t < 1.0f ? 0 : t >= pkt->rt_height ? pkt->rt_height : (uint32_t)t;
+}
+
+/*
  * A point: a screen-aligned square GA_POINT_SIZE wide (width in the high
  * half, height in the low half, in sixths of a pixel), or the vertex's
  * point size clamped to GA_POINT_MINMAX, with texture coordinates S0..S1
@@ -2125,6 +2229,10 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         pkt->num_verts = b.ntri;
         pkt->num_line_verts = b.nline;
         pkt->prim_class = 0;
+        /* Point lists only for now (they are squares: triangles here) */
+        if (cls == 2 && !b.nline && pkt->aa_samples <= 1) {
+            pkt->touch_y1 = tris_touch_y1(pkt, b.tri, b.ntri);
+        }
     }
     free(prov);
     free(list);

@@ -14,7 +14,7 @@ SPV="$R/r300_spirv.c -DR300_HAVE_SPIRV_CROSS $(pkg-config --cflags --libs shader
 SPV="$SPV -lspirv-cross-msl -lspirv-cross-hlsl -lspirv-cross-cpp -lspirv-cross-reflect"
 SPV="$SPV -lspirv-cross-glsl -lspirv-cross-util -lspirv-cross-core -lc++"
 
-for t in test_pvs test_us test_draw test_features; do
+for t in test_pvs test_us test_draw test_features test_vfetch; do
     cc -O1 -Wall -Wno-unused-function -o "$B/$t" $t.c $SRC -lm
 done
 # test_rtle includes r300_draw.c itself, for its static functions.
@@ -24,11 +24,14 @@ cc -O1 -Wall -o "$B/test_aperture" test_aperture.c
 cc -O1 -Wall -o "$B/glsl2msl" glsl2msl.c $SPV
 cc -O1 -Wall -o "$B/test_mslcache" test_mslcache.c $SPV -lz
 clang -fobjc-arc -framework Metal -framework Foundation mslcheck.m -o "$B/mslcheck"
+clang -O1 -Wall -Wno-unused-function -fobjc-arc -framework Metal -framework Foundation \
+    test_touch.m $R/r300_state.c $R/r300_pvs.c $R/r300_us.c -o "$B/test_touch"
 for t in test_zs test_fmt test_raster test_gpuvs; do
     clang -O1 -fobjc-arc -framework Metal -framework Foundation $t.m $SRC $SPV -o "$B/$t"
 done
 "$B/test_pvs"
 "$B/test_draw"
+"$B/test_vfetch"
 "$B/test_aperture"
 "$B/test_rtle"
 # Both shader outputs: 0 (Metal: uint texture views), 1 (Vulkan: VRAM SSBO).
@@ -52,4 +55,5 @@ done
 "$B/test_fmt"
 "$B/test_raster"
 "$B/test_gpuvs"
+"$B/test_touch"
 echo "all R300 tests passed"

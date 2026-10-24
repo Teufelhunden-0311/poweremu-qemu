@@ -158,6 +158,13 @@ typedef struct R300DrawPacket {
     uint32_t rt_gpu_addr;
     uint32_t rt_pitch;          /* pixels */
     uint32_t rt_width, rt_height;
+    /*
+     * Rows [0, touch_y1) hold every pixel the emitted geometry can cover,
+     * or 0 when not known (then rt_height).  A touched-memory bound only:
+     * rt_height stays the height of the viewport/NDC mapping.  Set for
+     * single-sample point lists expanded on the CPU (tris_touch_y1).
+     */
+    uint32_t touch_y1;
     uint32_t rt_format;         /* RB3D_COLORPITCH0 format field */
     uint32_t rt_bpp;            /* bytes per pixel */
     uint32_t rt_view;           /* R300_RTV_* */
@@ -233,6 +240,13 @@ typedef struct R300Indices {
     const uint32_t *dw;         /* raw dwords as fetched (VC_SWAP applied here) */
     uint32_t ndw;
 } R300Indices;
+
+/*
+ * Vertex fetch decodes the PSC (VAP_PROG_STREAM_CNTL*) once per draw instead
+ * of once per vertex.  Prototype, off by default (PPCGPU_VFETCH=1 sets it);
+ * the output is the same either way.
+ */
+extern bool r300_vfetch;
 
 /* Decode a 3D_LOAD_VBPNTR (type-3 0x2F) body. */
 void r300_load_vbpntr(R300Arrays *arr, const uint32_t *d, uint32_t ndw);
