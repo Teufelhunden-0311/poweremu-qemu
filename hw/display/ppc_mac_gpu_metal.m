@@ -6994,6 +6994,32 @@ typedef struct R300ExtEntry {
 static R300ExtEntry g_r300_ext[R300_EXT_N];
 static uint64_t g_r300_ext_clock;
 
+/*
+ * PPCGPU_EXT_RETIRE=1 (prototype, default off; only with the extent on):
+ * a draw the planner refuses still runs, on today's path, and stores its
+ * attachments' rows [0, rt_height) -- the ranges r300_job_ranges then
+ * publishes for it.  A registered hint of another surface overlapping
+ * those ranges is retired (dropped) before the job is published, so later
+ * draws establish their extent afresh.  The registry is planning metadata,
+ * not proof of an allocation, its owner or its contents: retiring a hint
+ * claims nothing about which bytes the draw overwrites (scissor, masks and
+ * depth tests decide that).  Same owner as the rest of the registry (the
+ * producer, BQL held).  Queued jobs keep their own heights and ranges, the
+ * write tracker its entries; alias conflicts still order the real accesses.
+ * Without it a stale hint can block every later plan, since the staleness
+ * clock only advances on successful plans (Q3 after its display-mode
+ * switch: 166,697 refusals, 464 plans).
+ */
+static bool r300_ext_retire_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_EXT_RETIRE");
+        on = e && e[0] == '1';
+    }
+    return on;
+}
+
 static MTLPixelFormat r300_rt_pf(uint32_t view);
 
 /*
@@ -7119,6 +7145,22 @@ static void r300_extent_plan(PPCMacGPUMetalState *st, RQJob *job)
         }
     }
     if (!ok) {
+        if (r300_ext_retire_on()) {
+            for (int j = 0; j < R300_EXT_N; j++) {
+                R300ExtEntry *g = &g_r300_ext[j];
+                bool mine = false, hit = false;
+                for (uint32_t m = 0; m < na; m++) {
+                    mine |= a[m].slot == j;
+                }
+                for (uint32_t i = 0; i < na && g->used && !mine && !hit; i++) {
+                    uint64_t lo = a[i].off, hi = lo + (uint64_t)a[i].pitch * p->rt_height;
+                    hit = lo < (uint64_t)g->off + (uint64_t)g->pitch * g->e && g->off < hi;
+                }
+                if (hit) {
+                    g->used = 0;
+                }
+            }
+        }
         return;
     }
     /* other surfaces' registered extents that this draw's ranges reach */
