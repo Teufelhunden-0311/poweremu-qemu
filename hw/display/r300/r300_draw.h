@@ -245,6 +245,14 @@ typedef struct R300Indices {
 void r300_load_vbpntr(R300Arrays *arr, const uint32_t *d, uint32_t ndw);
 
 /*
+ * Debug hook (waitprof, not for merging): called where the draw builder
+ * moves between phases, a few times per draw.  NULL (the default and the
+ * standalone tests) = nothing.
+ */
+enum { R300_PH_STATE, R300_PH_FETCH, R300_PH_VSPACK, R300_PH_FSMEMO, R300_PH_CPU };
+extern void (*r300_phase_hook)(int phase);
+
+/*
  * Build a draw from a 3D_DRAW_VBUF_2 (0x34), 3D_DRAW_IMMD_2 (0x35) or
  * 3D_DRAW_INDX_2 (0x36) body.  Returns false (with *err) when the draw
  * cannot be assembled at all; smaller omissions are flagged in pkt->warn.

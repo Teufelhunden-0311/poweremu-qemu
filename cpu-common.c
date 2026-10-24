@@ -21,6 +21,7 @@
 #include "qemu/main-loop.h"
 #include "exec/cpu-common.h"
 #include "hw/core/cpu.h"
+#include "system/waitprof.h"
 #include "qemu/lockable.h"
 #include "trace/trace-root.h"
 
@@ -160,7 +161,11 @@ void do_run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data,
     while (!qatomic_load_acquire(&wi.done)) {
         CPUState *self_cpu = current_cpu;
 
-        qemu_cond_wait(&qemu_work_cond, mutex);
+        if (waitprof_on) {
+            waitprof_cond_wait_mutex(&qemu_work_cond, mutex);
+        } else {
+            qemu_cond_wait(&qemu_work_cond, mutex);
+        }
         current_cpu = self_cpu;
     }
 }
