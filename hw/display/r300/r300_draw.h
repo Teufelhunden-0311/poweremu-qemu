@@ -310,7 +310,7 @@ void r300_draw_free(R300DrawPacket *pkt);
 /* VRAM [lo, hi) was written by something other than the card's own
  * unswapped rendering (an upload); see rt_note in r300_draw.c. */
 void r300_rt_forget(uint64_t lo, uint64_t hi);
-/* $R300_ENDIAN_MODEL=1: the experimental byte-order model (r300_draw.c). */
+/* The byte-order model (r300_draw.c), on unless $R300_ENDIAN_MODEL=0. */
 bool r300_endian_model(void);
 
 /*
