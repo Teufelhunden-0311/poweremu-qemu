@@ -7393,6 +7393,11 @@ static void r300_extent_plan(PPCMacGPUMetalState *st, RQJob *job)
      * the registry says.  If T collides, today's path.
      */
     int why = EXT_OK;
+    int blk_i[2] = { -1, -1 }, blk_j[2] = { -1, -1 };   /* PPCGPU_EXTDEBUG: who refused */
+    uint32_t e0[R300_US_MAX_TARGETS + 1];
+    for (uint32_t i = 0; i < na; i++) {
+        e0[i] = a[i].e;
+    }
     for (int pass = 0; pass < 2; pass++) {
         why = EXT_OK;
         if (pass) {
@@ -7429,6 +7434,8 @@ static void r300_extent_plan(PPCMacGPUMetalState *st, RQJob *job)
                     g->off < hi &&
                     (!pass || g_r300_ext_clock - g->used < R300_EXT_STALE)) {
                     why = EXT_REG_OVL;          /* another registered surface (in use) */
+                    blk_i[pass] = i;
+                    blk_j[pass] = j;
                 }
             }
         }
@@ -7438,6 +7445,28 @@ static void r300_extent_plan(PPCMacGPUMetalState *st, RQJob *job)
     }
     if (why != EXT_OK) {
         EXT_COUNT(why);
+        /* DIAGNOSTIC ONLY (PPCGPU_EXTDEBUG): the attachment and the registered
+         * surface that refused the plan, in each pass (pass 1 = at T). */
+        if (why == EXT_REG_OVL && ext_debug()) {
+            for (int ps = 0; ps < 2; ps++) {
+                if (blk_i[ps] < 0) {
+                    continue;
+                }
+                const R300ExtEntry *g = &g_r300_ext[blk_j[ps]];
+                uint32_t i = blk_i[ps], e = ps ? T : e0[i];
+                uint64_t glo = g->off, ghi = glo + (uint64_t)g->pitch * g->e;
+                uint64_t lo = a[i].off, hi = lo + (uint64_t)a[i].pitch * e;
+                qemu_log("ext-regovl p%d clk=%llu T=%u rt_h=%u na=%u att=%u role=%u off=%x w=%u "
+                         "pitch=%u fmt=%u e=%u slot=%d | blk=%d off=%x w=%u pitch=%u fmt=%u "
+                         "role=%u e=%u age=%llu | rel=%s ovl=%llu\n",
+                         ps, (unsigned long long)g_r300_ext_clock, T, p->rt_height, na, i,
+                         a[i].role, a[i].off, a[i].w, a[i].pitch, a[i].fmt, e, a[i].slot,
+                         blk_j[ps], g->off, g->w, g->pitch, g->fmt, g->role, g->e,
+                         (unsigned long long)(g_r300_ext_clock - g->used),
+                         glo == lo ? "same_off" : glo < lo ? "blk_below" : "blk_above",
+                         (unsigned long long)(MIN(hi, ghi) - MAX(lo, glo)));
+            }
+        }
         return;
     }
     /* other surfaces' registered extents that this draw's ranges reach */
@@ -7476,6 +7505,12 @@ static void r300_extent_plan(PPCMacGPUMetalState *st, RQJob *job)
             }
             g = &g_r300_ext[v];
             *g = (R300ExtEntry){ a[i].off, a[i].w, a[i].pitch, a[i].fmt, 0, a[i].role, 0 };
+        }
+        if (ext_debug() && (a[i].slot < 0 || a[i].e != g->e)) {
+            qemu_log("ext-reg %s slot=%d role=%u off=%x w=%u pitch=%u fmt=%u e=%u->%u T=%u rt_h=%u\n",
+                     a[i].slot < 0 ? "new" : "upd", (int)(g - g_r300_ext), a[i].role, a[i].off,
+                     a[i].w, a[i].pitch, a[i].fmt, a[i].slot < 0 ? 0 : g->e, a[i].e, T,
+                     p->rt_height);
         }
         g->e = a[i].e;
         g->used = ++g_r300_ext_clock;
