@@ -91,8 +91,9 @@ static void clear(void)
 
 int main(void)
 {
+    /* The record runs only with the byte-order model off. */
     unsetenv("R300_RT_LE");
-    unsetenv("R300_ENDIAN_MODEL");
+    setenv("R300_ENDIAN_MODEL", "0", 1);
 
     /* Endpoints are half-open. */
     both_note(0x1000, 0x2000, true);

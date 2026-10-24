@@ -729,8 +729,10 @@ void r300_border_color(uint32_t fmt, uint32_t v, float c[4])
  * byte-swapping apertures all call r300_rt_forget (vram_mark in
  * ppc_mac_gpu.c).  CPU writes through the plain linear aperture do not
  * trap, so a surface the CPU rewrites that way stays recorded -- the
- * proper fix is modelling the apertures' byte swap.  R300_RT_LE=0 turns
- * this off.
+ * proper fix is modelling the apertures' byte swap, which the byte-order
+ * model below does.  The model is on by default and this record is then
+ * off; with the model off ($R300_ENDIAN_MODEL=0) the record is on, and
+ * R300_RT_LE=0 turns it off as well.
  *
  * The record is sorted by address and its ranges never overlap (a note
  * forgets what it overlaps first), so lookups are binary searches.  An
@@ -764,10 +766,12 @@ static unsigned rt_le_find(uint64_t addr)
 }
 
 /*
- * The experimental byte-order model, $R300_ENDIAN_MODEL=1 (off by default;
- * the record above is then off too).  Written down before any default is
- * chosen, as the rules each path follows rather than a record of what was
- * drawn where.
+ * The byte-order model, on by default; $R300_ENDIAN_MODEL=0 turns it off
+ * (and the record above back on).  Written down as the rules each path
+ * follows rather than a record of what was drawn where.  Tested against
+ * the PowerBook on texprobe, scissorprobe and rbprobe, and with no
+ * regression found in the games and desktop sessions examined; not proven
+ * against every path (see "Not covered" and the open question below).
  *
  * Backing: VRAM here holds what the big-endian CPU sees, each element (a
  * texel or pixel of 1, 2 or 4 bytes) a big-endian value at its own address
@@ -825,7 +829,7 @@ bool r300_endian_model(void)
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("R300_ENDIAN_MODEL");
-        on = e && e[0] == '1';
+        on = !(e && e[0] == '0');
     }
     return on;
 }
