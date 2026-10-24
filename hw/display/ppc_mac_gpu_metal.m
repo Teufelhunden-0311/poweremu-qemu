@@ -7119,30 +7119,177 @@ static void metal_debug_log(void *opaque)
     g_string_free(g, true);
 }
 
+/*
+ * Debug (encode-vs-GPU profile, PPCGPU_ENCPROF=<file>; AI-generated, not
+ * for merging).  Host times in ns of mach_absolute_time, the base of
+ * MTLCommandBuffer GPUStartTime/GPUEndTime.  Records, written to <file>
+ * at exit (ep_dump):
+ *  EP_CB    one per committed batch command buffer, completed by a handler
+ *           the commit adds (nothing waits for it): opened, commit asked,
+ *           kernel and GPU start/end, handler; what was encoded since the
+ *           previous commit and the render thread's time for it -- net
+ *           encode (wall time inside the encode calls minus nested flushes
+ *           and pipeline builds), pipeline builds, waits for g_render_lock,
+ *           idle; queue depth at commit.
+ *  EP_WAIT  one per r200_flush_locked: the buffer waited for, commit /
+ *           waitUntilCompleted / settle times, calling thread.
+ *  EP_TICK  about once a second from the render thread: cumulative totals,
+ *           including the other threads' drains, g_render_lock waits and
+ *           flushes, and producer waits for a full queue.
+ * Wall-clock intervals on different threads and the GPU overlap; nothing
+ * here adds them.  Batches made outside r200_new_cb (blits and legacy
+ * paths that wait for themselves) are not recorded.
+ */
+#include <mach/mach_time.h>
+enum { EP_NONE, EP_CB, EP_WAIT, EP_TICK };
+typedef struct EpRec {
+    uint8_t type;           /* stored last (release); 0: not complete */
+    uint8_t kind;           /* CB: 1 fence (submit) commit; WAIT: 1 render thread */
+    uint8_t reason;         /* WAIT: hz_reason (PPCGPU_HAZDIAG only) */
+    uint8_t status;         /* CB: MTLCommandBufferStatus */
+    uint32_t id;            /* CB/WAIT: batch number */
+    uint32_t qdepth;        /* CB: queued jobs at commit */
+    uint32_t n_r300, n_r200, n_pass, n_comp, n_fence;
+    uint64_t v[26];
+} EpRec;
+/* CB v: 0 opened, 1 commit asked, 2/3 GPU start/end, 4/5 kernel start/end,
+ * 6 handler, 7 net encode R300, 8 net encode R200, 9 pipeline builds,
+ * 10 g_render_lock waits, 11 idle, 12 other render-thread work (fences).
+ * WAIT v: 0 start, 1 committed, 2 wait returned, 3 settled.
+ * TICK v: EP_T_* below, cumulative; the other threads' drains and lock
+ * waits also by caller (ppc_gpu_hz_who, set whether or not HAZDIAG is on). */
+enum { EP_T_NOW, EP_T_IDLE, EP_T_LOCK, EP_T_ENC300, EP_T_ENC200, EP_T_OTHER, EP_T_FLUSH_RT,
+       EP_T_COMP, EP_T_PUSHFULL, EP_T_DRAIN_X, EP_T_LOCK_X, EP_T_FLUSH_X, EP_T_JOBS,
+       EP_T_LOCK_WHO, EP_T_DRAIN_WHO = EP_T_LOCK_WHO + PPC_GPU_HZ_WHO_N,
+       EP_T_N = EP_T_DRAIN_WHO + PPC_GPU_HZ_WHO_N };
+QEMU_BUILD_BUG_ON(EP_T_N > 26);
+#define EP_MAX (1u << 19)
+static EpRec *g_ep_rec;
+static uint32_t g_ep_n, g_ep_drop;
+static FILE *g_ep_file;
+static uint64_t g_ep_tot[EP_T_N];
+static __thread bool ep_rt;             /* this is the render thread */
+static __thread uint64_t ep_excl;       /* ns of flushes and builds inside the current encode */
+static mach_timebase_info_data_t g_ep_tb;
+
+static uint64_t ep_now(void)
+{
+    return mach_absolute_time() * g_ep_tb.numer / g_ep_tb.denom;
+}
+
+static void ep_dump(void)
+{
+    uint32_t n = MIN(qatomic_read(&g_ep_n), EP_MAX), bad = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        bad += !qatomic_load_acquire(&g_ep_rec[i].type);
+    }
+    fprintf(g_ep_file, "EPROF1 %u %u %u %u\n", (unsigned)sizeof(EpRec), n,
+            qatomic_read(&g_ep_drop), bad);
+    fwrite(g_ep_rec, sizeof(EpRec), n, g_ep_file);
+    fclose(g_ep_file);
+}
+
+static bool ep_init_val;
+static void ep_init(void)
+{
+    const char *e = getenv("PPCGPU_ENCPROF");
+    if (!e || !e[0]) {
+        return;
+    }
+    mach_timebase_info(&g_ep_tb);
+    g_ep_rec = calloc(EP_MAX, sizeof(EpRec));
+    g_ep_file = fopen(e, "wb");
+    if (!g_ep_rec || !g_ep_file) {
+        qemu_log("ppc-mac-gpu-metal: PPCGPU_ENCPROF %s: cannot open\n", e);
+        return;
+    }
+    atexit(ep_dump);
+    ep_init_val = true;
+}
+static bool ep_on(void)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, ep_init);
+    return ep_init_val;
+}
+
+/* A slot for a record, or NULL when full (counted). */
+static EpRec *ep_slot(void)
+{
+    uint32_t i = qatomic_fetch_inc(&g_ep_n);
+    if (i >= EP_MAX) {
+        qatomic_inc(&g_ep_drop);
+        return NULL;
+    }
+    return &g_ep_rec[i];
+}
+
+static void ep_tot(int k, uint64_t ns)
+{
+    qatomic_add(&g_ep_tot[k], ns);
+}
+
+/* Render thread, about once a second: the totals so far. */
+static void ep_tick(void)
+{
+    static uint64_t last;
+    uint64_t now = ep_now();
+    if (now - last < 1000000000ull) {
+        return;
+    }
+    last = now;
+    EpRec *r = ep_slot();
+    if (!r) {
+        return;
+    }
+    for (int k = 0; k < EP_T_N; k++) {
+        r->v[k] = qatomic_read(&g_ep_tot[k]);
+    }
+    r->v[EP_T_NOW] = now;
+    qatomic_store_release(&r->type, EP_TICK);
+}
+
+/* What the render thread did since the last commit (under g_render_lock). */
+static struct {
+    uint32_t id, n_r300, n_r200, n_comp, n_fence;
+    uint64_t opened, pass0, enc300, enc200, comp, lock, idle, other;
+} g_ep_cur;
+static uint32_t g_ep_id, g_ep_last_id;
+
 /* C: take g_render_lock at a site, timing the wait when on. */
 static void hz_render_lock(int site)
 {
+    uint64_t e0 = ep_on() && !ep_rt ? ep_now() : 0;
     if (!ppc_gpu_hz_on()) {
         pthread_mutex_lock(&g_render_lock);
-        return;
+    } else {
+        int held = bql_locked(), who = ppc_gpu_hz_who, unl = ppc_gpu_hz_unlocked ? 1 : 0;
+        int64_t t0 = get_clock();
+        pthread_mutex_lock(&g_render_lock);
+        hz_add(&hz_lock[site][who][held][unl], get_clock() - t0);
     }
-    int held = bql_locked(), who = ppc_gpu_hz_who, unl = ppc_gpu_hz_unlocked ? 1 : 0;
-    int64_t t0 = get_clock();
-    pthread_mutex_lock(&g_render_lock);
-    hz_add(&hz_lock[site][who][held][unl], get_clock() - t0);
+    if (e0) {
+        ep_tot(EP_T_LOCK_X, ep_now() - e0);
+        ep_tot(EP_T_LOCK_WHO + ppc_gpu_hz_who, ep_now() - e0);
+    }
 }
 
 /* C: rqueue_drain at a site, timed when on. */
 static void hz_drain_at(int site)
 {
+    uint64_t e0 = ep_on() && !ep_rt ? ep_now() : 0;
     if (!ppc_gpu_hz_on()) {
         rqueue_drain();
-        return;
+    } else {
+        int held = bql_locked(), who = ppc_gpu_hz_who, unl = ppc_gpu_hz_unlocked ? 1 : 0;
+        int64_t t0 = get_clock();
+        rqueue_drain();
+        hz_add(&hz_drain[site][who][held][unl], get_clock() - t0);
     }
-    int held = bql_locked(), who = ppc_gpu_hz_who, unl = ppc_gpu_hz_unlocked ? 1 : 0;
-    int64_t t0 = get_clock();
-    rqueue_drain();
-    hz_add(&hz_drain[site][who][held][unl], get_clock() - t0);
+    if (e0) {
+        ep_tot(EP_T_DRAIN_X, ep_now() - e0);
+        ep_tot(EP_T_DRAIN_WHO + ppc_gpu_hz_who, ep_now() - e0);
+    }
 }
 
 static bool r200_split_enabled(void)
@@ -7943,10 +8090,14 @@ static void r200_commit_fence(PPCMacGPUMetalState *st,
 static void *rqueue_thread(void *unused)
 {
     PPCMacGPUMetalState *st = g_rq_st;
+    bool ep = ep_on();          /* PPCGPU_ENCPROF */
+    uint64_t ep_idle = 0;
 
+    ep_rt = true;
     for (;;) {
         RQJob *job = rq_pop();
         if (!job) {
+            uint64_t s0 = ep ? ep_now() : 0;
             /*
              * Say we are going to sleep, then look once more: a producer
              * publishes its cell and then checks g_rq_sleeping, each side
@@ -7964,17 +8115,46 @@ static void *rqueue_thread(void *unused)
             }
             qatomic_set(&g_rq_sleeping, false);
             pthread_mutex_unlock(&g_rq_mtx);
+            if (ep) {
+                ep_idle += ep_now() - s0;
+            }
             if (!job) {
                 break;      /* stopped, and the ring is empty */
             }
         }
+        uint64_t e0 = ep ? ep_now() : 0;
         pthread_mutex_lock(&g_render_lock);
+        uint64_t e1 = ep ? ep_now() : 0;
+        ep_excl = 0;
         if (job->kind == RQ_R200) {
             r200_draw_encode(st, st->vram_ptr, st->vram_size, &job->r200);
         } else if (job->kind == RQ_R300) {
             r300_draw_encode(st, st->vram_ptr, job->vram_size, &job->r300, &job->ext);
         } else {
             r200_commit_fence(st, job->sub.done, job->sub.arg, job->sub.seq);
+        }
+        if (ep) {
+            /* Work since the last commit; a fence's own goes to the next. */
+            uint64_t net = ep_now() - e1 - ep_excl;
+            g_ep_cur.lock += e1 - e0;
+            g_ep_cur.idle += ep_idle;
+            ep_tot(EP_T_LOCK, e1 - e0);
+            ep_tot(EP_T_IDLE, ep_idle);
+            ep_idle = 0;
+            if (job->kind == RQ_R300) {
+                g_ep_cur.n_r300++;
+                g_ep_cur.enc300 += net;
+                ep_tot(EP_T_ENC300, net);
+            } else if (job->kind == RQ_R200) {
+                g_ep_cur.n_r200++;
+                g_ep_cur.enc200 += net;
+                ep_tot(EP_T_ENC200, net);
+            } else {
+                g_ep_cur.other += net;
+                ep_tot(EP_T_OTHER, net);
+            }
+            ep_tot(EP_T_JOBS, 1);
+            ep_tick();
         }
         pthread_mutex_unlock(&g_render_lock);
         pthread_mutex_lock(&g_rq_mtx);
@@ -8003,13 +8183,20 @@ static void rq_push(RQJob *job)
 
     /* Full: wait for the render thread to finish a job.  FIFO order
      * means this draw cannot be encoded here instead. */
+    uint64_t ep_f0 = 0;
     while ((uintptr_t)qatomic_load_acquire(&c->seq) != pos) {
+        if (!ep_f0 && ep_on()) {
+            ep_f0 = ep_now();
+        }
         pthread_mutex_lock(&g_rq_mtx);
         if ((uintptr_t)qatomic_load_acquire(&c->seq) != pos) {
             g_rq_stat_full++;
             pthread_cond_wait(&g_rq_space, &g_rq_mtx);
         }
         pthread_mutex_unlock(&g_rq_mtx);
+    }
+    if (ep_f0) {
+        ep_tot(EP_T_PUSHFULL, ep_now() - ep_f0);
     }
     qatomic_set(&c->job, job);
     c->ranges = job->ranges;
@@ -8082,6 +8269,11 @@ static void rqueue_stop(void)
 static id<MTLCommandBuffer> r200_new_cb(PPCMacGPUMetalState *st)
 {
     id<MTLCommandBuffer> cb = [[st->commandQueue commandBuffer] retain];
+    if (ep_on()) {
+        g_ep_cur.id = ++g_ep_id;
+        g_ep_cur.opened = ep_now();
+        g_ep_cur.pass0 = g_r200_stat_passes;
+    }
     if (g_r200_event && g_r200_event_val) {
         [cb encodeWaitForEvent:g_r200_event value:g_r200_event_val];
     }
@@ -8638,6 +8830,36 @@ static uint32_t r200_commit_as(void (*done)(void *, uint32_t), void *arg,
         [g_r200_cb encodeSignalEvent:g_r200_event value:++g_r200_event_val];
     }
     r200_arena_recycle_on(g_r200_cb);
+    EpRec *er = ep_on() ? ep_slot() : NULL;
+    if (er) {
+        er->kind = done != NULL;
+        er->id = g_ep_cur.id;
+        er->qdepth = (uint32_t)(qatomic_read(&g_rq_enq) - qatomic_read(&g_rq_deq));
+        er->n_r300 = g_ep_cur.n_r300;
+        er->n_r200 = g_ep_cur.n_r200;
+        er->n_pass = (uint32_t)(g_r200_stat_passes - g_ep_cur.pass0);
+        er->n_comp = g_ep_cur.n_comp;
+        er->v[0] = g_ep_cur.opened;
+        er->v[7] = g_ep_cur.enc300;
+        er->v[8] = g_ep_cur.enc200;
+        er->v[9] = g_ep_cur.comp;
+        er->v[10] = g_ep_cur.lock;
+        er->v[11] = g_ep_cur.idle;
+        er->v[12] = g_ep_cur.other;
+        g_ep_last_id = g_ep_cur.id;
+        memset(&g_ep_cur, 0, sizeof(g_ep_cur));
+        g_ep_cur.pass0 = g_r200_stat_passes;
+        [g_r200_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            er->v[2] = (uint64_t)(cb.GPUStartTime * 1e9);
+            er->v[3] = (uint64_t)(cb.GPUEndTime * 1e9);
+            er->v[4] = (uint64_t)(cb.kernelStartTime * 1e9);
+            er->v[5] = (uint64_t)(cb.kernelEndTime * 1e9);
+            er->v[6] = ep_now();
+            er->status = (uint8_t)cb.status;
+            qatomic_store_release(&er->type, EP_CB);
+        }];
+        er->v[1] = ep_now();
+    }
     [g_r200_cb commit];
     if (g_r200_inflight) {                 /* its status is still to be read */
         if (g_r200_nunchecked == R200_UNCHECKED) {
@@ -8723,16 +8945,37 @@ static bool r200_flush_locked(PPCMacGPUMetalState *st)
     int64_t t0 = g_get_monotonic_time();
     int hz = ppc_gpu_hz_on(), hzr = hz_reason;
     int64_t h0 = hz ? get_clock() : 0, h1 = 0, h2 = 0;
+    EpRec *ew = ep_on() ? ep_slot() : NULL;
+    if (ew) {
+        ew->v[0] = ep_now();
+    }
     hz_reason = HZ_R_OTHER;
     r200_commit(NULL, NULL);
     if (hz) {
         h1 = get_clock();
     }
+    if (ew) {
+        ew->v[1] = ep_now();
+    }
     [g_r200_inflight waitUntilCompleted];
     if (hz) {
         h2 = get_clock();
     }
+    if (ew) {
+        ew->v[2] = ep_now();
+    }
     r200_settle_unchecked();               /* everything committed before it */
+    if (ew) {
+        ew->v[3] = ep_now();
+        ew->id = g_ep_last_id;
+        ew->kind = ep_rt;
+        ew->reason = (uint8_t)hzr;
+        ep_tot(ep_rt ? EP_T_FLUSH_RT : EP_T_FLUSH_X, ew->v[3] - ew->v[0]);
+        if (ep_rt) {
+            ep_excl += ew->v[3] - ew->v[0];
+        }
+        qatomic_store_release(&ew->type, EP_WAIT);
+    }
     if (hz) {
         hz_add(&hz_commit[hzr], h1 - h0);
         hz_add(&hz_wait[hzr], h2 - h1);
@@ -9972,6 +10215,11 @@ static id<MTLRenderPipelineState> r300_pipeline(id<MTLDevice> dev,
     return p;
 }
 
+static id<MTLRenderPipelineState> r300_pipeline_build(id<MTLDevice> dev, NSString *key,
+                                                       NSString *src, NSString *vsrc,
+                                                       const MTLPixelFormat *cfmt,
+                                                       uint32_t ncb, MTLPixelFormat zfmt);
+
 static id<MTLRenderPipelineState> r300_pipeline_by_text(id<MTLDevice> dev,
                                                         const char *glsl,
                                                         const char *vs_glsl,
@@ -9983,7 +10231,6 @@ static id<MTLRenderPipelineState> r300_pipeline_by_text(id<MTLDevice> dev,
     NSString *vsrc = vs_glsl ? [NSString stringWithUTF8String:vs_glsl] : src;
     NSMutableString *key = [NSMutableString stringWithString:src];
     id<MTLRenderPipelineState> p;
-    NSError *err = nil;
 
     for (uint32_t k = 0; k < ncb; k++) {
         [key appendFormat:@"\n// c%u %lu", k, (unsigned long)cfmt[k]];
@@ -9999,6 +10246,28 @@ static id<MTLRenderPipelineState> r300_pipeline_by_text(id<MTLDevice> dev,
     if (p) {
         return p;
     }
+    uint64_t ep_c0 = ep_on() ? ep_now() : 0;
+    p = r300_pipeline_build(dev, key, src, vsrc, cfmt, ncb, zfmt);
+    if (ep_c0) {
+        uint64_t d = ep_now() - ep_c0;
+        if (ep_rt) {
+            ep_excl += d;
+        }
+        g_ep_cur.comp += d;
+        g_ep_cur.n_comp++;
+        ep_tot(EP_T_COMP, d);
+    }
+    return p;
+}
+
+/* The rest of r300_pipeline_by_text on a miss: convert, compile, link. */
+static id<MTLRenderPipelineState> r300_pipeline_build(id<MTLDevice> dev, NSString *key,
+                                                       NSString *src, NSString *vsrc,
+                                                       const MTLPixelFormat *cfmt,
+                                                       uint32_t ncb, MTLPixelFormat zfmt)
+{
+    id<MTLRenderPipelineState> p;
+    NSError *err = nil;
     id<MTLFunction> vs = r300_function(dev, vsrc, R300_STAGE_VS);
     id<MTLFunction> fs = r300_function(dev, src, zfmt == MTLPixelFormatInvalid ?
                                        R300_STAGE_FS : R300_STAGE_FS_Z);
