@@ -6812,10 +6812,11 @@ static bool r300_extent_on(void)
 /* Plan outcomes (printed by PPCGPU_HAZDIAG's hz-sec as ext.*). */
 enum { EXT_OFF, EXT_NOBQL, EXT_VRAM, EXT_MSAA, EXT_NCB, EXT_PITCH, EXT_BEYOND, EXT_ATT_OVL,
        EXT_TEX_OVL, EXT_OK, EXT_ENC_FALLBACK, EXT_PIN_FLUSH, EXT_REG_OVL, EXT_SHRUNK,
-       EXT_REG_CLAMP, EXT_DEPTH_SHORT, EXT_TOUCH, EXT_N };
+       EXT_REG_CLAMP, EXT_DEPTH_SHORT, EXT_TOUCH, EXT_RETIRED, EXT_N };
 static const char *const ext_name[EXT_N] = { "off", "nobql", "staging_or_vram", "msaa", "ncb",
     "pitch0", "beyond_vram", "attach_overlap", "tex_overlap", "ok", "encode_fallback", "pin_flush",
-    "registry_overlap", "shrunk", "neighbour_clamped", "depth_short", "touch_below_rt" };
+    "registry_overlap", "shrunk", "neighbour_clamped", "depth_short", "touch_below_rt",
+    "retired" };
 static uint64_t g_ext_stat[EXT_N];
 #define EXT_COUNT(r) qatomic_inc(&g_ext_stat[r])
 
@@ -7309,6 +7310,32 @@ typedef struct R300ExtEntry {
 static R300ExtEntry g_r300_ext[R300_EXT_N];
 static uint64_t g_r300_ext_clock;
 
+/*
+ * PPCGPU_EXT_RETIRE=1 (prototype, default off; only with the extent on):
+ * a draw the planner refuses still runs, on today's path, and stores its
+ * attachments' rows [0, rt_height) -- the ranges r300_job_ranges then
+ * publishes for it.  A registered hint of another surface overlapping
+ * those ranges is retired (dropped) before the job is published, so later
+ * draws establish their extent afresh.  The registry is planning metadata,
+ * not proof of an allocation, its owner or its contents: retiring a hint
+ * claims nothing about which bytes the draw overwrites (scissor, masks and
+ * depth tests decide that).  Same owner as the rest of the registry (the
+ * producer, BQL held).  Queued jobs keep their own heights and ranges, the
+ * write tracker its entries; alias conflicts still order the real accesses.
+ * Without it a stale hint can block every later plan, since the staleness
+ * clock only advances on successful plans (Q3 after its display-mode
+ * switch: 166,697 refusals, 464 plans).
+ */
+static bool r300_ext_retire_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("PPCGPU_EXT_RETIRE");
+        on = e && e[0] == '1';
+    }
+    return on;
+}
+
 static MTLPixelFormat r300_rt_pf(uint32_t view);
 
 /*
@@ -7467,6 +7494,30 @@ static void r300_extent_plan(PPCMacGPUMetalState *st, RQJob *job)
                          (unsigned long long)(MIN(hi, ghi) - MAX(lo, glo)));
             }
         }
+        if (r300_ext_retire_on()) {
+            for (int j = 0; j < R300_EXT_N; j++) {
+                R300ExtEntry *g = &g_r300_ext[j];
+                bool mine = false, hit = false;
+                for (uint32_t m = 0; m < na; m++) {
+                    mine |= a[m].slot == j;
+                }
+                for (uint32_t i = 0; i < na && g->used && !mine && !hit; i++) {
+                    uint64_t lo = a[i].off, hi = lo + (uint64_t)a[i].pitch * p->rt_height;
+                    hit = lo < (uint64_t)g->off + (uint64_t)g->pitch * g->e && g->off < hi;
+                }
+                if (hit) {
+                    if (ext_debug()) {
+                        qemu_log("ext-retire slot=%d off=%x w=%u pitch=%u fmt=%u role=%u e=%u "
+                                 "age=%llu by off=%x w=%u pitch=%u rt_h=%u why=%s\n", j, g->off,
+                                 g->w, g->pitch, g->fmt, g->role, g->e,
+                                 (unsigned long long)(g_r300_ext_clock - g->used), a[0].off,
+                                 a[0].w, a[0].pitch, p->rt_height, ext_name[why]);
+                    }
+                    g->used = 0;
+                    EXT_COUNT(EXT_RETIRED);
+                }
+            }
+        }
         return;
     }
     /* other surfaces' registered extents that this draw's ranges reach */
@@ -7570,6 +7621,115 @@ static void r300_job_ranges(RQJob *job)
         }
         r->rd[r->nrd][0] = td->gpu_addr;
         r->rd[r->nrd++][1] = td->gpu_addr + td->size_bytes;
+    }
+}
+
+/*
+ * TEST ONLY (PPCGPU_EXT_SELFTEST=1 with the extent and PPCGPU_EXT_RETIRE on):
+ * once, from the first R300 draw (producer, BQL held), run the registry
+ * through synthetic single-target jobs, log "ext-selftest" PASS/FAIL lines,
+ * and put the real registry, clock and counters back.  Scenarios: an old
+ * large descriptor, then an overlapping draw of another signature (refused,
+ * retires it; the next such draw plans); returning to the old signature;
+ * a partial overlap, with an earlier job's heights and ranges unchanged.
+ */
+static void ext_st_job(PPCMacGPUMetalState *st, RQJob *j, uint32_t off, uint32_t w,
+                       uint32_t bpp, uint32_t h)
+{
+    memset(j, 0, sizeof(*j));
+    j->kind = RQ_R300;
+    j->vram_size = st->vram_size;
+    j->r300.num_cb = 1;
+    j->r300.aa_samples = 1;
+    j->r300.rt_gpu_addr = off;
+    j->r300.rt_pitch = w;
+    j->r300.rt_bpp = bpp;
+    j->r300.rt_width = w;
+    j->r300.rt_height = h;
+    r300_extent_plan(st, j);
+    r300_job_ranges(j);
+}
+
+static int ext_st_live(uint32_t off, uint32_t w)
+{
+    int n = 0;
+    for (int j = 0; j < R300_EXT_N; j++) {
+        n += g_r300_ext[j].used && g_r300_ext[j].off == off && g_r300_ext[j].w == w;
+    }
+    return n;
+}
+
+static void r300_ext_selftest(PPCMacGPUMetalState *st)
+{
+    static bool done;
+    const char *e = getenv("PPCGPU_EXT_SELFTEST");
+    if (done || !e || e[0] != '1' || !r300_extent_on() || !r300_ext_retire_on() ||
+        !bql_locked()) {
+        return;
+    }
+    done = true;
+    R300ExtEntry save[R300_EXT_N];
+    uint64_t save_clock = g_r300_ext_clock, save_stat[EXT_N];
+    memcpy(save, g_r300_ext, sizeof(save));
+    for (int i = 0; i < EXT_N; i++) {
+        save_stat[i] = qatomic_read(&g_ext_stat[i]);
+    }
+    memset(g_r300_ext, 0, sizeof(g_r300_ext));
+
+    const uint32_t B = 0x100000;                  /* inside any VRAM size */
+    RQJob *j = g_new0(RQJob, 1), *old = g_new0(RQJob, 1), snap;
+    int fails = 0;
+#define EXT_CHECK(c, what) do { bool ok_ = (c); fails += !ok_; \
+        qemu_log("ext-selftest %s %s\n", ok_ ? "PASS" : "FAIL", what); } while (0)
+
+    /* 1: old large descriptor; another signature over it */
+    ext_st_job(st, j, B, 1024, 4, 768);
+    EXT_CHECK(j->ext.on && j->ext.h[0] == 768 && ext_st_live(B, 1024) == 1,
+              "1a large 1024x768x4 plans and registers");
+    uint64_t ro = qatomic_read(&g_ext_stat[EXT_REG_OVL]);
+    ext_st_job(st, j, B, 640, 2, 480);
+    EXT_CHECK(!j->ext.on && qatomic_read(&g_ext_stat[EXT_REG_OVL]) == ro + 1,
+              "1b 640x480x2 at the same offset is refused (registry_overlap)");
+    EXT_CHECK(j->ranges.nwr == 1 && j->ranges.wr[0][0] == B &&
+              j->ranges.wr[0][1] == B + 640u * 2 * 480,
+              "1c the refused draw publishes its full rt_height range");
+    EXT_CHECK(ext_st_live(B, 1024) == 0, "1d the old descriptor is retired");
+    ext_st_job(st, j, B, 640, 2, 480);
+    EXT_CHECK(j->ext.on && j->ext.h[0] == 480 && ext_st_live(B, 640) == 1,
+              "1e the next 640x480x2 draw plans");
+
+    /* 2: back to the old signature */
+    ext_st_job(st, j, B, 1024, 4, 768);
+    EXT_CHECK(!j->ext.on && ext_st_live(B, 640) == 0,
+              "2a 1024x768x4 again: refused once, retires the 640 hint");
+    ext_st_job(st, j, B, 1024, 4, 768);
+    EXT_CHECK(j->ext.on && j->ext.h[0] == 768, "2b and then plans");
+
+    /* 3: partial overlap; an earlier job keeps its heights and ranges */
+    ext_st_job(st, old, B, 1024, 4, 768);
+    EXT_CHECK(old->ext.on, "3a earlier 1024x768x4 job planned");
+    snap = *old;
+    ext_st_job(st, j, B + 0x96000, 640, 2, 480);
+    EXT_CHECK(!j->ext.on && ext_st_live(B, 1024) == 0,
+              "3b 640x480x2 inside its range: refused, retires the 1024 hint");
+    EXT_CHECK(!memcmp(&snap.ext, &old->ext, sizeof(snap.ext)) &&
+              !memcmp(&snap.ranges, &old->ranges, sizeof(snap.ranges)),
+              "3c the earlier job's heights and ranges are unchanged");
+    ext_st_job(st, j, B + 0x96000, 640, 2, 480);
+    EXT_CHECK(j->ext.on, "3d the next draw there plans");
+
+    /* 4: disjoint surfaces are left alone */
+    ext_st_job(st, j, B + 0x400000, 256, 4, 256);
+    EXT_CHECK(j->ext.on && ext_st_live(B + 0x96000, 640) == 1,
+              "4 a disjoint surface plans and retires nothing");
+#undef EXT_CHECK
+    qemu_log("ext-selftest %s (%d failed)\n", fails ? "FAILED" : "ALL PASS", fails);
+    g_free(j);
+    g_free(old);
+    memcpy(g_r300_ext, save, sizeof(save));
+    g_r300_ext_clock = save_clock;
+    for (int i = 0; i < EXT_N; i++) {
+        qatomic_set(&g_ext_stat[i], save_stat[i]);
     }
 }
 
@@ -10994,6 +11154,7 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     if (r) {
         return r < 0 ? r : 0;       /* rejected, or nothing to draw */
     }
+    r300_ext_selftest(st);           /* TEST ONLY, PPCGPU_EXT_SELFTEST */
     /* The job takes the packet's heap buffers over (see r300_job_new);
      * the device's r300_draw_free frees what is left. */
     rq_push(r300_job_new(st, (R300DrawPacket *)(uintptr_t)pkt, vram_size));
