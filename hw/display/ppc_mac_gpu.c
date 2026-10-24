@@ -694,7 +694,16 @@ static bool ppc_mac_gpu_cp_on_thread(void);
  */
 static void r300_zmask_apply(PPCMacGPUState *s);
 
-static void r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
+static void r200_vram_access_1(PPCMacGPUState *s, uint64_t lo, uint64_t hi, bool write_access, uint32_t tag);
+/* waitprof debug: label BQL holds spent in here */
+static void r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi, bool write_access, uint32_t tag)
+{
+    int wp = WAITPROF_ACT(WAITPROF_ACT_VRAMACC);
+    r200_vram_access_1(s, lo, hi, write_access, tag);
+    WAITPROF_ACT_END(wp);
+}
+
+static void r200_vram_access_1(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
                              bool write_access, uint32_t tag)
 {
     if (s->r3_zclear_pending && lo < s->r3_zclear_off + s->r3_zclear_len &&
@@ -1936,7 +1945,16 @@ static uint8_t r200_dac_port_read(PPCMacGPUState *s, uint8_t idx, unsigned sub)
     return r200_dac_8bit(s) ? val : val >> 2;
 }
 
+static void ppc_mac_gpu_display_update_1(void *opaque);
+/* waitprof debug: label BQL holds spent in here */
 static void ppc_mac_gpu_display_update(void *opaque)
+{
+    int wp = WAITPROF_ACT(WAITPROF_ACT_DISPLAY);
+    ppc_mac_gpu_display_update_1(opaque);
+    WAITPROF_ACT_END(wp);
+}
+
+static void ppc_mac_gpu_display_update_1(void *opaque)
 {
     PPCMacGPUState *s = opaque;
 
@@ -2779,7 +2797,16 @@ static bool r200_scratch_read_wait(PPCMacGPUState *s, int idx)
  * GPU finishes it, as the hardware does, instead of stalling for it now.
  */
 static void r200_agp_tc_flush(void);
+static void r200_scratch_write_1(PPCMacGPUState *s, int idx, uint32_t val);
+/* waitprof debug: label BQL holds spent in here */
 static void r200_scratch_write(PPCMacGPUState *s, int idx, uint32_t val)
+{
+    int wp = WAITPROF_ACT(WAITPROF_ACT_FENCE);
+    r200_scratch_write_1(s, idx, val);
+    WAITPROF_ACT_END(wp);
+}
+
+static void r200_scratch_write_1(PPCMacGPUState *s, int idx, uint32_t val)
 {
     uint32_t seq = 0;
 
@@ -3976,8 +4003,10 @@ static int r300_draw_staged(PPCMacGPUState *s, uint8_t *vram, R300DrawPacket *pk
 
     pkt->rt_gpu_addr = off;
     pkt->rt_pitch = srow / pkt->rt_bpp;     /* rt_width stays the buffer's */
+    int wp_s = WAITPROF_ACT(WAITPROF_ACT_SUBMIT);
     rr = s->renderer->draw_r300(s->renderer_opaque, vram,
                                 s->vram_size + s->stage_size, pkt);
+    WAITPROF_ACT_END(wp_s);
     pkt->rt_gpu_addr = dst;
     pkt->rt_pitch = pitch;
     if (rr < 0) {
@@ -4137,11 +4166,13 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             s->r3->glsl_flags &= ~R300_GLSL_GPU_VS;
         }
     }
+    int wp_b = WAITPROF_ACT(WAITPROF_ACT_BUILD);
     bool build_ok = idx ?
         r300_draw_build_indexed(s->r3, &s->r3_arrays, d[0], idx, r300_read_raw,
                                 s, &pkt, &err) :
         r300_draw_build(s->r3, &s->r3_arrays, opcode, d, body_dw,
                         r300_read_raw, s, &pkt, &err);
+    WAITPROF_ACT_END(wp_b);
     if (s->r3_dump && g_r300_arm_rt &&
         (r300_reg(s->r3, 0x4E28) & ~0x1Fu) == g_r300_arm_rt) {
         fprintf(s->r3_dump, "TRY op %02x vf %08x ok %d err %s tex0 en %u off %06x "
@@ -4432,9 +4463,11 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
          * into it, copy it out -- all while this packet is processed, so
          * before any later fence the guest waits on. */
         bool sys_ok = !sys.len || r300_xfer_begin(s, &sys, vram);
+        int wp_s = WAITPROF_ACT(WAITPROF_ACT_SUBMIT);
         int rr = sys_ok ? s->renderer->draw_r300(s->renderer_opaque, vram,
                                                  s->vram_size + (sys.len ? s->stage_size : 0),
                                                  &pkt) : 0;
+        WAITPROF_ACT_END(wp_s);
         if (rr == PPC_MAC_GPU_DRAW_REMAP) {
             /* (a system-memory buffer is in the staging already, rows as
              * the guest's: not moved again) */
@@ -5739,7 +5772,16 @@ static inline uint32_t mc_vram_read32(PPCMacGPUState *s, uint8_t *vram,
     return 0;
 }
 
+static void ppc_mac_gpu_2d_blit_1(PPCMacGPUState *s);
+/* waitprof debug: label BQL holds spent in here */
 static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
+{
+    int wp = WAITPROF_ACT(WAITPROF_ACT_2D);
+    ppc_mac_gpu_2d_blit_1(s);
+    WAITPROF_ACT_END(wp);
+}
+
+static void ppc_mac_gpu_2d_blit_1(PPCMacGPUState *s)
 {
     /*
      * DP_GUI_MASTER_CNTL bits 0/1 select, per side, between the explicit
@@ -6337,7 +6379,16 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
  * offscreen surfaces.  The source offset may be an AGP/GART GPU address
  * (0x10000000+ range) pointing to system RAM.
  */
+static void ppc_mac_gpu_2d_blit_sep_1(PPCMacGPUState *s);
+/* waitprof debug: label BQL holds spent in here */
 static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
+{
+    int wp = WAITPROF_ACT(WAITPROF_ACT_2D);
+    ppc_mac_gpu_2d_blit_sep_1(s);
+    WAITPROF_ACT_END(wp);
+}
+
+static void ppc_mac_gpu_2d_blit_sep_1(PPCMacGPUState *s)
 {
     uint32_t src_offset = s->regs.src_offset;
     uint32_t src_pitch  = s->regs.src_pitch;  /* R200 separate PITCH regs are in bytes */

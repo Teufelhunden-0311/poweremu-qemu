@@ -8,6 +8,27 @@
 
 extern bool waitprof_on;
 
+/*
+ * Work labels for BQL holds: the holder's waiters are split by these.
+ * waitprof_act returns the previous label so callers can nest:
+ *   int wp = WAITPROF_ACT(WAITPROF_ACT_FENCE); ...; WAITPROF_ACT_END(wp);
+ */
+enum {
+    WAITPROF_ACT_NONE,      /* unlabelled: PM4 dispatch etc. on the CP thread */
+    WAITPROF_ACT_BUILD,     /* r300_draw_build: vertex fetch, shader memo */
+    WAITPROF_ACT_SUBMIT,    /* renderer->draw_r300: enqueue to the renderer */
+    WAITPROF_ACT_FENCE,     /* r200_scratch_write: fence submit + hybrid spin */
+    WAITPROF_ACT_VRAMACC,   /* r200_vram_access: CPU access ordering */
+    WAITPROF_ACT_2D,        /* 2D blits */
+    WAITPROF_ACT_DISPLAY,   /* display refresh (gfx_update) */
+    WAITPROF_NACT
+};
+static const char *const waitprof_act_name[WAITPROF_NACT] __attribute__((unused)) = {
+    "none", "build", "submit", "fence", "vramacc", "2d", "display" };
+int waitprof_act(int act);
+#define WAITPROF_ACT(a) (waitprof_on ? waitprof_act(a) : 0)
+#define WAITPROF_ACT_END(prev) do { if (waitprof_on) { waitprof_act(prev); } } while (0)
+
 /* Interrupt sources: 0..254 = OpenPIC source number, 255 = the GPU device. */
 #define WAITPROF_SRC_GPU 255
 void waitprof_irq(int src, int level);
