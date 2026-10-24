@@ -129,7 +129,7 @@ enum {
                                                storage images, read and written
                                                in an ordered pixel interlock
                                                (no colour outputs) */
-/* Experimental byte-order model ($R300_ENDIAN_MODEL=1, see r300_endian_model
+/* The byte-order model (on unless $R300_ENDIAN_MODEL=0, see r300_endian_model
  * in r300_draw.c); set by the device, not by a renderer. */
 #define R300_GLSL_ENDIAN_MODEL  (1u << 3)
 #define R300_GLSL_CB_VRAM(k)    (1u << (4 + (k)))   /* colour buffer k is in VRAM */
