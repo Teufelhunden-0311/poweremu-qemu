@@ -717,16 +717,26 @@ typedef struct {
 #define WP_NSITES 256
 static WPSite wp_site[WP_NSITES];
 static int wp_nsites;
-typedef struct { uint16_t w, o; uint64_t ns, n; } WPPair;
-#define WP_NPAIRS 512
+typedef struct { uint16_t w, o; uint8_t a; uint64_t ns, n; } WPPair;
+#define WP_NPAIRS 1024
 static WPPair wp_pair[WP_NPAIRS];
 static int wp_npairs;
-typedef struct { uint16_t site; int64_t t0, t1; } WPHold;
-#define WP_RING 8192
+typedef struct { uint16_t site; uint8_t act; int64_t t0, t1; } WPHold;
+#define WP_RING 16384
 static WPHold wp_ring[WP_RING];
 static uint64_t wp_ring_head;
 static __thread int wp_cur = -1;
 static __thread int64_t wp_hold_t0, wp_last_rel;
+/*
+ * Work labels (waitprof_act): a hold is recorded as segments, split where
+ * its thread changes label, so a waiter's time is split by what the owner
+ * was doing, not only by where it took the lock.  wp_occ = hold time per
+ * (site, label).
+ */
+static __thread int wp_act_cur;
+static __thread int64_t wp_seg_t0;
+static __thread bool wp_held;
+static uint64_t wp_occ[256][WAITPROF_NACT];
 /* Accounting checks: waits >= 1 us (total, attributed to holds, free), lost records. */
 static uint64_t wp_w1, wp_w1_owned, wp_w1_free, wp_ring_trunc, wp_pair_drop, wp_site_drop;
 static __thread char wp_tname[16];
@@ -759,17 +769,17 @@ static int wp_site_find(const char *file, int line)
     return wp_nsites++;
 }
 
-static void wp_pair_add(int w, int o, int64_t ns)
+static void wp_pair_add(int w, int o, int a, int64_t ns)
 {
     for (int i = 0; i < wp_npairs; i++) {
-        if (wp_pair[i].w == w && wp_pair[i].o == o) {
+        if (wp_pair[i].w == w && wp_pair[i].o == o && wp_pair[i].a == a) {
             wp_pair[i].ns += ns;
             wp_pair[i].n++;
             return;
         }
     }
     if (wp_npairs < WP_NPAIRS) {
-        wp_pair[wp_npairs++] = (WPPair){ w, o, ns, 1 };
+        wp_pair[wp_npairs++] = (WPPair){ w, o, a, ns, 1 };
     } else {
         wp_pair_drop++;
     }
@@ -782,6 +792,8 @@ static void wp_acquired(const char *file, int line, int64_t t_req)
 
     wp_cur = w;
     wp_hold_t0 = now;
+    wp_seg_t0 = now;
+    wp_held = true;
     if (w < 0) {
         return;
     }
@@ -807,7 +819,7 @@ static void wp_acquired(const char *file, int line, int64_t t_req)
         }
         int64_t ov = MIN(h->t1, now) - MAX(h->t0, t_req);
         if (ov > 0) {
-            wp_pair_add(w, h->site, ov);
+            wp_pair_add(w, h->site, h->act, ov);
             owned += ov;
         }
     }
@@ -817,9 +829,31 @@ static void wp_acquired(const char *file, int line, int64_t t_req)
     wp_w1 += wait;
     wp_w1_owned += owned;
     if (wait > owned) {
-        wp_pair_add(w, WP_FREE, wait - owned);
+        wp_pair_add(w, WP_FREE, 0, wait - owned);
         wp_w1_free += wait - owned;
     }
+}
+
+/* Held: close this thread's current segment at now. */
+static void wp_seg_close(int64_t now)
+{
+    if (wp_cur >= 0 && now > wp_seg_t0) {
+        wp_ring[wp_ring_head++ % WP_RING] =
+            (WPHold){ wp_cur, wp_act_cur, wp_seg_t0, now };
+        wp_occ[wp_cur][wp_act_cur] += now - wp_seg_t0;
+    }
+    wp_seg_t0 = now;
+}
+
+int waitprof_act(int act)
+{
+    int prev = wp_act_cur;
+
+    if (act != prev && wp_held && bql_locked()) {
+        wp_seg_close(get_clock());
+    }
+    wp_act_cur = act;
+    return prev;
 }
 
 /* About to release (still held): record the hold. */
@@ -829,8 +863,9 @@ static bool wp_release(void)
     if (wp_cur >= 0) {
         wp_site[wp_cur].hold += now - wp_hold_t0;
         wp_site[wp_cur].hhist[wp_bucket(now - wp_hold_t0)]++;
-        wp_ring[wp_ring_head++ % WP_RING] = (WPHold){ wp_cur, wp_hold_t0, now };
     }
+    wp_seg_close(now);
+    wp_held = false;
     wp_last_rel = now;
     return wp_last_dump && now - wp_last_dump >= 10 * NANOSECONDS_PER_SECOND;
 }
@@ -841,6 +876,7 @@ static struct {
     int nsites;
     WPPair pair[WP_NPAIRS];
     int npairs;
+    uint64_t occ[256][WAITPROF_NACT];
     WPIdle idle[WP_NIDLE];
     int nidle;
     uint64_t execlat, execlat_n, kicks;
@@ -857,6 +893,8 @@ static void wp_snapshot(void)
     wp_snap.nsites = wp_nsites;
     memcpy(wp_snap.pair, wp_pair, sizeof(wp_pair));
     wp_snap.npairs = wp_npairs;
+    memcpy(wp_snap.occ, wp_occ, sizeof(wp_occ));
+    memset(wp_occ, 0, sizeof(wp_occ));
     memcpy(wp_snap.idle, wp_idle, sizeof(wp_idle));
     wp_snap.nidle = wp_nidle;
     wp_snap.execlat = wp_execlat;
@@ -934,10 +972,21 @@ static void wp_print(void)
         if (p->ns < wp_snap.dt / 2000) {
             continue;
         }
-        fprintf(stderr, "wp-pair %-44s <- %-44s ms=%.2f pct=%.2f n=%" PRIu64 "\n",
+        fprintf(stderr, "wp-pair %-44s <- %-44s act=%s ms=%.2f pct=%.2f n=%" PRIu64 "\n",
                 wp_sname(&wp_snap.site[p->w], a, sizeof(a)),
                 p->o == WP_FREE ? "(free)" : wp_sname(&wp_snap.site[p->o], b, sizeof(b)),
+                p->o == WP_FREE ? "-" : waitprof_act_name[p->a],
                 p->ns / 1e6, 100.0 * p->ns / wp_snap.dt, p->n);
+    }
+    for (int i = 0; i < wp_snap.nsites; i++) {
+        for (int k = 0; k < WAITPROF_NACT; k++) {
+            if (wp_snap.occ[i][k] < wp_snap.dt / 2000) {
+                continue;
+            }
+            fprintf(stderr, "wp-occ %-44s act=%s ms=%.2f pct=%.2f\n",
+                    wp_sname(&wp_snap.site[i], a, sizeof(a)), waitprof_act_name[k],
+                    wp_snap.occ[i][k] / 1e6, 100.0 * wp_snap.occ[i][k] / wp_snap.dt);
+        }
     }
 }
 
@@ -985,7 +1034,8 @@ void qemu_cond_wait_bql(QemuCond *cond)
     }
     qemu_cond_wait(cond, &bql);
     if (waitprof_on) {
-        wp_hold_t0 = get_clock();     /* same site holds again */
+        wp_hold_t0 = wp_seg_t0 = get_clock();     /* same site holds again */
+        wp_held = true;
     }
 }
 
@@ -996,7 +1046,8 @@ void qemu_cond_timedwait_bql(QemuCond *cond, int ms)
     }
     qemu_cond_timedwait(cond, &bql, ms);
     if (waitprof_on) {
-        wp_hold_t0 = get_clock();
+        wp_hold_t0 = wp_seg_t0 = get_clock();
+        wp_held = true;
     }
 }
 
