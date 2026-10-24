@@ -660,6 +660,7 @@ struct PPCMacGPUState {
 
     /* Memory regions */
     MemoryRegion vram;          /* BAR0: VRAM aperture */
+    uint8_t *vram_host;         /* vram's backing memory, set once it exists */
     MemoryRegion vram_bar;      /* r300: BAR0 = aperture 0 (vram) + aperture 1 */
     MemoryRegion vram_ap1;      /* r300: aperture 1, byte-swapping view of vram */
     uint32_t r300_surf[32];     /* r300: SURFACE0..7 regs (0x0B00 + 4*i) */
