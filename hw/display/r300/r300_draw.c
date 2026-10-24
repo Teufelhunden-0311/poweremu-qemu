@@ -729,18 +729,49 @@ void r300_border_color(uint32_t fmt, uint32_t v, float c[4])
  * byte-swapping apertures all call r300_rt_forget (vram_mark in
  * ppc_mac_gpu.c).  CPU writes through the plain linear aperture do not
  * trap, so a surface the CPU rewrites that way stays recorded -- the
- * proper fix is modelling the apertures' byte swap.  R300_RT_LE=0 turns
- * this off.
+ * proper fix is modelling the apertures' byte swap, which the byte-order
+ * model below does.  The model is on by default and this record is then
+ * off; with the model off ($R300_ENDIAN_MODEL=0) the record is on, and
+ * R300_RT_LE=0 turns it off as well.
+ *
+ * The record is sorted by address and its ranges never overlap (a note
+ * forgets what it overlaps first), so lookups are binary searches.  An
+ * entry is decoding state, not a cache: dropping one misreads that
+ * surface (it used to keep the 16 most recent, and a texture rendered
+ * before more than 16 others and sampled after them read black as red --
+ * scissorprobe D, 34 framebuffer objects in between).  So only a writer
+ * removes entries, and the array grows instead; if it cannot, abort, as
+ * QEMU does for any failed allocation.  Entries are disjoint and at least
+ * 4 bytes long, so there are at most 2^30 of them.  Every caller holds
+ * the BQL (the draw build and the 2D and upload paths on the CP thread,
+ * vram_mark from MMIO too), which is what makes the realloc safe.  Tests:
+ * tests/r300/test_rtle.c.
  */
-#define RT_LE_SLOTS 16
-static struct { uint32_t lo, hi; } rt_le[RT_LE_SLOTS];
-static unsigned rt_le_n;
+static struct { uint32_t lo, hi; } *rt_le;
+static unsigned rt_le_n, rt_le_cap;
+
+/* The first entry that ends after addr (rt_le_n if none) */
+static unsigned rt_le_find(uint64_t addr)
+{
+    unsigned a = 0, b = rt_le_n;
+    while (a < b) {
+        unsigned m = (a + b) / 2;
+        if (rt_le[m].hi <= addr) {
+            a = m + 1;
+        } else {
+            b = m;
+        }
+    }
+    return a;
+}
 
 /*
- * The experimental byte-order model, $R300_ENDIAN_MODEL=1 (off by default;
- * the record above is then off too).  Written down before any default is
- * chosen, as the rules each path follows rather than a record of what was
- * drawn where.
+ * The byte-order model, on by default; $R300_ENDIAN_MODEL=0 turns it off
+ * (and the record above back on).  Written down as the rules each path
+ * follows rather than a record of what was drawn where.  Tested against
+ * the PowerBook on texprobe, scissorprobe and rbprobe, and with no
+ * regression found in the games and desktop sessions examined; not proven
+ * against every path (see "Not covered" and the open question below).
  *
  * Backing: VRAM here holds what the big-endian CPU sees, each element (a
  * texel or pixel of 1, 2 or 4 bytes) a big-endian value at its own address
@@ -798,7 +829,7 @@ bool r300_endian_model(void)
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("R300_ENDIAN_MODEL");
-        on = e && e[0] == '1';
+        on = !(e && e[0] == '0');
     }
     return on;
 }
@@ -815,12 +846,13 @@ static bool rt_le_on(void)
 
 void r300_rt_forget(uint64_t lo, uint64_t hi)
 {
-    for (unsigned i = 0; i < rt_le_n;) {
-        if (rt_le[i].lo < hi && lo < rt_le[i].hi) {
-            rt_le[i] = rt_le[--rt_le_n];
-        } else {
-            i++;
-        }
+    unsigned i = rt_le_find(lo), j = i;
+    while (j < rt_le_n && rt_le[j].lo < hi) {
+        j++;
+    }
+    if (j > i) {
+        memmove(&rt_le[i], &rt_le[j], (rt_le_n - j) * sizeof(rt_le[0]));
+        rt_le_n -= j - i;
     }
 }
 
@@ -829,34 +861,35 @@ static void rt_note(uint32_t lo, uint32_t hi, bool le)
     if (!rt_le_on() || hi <= lo) {
         return;
     }
-    for (unsigned i = 0; i < rt_le_n; i++) {
-        if (rt_le[i].lo == lo && rt_le[i].hi == hi) {
-            if (!le) {
-                rt_le[i] = rt_le[--rt_le_n];
-            }
-            return;
+    unsigned i = rt_le_find(lo);
+    if (i < rt_le_n && rt_le[i].lo == lo && rt_le[i].hi == hi) {
+        if (le) {
+            return;                     /* already recorded */
         }
     }
     r300_rt_forget(lo, hi);
     if (le) {
-        if (rt_le_n == RT_LE_SLOTS) {
-            memmove(&rt_le[0], &rt_le[1], (RT_LE_SLOTS - 1) * sizeof(rt_le[0]));
-            rt_le_n--;
+        if (rt_le_n == rt_le_cap) {
+            unsigned cap = rt_le_cap ? rt_le_cap * 2 : 64;
+            void *p = realloc(rt_le, (size_t)cap * sizeof(rt_le[0]));
+            if (!p) {
+                abort();
+            }
+            rt_le = p;
+            rt_le_cap = cap;
         }
-        rt_le[rt_le_n].lo = lo;
-        rt_le[rt_le_n].hi = hi;
+        i = rt_le_find(lo);             /* nothing left overlaps [lo, hi) */
+        memmove(&rt_le[i + 1], &rt_le[i], (rt_le_n - i) * sizeof(rt_le[0]));
+        rt_le[i].lo = lo;
+        rt_le[i].hi = hi;
         rt_le_n++;
     }
 }
 
 static bool rt_le_holds(uint32_t addr)
 {
-    for (unsigned i = 0; i < rt_le_n; i++) {
-        if (addr >= rt_le[i].lo && addr < rt_le[i].hi) {
-            return true;
-        }
-    }
-    return false;
+    unsigned i = rt_le_find(addr);
+    return i < rt_le_n && rt_le[i].lo <= addr;
 }
 
 static void set_textures(const R300State *st, R300DrawPacket *pkt)
