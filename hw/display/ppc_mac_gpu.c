@@ -2951,8 +2951,11 @@ static bool r300_read_raw(void *opaque, uint32_t gpu_addr, void *dst,
     uint8_t *out = dst;
 
     if (r300_in_fb(s, gpu_addr, len)) {
-        memcpy(dst, (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
-                    (gpu_addr - fb_base), len);
+        /* Vertex fetch comes here for every element: with r300_vfetch the
+         * pointer from realize, not memory_region_get_ram_ptr each time. */
+        uint8_t *vram = r300_vfetch && s->vram_host ? s->vram_host :
+                        memory_region_get_ram_ptr(&s->vram);
+        memcpy(dst, vram + (gpu_addr - fb_base), len);
         return true;
     }
     if (!len || (uint64_t)gpu_addr + len > 0x100000000ull) {
@@ -14238,6 +14241,12 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         /* Fallback: normal QEMU-managed RAM */
         memory_region_init_ram(&s->vram, obj, "ppc-mac-gpu-vram",
                                s->vram_size, &error_fatal);
+    }
+    /* Either way the backing stays for the device's lifetime (no resize). */
+    s->vram_host = memory_region_get_ram_ptr(&s->vram);
+    {
+        const char *e = getenv("PPCGPU_VFETCH");
+        r300_vfetch = e && e[0] == '1';
     }
     if (s->r300) {
         /* Two apertures onto VRAM, as on a real Radeon (see r300_ap1_ops). */

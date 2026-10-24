@@ -14,7 +14,7 @@ SPV="$R/r300_spirv.c -DR300_HAVE_SPIRV_CROSS $(pkg-config --cflags --libs shader
 SPV="$SPV -lspirv-cross-msl -lspirv-cross-hlsl -lspirv-cross-cpp -lspirv-cross-reflect"
 SPV="$SPV -lspirv-cross-glsl -lspirv-cross-util -lspirv-cross-core -lc++"
 
-for t in test_pvs test_us test_draw test_features; do
+for t in test_pvs test_us test_draw test_features test_vfetch; do
     cc -O1 -Wall -Wno-unused-function -o "$B/$t" $t.c $SRC -lm
 done
 # test_rtle includes r300_draw.c itself, for its static functions.
@@ -31,6 +31,7 @@ for t in test_zs test_fmt test_raster test_gpuvs; do
 done
 "$B/test_pvs"
 "$B/test_draw"
+"$B/test_vfetch"
 "$B/test_aperture"
 "$B/test_rtle"
 # Both shader outputs: 0 (Metal: uint texture views), 1 (Vulkan: VRAM SSBO).
