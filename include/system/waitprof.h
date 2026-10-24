@@ -6,6 +6,8 @@
 #ifndef SYSTEM_WAITPROF_H
 #define SYSTEM_WAITPROF_H
 
+#include "qemu/thread.h"
+
 extern bool waitprof_on;
 
 /*
@@ -21,10 +23,17 @@ enum {
     WAITPROF_ACT_VRAMACC,   /* r200_vram_access: CPU access ordering */
     WAITPROF_ACT_2D,        /* 2D blits */
     WAITPROF_ACT_DISPLAY,   /* display refresh (gfx_update) */
+    /* Inside r300_draw_build (r300_phase_hook); "build" is then the rest:
+     * packet/state setup, vertex order, constants, layout/routing. */
+    WAITPROF_ACT_B_FETCH,   /* GPU-VS path: per-distinct-vertex fetch/decode loop */
+    WAITPROF_ACT_B_VSPACK,  /* GPU-VS path: the rest (VS memo, index list, uniforms) */
+    WAITPROF_ACT_B_FSMEMO,  /* fragment shader memo (r300_us_glsl_cached) */
+    WAITPROF_ACT_B_CPU,     /* CPU-VS path: transform loop incl. its fetches */
     WAITPROF_NACT
 };
 static const char *const waitprof_act_name[WAITPROF_NACT] __attribute__((unused)) = {
-    "none", "build", "submit", "fence", "vramacc", "2d", "display" };
+    "none", "build", "submit", "fence", "vramacc", "2d", "display",
+    "b_fetch", "b_vspack", "b_fsmemo", "b_cpu" };
 int waitprof_act(int act);
 #define WAITPROF_ACT(a) (waitprof_on ? waitprof_act(a) : 0)
 #define WAITPROF_ACT_END(prev) do { if (waitprof_on) { waitprof_act(prev); } } while (0)
@@ -33,6 +42,8 @@ int waitprof_act(int act);
 #define WAITPROF_SRC_GPU 255
 void waitprof_irq(int src, int level);
 void waitprof_kick(void);
+/* do_run_on_cpu's wait: accounted as a BQL condition wait if mutex is the BQL. */
+void waitprof_cond_wait_mutex(QemuCond *cond, QemuMutex *mutex);
 
 /* RR vCPU thread, BQL held. */
 void waitprof_idle_enter(void);

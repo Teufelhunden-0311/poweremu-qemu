@@ -691,6 +691,19 @@ static bool cp_cancelled(void);
  */
 static void r300_zmask_apply(PPCMacGPUState *s);
 
+/* waitprof debug: draw-builder phases as BQL hold labels (protected builds
+ * only: a parked build runs without the BQL and is not a hold). */
+static void wp_r300_phase(int phase)
+{
+    static const int act[] = {
+        [R300_PH_STATE] = WAITPROF_ACT_BUILD, [R300_PH_FETCH] = WAITPROF_ACT_B_FETCH,
+        [R300_PH_VSPACK] = WAITPROF_ACT_B_VSPACK, [R300_PH_FSMEMO] = WAITPROF_ACT_B_FSMEMO,
+        [R300_PH_CPU] = WAITPROF_ACT_B_CPU };
+    if (bql_locked()) {
+        waitprof_act(act[phase]);
+    }
+}
+
 static bool r200_vram_access_1(PPCMacGPUState *s, uint64_t lo, uint64_t hi, bool write_access, uint32_t tag);
 /* waitprof debug: label BQL holds spent in here */
 static bool r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi, bool write_access, uint32_t tag)
@@ -4280,6 +4293,9 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         if (cpu_vs) {
             s->r3->glsl_flags &= ~R300_GLSL_GPU_VS;
         }
+    }
+    if (waitprof_on && !r300_phase_hook) {
+        r300_phase_hook = wp_r300_phase;
     }
     bool build_ok;
     int parked = r300_build_parked(s, opcode, d, body_dw, idx, &pkt, &err,

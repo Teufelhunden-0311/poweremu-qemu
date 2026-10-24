@@ -359,6 +359,15 @@ static bool fetch_vertex_planned(Fetch *f, uint32_t vtx,
     return true;
 }
 
+void (*r300_phase_hook)(int phase);
+
+static inline void r300_phase(int phase)
+{
+    if (r300_phase_hook) {
+        r300_phase_hook(phase);
+    }
+}
+
 /* Fill the input vertex memory for one vertex through the PSC. */
 static bool fetch_vertex(Fetch *f, uint32_t vtx, float in[R300_PVS_NUM_INPUTS][4])
 {
@@ -1787,6 +1796,7 @@ static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *pr
 {
     uint32_t colctl = r300_reg(st, GA_COLOR_CONTROL);
 
+    r300_phase(R300_PH_VSPACK);
     *failed = false;
     if ((r300_reg(st, GA_POLY_MODE) & 3) == 1 ||
         (r300_reg(st, VAP_OUTPUT_VTX_FMT_0) & (3u << 3))) {
@@ -1828,6 +1838,7 @@ static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *pr
     float (*in)[4] = malloc((size_t)n * stride * sizeof(*in));
     uint32_t nu = 0;
     memset(hval, 0xFF, hn * sizeof(*hval));
+    r300_phase(R300_PH_FETCH);
     for (uint32_t i = 0; i < n; i++) {
         uint32_t h = (order[i] * 2654435761u) & (hn - 1);
         while (hval[h] != UINT32_MAX && hkey[h] != order[i]) {
@@ -1852,6 +1863,7 @@ static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *pr
         }
         pos[i] = hval[h];
     }
+    r300_phase(R300_PH_VSPACK);
     for (uint32_t k = 0; k < nidx; k++) {
         list[k] = pos[list[k]];
     }
@@ -2030,6 +2042,7 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
                          &failed, err)) {
             pkt->warn |= f.warn;
             free(order);
+            r300_phase(R300_PH_FSMEMO);
             pkt->glsl = r300_us_glsl_cached(st, &desc,
                                             r300_glsl_flags_for_draw(st, st->glsl_flags),
                                             &pkt->glsl_id, err);
@@ -2053,6 +2066,7 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         return false;
     }
 
+    r300_phase(R300_PH_CPU);
     /* Transform every vertex in draw order (cheap next to the GPU work). */
     R300Vertex *xv = calloc(nsrc ? nsrc : 1, sizeof(R300Vertex));
     float (*outs)[R300_PVS_NUM_OUTPUTS][4] = calloc(nsrc ? nsrc : 1, sizeof(*outs));
@@ -2255,6 +2269,7 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     free(xv);
     free(order);
 
+    r300_phase(R300_PH_FSMEMO);
     pkt->glsl = r300_us_glsl_cached(st, &desc, r300_glsl_flags_for_draw(st, st->glsl_flags),
                                     &pkt->glsl_id, err);
     if (!pkt->glsl) {
