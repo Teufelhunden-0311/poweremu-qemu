@@ -17,6 +17,11 @@ SPV="$SPV -lspirv-cross-glsl -lspirv-cross-util -lspirv-cross-core -lc++"
 for t in test_pvs test_us test_draw test_features test_vfetch; do
     cc -O1 -Wall -Wno-unused-function -o "$B/$t" $t.c $SRC -lm
 done
+# Shared shader texts: under AddressSanitizer and ThreadSanitizer.
+for san in address thread; do
+    cc -O1 -g -fsanitize=$san -Wall -Wno-unused-function -o "$B/test_glslshare_$san" \
+        test_glslshare.c $SRC -lm
+done
 # test_rtle includes r300_draw.c itself, for its static functions.
 cc -O1 -Wall -Wno-unused-function -o "$B/test_rtle" test_rtle.c \
     $R/r300_state.c $R/r300_pvs.c $R/r300_us.c -lm
@@ -32,6 +37,8 @@ done
 "$B/test_pvs"
 "$B/test_draw"
 "$B/test_vfetch"
+"$B/test_glslshare_address"
+"$B/test_glslshare_thread"
 "$B/test_aperture"
 "$B/test_rtle"
 # Both shader outputs: 0 (Metal: uint texture views), 1 (Vulkan: VRAM SSBO).

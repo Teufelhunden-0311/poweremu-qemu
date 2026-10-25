@@ -23,6 +23,7 @@
 #include <stdint.h>
 
 #include "r300_state.h"
+#include "r300_text.h"
 #include "r300_us.h"
 
 #define R300_MAX_ARRAYS 16
@@ -255,7 +256,8 @@ void r300_load_vbpntr(R300Arrays *arr, const uint32_t *d, uint32_t ndw);
  * Build a draw from a 3D_DRAW_VBUF_2 (0x34), 3D_DRAW_IMMD_2 (0x35) or
  * 3D_DRAW_INDX_2 (0x36) body.  Returns false (with *err) when the draw
  * cannot be assembled at all; smaller omissions are flagged in pkt->warn.
- * On success the caller owns pkt->glsl and pkt->verts (r300_draw_free).
+ * On success the caller owns pkt->glsl and pkt->verts (r300_draw_free);
+ * the shader texts are r300_text (r300_text.h): never free() them.
  */
 bool r300_draw_build(const R300State *st, const R300Arrays *arr,
                      uint32_t opcode, const uint32_t *d, uint32_t ndw,
