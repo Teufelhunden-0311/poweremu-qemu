@@ -1692,17 +1692,88 @@ static bool us_memo_match(const USMemo *m, const R300State *st,
     return true;
 }
 
+/*
+ * DEBUG (PPCGPU_FSMEMO_STATS=1; AI-generated, not for merging): where a
+ * lookup's time goes.  Counts and nanoseconds, printed to stderr at exit.
+ */
+#include <time.h>
+static struct {
+    int on;
+    uint64_t calls, hits, misses, depth[7], regs_cmp, bytes;
+    uint64_t ns_scan, ns_move, ns_dup, ns_miss;
+    uint64_t len_min, len_max, n_max;
+} fsm = { -1 };
+static uint64_t fsm_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000u + ts.tv_nsec;
+}
+static void fsm_dump(void)
+{
+    fprintf(stderr, "fsmemo calls=%llu hits=%llu misses=%llu depth(0,1,2-3,4-7,8-15,16-31,32-63)="
+            "%llu,%llu,%llu,%llu,%llu,%llu,%llu regs_cmp=%llu bytes=%llu len=%llu..%llu n_max=%llu "
+            "ns scan=%llu move=%llu dup=%llu miss=%llu\n",
+            (unsigned long long)fsm.calls, (unsigned long long)fsm.hits,
+            (unsigned long long)fsm.misses,
+            (unsigned long long)fsm.depth[0], (unsigned long long)fsm.depth[1],
+            (unsigned long long)fsm.depth[2], (unsigned long long)fsm.depth[3],
+            (unsigned long long)fsm.depth[4], (unsigned long long)fsm.depth[5],
+            (unsigned long long)fsm.depth[6], (unsigned long long)fsm.regs_cmp,
+            (unsigned long long)fsm.bytes, (unsigned long long)fsm.len_min,
+            (unsigned long long)fsm.len_max, (unsigned long long)fsm.n_max,
+            (unsigned long long)fsm.ns_scan, (unsigned long long)fsm.ns_move,
+            (unsigned long long)fsm.ns_dup, (unsigned long long)fsm.ns_miss);
+}
+static bool fsm_on(void)
+{
+    if (fsm.on < 0) {
+        const char *e = getenv("PPCGPU_FSMEMO_STATS");
+        fsm.on = e && e[0] == '1';
+        fsm.len_min = ~0ull;
+        if (fsm.on) {
+            atexit(fsm_dump);
+        }
+    }
+    return fsm.on;
+}
+
 char *r300_us_glsl_cached(const R300State *st, const R300FSDesc *desc,
                           uint32_t flags, uint32_t *id, const char **err)
 {
+    bool S = fsm_on();
+    uint64_t t0 = S ? fsm_now() : 0;
+    if (S) {
+        fsm.calls++;
+    }
     for (unsigned k = 0; k < US_MEMO_SLOTS; k++) {
+        if (S && us_memo[k].glsl && us_memo[k].flags == flags &&
+            !memcmp(&us_memo[k].desc, desc, sizeof(*desc))) {
+            fsm.regs_cmp += us_memo[k].n;     /* upper bound: compares stop at a mismatch */
+        }
         if (us_memo_match(&us_memo[k], st, desc, flags)) {
+            uint64_t t1 = S ? fsm_now() : 0;
             USMemo hit = us_memo[k];
             memmove(&us_memo[1], &us_memo[0], k * sizeof(USMemo));
             us_memo[0] = hit;
             *id = hit.id;
             *err = NULL;
-            return strdup(hit.glsl);
+            if (!S) {
+                return strdup(hit.glsl);
+            }
+            uint64_t t2 = fsm_now();
+            char *r = strdup(hit.glsl);
+            uint64_t t3 = fsm_now(), len = strlen(r);
+            fsm.hits++;
+            fsm.depth[k == 0 ? 0 : k == 1 ? 1 : k < 4 ? 2 : k < 8 ? 3 : k < 16 ? 4 : k < 32 ? 5 : 6]++;
+            fsm.bytes += len;
+            fsm.len_min = len < fsm.len_min ? len : fsm.len_min;
+            fsm.len_max = len > fsm.len_max ? len : fsm.len_max;
+            fsm.n_max = hit.n > fsm.n_max ? hit.n : fsm.n_max;
+            fsm.ns_scan += t1 - t0;
+            fsm.ns_move += t2 - t1;
+            fsm.ns_dup += t3 - t2;
+            return r;
         }
     }
 
@@ -1713,6 +1784,10 @@ char *r300_us_glsl_cached(const R300State *st, const R300FSDesc *desc,
     char *glsl = r300_us_to_glsl(st, desc, flags, err);
     us_rec.on = false;
     *id = 0;
+    if (S) {
+        fsm.misses++;
+        fsm.ns_miss += fsm_now() - t0;
+    }
     if (!glsl || us_rec.overflow) {
         return glsl;
     }
