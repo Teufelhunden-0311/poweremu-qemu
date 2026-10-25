@@ -306,6 +306,34 @@ static bool ppc_exittb_dedup(void)
     return on;
 }
 
+/*
+ * DEBUG (PPC_MSR_STATS=1; AI-generated, not for merging): exit-TB requests
+ * and the BQL takes they cost, printed to stderr at exit.  vCPU-thread
+ * counts are plain; requests from other threads are counted separately.
+ */
+static struct {
+    int on;
+    uint64_t calls, skipped_dedup, takes_self, takes_other;
+} xts = { -1 };
+static void xts_dump(void)
+{
+    fprintf(stderr, "exittbstats requests=%llu dedup_skipped=%llu bql_takes_self=%llu "
+            "bql_takes_other=%llu\n",
+            (unsigned long long)xts.calls, (unsigned long long)xts.skipped_dedup,
+            (unsigned long long)xts.takes_self, (unsigned long long)xts.takes_other);
+}
+static bool xts_on(void)
+{
+    if (xts.on < 0) {
+        const char *e = getenv("PPC_MSR_STATS");
+        xts.on = e && e[0] == '1';
+        if (xts.on) {
+            atexit(xts_dump);
+        }
+    }
+    return xts.on;
+}
+
 void cpu_interrupt_exittb(CPUState *cs)
 {
     /*
@@ -313,10 +341,24 @@ void cpu_interrupt_exittb(CPUState *cs)
      * unless running with TCG.
      */
     if (tcg_enabled()) {
-        if (ppc_exittb_dedup() && qemu_cpu_is_self(cs) &&
+        bool S = xts_on(), self = qemu_cpu_is_self(cs);
+        if (S && self) {
+            xts.calls++;
+        }
+        if (ppc_exittb_dedup() && self &&
             (qatomic_read(&cs->interrupt_request) & CPU_INTERRUPT_EXITTB) &&
             qatomic_read(&cs->neg.icount_decr.u16.high) == 0xffff) {
+            if (S) {
+                xts.skipped_dedup++;
+            }
             return;
+        }
+        if (S) {
+            if (self) {
+                xts.takes_self++;
+            } else {
+                qatomic_inc(&xts.takes_other);
+            }
         }
         BQL_LOCK_GUARD();
         cpu_interrupt(cs, CPU_INTERRUPT_EXITTB);
