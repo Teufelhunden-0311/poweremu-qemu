@@ -23,6 +23,8 @@
 #include "exec/cputlb.h"
 #include "system/kvm.h"
 #include "system/tcg.h"
+#include "system/cpu-timers.h"
+#include "exec/replay-core.h"
 #include "helper_regs.h"
 #include "exec/perf-counters.h"
 #include "power8-pmu.h"
@@ -285,6 +287,41 @@ void cpu_get_tb_cpu_state(CPUPPCState *env, vaddr *pc,
 }
 #endif
 
+/*
+ * PPC_EXITTB_DEDUP=1: a vCPU asking itself again for an exit-TB it has
+ * already asked for skips the BQL.  For a call on the vCPU's own thread,
+ * tcg_handle_interrupt only ORs the bit into interrupt_request and sets
+ * icount_decr.u16.high to -1; when both are already so, the call changes
+ * nothing.  Only this thread clears them (cpu_handle_interrupt), so they
+ * cannot be cleared between the check and where the call would have been.
+ * rfi asks twice when it changes IR/DR (hreg_store_msr, then do_rfi): some
+ * ten million BQL takes in a Doom 3 timedemo.  Off by default.
+ *
+ * The PPC_EXITTB_* switches are read once, by a constructor that runs
+ * before QEMU starts its worker threads, and have no effect under icount
+ * or record/replay: icount routes requests through icount_handle_interrupt,
+ * and neither mode has been checked with them.
+ */
+static bool ppc_exittb_dedup_env;
+
+static void __attribute__((constructor)) ppc_exittb_init(void)
+{
+    const char *e;
+
+    e = getenv("PPC_EXITTB_DEDUP");
+    ppc_exittb_dedup_env = e && e[0] == '1';
+}
+
+static bool ppc_exittb_mode_ok(void)
+{
+    return !icount_enabled() && replay_mode == REPLAY_MODE_NONE;
+}
+
+static bool ppc_exittb_dedup(void)
+{
+    return ppc_exittb_dedup_env && ppc_exittb_mode_ok();
+}
+
 void cpu_interrupt_exittb(CPUState *cs)
 {
     /*
@@ -292,6 +329,11 @@ void cpu_interrupt_exittb(CPUState *cs)
      * unless running with TCG.
      */
     if (tcg_enabled()) {
+        if (ppc_exittb_dedup() && qemu_cpu_is_self(cs) &&
+            (qatomic_read(&cs->interrupt_request) & CPU_INTERRUPT_EXITTB) &&
+            qatomic_read(&cs->neg.icount_decr.u16.high) == 0xffff) {
+            return;
+        }
         BQL_LOCK_GUARD();
         cpu_interrupt(cs, CPU_INTERRUPT_EXITTB);
     }
