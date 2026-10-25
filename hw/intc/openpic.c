@@ -704,6 +704,22 @@ static void qemu_timer_cb(void *opaque)
 static void openpic_tmr_set_tmr(OpenPICTimer *tmr, uint32_t val, bool enabled)
 {
     uint64_t ns = ticks_to_ns(val & ~TCCR_TOG);
+
+    /*
+     * Only the Freescale init creates these timers, but every model maps the
+     * timer registers -- so a guest writing TBCR on the KeyLargo/U3 MPIC that
+     * mac99 uses reached timer_mod()/timer_del() on a NULL QEMUTimer and took
+     * the emulator down with it.  A model with no timers has none to arm:
+     * keep the register state the caller already wrote and return.
+     *
+     * Found in lyons88/qemu-g5 (hw/intc/openpic: don't arm the timers a
+     * non-Freescale model never created), which is chasing the same machine
+     * from the other side.
+     */
+    if (!tmr->qemu_timer) {
+        tmr->qemu_timer_active = false;
+        return;
+    }
     /*
      * A count of zero causes a timer to be set to expire immediately.  This
      * effectively stops the simulation since the timer is constantly expiring
