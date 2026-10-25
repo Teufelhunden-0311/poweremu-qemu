@@ -25,6 +25,9 @@ void hreg_compute_hflags(CPUPPCState *env);
 void hreg_update_pmu_hflags(CPUPPCState *env);
 void cpu_interrupt_exittb(CPUState *cs);
 int hreg_store_msr(CPUPPCState *env, target_ulong value, int alter_hv);
+int hreg_store_msr_tb_end(CPUPPCState *env, target_ulong value, int alter_hv,
+                          bool skip_exittb);
+bool ppc_exittb_skip(CPUPPCState *env);
 
 #ifdef CONFIG_USER_ONLY
 static inline void check_tlb_flush(CPUPPCState *env, bool global) { }

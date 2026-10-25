@@ -473,7 +473,8 @@ void helper_pminsn(CPUPPCState *env, uint32_t insn)
 #endif /* TARGET_PPC64 */
 void helper_store_msr(CPUPPCState *env, target_ulong val)
 {
-    uint32_t excp = hreg_store_msr(env, val, 0);
+    /* gen_mtmsr and gen_mtmsrd end the TB after this (DISAS_EXIT_UPDATE) */
+    uint32_t excp = hreg_store_msr_tb_end(env, val, 0, ppc_exittb_skip(env));
 
     if (excp != 0) {
         cpu_interrupt_exittb(env_cpu(env));
@@ -488,6 +489,9 @@ void helper_ppc_maybe_interrupt(CPUPPCState *env)
 
 static void do_rfi(CPUPPCState *env, target_ulong nip, target_ulong msr)
 {
+    /* Before the MSR store, while env->hflags are still the TB's */
+    bool skip_exittb = ppc_exittb_skip(env);
+
     /* MSR:POW cannot be set by any form of rfi */
     msr &= ~(1ULL << MSR_POW);
 
@@ -506,13 +510,17 @@ static void do_rfi(CPUPPCState *env, target_ulong nip, target_ulong msr)
 #endif
     /* XXX: beware: this is false if VLE is supported */
     env->nip = nip & ~((target_ulong)0x00000003);
-    hreg_store_msr(env, msr, 1);
+    /* Every rfi-family translator ends the TB after this (DISAS_EXIT) */
+    hreg_store_msr_tb_end(env, msr, 1, skip_exittb);
     trace_ppc_excp_rfi(env->nip, env->msr);
     /*
      * No need to raise an exception here, as rfi is always the last
-     * insn of a TB
+     * insn of a TB -- which also makes the exit-TB request redundant
+     * (see ppc_exittb_skip)
      */
-    cpu_interrupt_exittb(env_cpu(env));
+    if (!skip_exittb) {
+        cpu_interrupt_exittb(env_cpu(env));
+    }
     /* Reset the reservation */
     env->reserve_addr = -1;
 
