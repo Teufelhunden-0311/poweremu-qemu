@@ -1677,6 +1677,53 @@ static void gpu_vs_emit_post(R300Sb *sb, const R300State *st, const Layout *lay,
     }
 }
 
+/*
+ * DEBUG (PPCGPU_VCONST_STATS=1; AI-generated, not for merging): how many
+ * vertex constants draws can read (max_const), how many bypass the vertex
+ * program, which path builds them, and the time in the two constant
+ * copies.  Printed to stderr at exit.  CP thread only.
+ */
+#include <time.h>
+static struct {
+    int on;
+    uint64_t draws, bypass, rects, gpu, cpu, base_nz, clipped;
+    uint64_t hist[257];
+    uint64_t ns_stack, ns_unif, n_unif;
+} vcs = { -1 };
+static uint64_t vcs_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000u + ts.tv_nsec;
+}
+static void vcs_dump(void)
+{
+    fprintf(stderr, "vconst draws=%llu bypass=%llu rects=%llu gpu=%llu cpu=%llu base_nz=%llu "
+            "clipped=%llu ns_stack=%llu ns_unif=%llu n_unif=%llu\nvconst hist(max_const:draws)",
+            (unsigned long long)vcs.draws, (unsigned long long)vcs.bypass,
+            (unsigned long long)vcs.rects, (unsigned long long)vcs.gpu,
+            (unsigned long long)vcs.cpu, (unsigned long long)vcs.base_nz,
+            (unsigned long long)vcs.clipped, (unsigned long long)vcs.ns_stack,
+            (unsigned long long)vcs.ns_unif, (unsigned long long)vcs.n_unif);
+    for (int i = 0; i < 256; i++) {
+        if (vcs.hist[i]) {
+            fprintf(stderr, " %d:%llu", i, (unsigned long long)vcs.hist[i]);
+        }
+    }
+    fprintf(stderr, "\n");
+}
+static bool vcs_on(void)
+{
+    if (vcs.on < 0) {
+        const char *e = getenv("PPCGPU_VCONST_STATS");
+        vcs.on = e && e[0] == '1';
+        if (vcs.on) {
+            atexit(vcs_dump);
+        }
+    }
+    return vcs.on;
+}
+
 /* The vertex shader for the current state (remembered), or NULL. */
 static const GpuVs *gpu_vs_get(const R300State *st, const R300PVSProgram *prog,
                                const Layout *lay, const Route *route)
@@ -1860,7 +1907,12 @@ static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *pr
     free(pos);
 
     R300VSUniforms *u = calloc(1, sizeof(*u));
+    uint64_t vu0 = vcs.on > 0 ? vcs_now() : 0;
     memcpy(u->c, prog->consts, sizeof(u->c));
+    if (vcs.on > 0) {
+        vcs.ns_unif += vcs_now() - vu0;
+        vcs.n_unif++;
+    }
     for (int k = 0; k < 6; k++) {
         memcpy(u->ucp[k], &st->pvs_mem[(R300_PVS_UCP_START + k) * 4], sizeof(u->ucp[k]));
     }
@@ -1994,11 +2046,24 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     f.immd_dw = immd_dw;
 
     /* Vertex program */
+    bool VS = vcs_on();
+    uint64_t vt0 = VS ? vcs_now() : 0;
     for (int i = 0; i < 256; i++) {
         memcpy(consts[i], &st->pvs_mem[(R300_PVS_CONST_START + (cc & 0xFF) + i) * 4],
                sizeof(consts[i]));
         if (R300_PVS_CONST_START + (cc & 0xFF) + i + 1 >= R300_PVS_MEM_VECS) {
             break;
+        }
+    }
+    if (VS) {
+        vcs.ns_stack += vcs_now() - vt0;
+        vcs.draws++;
+        vcs.bypass += bypass;
+        vcs.rects += (vf & 0xF) == 8;
+        vcs.base_nz += (cc & 0xFF) != 0;
+        vcs.clipped += R300_PVS_CONST_START + (cc & 0xFF) + ((cc >> 16) & 0xFF) >= R300_PVS_MEM_VECS;
+        if (!bypass) {
+            vcs.hist[(cc >> 16) & 0xFF]++;
         }
     }
     prog.code = &st->pvs_mem[R300_PVS_CODE_START * 4];
@@ -2026,6 +2091,9 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
                          &failed, err)) {
             pkt->warn |= f.warn;
             free(order);
+            if (VS) {
+                vcs.gpu++;
+            }
             pkt->glsl = r300_us_glsl_cached(st, &desc, st->glsl_flags,
                                             &pkt->glsl_id, err);
             if (!pkt->glsl) {
@@ -2040,6 +2108,9 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
         }
     }
 
+    if (VS) {
+        vcs.cpu++;
+    }
     /* Transform every vertex in draw order (cheap next to the GPU work). */
     R300Vertex *xv = calloc(nsrc ? nsrc : 1, sizeof(R300Vertex));
     float (*outs)[R300_PVS_NUM_OUTPUTS][4] = calloc(nsrc ? nsrc : 1, sizeof(*outs));
