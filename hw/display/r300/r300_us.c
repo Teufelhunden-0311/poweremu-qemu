@@ -22,6 +22,9 @@
 #include <string.h>
 
 #include "r300_sb.h"
+#include "r300_text.h"
+
+bool r300_glsl_share;
 
 /*
  * While r300_us_glsl_cached() generates a program, every register the
@@ -1670,7 +1673,7 @@ typedef struct USMemo {
     unsigned n;
     uint16_t *idx;
     uint32_t *val;
-    char *glsl;
+    char *glsl;                 /* r300_text */
 } USMemo;
 
 #define US_MEMO_SLOTS 64
@@ -1702,7 +1705,7 @@ char *r300_us_glsl_cached(const R300State *st, const R300FSDesc *desc,
             us_memo[0] = hit;
             *id = hit.id;
             *err = NULL;
-            return strdup(hit.glsl);
+            return r300_text_ref(hit.glsl);
         }
     }
 
@@ -1713,14 +1716,19 @@ char *r300_us_glsl_cached(const R300State *st, const R300FSDesc *desc,
     char *glsl = r300_us_to_glsl(st, desc, flags, err);
     us_rec.on = false;
     *id = 0;
-    if (!glsl || us_rec.overflow) {
-        return glsl;
+    if (!glsl) {
+        return NULL;
+    }
+    char *text = r300_text_new(glsl);
+    free(glsl);
+    if (us_rec.overflow) {
+        return text;
     }
 
     USMemo *last = &us_memo[US_MEMO_SLOTS - 1];
     free(last->idx);
     free(last->val);
-    free(last->glsl);
+    r300_text_unref(last->glsl);
     memmove(&us_memo[1], &us_memo[0], (US_MEMO_SLOTS - 1) * sizeof(USMemo));
     USMemo *m = &us_memo[0];
     m->flags = flags;
@@ -1732,8 +1740,8 @@ char *r300_us_glsl_cached(const R300State *st, const R300FSDesc *desc,
         m->idx[i] = us_rec.idx[i];
         m->val[i] = st->regs[us_rec.idx[i]];
     }
-    m->glsl = strdup(glsl);
+    m->glsl = text;
     m->id = us_memo_next_id++;
     *id = m->id;
-    return glsl;
+    return r300_text_ref(text);
 }

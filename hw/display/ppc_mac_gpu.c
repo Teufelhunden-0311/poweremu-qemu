@@ -14247,6 +14247,8 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
     {
         const char *e = getenv("PPCGPU_VFETCH");
         r300_vfetch = e && e[0] == '1';
+        e = getenv("PPCGPU_GLSL_SHARE");
+        r300_glsl_share = e && e[0] == '1';
     }
     if (s->r300) {
         /* Two apertures onto VRAM, as on a real Radeon (see r300_ap1_ops). */

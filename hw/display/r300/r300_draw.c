@@ -1567,7 +1567,7 @@ static float s312(uint32_t v)
 
 /* Which inputs the shader reads, packed in this order per vertex. */
 typedef struct GpuVs {
-    char *glsl;
+    char *glsl;                 /* r300_text */
     uint32_t id;
     uint32_t in_used;
     uint32_t *key;
@@ -1759,13 +1759,15 @@ static const GpuVs *gpu_vs_get(const R300State *st, const R300PVSProgram *prog,
         r300_sb_printf(&sb, "%s", body.buf);
         gpu_vs_emit_post(&sb, st, lay, route, persp, fog, fogsel, clip);
         r300_sb_printf(&sb, "}\n");
-        glsl = r300_sb_steal(&sb);
+        char *g = r300_sb_steal(&sb);
+        glsl = r300_text_new(g);
+        free(g);
     }
     r300_sb_free(&body);
 
     GpuVs *last = &gpu_vs_memo[GPU_VS_SLOTS - 1];
     free(last->key);
-    free(last->glsl);
+    r300_text_unref(last->glsl);
     memmove(&gpu_vs_memo[1], &gpu_vs_memo[0], (GPU_VS_SLOTS - 1) * sizeof(GpuVs));
     gpu_vs_memo[0] = (GpuVs){ .glsl = glsl, .id = glsl ? gpu_vs_next_id++ : 0,
                               .in_used = in_used, .key = key, .klen = klen };
@@ -1877,7 +1879,7 @@ static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *pr
     u->fogp[1] = bits_to_float(r300_reg(st, GA_FOG_OFFSET));
     u->info[0] = stride;
 
-    pkt->vs_glsl = strdup(vs->glsl);
+    pkt->vs_glsl = r300_text_ref(vs->glsl);
     pkt->vs_id = vs->id;
     pkt->vs_in = in;
     pkt->vs_in_vecs = nu * stride;
@@ -2366,9 +2368,9 @@ bool r300_draw_build_indexed(const R300State *st, const R300Arrays *arr,
 
 void r300_draw_free(R300DrawPacket *pkt)
 {
-    free(pkt->glsl);
+    r300_text_unref(pkt->glsl);
     free(pkt->verts);
-    free(pkt->vs_glsl);
+    r300_text_unref(pkt->vs_glsl);
     free(pkt->vs_in);
     free(pkt->vs_idx);
     free(pkt->vs_u);
