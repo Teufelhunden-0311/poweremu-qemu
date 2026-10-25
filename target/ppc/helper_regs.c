@@ -323,7 +323,42 @@ void cpu_interrupt_exittb(CPUState *cs)
     }
 }
 
-int hreg_store_msr(CPUPPCState *env, target_ulong value, int alter_hv)
+/*
+ * PPC_EXITTB_SKIP=1: no exit-TB request for an IR/DR change made by mtmsr,
+ * mtmsrd or the rfi family (hreg_store_msr_tb_end).  Their translators end
+ * the TB right after the helper with DISAS_EXIT or DISAS_EXIT_UPDATE, which
+ * is tcg_gen_exit_tb(NULL, 0): cpu_tb_exec then returns no last_tb, so
+ * nothing is chained from that TB, and the next one is looked up with the
+ * new hflags.  The request would only add a BQL take here and another in
+ * cpu_handle_interrupt.
+ *
+ * Not when the TB is single-stepped (HFLAGS_SE, from MSR[SE] or BookE
+ * DBCR0[ICMP]): then ppc_tr_tb_exit emits no exit_tb, and a Book3S rfi
+ * emits nothing at all, falling into gen_tb_end's TB_EXIT_REQUESTED exit,
+ * which relies on the request having set icount_decr.u16.high (otherwise
+ * cpu_loop_exec_tb asserts icount).  A stepped TB is one instruction, so
+ * env->hflags before the store are the TB's own.  Other callers (gdbstub,
+ * migration, reset) keep the request.  Off by default.
+ */
+static bool ppc_exittb_skip_on(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("PPC_EXITTB_SKIP");
+        on = e && e[0] == '1';
+    }
+    return on;
+}
+
+/* Call before the MSR store, while env->hflags are still the TB's. */
+bool ppc_exittb_skip(CPUPPCState *env)
+{
+    return ppc_exittb_skip_on() && !((env->hflags >> HFLAGS_SE) & 1);
+}
+
+static int store_msr(CPUPPCState *env, target_ulong value, int alter_hv,
+                     bool tb_ends)
 {
     int excp;
 #if !defined(CONFIG_USER_ONLY)
@@ -343,7 +378,7 @@ int hreg_store_msr(CPUPPCState *env, target_ulong value, int alter_hv)
         value &= ~(1 << MSR_ME);
         value |= env->msr & (1 << MSR_ME);
     }
-    if ((value ^ env->msr) & (R_MSR_IR_MASK | R_MSR_DR_MASK)) {
+    if (!tb_ends && ((value ^ env->msr) & (R_MSR_IR_MASK | R_MSR_DR_MASK))) {
         cpu_interrupt_exittb(cs);
     }
     if ((env->mmu_model == POWERPC_MMU_BOOKE ||
@@ -387,6 +422,21 @@ int hreg_store_msr(CPUPPCState *env, target_ulong value, int alter_hv)
 #endif
 
     return excp;
+}
+
+int hreg_store_msr(CPUPPCState *env, target_ulong value, int alter_hv)
+{
+    return store_msr(env, value, alter_hv, false);
+}
+
+/*
+ * For callers whose TB ends right after the store; skip_exittb from
+ * ppc_exittb_skip(), taken before the store.
+ */
+int hreg_store_msr_tb_end(CPUPPCState *env, target_ulong value, int alter_hv,
+                          bool skip_exittb)
+{
+    return store_msr(env, value, alter_hv, skip_exittb);
 }
 
 #ifndef CONFIG_USER_ONLY
