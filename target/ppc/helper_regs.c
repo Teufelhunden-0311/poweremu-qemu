@@ -285,6 +285,27 @@ void cpu_get_tb_cpu_state(CPUPPCState *env, vaddr *pc,
 }
 #endif
 
+/*
+ * PPC_EXITTB_DEDUP=1: a vCPU asking itself again for an exit-TB it has
+ * already asked for skips the BQL.  For a call on the vCPU's own thread,
+ * tcg_handle_interrupt only ORs the bit into interrupt_request and sets
+ * icount_decr.u16.high to -1; when both are already so, the call changes
+ * nothing.  Only this thread clears them (cpu_handle_interrupt), so they
+ * cannot be cleared between the check and where the call would have been.
+ * rfi asks twice when it changes IR/DR (hreg_store_msr, then do_rfi): some
+ * ten million BQL takes in a Doom 3 timedemo.  Off by default.
+ */
+static bool ppc_exittb_dedup(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("PPC_EXITTB_DEDUP");
+        on = e && e[0] == '1';
+    }
+    return on;
+}
+
 void cpu_interrupt_exittb(CPUState *cs)
 {
     /*
@@ -292,6 +313,11 @@ void cpu_interrupt_exittb(CPUState *cs)
      * unless running with TCG.
      */
     if (tcg_enabled()) {
+        if (ppc_exittb_dedup() && qemu_cpu_is_self(cs) &&
+            (qatomic_read(&cs->interrupt_request) & CPU_INTERRUPT_EXITTB) &&
+            qatomic_read(&cs->neg.icount_decr.u16.high) == 0xffff) {
+            return;
+        }
         BQL_LOCK_GUARD();
         cpu_interrupt(cs, CPU_INTERRUPT_EXITTB);
     }
