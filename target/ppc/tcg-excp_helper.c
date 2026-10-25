@@ -473,7 +473,9 @@ void helper_pminsn(CPUPPCState *env, uint32_t insn)
 #endif /* TARGET_PPC64 */
 void helper_store_msr(CPUPPCState *env, target_ulong val)
 {
+    ppc_msr_caller = 1;
     uint32_t excp = hreg_store_msr(env, val, 0);
+    ppc_msr_caller = 0;
 
     if (excp != 0) {
         cpu_interrupt_exittb(env_cpu(env));
@@ -506,12 +508,15 @@ static void do_rfi(CPUPPCState *env, target_ulong nip, target_ulong msr)
 #endif
     /* XXX: beware: this is false if VLE is supported */
     env->nip = nip & ~((target_ulong)0x00000003);
+    ppc_msr_caller = 2;
     hreg_store_msr(env, msr, 1);
+    ppc_msr_caller = 0;
     trace_ppc_excp_rfi(env->nip, env->msr);
     /*
      * No need to raise an exception here, as rfi is always the last
      * insn of a TB
      */
+    ppc_msr_stats_rfi_exittb();
     cpu_interrupt_exittb(env_cpu(env));
     /* Reset the reservation */
     env->reserve_addr = -1;

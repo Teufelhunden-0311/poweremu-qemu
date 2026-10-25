@@ -830,6 +830,33 @@ static inline bool icount_exit_request(CPUState *cpu)
     return cpu->neg.icount_decr.u16.low + cpu->icount_extra == 0;
 }
 
+/*
+ * DEBUG (PPC_MSR_STATS=1; AI-generated, not for merging): BQL takes in
+ * cpu_handle_interrupt, and how many found only CPU_INTERRUPT_EXITTB.
+ */
+static struct {
+    int on;
+    uint64_t takes, exittb_only, with_exittb;
+} exittb_stats = { -1 };
+static void exittb_stats_dump(void)
+{
+    fprintf(stderr, "msrstats handle_interrupt bql_takes=%llu exittb_only=%llu with_exittb=%llu\n",
+            (unsigned long long)exittb_stats.takes,
+            (unsigned long long)exittb_stats.exittb_only,
+            (unsigned long long)exittb_stats.with_exittb);
+}
+static bool exittb_stats_on(void)
+{
+    if (exittb_stats.on < 0) {
+        const char *e = getenv("PPC_MSR_STATS");
+        exittb_stats.on = e && e[0] == '1';
+        if (exittb_stats.on) {
+            atexit(exittb_stats_dump);
+        }
+    }
+    return exittb_stats.on;
+}
+
 static inline bool cpu_handle_interrupt(CPUState *cpu,
                                         TranslationBlock **last_tb)
 {
@@ -853,6 +880,11 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
         int interrupt_request;
         bql_lock();
         interrupt_request = cpu->interrupt_request;
+        if (exittb_stats_on()) {
+            exittb_stats.takes++;
+            exittb_stats.exittb_only += interrupt_request == CPU_INTERRUPT_EXITTB;
+            exittb_stats.with_exittb += !!(interrupt_request & CPU_INTERRUPT_EXITTB);
+        }
         if (unlikely(cpu->singlestep_enabled & SSTEP_NOIRQ)) {
             /* Mask out external interrupts for this step. */
             interrupt_request &= ~CPU_INTERRUPT_SSTEP_MASK;

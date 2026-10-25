@@ -25,6 +25,9 @@ void hreg_compute_hflags(CPUPPCState *env);
 void hreg_update_pmu_hflags(CPUPPCState *env);
 void cpu_interrupt_exittb(CPUState *cs);
 int hreg_store_msr(CPUPPCState *env, target_ulong value, int alter_hv);
+extern int ppc_msr_caller;             /* DEBUG PPC_MSR_STATS */
+bool ppc_msr_stats_on(void);
+void ppc_msr_stats_rfi_exittb(void);
 
 #ifdef CONFIG_USER_ONLY
 static inline void check_tlb_flush(CPUPPCState *env, bool global) { }

@@ -297,6 +297,53 @@ void cpu_interrupt_exittb(CPUState *cs)
     }
 }
 
+/*
+ * DEBUG (PPC_MSR_STATS=1; AI-generated, not for merging): how often an MSR
+ * write could skip the interrupt recompute or the exit-TB request beyond
+ * what ppc_maybe_interrupt's existing fast return already saves.  Indexed
+ * by caller (ppc_msr_caller: 0 other, 1 mtmsr, 2 rfi).  vCPU thread only
+ * (single-threaded TCG).  Printed to stderr at exit.
+ */
+int ppc_msr_caller;
+static struct {
+    int on;
+    uint64_t calls[3], irq_unch[3], irq_unch_slow[3], irq_ch[3], irq_ch_slow[3];
+    uint64_t irdr[3], rfi_exittb, same[3];
+} msrs = { -1 };
+static void msrs_dump(void)
+{
+    static const char *nm[3] = { "other", "mtmsr", "rfi" };
+    for (int i = 0; i < 3; i++) {
+        fprintf(stderr, "msrstats %s calls=%llu same=%llu irq_unchanged=%llu "
+                "irq_unchanged_slow=%llu irq_changed=%llu irq_changed_slow=%llu "
+                "irdr_exittb=%llu\n", nm[i],
+                (unsigned long long)msrs.calls[i], (unsigned long long)msrs.same[i],
+                (unsigned long long)msrs.irq_unch[i],
+                (unsigned long long)msrs.irq_unch_slow[i],
+                (unsigned long long)msrs.irq_ch[i],
+                (unsigned long long)msrs.irq_ch_slow[i],
+                (unsigned long long)msrs.irdr[i]);
+    }
+    fprintf(stderr, "msrstats rfi_exittb=%llu\n", (unsigned long long)msrs.rfi_exittb);
+}
+bool ppc_msr_stats_on(void)
+{
+    if (msrs.on < 0) {
+        const char *e = getenv("PPC_MSR_STATS");
+        msrs.on = e && e[0] == '1';
+        if (msrs.on) {
+            atexit(msrs_dump);
+        }
+    }
+    return msrs.on;
+}
+void ppc_msr_stats_rfi_exittb(void)
+{
+    if (ppc_msr_stats_on()) {
+        msrs.rfi_exittb++;
+    }
+}
+
 int hreg_store_msr(CPUPPCState *env, target_ulong value, int alter_hv)
 {
     int excp;
@@ -318,6 +365,9 @@ int hreg_store_msr(CPUPPCState *env, target_ulong value, int alter_hv)
         value |= env->msr & (1 << MSR_ME);
     }
     if ((value ^ env->msr) & (R_MSR_IR_MASK | R_MSR_DR_MASK)) {
+        if (ppc_msr_stats_on()) {
+            msrs.irdr[ppc_msr_caller]++;
+        }
         cpu_interrupt_exittb(cs);
     }
     if ((env->mmu_model == POWERPC_MMU_BOOKE ||
@@ -345,6 +395,25 @@ int hreg_store_msr(CPUPPCState *env, target_ulong value, int alter_hv)
      */
     if (is_book3s_arch2x(env) && ((value >> MSR_PR) & 1)) {
         value |= (1 << MSR_EE) | (1 << MSR_DR) | (1 << MSR_IR);
+    }
+#endif
+#if !defined(CONFIG_USER_ONLY)
+    if (ppc_msr_stats_on()) {
+        int c = ppc_msr_caller;
+        target_ulong ch = value ^ env->msr;
+        bool slow = bql_locked() || qatomic_read(&env->pending_interrupts) ||
+                    (qatomic_read(&cs->interrupt_request) & CPU_INTERRUPT_HARD);
+        bool irq = ch & (R_MSR_EE_MASK | R_MSR_PR_MASK | MSR_HVB | R_MSR_CE_MASK |
+                         R_MSR_ME_MASK | R_MSR_DE_MASK | R_MSR_POW_MASK);
+        msrs.calls[c]++;
+        msrs.same[c] += !ch;
+        if (irq) {
+            msrs.irq_ch[c]++;
+            msrs.irq_ch_slow[c] += slow;
+        } else {
+            msrs.irq_unch[c]++;
+            msrs.irq_unch_slow[c] += slow;
+        }
     }
 #endif
     env->msr = value;
