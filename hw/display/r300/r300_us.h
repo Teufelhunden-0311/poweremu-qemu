@@ -153,7 +153,8 @@ char *r300_us_to_glsl(const R300State *st, const R300FSDesc *desc,
  * r300_us_to_glsl(), remembered: returns the same text for the same
  * inputs without regenerating it.  *id names the text (equal ids, equal
  * text), so a renderer can cache per id without hashing the string; 0
- * means none (not cacheable).  Not thread-safe.
+ * means none (not cacheable).  The text is an r300_text (r300_text.h):
+ * release it with r300_text_unref.  Not thread-safe.
  */
 char *r300_us_glsl_cached(const R300State *st, const R300FSDesc *desc,
                           uint32_t flags, uint32_t *id, const char **err);

@@ -7354,8 +7354,8 @@ static void r300_job_free(RQJob *job)
 {
     R300DrawPacket *p = &job->r300;
 
-    free(p->glsl);
-    free(p->vs_glsl);
+    r300_text_unref(p->glsl);
+    r300_text_unref(p->vs_glsl);
     free(p->verts);
     free(p->vs_in);
     free(p->vs_idx);
