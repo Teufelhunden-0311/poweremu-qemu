@@ -6770,16 +6770,21 @@ static uint32_t g_r300_enc_vp_h;    /* PPCGPU_R300_EXTENT: its viewport height *
  * The cache describes one encoder: every end of g_r200_enc (commit, the
  * depth-clear path, an R200 pass, an incompatible R300 pass) and every
  * R300 creation clears it, and r300_draw_encode only uses it on an encoder
- * it owns.  The cache retains the ids it compares (released when it is
- * cleared), so none can be freed and its address reused for another
- * object while it is cached.  Only setters are skipped.  Texture resolution,
+ * it owns.  The command buffer already keeps every encoded object (buffers,
+ * textures, samplers, pipeline states) alive until it completes; the cache
+ * also retains the ids it compares, released when it is cleared, as extra
+ * protection against a reused address.  Only setters are skipped.  Texture resolution,
  * content checks, hazards, views and staging stay as they are; the
  * viewport, vertex input (buffer 0), indices and depth clip mode are set
  * as before.  The GPU vertex uniforms (buffer 2) are skipped only when
  * byte-identical to an owned copy of the last ones bound (the job that
  * carried those is freed after encoding); the staged copy stays bound,
  * and the arena does not reuse it until its command buffer completes.
- * Under g_render_lock.
+ *
+ * The switches are read once (pthread_once).  Everything else -- the
+ * lookups, updates, retains and releases -- relies on g_render_lock, which
+ * every encode and every end of g_r200_enc holds, and r300_reuse_fini on
+ * the render queue being stopped first.
  *
  * PPCGPU_R300_ENC_STATS=1 (diagnostic) counts the setters made and
  * skipped per family, with or without the cache.

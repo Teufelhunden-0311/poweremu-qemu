@@ -100,11 +100,14 @@ for name, old, new in MUTANTS:
     how = []
     for q in "01":
         rc, steps, fails = run(exe, d, q, "1")
-        if steps != ref[q]:
-            first = next((i for i, (a, b) in enumerate(zip(steps, ref[q])) if a != b),
-                         min(len(steps), len(ref[q])))
-            how.append("q%s pixels differ from step %d" % (q, first))
-        if rc:
+        diff = next((i for i, (a, b) in enumerate(zip(steps, ref[q])) if a != b), None)
+        if diff is not None:
+            how.append("q%s hashes differ from step %d" % (q, diff))
+        elif len(steps) < len(ref[q]):
+            how.append("q%s output stops after %d of %d steps" % (q, len(steps), len(ref[q])))
+        if rc < 0:
+            how.append("q%s killed by signal %d" % (q, -rc))
+        elif rc:
             how.append("q%s exit %d, %d check(s) failed" % (q, rc, len(fails)))
     print("%-40s %s  %s" % (name, "caught" if how else "MISSED", "; ".join(how)[:120]))
     missed += not how

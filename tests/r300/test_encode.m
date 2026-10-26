@@ -39,6 +39,7 @@ static NSArray<NSString *> *test_search_path(NSSearchPathDirectory d,
 #undef NSSearchPathForDirectoriesInDomains
 
 FrameTracker *g_frame_tracker;     /* the device's (hw/display/ppc_mac_gpu.c); unused here */
+bool encshim_bql = true;           /* draws come from the device with the BQL held */
 
 static NSArray<NSString *> *test_search_path(NSSearchPathDirectory d,
                                              NSSearchPathDomainMask m, BOOL e)
@@ -59,6 +60,7 @@ static NSArray<NSString *> *test_search_path(NSSearchPathDirectory d,
 
 /* Registers (as r300_draw.c names them) */
 #define H_SU_CULL_MODE        0x42B8
+#define H_SC_SCISSORS_BR      0x43E4
 #define H_TX_FILTER0_0        0x4400
 #define H_TX_OFFSET_0         0x4540
 #define H_RB3D_COLOROFFSET0   0x4E28
@@ -74,6 +76,7 @@ static uint8_t *V;
 static R300State S;
 static bool reuse;
 static int fails, step;
+static uint32_t br0;            /* the capture's SC_SCISSORS_BR (bottom row 599) */
 
 #define CHECK(c, ...) do { if (!(c)) { printf("FAIL step %d: ", step); \
     printf(__VA_ARGS__); printf("\n"); fails++; } } while (0)
@@ -104,6 +107,7 @@ static void load_capture(void)
     }
     fclose(f);
     S.pvs_gen++;
+    br0 = r300_reg(&S, H_SC_SCISSORS_BR);
 }
 
 /* Two textures with different, position-dependent texels. */
@@ -132,6 +136,8 @@ typedef struct Draw {
     uint32_t tex;               /* TX_OFFSET_0; 0: TEX0 */
     bool linear;                /* TX_FILTER0_0 magnification/minification */
     float c0x;                  /* PVS constant c0.x; 0: the capture's */
+    uint32_t h;                 /* the packet's height (the scissor's bottom edge);
+                                   0: the capture's 600 */
 } Draw;
 
 static bool build(const Draw *d, R300DrawPacket *p)
@@ -168,6 +174,9 @@ static bool build(const Draw *d, R300DrawPacket *p)
     r300_state_write(&S, H_TX_OFFSET_0, d->tex ? d->tex : TEX0);
     /* MAG_FILTER / MIN_FILTER: 1 point (the capture), 2 linear */
     r300_state_write(&S, H_TX_FILTER0_0, d->linear ? 0x1412 : 0xA12);
+    /* SC_SCISSORS_BR: x in bits 0-12, y in 13-25, both biased by 1440 */
+    r300_state_write(&S, H_SC_SCISSORS_BR,
+                     d->h ? ((1440 + d->h - 1) << 13) | (br0 & 0x1FFF) : br0);
     float c0x = d->c0x ? d->c0x : c0x_capture;
     if (memcmp(&S.pvs_mem[512 * 4], &c0x, 4)) {
         memcpy(&S.pvs_mem[512 * 4], &c0x, 4);
@@ -213,6 +222,11 @@ static void snap(void)
 }
 static uint64_t made(int f)    { drained(); return g_r300_reuse_made[f] - m0[f]; }
 static uint64_t skipped(int f) { drained(); return g_r300_reuse_skipped[f] - s0[f]; }
+
+/* Render passes opened since snap_passes(). */
+static uint64_t p0;
+static void snap_passes(void) { drained(); p0 = g_r200_stat_passes; }
+static uint64_t passes(void)  { drained(); return g_r200_stat_passes - p0; }
 
 /* With the cache on, a draw on the same encoder that changes only family
  * f (or nothing, f < 0) sets f and skips everything else. */
@@ -263,6 +277,8 @@ static void end_step(const char *name)
 {
     R->flush_r200(ST);
     uint32_t zp = R->zpass_r300(ST, false, 0);
+    uint64_t gf = R->gpu_failures(ST);
+    CHECK(gf == 0, "%llu GPU command buffer failure(s)", (unsigned long long)gf);
     uint64_t h1 = fnv(V + RT1, (size_t)RTW * 4 * RTH, 0xCBF29CE484222325ull);
     uint64_t h2 = fnv(V + RT2, (size_t)RTW * 4 * RTH, 0xCBF29CE484222325ull);
     uint64_t h3 = fnv(V + RT3, (size_t)RTW * 4 * RTH * 2, 0xCBF29CE484222325ull);
@@ -574,7 +590,124 @@ int main(void)
         }
         end_step("arena");
 
-        /* 9. A texture rewritten in place between two draws of a pass. */
+        /* 9. PPCGPU_R300_EXTENT keeps one pass while the packet's height
+         * (its scissor's bottom edge) changes: the viewport follows the
+         * packet, the attachments stay. */
+        {
+            static const uint32_t hs[4] = { 600, 400, 500, 300 };
+            g = (Draw){ .gpu = true, .x = 16, .y = 16, .size = 128 };
+            for (int k = 0; k < 4; k++) {
+                g.h = hs[k];
+                g.x = 16 + 140 * k;
+                draw(&g);
+                if (k == 0) {
+                    snap_passes();
+                }
+            }
+            if (r300_extent_on() && rqueue_enabled()) {
+                CHECK(passes() == 0, "extent: %llu new passes for height changes",
+                      (unsigned long long)passes());
+            }
+        }
+        end_step("extent-height");
+
+        /* 10. Depth, then a depth-less draw kept in the depth pass (test and
+         * write off), then depth again: one pass throughout. */
+        {
+            R300DrawPacket p;
+            bool dz[3] = { true, false, true };
+            for (int k = 0; k < 3; k++) {
+                g = (Draw){ .gpu = true, .x = 16 + 64 * k, .y = 16, .size = 128,
+                            .depth = dz[k] };
+                if (build(&g, &p)) {
+                    p.uniforms.zpass_count = 1;
+                    submit(&p);
+                }
+                if (k == 0) {
+                    snap_passes();
+                }
+            }
+            CHECK(passes() == 0, "depth-less draw: %llu new passes", (unsigned long long)passes());
+        }
+        end_step("depth-depthless-depth");
+
+        /* 11. GPU vertex uniforms kept bound while the index staging runs
+         * through more than one 8 MiB arena buffer; a fence commit, then a
+         * new encoder binds them again. */
+        {
+            R300DrawPacket p;
+            uint32_t n = 6u * 131072u;          /* 3 MiB of indices per draw */
+            for (int k = 0; k < 4; k++) {
+                g = (Draw){ .gpu = true, .x = 16 + 100 * k, .y = 16, .size = 96 };
+                if (!build(&g, &p)) {
+                    continue;
+                }
+                uint32_t *idx = malloc((size_t)n * 4);
+                for (uint32_t i = 0; i < n; i++) {
+                    idx[i] = p.vs_idx[i % p.num_verts];
+                }
+                free(p.vs_idx);
+                p.vs_idx = idx;
+                p.num_verts = n;
+                if (k == 1) {
+                    snap();
+                    snap_passes();
+                }
+                submit(&p);
+            }
+            drained();
+            CHECK(g_r200_arena_used && g_r200_arena_used.count >= 1,
+                  "arena: no buffer turnover in the pass");
+            CHECK(passes() == 0, "arena: %llu new passes", (unsigned long long)passes());
+            if (reuse) {
+                CHECK(made(R300R_VSU) == 0 && skipped(R300R_VSU) == 3,
+                      "arena: vsu set %llu, skipped %llu", (unsigned long long)made(R300R_VSU),
+                      (unsigned long long)skipped(R300R_VSU));
+            }
+            R->submit_r200(ST, fence_done, NULL);
+            snap();
+            g = (Draw){ .gpu = true, .x = 16, .y = 140, .size = 96 };
+            draw(&g);
+            if (reuse) {
+                CHECK(made(R300R_VSU) == 1, "after the fence: vsu not bound again");
+            }
+            expect_fresh("arena, after the fence");
+        }
+        end_step("vsu-arena");
+
+        /* 12. Polygon-mode lines in a two-sample pass, then culled triangles
+         * of both windings: the cull mode comes back in each sample. */
+        {
+            R300DrawPacket p;
+            g = (Draw){ .gpu = false, .x = 16, .y = 16, .size = 128, .rt = RT3,
+                        .cull = R300_CULL_BACK };
+            if (build(&g, &p)) {
+                uint32_t nv = p.num_verts;
+                p.verts = realloc(p.verts, (nv + 2) * sizeof(R300Vertex));
+                p.verts[nv] = p.verts[0];
+                p.verts[nv + 1] = p.verts[2];
+                p.num_line_verts = 2;
+                p.aa_samples = 2;
+                p.aa_pos[0][0] = -0.25f;
+                p.aa_pos[0][1] = -0.25f;
+                p.aa_pos[1][0] = 0.25f;
+                p.aa_pos[1][1] = 0.25f;
+                submit(&p);
+            }
+            for (int k = 0; k < 2; k++) {
+                g = (Draw){ .gpu = true, .x = 160 + 140 * k, .y = 16, .size = 128, .rt = RT3,
+                            .cull = R300_CULL_BACK | (k ? 0 : R300_FACE_CW) };
+                if (build(&g, &p)) {
+                    p.aa_samples = 2;
+                    memcpy(p.aa_pos, (float[2][2]){ { -0.25f, -0.25f }, { 0.25f, 0.25f } },
+                           sizeof(float[2][2]));
+                    submit(&p);
+                }
+            }
+        }
+        end_step("aa-lines");
+
+        /* 13. A texture rewritten in place between two draws of a pass. */
         g = (Draw){ .gpu = true, .x = 16, .y = 16, .size = 128 };
         draw(&g);
         drained();
