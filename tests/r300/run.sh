@@ -69,10 +69,11 @@ done
 "$B/test_gpuvs"
 "$B/test_touch"
 # The same pixels from the production encoder in every configuration: the
-# render queue and PPCGPU_R300_EXTENT each off and on.
+# render queue, PPCGPU_R300_EXTENT and the setter cache PPCGPU_R300_ENC_REUSE
+# each off and on.
 for ext in 0 1; do
     for q in 0 1; do
-        for r in 0; do
+        for r in 0 1; do
             o="$B/encode_$ext$q$r"
             ENC_TEST_DIR="$B" PPCGPU_R300_EXTENT=$ext PPCGPU_EXT_RETIRE=$ext \
                 PPCGPU_RENDER_QUEUE=$q PPCGPU_R300_ENC_REUSE=$r \
@@ -83,5 +84,5 @@ for ext in 0 1; do
         done
     done
 done
-echo "test_encode: the same pixels in all 4 configurations"
+echo "test_encode: the same pixels in all 8 configurations"
 echo "all R300 tests passed"

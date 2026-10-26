@@ -1254,6 +1254,7 @@ static pthread_mutex_t g_render_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool rqueue_wanted(void);
 static bool rqueue_enabled(void);
 static void rqueue_drain(void);
+static void r300_reuse_fini(void);
 
 /*
  * A persistent Metal binary archive of compiled pipeline states, in
@@ -1535,6 +1536,7 @@ static void metal_fini(void *opaque)
 
     rqueue_stop();
     bin_archive_serialize();
+    r300_reuse_fini();
 
     /* Free shadow RT buffers */
     for (int i = 0; i < SHADOW_RT_MAX; i++) {
@@ -6758,27 +6760,105 @@ static bool g_r300_enc_mine;        /* open encoder belongs to draw_r300 */
 static uint32_t g_r300_enc_vp_h;    /* PPCGPU_R300_EXTENT: its viewport height */
 
 /*
- * PPCGPU_R300_ENC_STATS=1 (diagnostic, AI-generated, default off): counts
- * the encoder setters r300_draw_encode makes, per binding family, and logs
- * them every 20000 draws (tests/r300/test_encode reads the counters).
+ * PPCGPU_R300_ENC_REUSE=1 (prototype, AI-generated, default off; the idea
+ * is linuxkid473's, from a70c4ce): what the open R300 encoder already has
+ * bound, so r300_draw_encode skips setters that would change nothing.  A
+ * frame is mostly draws in one pass that differ in their geometry, and
+ * each one set the pipeline, sixteen textures and samplers and the
+ * uniforms again.
+ *
+ * The cache describes one encoder: every end of g_r200_enc (commit, the
+ * depth-clear path, an R200 pass, an incompatible R300 pass) and every
+ * R300 creation clears it, and r300_draw_encode only uses it on an encoder
+ * it owns.  The cache retains the ids it compares (released when it is
+ * cleared), so none can be freed and its address reused for another
+ * object while it is cached.  Only setters are skipped.  Texture resolution,
+ * content checks, hazards, views and staging stay as they are; the
+ * viewport, vertex input (buffer 0), indices and depth clip mode are set
+ * as before.  The GPU vertex uniforms (buffer 2) are skipped only when
+ * byte-identical to an owned copy of the last ones bound (the job that
+ * carried those is freed after encoding); the staged copy stays bound,
+ * and the arena does not reuse it until its command buffer completes.
+ * Under g_render_lock.
+ *
+ * PPCGPU_R300_ENC_STATS=1 (diagnostic) counts the setters made and
+ * skipped per family, with or without the cache.
  */
 enum {
     R300R_PIPE, R300R_WIND, R300R_CULL, R300R_RECT, R300R_ZPASS, R300R_TEX,
     R300R_SMP, R300R_MS, R300R_FSU, R300R_VSU, R300R_N
 };
-static bool g_r300_reuse_stats;
+typedef struct R300Reuse {
+    bool pipe_ok, wind_ok, cull_ok, rect_ok, zpass_ok, ms_ok, fsu_ok, vsu_ok;
+    bool tex_ok[R300_NUM_TEX_UNITS], smp_ok[R300_NUM_TEX_UNITS];
+    id<MTLRenderPipelineState> pipe;
+    MTLWinding wind;
+    MTLCullMode cull;
+    MTLScissorRect rect;
+    float ms[4];
+    id<MTLTexture> tex[R300_NUM_TEX_UNITS];
+    id<MTLSamplerState> smp[R300_NUM_TEX_UNITS];
+    R300FSUniforms fsu;
+    R300VSUniforms *vsu;        /* owned: the last bytes bound as vertex buffer 2 */
+} R300Reuse;
+static R300Reuse g_r300_reuse;
+static bool g_r300_reuse_on, g_r300_reuse_stats;
 static uint64_t g_r300_reuse_made[R300R_N], g_r300_reuse_skipped[R300R_N];
 
 static void r300_reuse_init(void)
 {
-    const char *e = getenv("PPCGPU_R300_ENC_STATS");
+    const char *e = getenv("PPCGPU_R300_ENC_REUSE");
+    g_r300_reuse_on = e && e[0] == '1';
+    e = getenv("PPCGPU_R300_ENC_STATS");
     g_r300_reuse_stats = e && e[0] == '1';
+}
+
+/* The cache, or NULL when PPCGPU_R300_ENC_REUSE is off. */
+static R300Reuse *r300_reuse(void)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, r300_reuse_init);
+    return g_r300_reuse_on ? &g_r300_reuse : NULL;
+}
+
+/* Store obj in a cache slot, retained (releasing what the slot held). */
+static void r300_reuse_hold(id *slot, id obj)
+{
+    if (*slot != obj) {
+        [obj retain];
+        [*slot release];
+        *slot = obj;
+    }
+}
+
+/* Forget everything: the encoder it described ended or was replaced. */
+static void r300_reuse_reset(void)
+{
+    R300Reuse *rc = r300_reuse();
+    R300VSUniforms *keep;
+
+    if (!rc) {
+        return;                 /* off: nothing is ever cached */
+    }
+    keep = rc->vsu;
+    [rc->pipe release];
+    for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
+        [rc->tex[t] release];
+        [rc->smp[t] release];
+    }
+    memset(rc, 0, sizeof(*rc));
+    rc->vsu = keep;
+}
+
+static void r300_reuse_fini(void)
+{
+    r300_reuse_reset();
+    g_free(g_r300_reuse.vsu);
+    g_r300_reuse.vsu = NULL;
 }
 
 static inline void r300_reuse_count(int f, bool made)
 {
-    static pthread_once_t once = PTHREAD_ONCE_INIT;
-    pthread_once(&once, r300_reuse_init);
     if (g_r300_reuse_stats) {
         (made ? g_r300_reuse_made : g_r300_reuse_skipped)[f]++;
     }
@@ -8175,6 +8255,7 @@ static uint32_t r200_commit_as(void (*done)(void *, uint32_t), void *arg,
         [g_r200_enc endEncoding];
         [g_r200_enc release];
         g_r200_enc = nil;
+        r300_reuse_reset();
     }
     g_r200_enc_depth_off = ~0u;
     uint32_t seq = ++g_r200_seq;
@@ -8359,6 +8440,7 @@ static void metal_fill_notify_r200_locked(void *opaque, uint32_t offset,
                 [g_r200_enc endEncoding];
                 [g_r200_enc release];
                 g_r200_enc = nil;
+                r300_reuse_reset();
             }
             g_r200_enc_depth_off = ~0u;
             MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -8804,6 +8886,7 @@ static int r200_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             [g_r200_enc endEncoding];
             [g_r200_enc release];
             g_r200_enc = nil;
+            r300_reuse_reset();
         }
         if (!g_r200_enc) {
             id<MTLTexture> rt = r200_view(st, rk, rtpf, true);
@@ -10351,6 +10434,7 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             [g_r200_enc endEncoding];
             [g_r200_enc release];
             g_r200_enc = nil;
+            r300_reuse_reset();
         }
         if (!g_r200_enc) {
             MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -10390,6 +10474,7 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             g_r300_enc_ncb = ncb;
             memcpy(g_r300_enc_cb, ck, sizeof(ck[0]) * ncb);
             g_r300_enc_mine = true;
+            r300_reuse_reset();     /* a new encoder has nothing bound */
             g_r200_stat_passes++;
             for (uint32_t k = 0; k < ncb; k++) {
                 r200_note_written(ck[k].offset,
@@ -10415,13 +10500,29 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             return -1;
         }
         id<MTLRenderCommandEncoder> enc = g_r200_enc;
-        [enc setRenderPipelineState:pipe];
-        r300_reuse_count(R300R_PIPE, true);
+        R300Reuse *rc = r300_reuse();   /* NULL: PPCGPU_R300_ENC_REUSE off */
+        bool set = !rc || !rc->pipe_ok || rc->pipe != pipe;
+        if (set) {
+            [enc setRenderPipelineState:pipe];
+            if (rc) {
+                r300_reuse_hold((id *)&rc->pipe, pipe);
+                rc->pipe_ok = true;
+            }
+        }
+        r300_reuse_count(R300R_PIPE, set);
         /* SU_CULL_MODE; the winding also decides [[front_facing]] for
          * two-sided stencil. */
-        [enc setFrontFacingWinding:r300_front_ccw(pkt->cull) ?
-                                   MTLWindingCounterClockwise : MTLWindingClockwise];
-        r300_reuse_count(R300R_WIND, true);
+        MTLWinding wind = r300_front_ccw(pkt->cull) ? MTLWindingCounterClockwise
+                                                    : MTLWindingClockwise;
+        set = !rc || !rc->wind_ok || rc->wind != wind;
+        if (set) {
+            [enc setFrontFacingWinding:wind];
+            if (rc) {
+                rc->wind = wind;
+                rc->wind_ok = true;
+            }
+        }
+        r300_reuse_count(R300R_WIND, set);
         MTLCullMode cull = (pkt->cull & R300_CULL_FRONT) ? MTLCullModeFront :
                            (pkt->cull & R300_CULL_BACK) ? MTLCullModeBack
                                                         : MTLCullModeNone;
@@ -10431,11 +10532,26 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
         if (pkt->vs_glsl) {
             /* Vertex program on the GPU: input vertices, their uniforms
              * (R300_BIND_VSU = buffer 2) and the triangle list's indices. */
-            if (!r300_bind_bytes(st, dev, enc, pkt->vs_in, pkt->vs_in_vecs * 16u, 0) ||
-                !r300_bind_bytes(st, dev, enc, pkt->vs_u, sizeof(*pkt->vs_u), 2)) {
+            if (!r300_bind_bytes(st, dev, enc, pkt->vs_in, pkt->vs_in_vecs * 16u, 0)) {
                 return -1;
             }
-            r300_reuse_count(R300R_VSU, true);
+            set = !rc || !rc->vsu_ok || memcmp(rc->vsu, pkt->vs_u, sizeof(*pkt->vs_u));
+            if (set) {
+                if (rc) {
+                    rc->vsu_ok = false;         /* until the new bytes are bound */
+                }
+                if (!r300_bind_bytes(st, dev, enc, pkt->vs_u, sizeof(*pkt->vs_u), 2)) {
+                    return -1;
+                }
+                if (rc) {
+                    if (!rc->vsu) {
+                        rc->vsu = g_malloc(sizeof(*rc->vsu));
+                    }
+                    memcpy(rc->vsu, pkt->vs_u, sizeof(*rc->vsu));
+                    rc->vsu_ok = true;
+                }
+            }
+            r300_reuse_count(R300R_VSU, set);
             size_t ibytes = (size_t)pkt->num_verts * 4;
             void *idst = r200_arena_alloc(st, ibytes, &ib, &ioff);
             if (idst) {
@@ -10451,14 +10567,38 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             if (!r300_bind_bytes(st, dev, enc, pkt->verts, (size_t)nv * sizeof(R300Vertex), 0)) {
                 return -1;
             }
+            if (rc) {
+                rc->vsu_ok = false;     /* conservative: the CPU path leaves buffer 2 */
+            }
         }
-        [enc setFragmentBuffer:r300_zpass_buf(dev) offset:0 atIndex:1];
-        r300_reuse_count(R300R_ZPASS, true);
+        /* g_r300_zpass is one buffer for the renderer's lifetime */
+        set = !rc || !rc->zpass_ok;
+        if (set) {
+            [enc setFragmentBuffer:r300_zpass_buf(dev) offset:0 atIndex:1];
+            if (rc) {
+                rc->zpass_ok = true;
+            }
+        }
+        r300_reuse_count(R300R_ZPASS, set);
         for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
-            [enc setFragmentTexture:tex[t] atIndex:t];
-            [enc setFragmentSamplerState:smp[t] atIndex:t];
-            r300_reuse_count(R300R_TEX, true);
-            r300_reuse_count(R300R_SMP, true);
+            set = !rc || !rc->tex_ok[t] || rc->tex[t] != tex[t];
+            if (set) {
+                [enc setFragmentTexture:tex[t] atIndex:t];
+                if (rc) {
+                    r300_reuse_hold((id *)&rc->tex[t], tex[t]);
+                    rc->tex_ok[t] = true;
+                }
+            }
+            r300_reuse_count(R300R_TEX, set);
+            set = !rc || !rc->smp_ok[t] || rc->smp[t] != smp[t];
+            if (set) {
+                [enc setFragmentSamplerState:smp[t] atIndex:t];
+                if (rc) {
+                    r300_reuse_hold((id *)&rc->smp[t], smp[t]);
+                    rc->smp_ok[t] = true;
+                }
+            }
+            r300_reuse_count(R300R_SMP, set);
         }
         for (uint32_t k = 0; k < ns; k++) {
             /* Sample k: its columns, and the geometry moved so that the
@@ -10482,14 +10622,44 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                 [enc setViewport:(MTLViewport){ 0, 0, pkt->rt_width, pkt->rt_height, 0, 1 }];
                 g_r300_enc_vp_h = pkt->rt_height;
             }
-            [enc setScissorRect:(MTLScissorRect){ cx + sx0, sy0, sx1 - sx0, sy1 - sy0 }];
-            [enc setVertexBytes:ms length:sizeof(ms) atIndex:1];
-            [enc setFragmentBytes:&uk length:sizeof(uk) atIndex:0];
-            [enc setCullMode:cull];
-            r300_reuse_count(R300R_RECT, true);
-            r300_reuse_count(R300R_MS, true);
-            r300_reuse_count(R300R_FSU, true);
-            r300_reuse_count(R300R_CULL, true);
+            /* The final scissor, shifts and uniforms of this sample. */
+            MTLScissorRect rect = { cx + sx0, sy0, sx1 - sx0, sy1 - sy0 };
+            set = !rc || !rc->rect_ok || memcmp(&rc->rect, &rect, sizeof(rect));
+            if (set) {
+                [enc setScissorRect:rect];
+                if (rc) {
+                    rc->rect = rect;
+                    rc->rect_ok = true;
+                }
+            }
+            r300_reuse_count(R300R_RECT, set);
+            set = !rc || !rc->ms_ok || memcmp(rc->ms, ms, sizeof(ms));
+            if (set) {
+                [enc setVertexBytes:ms length:sizeof(ms) atIndex:1];
+                if (rc) {
+                    memcpy(rc->ms, ms, sizeof(ms));
+                    rc->ms_ok = true;
+                }
+            }
+            r300_reuse_count(R300R_MS, set);
+            set = !rc || !rc->fsu_ok || memcmp(&rc->fsu, &uk, sizeof(uk));
+            if (set) {
+                [enc setFragmentBytes:&uk length:sizeof(uk) atIndex:0];
+                if (rc) {
+                    rc->fsu = uk;
+                    rc->fsu_ok = true;
+                }
+            }
+            r300_reuse_count(R300R_FSU, set);
+            set = !rc || !rc->cull_ok || rc->cull != cull;
+            if (set) {
+                [enc setCullMode:cull];
+                if (rc) {
+                    rc->cull = cull;
+                    rc->cull_ok = true;
+                }
+            }
+            r300_reuse_count(R300R_CULL, set);
             if (pkt->num_verts && ib) {
                 [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                                 indexCount:pkt->num_verts
@@ -10504,6 +10674,10 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             if (pkt->num_line_verts) {
                 /* polygon-mode edges: lines, never culled */
                 [enc setCullMode:MTLCullModeNone];
+                if (rc) {
+                    rc->cull = MTLCullModeNone;     /* the next sample or draw restores */
+                    rc->cull_ok = true;
+                }
                 [enc drawPrimitives:MTLPrimitiveTypeLine vertexStart:pkt->num_verts
                         vertexCount:pkt->num_line_verts];
             }
@@ -10511,7 +10685,7 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
         [ib release];
         g_r200_stat_draws++;
         if (g_r300_reuse_stats && g_r200_stat_draws % 20000 == 0) {
-            r300_reuse_log(false);
+            r300_reuse_log(rc != NULL);
         }
         for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
             if (u.tex_info[t][0] && !pkt->tex[t].host_data && tex_view[t]) {
