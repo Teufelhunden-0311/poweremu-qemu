@@ -612,6 +612,85 @@ static bool metal_ensure_vram_render_target(PPCMacGPUMetalState *st,
 /* ========================================================================
  * Create / resize the offscreen render target (legacy path)
  * ======================================================================== */
+/*
+ * PPCGPU_GPUTIME=1 (diagnostic, not for merging): the union of the GPU
+ * execution intervals (MTLCommandBuffer GPUStartTime..GPUEndTime) of every
+ * command buffer this renderer commits, read in its completion handler.
+ * Logged once a second, cumulative: buffers completed, union and sum of the
+ * intervals (s), buffers with an error status, with no valid interval, and
+ * whose interval started before the previous one (counted in the sum and
+ * merged into the open interval), and R300 draws so far.  A run's window
+ * is chosen afterwards from the draw counts.  AI-generated (Claude).
+ */
+static int g_gt_on = -1;
+static pthread_mutex_t g_gt_lock = PTHREAD_MUTEX_INITIALIZER;
+static double g_gt_s, g_gt_e, g_gt_closed, g_gt_sum, g_gt_next;
+static uint64_t g_gt_n, g_gt_bad, g_gt_err, g_gt_ooo, g_gt_r300;
+
+static bool gt_enabled(void)
+{
+    if (g_gt_on < 0) {
+        const char *e = getenv("PPCGPU_GPUTIME");
+        g_gt_on = e && e[0] == '1';
+    }
+    return g_gt_on;
+}
+
+static void gt_log_locked(double now)
+{
+    double u = g_gt_closed + (g_gt_e > g_gt_s ? g_gt_e - g_gt_s : 0);
+    qemu_log("gputime: t %.3f cbs %llu union %.6f sum %.6f err %llu bad %llu ooo %llu "
+             "r300 %llu\n", now, (unsigned long long)g_gt_n, u, g_gt_sum,
+             (unsigned long long)g_gt_err, (unsigned long long)g_gt_bad,
+             (unsigned long long)g_gt_ooo, (unsigned long long)qatomic_read(&g_gt_r300));
+}
+
+/* Call before [cb commit]. */
+static void gt_track(id<MTLCommandBuffer> cb)
+{
+    if (!gt_enabled()) {
+        return;
+    }
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+        double s = b.GPUStartTime, e = b.GPUEndTime;
+        double now = g_get_monotonic_time() / 1e6;
+        pthread_mutex_lock(&g_gt_lock);
+        g_gt_n++;
+        if (b.status != MTLCommandBufferStatusCompleted) {
+            g_gt_err++;
+        }
+        if (!(s > 0 && e >= s)) {
+            g_gt_bad++;
+        } else {
+            g_gt_sum += e - s;
+            if (s < g_gt_s) {
+                g_gt_ooo++;
+            }
+            if (g_gt_e == 0 || s > g_gt_e) {
+                g_gt_closed += g_gt_e - g_gt_s;
+                g_gt_s = s;
+                g_gt_e = e;
+            } else if (e > g_gt_e) {
+                g_gt_e = e;
+            }
+        }
+        if (now >= g_gt_next) {
+            g_gt_next = now + 1.0;
+            gt_log_locked(now);
+        }
+        pthread_mutex_unlock(&g_gt_lock);
+    }];
+}
+
+static void gt_final(void)
+{
+    if (gt_enabled()) {
+        pthread_mutex_lock(&g_gt_lock);
+        gt_log_locked(g_get_monotonic_time() / 1e6);
+        pthread_mutex_unlock(&g_gt_lock);
+    }
+}
+
 static bool metal_ensure_render_target(PPCMacGPUMetalState *st,
                                         uint32_t width, uint32_t height)
 {
@@ -677,6 +756,7 @@ static bool metal_ensure_render_target(PPCMacGPUMetalState *st,
                         destinationLevel:0
                        destinationOrigin:MTLOriginMake(0, 0, 0)];
                 [blitEnc endEncoding];
+                gt_track(blitCmd);
                 [blitCmd commit];
                 [blitCmd waitUntilCompleted];
             }
@@ -1374,6 +1454,9 @@ static void *metal_init(uint8_t *vram_ptr, uint64_t vram_size)
             qemu_log("ppc-mac-gpu-metal: R300 early depth/stencil rejection on\n");
         }
     }
+    if (gt_enabled()) {
+        qemu_log("ppc-mac-gpu-metal: GPU interval diagnostic on (PPCGPU_GPUTIME)\n");
+    }
     st->vram_ptr = vram_ptr;
     st->vram_size = vram_size;
 
@@ -1542,6 +1625,7 @@ static void *metal_init(uint8_t *vram_ptr, uint64_t vram_size)
 
 static void metal_fini(void *opaque)
 {
+    gt_final();
     PPCMacGPUMetalState *st = opaque;
     if (!st) return;
 
@@ -3290,6 +3374,7 @@ static void metal_roundtrip_test(PPCMacGPUMetalState *st,
        destinationBytesPerRow:TW * 4
      destinationBytesPerImage:TW * TH * 4];
         [blit endEncoding];
+        gt_track(cmdBuf);
         [cmdBuf commit];
         [cmdBuf waitUntilCompleted];
 
@@ -5330,6 +5415,7 @@ static int metal_draw_3d_locked(void *opaque, uint8_t *vram_ptr, uint64_t vram_s
              * The draw output is already in the guest's VRAM buffer.
              * Mark the VRAM region dirty so the display update picks it up. */
 
+            gt_track(cmdBuf);
             [cmdBuf commit];
             [cmdBuf waitUntilCompleted];
 
@@ -8159,6 +8245,7 @@ static uint32_t r200_commit_as(void (*done)(void *, uint32_t), void *arg,
         [g_r200_cb encodeSignalEvent:g_r200_event value:++g_r200_event_val];
     }
     r200_arena_recycle_on(g_r200_cb);
+    gt_track(g_r200_cb);
     [g_r200_cb commit];
     if (g_r200_inflight) {                 /* its status is still to be read */
         if (g_r200_nunchecked == R200_UNCHECKED) {
@@ -10535,6 +10622,9 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     PPCMacGPUMetalState *st = opaque;
     int r;
 
+    if (g_gt_on > 0) {
+        qatomic_inc(&g_gt_r300);
+    }
     if (!rqueue_enabled()) {
         pthread_mutex_lock(&g_render_lock);
         r = r300_draw_encode(st, vram_ptr, vram_size, pkt, NULL);   /* sync: today's path */
