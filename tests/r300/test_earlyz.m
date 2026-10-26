@@ -111,13 +111,14 @@ typedef struct Prog {
     const char *name;
     unsigned ncb;
     MTLPixelFormat cfmt;
+    uint32_t xflags;                        /* more r300_us_to_glsl flags (byte-order model) */
     id<MTLRenderPipelineState> p[2][2];     /* [early][z16] */
 } Prog;
 
 static bool make_prog(Prog *pg, R300State *st)
 {
     for (int early = 0; early < 2; early++) {
-        char *m = glsl(st, early ? R300_GLSL_EARLY_Z : 0);
+        char *m = glsl(st, pg->xflags | (early ? R300_GLSL_EARLY_Z : 0));
         if (!m) return false;
         CHECK((strstr(m, "r300_zpreview(zb") != NULL) == early, "%s: preview in text %d",
               pg->name, early);
@@ -559,6 +560,12 @@ int main(void)
         Prog pkil = { "tex+KIL", 1, MTLPixelFormatRGBA8Unorm };
         Prog ptxp = { "TXP", 1, MTLPixelFormatRGBA8Unorm };
         Prog ptxb = { "TXB", 1, MTLPixelFormatRGBA8Unorm };
+        /* The default byte-order model: both colour buffers in VRAM, COLORENDIAN
+         * 0 (big-endian stores; rt_swap32 for target A, as r300_draw sets it). */
+        const uint32_t MODEL = R300_GLSL_ENDIAN_MODEL | R300_GLSL_CB_VRAM(0) | R300_GLSL_CB_VRAM(1);
+        Prog ptex_m = { "tex model", 1, MTLPixelFormatRGBA8Unorm, MODEL };
+        Prog pmrt_m = { "MRT model", 2, MTLPixelFormatRGBA8Unorm, MODEL };
+        Prog pmw_m = { "multiwrite model", 2, MTLPixelFormatRGBA8Unorm, MODEL };
         program(&st, true, false, false);
         {
             char *m = glsl(&st, 0);
@@ -574,6 +581,17 @@ int main(void)
         if (!make_prog(&pmw, &st)) return 1;
         program_op(&st, 1, true, false, false);
         if (!make_prog(&pkil, &st)) return 1;
+        program(&st, true, false, false);
+        if (!make_prog(&ptex_m, &st)) return 1;
+        program(&st, true, true, false);
+        {
+            char *a = glsl(&st, 0), *b = glsl(&st, MODEL);
+            CHECK(a && b && strcmp(a, b) != 0, "the model changes the MRT text");
+            free(a); free(b);
+        }
+        if (!make_prog(&pmrt_m, &st)) return 1;
+        r300_state_write(&st, 0x4E00, 1u << 5);
+        if (!make_prog(&pmw_m, &st)) return 1;
         program_op(&st, 3, false, false, false);
         if (!make_prog(&ptxp, &st)) return 1;
         program_op(&st, 4, false, false, false);
@@ -771,6 +789,62 @@ int main(void)
                 CHECK(f == rq[i].level && r[1].zpass == (unsigned)(rq[i].px * rq[i].px / 2),
                       "raw level %g want %d, count %u", f, rq[i].level, r[1].zpass);
             }
+        }
+
+        /* ---- the byte-order model (default configuration) ---- */
+        {
+            /* Colour bytes that no swap leaves alone. */
+            static const uint8_t pat[8] = { 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF };
+            /* M1: Z LESS fails everywhere, KEEP: every fragment is rejected
+             *     early; nothing changes, nothing counted. */
+            one(&c, 1 | 2 | 4, 1 | (7u << 3), 0xFFFF00, false, 0.75f, true);
+            c.u.rt_swap32 = 1;
+            fill(&init, word(quant(0.5f, false), 5, 0, false));
+            for (size_t i = 0; i < sizeof(init.col); i++) ((uint8_t *)init.col)[i] = pat[i % 8];
+            CHECK(both(&ptex_m, false, &c, &init, rtex, smp, r), "model M1 variants differ");
+            CHECK(memcmp(r[1].c.col[0], init.col[0], W * H * 4) == 0 &&
+                  memcmp(r[1].c.z, init.z, sizeof(init.z)) == 0 && r[1].zpass == 0,
+                  "model M1: contents changed, count %u", r[1].zpass);
+            /* M2: passes: every fragment survives, colour and depth written. */
+            c.u.zinfo[1] = 4 | (7u << 3);                   /* GEQUAL */
+            CHECK(both(&ptex_m, false, &c, &init, rtex, smp, r), "model M2 variants differ");
+            CHECK(memcmp(r[1].c.col[0], init.col[0], W * H * 4) != 0 && r[1].zpass == W * H &&
+                  r[1].c.z[5] >> 8 == quant(0.75f, false), "model M2: count %u word %08x",
+                  r[1].zpass, r[1].c.z[5]);
+            /* M3: MRT and multiwrite, channel mask and blending, half the
+             *     pixels rejected (checkerboard). */
+            const Prog *mp[2] = { &pmrt_m, &pmw_m };
+            for (int k = 0; k < 2; k++) {
+                one(&c, 2, 1, 0, false, 0.5f, true);
+                c.u.rt_swap32 = 1;
+                c.u.chanmask = 0x5;
+                c.u.cblend = 1 | (4u << 16) | (5u << 24);       /* enable, src alpha / 1 - src alpha */
+                c.u.ablend = c.u.cblend;
+                for (int y = 0; y < H; y++) {
+                    for (int x = 0; x < W; x++) {
+                        init.z[y * W + x] = word(quant((x ^ y) & 1 ? 0.25f : 0.75f, false), 0, 0,
+                                                 false);
+                    }
+                }
+                CHECK(both(mp[k], false, &c, &init, rtex, smp, r), "model M3 %s variants differ",
+                      mp[k]->name);
+                CHECK(r[1].zpass == W * H / 2 &&
+                      memcmp(r[1].c.col[1], init.col[1], W * H * 4) != 0 &&
+                      memcmp(&r[1].c.col[0][4], &init.col[0][4], 4) == 0,   /* (1, 0): rejected */
+                      "model M3 %s: count %u", mp[k]->name, r[1].zpass);
+            }
+            /* Random cases under the model. */
+            const Prog *rp[3] = { &ptex_m, &pmrt_m, &pmw_m };
+            unsigned n = getenv("EARLYZ_CASES") ? atoi(getenv("EARLYZ_CASES")) / 5 : 1000;
+            unsigned differ = 0;
+            for (unsigned i = 0; i < n; i++) {
+                bool z16 = (i / 3) & 1;
+                random_case(&c, &init, rp[i % 3], z16, false);
+                c.u.rt_swap32 = 1;
+                differ += !both(rp[i % 3], z16, &c, &init, rtex, smp, r);
+            }
+            CHECK(differ == 0, "%u of %u model random cases differ", differ, n);
+            printf("byte-order model: %u random cases, %u differ\n", n, differ);
         }
 
         /* ---- random cases ---- */
