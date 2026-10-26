@@ -38,6 +38,12 @@ MUTANTS = [
     ("no per-draw exclusions", "r300_draw.c",
      "    if ((flags & R300_GLSL_EARLY_Z) &&\n        (r300_aa_samples(st) != 1 || (zf != 0 && zf != 2))) {",
      "    if (false) {", True),
+    ("GPU-VS call site without exclusions", "r300_draw.c",
+     "                                            r300_glsl_flags_for_draw(st, st->glsl_flags),",
+     "                                            st->glsl_flags,", True),
+    ("CPU-VS call site without exclusions", "r300_draw.c",
+     "    pkt->glsl = r300_us_glsl_cached(st, &desc, r300_glsl_flags_for_draw(st, st->glsl_flags),",
+     "    pkt->glsl = r300_us_glsl_cached(st, &desc, st->glsl_flags,", True),
     ("interlock not excluded", "r300_us.c",
      "    bool early = (flags & R300_GLSL_EARLY_Z) && !il &&",
      "    bool early = (flags & R300_GLSL_EARLY_Z) &&", True),
@@ -62,15 +68,18 @@ SPV="$R/r300_spirv.c -DR300_HAVE_SPIRV_CROSS $(pkg-config --cflags --libs shader
 SPV="$SPV -lspirv-cross-msl -lspirv-cross-hlsl -lspirv-cross-cpp -lspirv-cross-reflect"
 SPV="$SPV -lspirv-cross-glsl -lspirv-cross-util -lspirv-cross-core -lc++"
 clang -O1 -w -I$R -fobjc-arc -framework Metal -framework Foundation test_earlyz.m %s $SPV -o "%s"
-''' % (srcs, exe))
+cc -O1 -w -I$R -o "%s_draw" test_draw.c %s -lm
+''' % (srcs, exe, exe, srcs))
     subprocess.run(["sh", sh], cwd=HERE, check=True, stderr=subprocess.DEVNULL)
     return exe
 
 def run(exe):
     r = subprocess.run([exe], cwd=HERE, capture_output=True, text=True)
-    fails = [l for l in r.stdout.splitlines() if l.startswith("FAIL")]
+    d = subprocess.run([exe + "_draw"], cwd=HERE, capture_output=True, text=True)
+    fails = [l for l in r.stdout.splitlines() + d.stdout.splitlines() if l.startswith("FAIL")]
     rnd = [l for l in r.stdout.splitlines() if l.startswith("random cases:")]
-    return r.returncode, fails, (rnd[0].split(";")[0][len("random cases: "):] if rnd else "")
+    rc = r.returncode if r.returncode else d.returncode
+    return rc, fails, (rnd[0].split(";")[0][len("random cases: "):] if rnd else "")
 
 bdir = sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp()
 os.makedirs(bdir, exist_ok=True)

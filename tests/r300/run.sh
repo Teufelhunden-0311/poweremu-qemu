@@ -60,7 +60,11 @@ done
 "$B/test_mslcache" "$B/qe0.glsl" "$B"
 "$B/test_features"
 "$B/test_zs"
-"$B/test_earlyz"
+mkdir -p "$B/earlyz-msl"
+EARLYZ_MSL_DIR="$B/earlyz-msl" "$B/test_earlyz"
+# The early variant's shape (design B5) in the MSL of the test programs and the QE capture.
+cp "$B/qe256.fs_z.metal" "$B/earlyz-msl/qe.fs_z.metal"
+python3 -I earlyz_mslcheck.py "$B/earlyz-msl"
 "$B/test_fmt"
 "$B/test_raster"
 "$B/test_gpuvs"

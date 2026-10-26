@@ -84,6 +84,12 @@ static Target target(int scene)
     d.usage = MTLTextureUsageRenderTarget;
     d.storageMode = MTLStorageModeShared;
     t.col = [dev newTextureWithDescriptor:d];
+    {
+        static uint8_t grey[W * H * 4];         /* the same start for every target */
+        memset(grey, 0x40, sizeof(grey));
+        [t.col replaceRegion:MTLRegionMake2D(0, 0, W, H) mipmapLevel:0 withBytes:grey
+                 bytesPerRow:W * 4];
+    }
     t.zb = [dev newBufferWithLength:W * H * 4 options:MTLResourceStorageModeShared];
     uint32_t *z = t.zb.contents;
     for (int y = 0; y < H; y++) {
@@ -138,6 +144,10 @@ static double measure(Target *t, id<MTLRenderPipelineState> p)
         [cb waitUntilCompleted];
         if (cb.status != MTLCommandBufferStatusCompleted) {
             printf("command buffer failed\n");
+            exit(1);
+        }
+        if (!(cb.GPUStartTime > 0 && cb.GPUEndTime >= cb.GPUStartTime)) {
+            printf("invalid GPU interval %f..%f\n", cb.GPUStartTime, cb.GPUEndTime);
             exit(1);
         }
         sum += (cb.GPUEndTime - cb.GPUStartTime) * 1e3;
@@ -204,6 +214,7 @@ int main(void)
         static const char *scenes[4] = { "all kept", "all rejected", "half, per pixel",
                                          "half, 16x16 blocks" };
         static const unsigned chains[2] = { 1, 4 };
+        int differ = 0;
         printf("GPU ms per %d command buffers of %d full-screen %dx%d layers; "
                "mean of %d ABBA rounds (min-max)\n", REPS, LAYERS, W, H, ROUNDS);
         for (int ci = 0; ci < 2; ci++) {
@@ -237,7 +248,12 @@ int main(void)
                 printf("%u fetch%s  %-20s off %8.2f (%.2f-%.2f)  on %8.2f (%.2f-%.2f)  on/off %.3f  %s\n",
                        chains[ci], chains[ci] > 1 ? "es" : "  ", scenes[sc], off, lo[0], hi[0],
                        on, lo[1], hi[1], on / off, same ? "outputs equal" : "OUTPUTS DIFFER");
+                differ += !same;
             }
+        }
+        if (differ) {
+            printf("FAIL: %d scene(s) with different outputs\n", differ);
+            return 1;
         }
     }
     return 0;

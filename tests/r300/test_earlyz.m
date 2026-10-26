@@ -91,6 +91,20 @@ static void program_op(R300State *st, unsigned op, bool kil, bool mrt, bool w)
     }
 }
 
+/* No texture: n ALU instructions, the last writing out A = t0 (work n). */
+static void alu_program(R300State *st, unsigned n)
+{
+    program_op(st, 0, false, false, false);
+    r300_state_write(st, 0x461C, (n - 1) << 6);
+    for (unsigned i = 0; i < n; i++) {
+        bool last = i + 1 == n;
+        r300_state_write(st, 0x46C0 + 4 * i, last ? 7u << 26 : 0);
+        r300_state_write(st, 0x48C0 + 4 * i, 0 | (21u << 7) | (20u << 14));
+        r300_state_write(st, 0x47C0 + 4 * i, last ? 1u << 24 : 0);
+        r300_state_write(st, 0x49C0 + 4 * i, 9 | (17u << 7) | (16u << 14));
+    }
+}
+
 static void program(R300State *st, bool tex, bool mrt, bool w)
 {
     program_op(st, tex ? 1 : 0, false, mrt, w);
@@ -105,6 +119,21 @@ static char *glsl(R300State *st, uint32_t flags)
     char *m = r300_us_to_glsl(st, &d, flags, &err);
     if (!m) { printf("glsl: %s\n", err); fails++; }
     return m;
+}
+
+/* With $EARLYZ_MSL_DIR set: write st's early r300_fs_z MSL as
+ * <dir>/<name>.fs_z.metal for earlyz_mslcheck.py (run.sh). */
+static void dump_msl(R300State *st, const char *name)
+{
+    const char *dir = getenv("EARLYZ_MSL_DIR");
+    if (!dir) return;
+    char *m = glsl(st, R300_GLSL_EARLY_Z), *err = NULL, path[1024];
+    char *msl = m ? r300_glsl_to_msl(m, R300_STAGE_FS_Z, &err) : NULL;
+    snprintf(path, sizeof(path), "%s/%s.fs_z.metal", dir, name);
+    FILE *f = msl ? fopen(path, "w") : NULL;
+    CHECK(f != NULL, "dump %s: %s", path, err ? err : "cannot write");
+    if (f) { fputs(msl, f); fclose(f); }
+    free(m); free(msl); free(err);
 }
 
 typedef struct Prog {
@@ -533,6 +562,22 @@ int main(void)
             b = glsl(&st, R300_GLSL_EARLY_Z);
             CHECK(a && b && strcmp(a, b) == 0, "short program text with the bit");
             free(a); free(b);
+            /* The work threshold without textures: 7 ALU instructions stay
+             * on the off text, 8 get the preview (and compile). */
+            for (unsigned n = 7; n <= 8; n++) {
+                alu_program(&st, n);
+                a = glsl(&st, 0);
+                b = glsl(&st, R300_GLSL_EARLY_Z);
+                bool pre = b && strstr(b, "r300_zpreview(zb") != NULL;
+                CHECK(a && b && strstr(a, "alu 0+") && pre == (n >= 8) &&
+                      (n >= 8 || strcmp(a, b) == 0), "ALU-only threshold at %u: preview %d", n, pre);
+                CHECK(strstr(b, n == 7 ? "alu 0+7" : "alu 0+8") != NULL, "ALU count %u in text", n);
+                if (n == 8) {
+                    NSArray<id<MTLFunction>> *lib = r300_test_lib(dev, b);
+                    CHECK(lib != nil, "8-instruction early text compiles");
+                }
+                free(a); free(b);
+            }
             /* Per draw: single-sampled Z16 / Z24S8 only. */
             program(&st, true, false, false);
             static const struct { uint32_t aa, zf; bool keep; } ex[] = {
@@ -572,14 +617,18 @@ int main(void)
             CHECK(m && strstr(m, "uniform sampler2D tex0"), "unit 0 is a sampled texture");
             free(m);
         }
+        dump_msl(&st, "tex");
         if (!make_prog(&ptex, &st)) return 1;
         program(&st, true, false, true);
+        dump_msl(&st, "tex_w");
         if (!make_prog(&pw, &st)) return 1;
         program(&st, true, true, false);
+        dump_msl(&st, "tex_mrt");
         if (!make_prog(&pmrt, &st)) return 1;
         r300_state_write(&st, 0x4E00, 1u << 5);            /* RB3D_CCTL: output A to both */
         if (!make_prog(&pmw, &st)) return 1;
         program_op(&st, 1, true, false, false);
+        dump_msl(&st, "tex_kil");
         if (!make_prog(&pkil, &st)) return 1;
         program(&st, true, false, false);
         if (!make_prog(&ptex_m, &st)) return 1;
@@ -593,8 +642,10 @@ int main(void)
         r300_state_write(&st, 0x4E00, 1u << 5);
         if (!make_prog(&pmw_m, &st)) return 1;
         program_op(&st, 3, false, false, false);
+        dump_msl(&st, "txp");
         if (!make_prog(&ptxp, &st)) return 1;
         program_op(&st, 4, false, false, false);
+        dump_msl(&st, "txb");
         if (!make_prog(&ptxb, &st)) return 1;
         id<MTLTexture> rtex = mip_tex(true), ltex = mip_tex(false);
         id<MTLSamplerState> smp = sampler();
@@ -752,6 +803,7 @@ int main(void)
             r300_state_write(&st, 0x4E38, (7u << 21) | W);  /* ARGB32323232 */
             r300_state_write(&st, 0x46A4, 21);              /* C4_32_FP */
             Prog praw = { "raw 16F", 1, MTLPixelFormatRGBA32Uint };
+            dump_msl(&st, "raw16f");
             if (!make_prog(&praw, &st)) return 1;
             uint32_t rowel = td.lvl_pitch[0] / 4, rows = (td.size_bytes + rowel * 4 - 1) / (rowel * 4);
             MTLTextureDescriptor *d = [MTLTextureDescriptor
