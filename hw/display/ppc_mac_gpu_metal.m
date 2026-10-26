@@ -6756,6 +6756,50 @@ static id<MTLRenderCommandEncoder> g_r200_enc;
 static R200TexKey g_r200_enc_key;
 static bool g_r300_enc_mine;        /* open encoder belongs to draw_r300 */
 static uint32_t g_r300_enc_vp_h;    /* PPCGPU_R300_EXTENT: its viewport height */
+
+/*
+ * PPCGPU_R300_ENC_STATS=1 (diagnostic, AI-generated, default off): counts
+ * the encoder setters r300_draw_encode makes, per binding family, and logs
+ * them every 20000 draws (tests/r300/test_encode reads the counters).
+ */
+enum {
+    R300R_PIPE, R300R_WIND, R300R_CULL, R300R_RECT, R300R_ZPASS, R300R_TEX,
+    R300R_SMP, R300R_MS, R300R_FSU, R300R_VSU, R300R_N
+};
+static bool g_r300_reuse_stats;
+static uint64_t g_r300_reuse_made[R300R_N], g_r300_reuse_skipped[R300R_N];
+
+static void r300_reuse_init(void)
+{
+    const char *e = getenv("PPCGPU_R300_ENC_STATS");
+    g_r300_reuse_stats = e && e[0] == '1';
+}
+
+static inline void r300_reuse_count(int f, bool made)
+{
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, r300_reuse_init);
+    if (g_r300_reuse_stats) {
+        (made ? g_r300_reuse_made : g_r300_reuse_skipped)[f]++;
+    }
+}
+
+static void r300_reuse_log(bool on)
+{
+    static const char *const name[R300R_N] = {
+        "pipe", "wind", "cull", "rect", "zpass", "tex", "smp", "ms", "fsu", "vsu"
+    };
+    char line[512];
+    int n = 0;
+
+    for (int f = 0; f < R300R_N; f++) {
+        n += snprintf(line + n, sizeof(line) - n, " %s %llu/%llu", name[f],
+                      (unsigned long long)g_r300_reuse_made[f],
+                      (unsigned long long)g_r300_reuse_skipped[f]);
+    }
+    qemu_log("ppc-mac-gpu r300: setters made/skipped (reuse %s):%s\n",
+             on ? "on" : "off", line);
+}
 static uint32_t g_r200_enc_variant;                 /* g_r200_pipes_gen index */
 static id<MTLRenderPipelineState> g_r200_enc_pipe;  /* last set on the pass */
 static uint32_t g_r200_enc_depth_off = ~0u, g_r200_enc_depth_pitch; /* ~0: none */
@@ -10372,10 +10416,12 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
         }
         id<MTLRenderCommandEncoder> enc = g_r200_enc;
         [enc setRenderPipelineState:pipe];
+        r300_reuse_count(R300R_PIPE, true);
         /* SU_CULL_MODE; the winding also decides [[front_facing]] for
          * two-sided stencil. */
         [enc setFrontFacingWinding:r300_front_ccw(pkt->cull) ?
                                    MTLWindingCounterClockwise : MTLWindingClockwise];
+        r300_reuse_count(R300R_WIND, true);
         MTLCullMode cull = (pkt->cull & R300_CULL_FRONT) ? MTLCullModeFront :
                            (pkt->cull & R300_CULL_BACK) ? MTLCullModeBack
                                                         : MTLCullModeNone;
@@ -10389,6 +10435,7 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
                 !r300_bind_bytes(st, dev, enc, pkt->vs_u, sizeof(*pkt->vs_u), 2)) {
                 return -1;
             }
+            r300_reuse_count(R300R_VSU, true);
             size_t ibytes = (size_t)pkt->num_verts * 4;
             void *idst = r200_arena_alloc(st, ibytes, &ib, &ioff);
             if (idst) {
@@ -10406,9 +10453,12 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             }
         }
         [enc setFragmentBuffer:r300_zpass_buf(dev) offset:0 atIndex:1];
+        r300_reuse_count(R300R_ZPASS, true);
         for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
             [enc setFragmentTexture:tex[t] atIndex:t];
             [enc setFragmentSamplerState:smp[t] atIndex:t];
+            r300_reuse_count(R300R_TEX, true);
+            r300_reuse_count(R300R_SMP, true);
         }
         for (uint32_t k = 0; k < ns; k++) {
             /* Sample k: its columns, and the geometry moved so that the
@@ -10436,6 +10486,10 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
             [enc setVertexBytes:ms length:sizeof(ms) atIndex:1];
             [enc setFragmentBytes:&uk length:sizeof(uk) atIndex:0];
             [enc setCullMode:cull];
+            r300_reuse_count(R300R_RECT, true);
+            r300_reuse_count(R300R_MS, true);
+            r300_reuse_count(R300R_FSU, true);
+            r300_reuse_count(R300R_CULL, true);
             if (pkt->num_verts && ib) {
                 [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
                                 indexCount:pkt->num_verts
@@ -10456,6 +10510,9 @@ static int r300_draw_encode(PPCMacGPUMetalState *st, uint8_t *vram_ptr,
         }
         [ib release];
         g_r200_stat_draws++;
+        if (g_r300_reuse_stats && g_r200_stat_draws % 20000 == 0) {
+            r300_reuse_log(false);
+        }
         for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
             if (u.tex_info[t][0] && !pkt->tex[t].host_data && tex_view[t]) {
                 r200_note_read(pkt->tex[t].gpu_addr,

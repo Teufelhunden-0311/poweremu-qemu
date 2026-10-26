@@ -34,6 +34,11 @@ clang -O1 -Wall -Wno-unused-function -fobjc-arc -framework Metal -framework Foun
 for t in test_zs test_fmt test_raster test_gpuvs; do
     clang -O1 -fobjc-arc -framework Metal -framework Foundation $t.m $SRC $SPV -o "$B/$t"
 done
+# The production Metal encoder (hw/display/ppc_mac_gpu_metal.m, no ARC, with
+# QEMU's headers from encshim/).
+clang -O1 -w -Iencshim -I../../hw/display -framework Metal -framework Foundation \
+    -framework QuartzCore test_encode.m $SRC $R/r300_msl_cache.c $SPV \
+    $(pkg-config --cflags --libs glib-2.0) -lz -o "$B/test_encode"
 "$B/test_pvs"
 "$B/test_draw"
 "$B/test_vfetch"
@@ -63,4 +68,20 @@ done
 "$B/test_raster"
 "$B/test_gpuvs"
 "$B/test_touch"
+# The same pixels from the production encoder in every configuration: the
+# render queue and PPCGPU_R300_EXTENT each off and on.
+for ext in 0 1; do
+    for q in 0 1; do
+        for r in 0; do
+            o="$B/encode_$ext$q$r"
+            ENC_TEST_DIR="$B" PPCGPU_R300_EXTENT=$ext PPCGPU_EXT_RETIRE=$ext \
+                PPCGPU_RENDER_QUEUE=$q PPCGPU_R300_ENC_REUSE=$r \
+                "$B/test_encode" > "$o.txt" 2> "$o.log" || { cat "$o.txt"; exit 1; }
+            grep '^step' "$o.txt" > "$o.steps"
+            cmp "$B/encode_000.steps" "$o.steps" ||
+                { diff "$B/encode_000.steps" "$o.steps"; exit 1; }
+        done
+    done
+done
+echo "test_encode: the same pixels in all 4 configurations"
 echo "all R300 tests passed"
