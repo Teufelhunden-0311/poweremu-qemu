@@ -1359,9 +1359,21 @@ static id<MTLRenderPipelineState> bin_pso(id<MTLDevice> dev,
     return p;
 }
 
+static PPCMacGPURenderer metal_renderer;
+
 static void *metal_init(uint8_t *vram_ptr, uint64_t vram_size)
 {
     PPCMacGPUMetalState *st = g_new0(PPCMacGPUMetalState, 1);
+    /* PPCGPU_R300_EARLY_Z=1: R300 fragment programs test depth/stencil
+     * before shading (R300_GLSL_EARLY_Z, r300_us.c).  Off by default; read
+     * once, before any draw.  AI-generated (Claude). */
+    {
+        const char *e = getenv("PPCGPU_R300_EARLY_Z");
+        if (e && e[0] == '1') {
+            metal_renderer.r300_glsl_flags |= R300_GLSL_EARLY_Z;
+            qemu_log("ppc-mac-gpu-metal: R300 early depth/stencil rejection on\n");
+        }
+    }
     st->vram_ptr = vram_ptr;
     st->vram_size = vram_size;
 
