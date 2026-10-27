@@ -18,9 +18,10 @@ static struct {
     uint64_t req[FD_NREQ][FD_NCAUSE], req_pages;
     uint64_t exec[FD_NCAUSE], asked_bits, cleaned_bits;
     uint64_t jc_tlb, jc_all, jc_page, lp_esc, slot_hit, slot_evict;
+    uint64_t tlbie, tlbie_seg[16], tlbie_per_req[6];
 } fd;
 
-static unsigned fd_pending, fd_inflight;
+static unsigned fd_pending, fd_inflight, fd_tlbie_since;
 static bool fd_bat_since, fd_sdr1_since;
 static uint32_t fd_last_sr[16];
 static uint64_t fd_recent[FD_RECENT];
@@ -53,6 +54,15 @@ static void fd_report(const char *tag)
             " req_pages=%" PRIu64 "\n", t, fd.asked_bits, fd.cleaned_bits,
             fd.jc_tlb, fd.jc_all, fd.jc_page, fd.lp_esc, fd.slot_hit,
             fd.slot_evict, fd.req_pages);
+    fprintf(stderr, "fdiag-tlbie T=%.3f tlbie=%" PRIu64 " per_req=%" PRIu64 "/%"
+            PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 " seg=", t,
+            fd.tlbie, fd.tlbie_per_req[0], fd.tlbie_per_req[1],
+            fd.tlbie_per_req[2], fd.tlbie_per_req[3], fd.tlbie_per_req[4],
+            fd.tlbie_per_req[5]);
+    for (int i = 0; i < 16; i++) {
+        fprintf(stderr, "%s%" PRIu64, i ? "/" : "", fd.tlbie_seg[i]);
+    }
+    fprintf(stderr, "\n");
     for (int c = 0; c < FD_NCAUSE; c++) {
         if (fd.exec[c]) {
             fprintf(stderr, "fdiag-x T=%.3f causes=%02x n=%" PRIu64 "\n", t, c,
@@ -86,6 +96,14 @@ static void __attribute__((constructor)) fd_init(void)
 void fdiag_pending(int cause)
 {
     fd_pending |= cause;
+}
+
+void fdiag_tlbie(uint32_t ea)
+{
+    fd.tlbie++;
+    fd.tlbie_seg[ea >> 28]++;
+    fd_tlbie_since++;
+    fd_pending |= FD_TLBIE;
 }
 
 void fdiag_inflight(int cause)
@@ -173,12 +191,20 @@ void fdiag_request(int outcome, int causes, unsigned pages)
     switch (outcome) {
     case FD_REQ_GLOBAL:
     case FD_REQ_LOCAL:
+        if (fd_pending & FD_TLBIE) {
+            /* tlbies consumed by this request: 1, 2-3, 4-7, 8-15, 16-63, 64+ */
+            unsigned n = fd_tlbie_since;
+            fd.tlbie_per_req[n < 2 ? 0 : n < 4 ? 1 : n < 8 ? 2 : n < 16 ? 3 :
+                             n < 64 ? 4 : 5]++;
+            fd_tlbie_since = 0;
+        }
         fd_inflight |= fd_pending;
         fd_pending = 0;
         break;
     case FD_REQ_PAGE:
         fd.req_pages += pages;
         fd_pending &= ~FD_TLBIE;
+        fd_tlbie_since = 0;
         break;
     case FD_REQ_SRSW:
         fd_pending &= ~FD_SR;

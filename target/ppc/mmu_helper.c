@@ -479,7 +479,7 @@ void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
          * page it changes, as Darwin and Linux do) needs the default.
          */
         if (unlikely(fdiag_on)) {
-            fdiag_pending(FD_TLBIE);
+            fdiag_tlbie(addr);
         }
         if (ppc_tlbie_flushes_all()) {
             env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;

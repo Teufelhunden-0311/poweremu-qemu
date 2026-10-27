@@ -36,6 +36,8 @@ enum { FD_REQ_NONE, FD_REQ_GLOBAL, FD_REQ_LOCAL, FD_REQ_PAGE, FD_REQ_SRSW,
 
 /* a deferred cause (SR, tlbie): consumed by check_tlb_flush */
 void fdiag_pending(int cause);
+/* tlbie of effective address @ea (setter count; per-request histogram) */
+void fdiag_tlbie(uint32_t ea);
 /* an immediate whole flush is about to be requested for @cause */
 void fdiag_inflight(int cause);
 /* store to a segment register: @changed if the value differs */
