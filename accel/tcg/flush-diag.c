@@ -19,6 +19,7 @@ static struct {
     uint64_t exec[FD_NCAUSE], asked_bits, cleaned_bits;
     uint64_t jc_tlb, jc_all, jc_page, lp_esc, slot_hit, slot_evict;
     uint64_t tlbie, tlbie_seg[16], tlbie_per_req[6];
+    uint64_t slot_fill_unused, slot_moved, tb_gen;
 } fd;
 
 static unsigned fd_pending, fd_inflight, fd_tlbie_since;
@@ -26,7 +27,7 @@ static bool fd_bat_since, fd_sdr1_since;
 static uint32_t fd_last_sr[16];
 static uint64_t fd_recent[FD_RECENT];
 static unsigned fd_nrecent;
-static GHashTable *fd_seen;
+static GHashTable *fd_seen;     /* SR-set hash -> 1 + slot it was last in */
 static int64_t fd_next;
 static unsigned fd_calls;
 
@@ -54,6 +55,9 @@ static void fd_report(const char *tag)
             " req_pages=%" PRIu64 "\n", t, fd.asked_bits, fd.cleaned_bits,
             fd.jc_tlb, fd.jc_all, fd.jc_page, fd.lp_esc, fd.slot_hit,
             fd.slot_evict, fd.req_pages);
+    fprintf(stderr, "fdiag-slot T=%.3f slot_fill_unused=%" PRIu64
+            " slot_moved=%" PRIu64 " tb_gen=%" PRIu64 "\n", t,
+            fd.slot_fill_unused, fd.slot_moved, fd.tb_gen);
     fprintf(stderr, "fdiag-tlbie T=%.3f tlbie=%" PRIu64 " per_req=%" PRIu64 "/%"
             PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 " seg=", t,
             fd.tlbie, fd.tlbie_per_req[0], fd.tlbie_per_req[1],
@@ -159,7 +163,7 @@ static void fd_sr_event(const uint32_t *sr)
     if (!g_hash_table_contains(fd_seen, &h)) {
         uint64_t *k = g_new(uint64_t, 1);
         *k = h;
-        g_hash_table_add(fd_seen, k);
+        g_hash_table_insert(fd_seen, k, GINT_TO_POINTER(0));
         fd.distinct++;
     }
 }
@@ -212,13 +216,31 @@ void fdiag_request(int outcome, int causes, unsigned pages)
     }
 }
 
-void fdiag_slot(bool hit)
+void fdiag_slot(bool hit, bool unused, int slot)
 {
+    /* the set being synced is the most recent SR event's (fd_recent[0]),
+     * already a key in fd_seen (fd_sr_event); value 0 = no slot yet */
+    gpointer key = NULL, prev = NULL;
+    bool known = fd_nrecent &&
+        g_hash_table_lookup_extended(fd_seen, &fd_recent[0], &key, &prev);
+
     if (hit) {
         fd.slot_hit++;
     } else {
         fd.slot_evict++;
+        fd.slot_fill_unused += unused;
     }
+    if (known) {
+        if (prev && GPOINTER_TO_INT(prev) != slot + 1) {
+            fd.slot_moved++;
+        }
+        g_hash_table_insert(fd_seen, key, GINT_TO_POINTER(slot + 1));
+    }
+}
+
+void fdiag_tb_gen(void)
+{
+    fd.tb_gen++;
 }
 
 void fdiag_flush_exec(uint16_t asked, uint16_t cleaned)
