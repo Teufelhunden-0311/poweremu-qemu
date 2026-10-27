@@ -467,6 +467,9 @@ void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
         break;
     case POWERPC_MMU_32B:
         if (ppc_tlbie_class(env)) {
+            if (unlikely(fdiag_on)) {
+                fdiag_tlbie_class(addr);
+            }
             /* translated user/supervisor indexes of every SR set (as below) */
             tlb_flush_page_class_by_mmuidx(env_cpu(env), addr,
                                            PPC_TLBIE_CLASS_MASK, 0x3333);

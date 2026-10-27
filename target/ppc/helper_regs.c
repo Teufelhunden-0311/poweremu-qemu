@@ -399,6 +399,9 @@ void check_tlb_flush(CPUPPCState *env, bool global)
     if (global && (env->tlb_need_flush & TLB_NEED_GLOBAL_FLUSH) &&
         !(env->tlb_need_flush & (TLB_NEED_LOCAL_FLUSH | TLB_NEED_PAGE_FLUSH)) &&
         ppc_tlbie_class(env)) {
+        if (unlikely(fdiag_on)) {
+            fdiag_request(FD_REQ_CLASS, fdc, 0);
+        }
         env->tlb_need_flush &= ~TLB_NEED_GLOBAL_FLUSH;
     }
 

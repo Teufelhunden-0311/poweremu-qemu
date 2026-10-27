@@ -19,7 +19,7 @@ static struct {
     uint64_t exec[FD_NCAUSE], asked_bits, cleaned_bits;
     uint64_t jc_tlb, jc_all, jc_page, lp_esc, slot_hit, slot_evict;
     uint64_t tlbie, tlbie_seg[16], tlbie_per_req[6];
-    uint64_t slot_fill_unused, slot_moved, tb_gen;
+    uint64_t slot_fill_unused, slot_moved, tb_gen, class_flush;
 } fd;
 
 static unsigned fd_pending, fd_inflight, fd_tlbie_since;
@@ -56,8 +56,8 @@ static void fd_report(const char *tag)
             fd.jc_tlb, fd.jc_all, fd.jc_page, fd.lp_esc, fd.slot_hit,
             fd.slot_evict, fd.req_pages);
     fprintf(stderr, "fdiag-slot T=%.3f slot_fill_unused=%" PRIu64
-            " slot_moved=%" PRIu64 " tb_gen=%" PRIu64 "\n", t,
-            fd.slot_fill_unused, fd.slot_moved, fd.tb_gen);
+            " slot_moved=%" PRIu64 " tb_gen=%" PRIu64 " class_flush=%" PRIu64 "\n",
+            t, fd.slot_fill_unused, fd.slot_moved, fd.tb_gen, fd.class_flush);
     fprintf(stderr, "fdiag-tlbie T=%.3f tlbie=%" PRIu64 " per_req=%" PRIu64 "/%"
             PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 " seg=", t,
             fd.tlbie, fd.tlbie_per_req[0], fd.tlbie_per_req[1],
@@ -108,6 +108,13 @@ void fdiag_tlbie(uint32_t ea)
     fd.tlbie_seg[ea >> 28]++;
     fd_tlbie_since++;
     fd_pending |= FD_TLBIE;
+}
+
+void fdiag_tlbie_class(uint32_t ea)
+{
+    fd.tlbie++;
+    fd.tlbie_seg[ea >> 28]++;
+    fd.class_flush++;
 }
 
 void fdiag_inflight(int cause)
