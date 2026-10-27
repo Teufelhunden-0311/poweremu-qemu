@@ -133,6 +133,13 @@ enum {
  * in r300_draw.c); set by the device, not by a renderer. */
 #define R300_GLSL_ENDIAN_MODEL  (1u << 3)
 #define R300_GLSL_CB_VRAM(k)    (1u << (4 + (k)))   /* colour buffer k is in VRAM */
+/* Early depth/stencil rejection (PPCGPU_R300_EARLY_Z=1, Metal only): r300_fs_z
+ * tests the rasterizer's depth before shading and discards a fragment that
+ * fails without changing the depth/stencil word.  Cleared per draw by
+ * r300_glsl_flags_for_draw (multisampling, depth formats other than Z16 and
+ * Z24S8) and by the generator (interlock, short programs); a text without the
+ * preview is the same as with the bit off.  AI-generated (Claude). */
+#define R300_GLSL_EARLY_Z       (1u << 8)
 
 /*
  * Build the GLSL source for the current US program.  It compiles as three

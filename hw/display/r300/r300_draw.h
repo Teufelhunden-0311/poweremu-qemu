@@ -284,6 +284,10 @@ uint32_t r300_index_at(const uint32_t *dw, uint32_t ndw, bool i32, uint32_t i);
 uint32_t r300_aa_samples(const R300State *st);
 void r300_aa_positions(const R300State *st, float pos[6][2]);
 
+/* st's fragment-program flags with R300_GLSL_EARLY_Z cleared where this draw
+ * cannot use it (multisampling, depth formats other than Z16 / Z24S8). */
+uint32_t r300_glsl_flags_for_draw(const R300State *st, uint32_t flags);
+
 /*
  * Byte offset of sample `sample` of pixel (x, y) in a multisampled R300
  * colour/depth buffer (ns = 2 or 4 samples) as Apple's ATIRadeon9700

@@ -31,7 +31,7 @@ cc -O1 -Wall -o "$B/test_mslcache" test_mslcache.c $SPV -lz
 clang -fobjc-arc -framework Metal -framework Foundation mslcheck.m -o "$B/mslcheck"
 clang -O1 -Wall -Wno-unused-function -fobjc-arc -framework Metal -framework Foundation \
     test_touch.m $R/r300_state.c $R/r300_pvs.c $R/r300_us.c -o "$B/test_touch"
-for t in test_zs test_fmt test_raster test_gpuvs; do
+for t in test_zs test_earlyz test_fmt test_raster test_gpuvs; do
     clang -O1 -fobjc-arc -framework Metal -framework Foundation $t.m $SRC $SPV -o "$B/$t"
 done
 "$B/test_pvs"
@@ -41,8 +41,9 @@ done
 "$B/test_glslshare_thread"
 "$B/test_aperture"
 "$B/test_rtle"
-# Both shader outputs: 0 (Metal: uint texture views), 1 (Vulkan: VRAM SSBO).
-for flags in 0 1; do
+# Shader outputs: 0 (Metal: uint texture views), 1 (Vulkan: VRAM SSBO), 256 (Metal with
+# early depth/stencil rejection, R300_GLSL_EARLY_Z).
+for flags in 0 1 256; do
     "$B/test_us" qe_state_draw1.txt $flags > "$B/qe$flags.glsl" 2>/dev/null
     for s in vert:R300_VS frag:R300_FS frag:R300_FS_Z; do
         glslangValidator -V --target-env vulkan1.1 -S "${s%%:*}" -D"${s#*:}" \
@@ -59,6 +60,11 @@ done
 "$B/test_mslcache" "$B/qe0.glsl" "$B"
 "$B/test_features"
 "$B/test_zs"
+mkdir -p "$B/earlyz-msl"
+EARLYZ_MSL_DIR="$B/earlyz-msl" "$B/test_earlyz"
+# The early variant's shape (design B5) in the MSL of the test programs and the QE capture.
+cp "$B/qe256.fs_z.metal" "$B/earlyz-msl/qe.fs_z.metal"
+python3 -I earlyz_mslcheck.py "$B/earlyz-msl"
 "$B/test_fmt"
 "$B/test_raster"
 "$B/test_gpuvs"
