@@ -439,15 +439,19 @@ static struct {
  * PPCGPU_TEST_RESET_REBOOT=1 it then asks for a system reset, so the guest
  * boots again.  AI-generated (Claude).
  */
-enum { CP_TEST_PARK = 1, CP_TEST_WAIT = 2 };
-enum { CPT_PACKET, CPT_TYPE0, CPT_DRAW, CPT_VRAM, CPT_SCRATCH, CPT_RPTR, CPT_N };
+enum { CP_TEST_PARK = 1, CP_TEST_WAIT = 2, CP_TEST_NESTED = 3 };
+enum { CPT_PACKET, CPT_TYPE0, CPT_DRAW, CPT_VRAM, CPT_SCRATCH, CPT_RPTR, CPT_ACCESS_OK, CPT_N };
 static const char *const cpt_name[CPT_N] = {
-    "packets", "type0_writes", "draws", "vram_writes", "scratch_wb", "rptr_publish" };
+    "packets", "type0_writes", "draws", "vram_writes", "scratch_wb", "rptr_publish",
+    "access_ok" };
 static struct {
     int kind;                   /* 0: off */
     uint64_t draws;
     bool init, done, stale, reboot, released, want_waiter, stall_logged;
     int waiter_ms;
+    bool armed, in_nested;
+    uint32_t saved_addr, saved_umsk, outer_tag;
+    uint64_t outer_lo, outer_hi;
     int64_t hold_us;
     unsigned waiters_at;
     int nest_at;
@@ -467,7 +471,8 @@ static void cp_test_init(void)
         return;
     }
     cpt.kind = !strncmp(e, "park", 4) ? CP_TEST_PARK :
-               !strncmp(e, "wait", 4) ? CP_TEST_WAIT : 0;
+               !strncmp(e, "wait", 4) ? CP_TEST_WAIT :
+               !strncmp(e, "nested", 6) ? CP_TEST_NESTED : 0;
     cpt.draws = strchr(e, ':') ? strtoull(strchr(e, ':') + 1, NULL, 0) : 200000;
     cpt.waiter_ms = getenv("PPCGPU_TEST_RESET_WAITER") ?
                     atoi(getenv("PPCGPU_TEST_RESET_WAITER")) : 0;
@@ -495,6 +500,9 @@ static void cp_test_inject(int kind)
     if (unlikely(!cpt.init)) {
         cp_test_init();
     }
+    if (cpt.kind == CP_TEST_NESTED && kind == CP_TEST_WAIT && cpt.in_nested) {
+        kind = CP_TEST_NESTED;
+    }
     if (likely(!cpt.kind) || cpt.done || cpt.kind != kind || !s || !s->r3 ||
         s->r3->draws < cpt.draws) {
         return;
@@ -517,9 +525,57 @@ static void cp_test_inject(int kind)
     cpt.t = g_get_monotonic_time();
     fprintf(stderr, "cp-test: device reset injected at the %s relock (draw %llu, "
             "cp_sync waiters %u, IB nesting %d)\n",
-            kind == CP_TEST_PARK ? "park" : "renderer-wait",
+            kind == CP_TEST_PARK ? "park" : kind == CP_TEST_NESTED ?
+            "nested fence-write-back wait" : "renderer-wait",
             (unsigned long long)s->r3->draws, cpt.waiters_at, cpt.nest_at);
     ppc_mac_gpu_reset(DEVICE(s));
+}
+
+
+#define CPT_MAGIC 0x7e570005u
+/*
+ * Debug (cptest nested): an outer r200_vram_access on the CP thread has
+ * taken the BQL back and is about to flush.  Queue a fence in front whose
+ * write-back goes to VRAM, so the flush's fence drain makes a nested access.
+ */
+static void cp_test_arm_nested(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
+                               uint32_t tag, bool will_flush)
+{
+    uint32_t fb_base, off;
+
+    if (likely(cpt.kind != CP_TEST_NESTED) || cpt.armed || cpt.done || !will_flush ||
+        !ppc_mac_gpu_cp_on_thread() || !s->r3 || s->r3->draws < cpt.draws ||
+        !s->renderer->draw_queue_async ||
+        s->regs.r200_fence_n >= ARRAY_SIZE(s->regs.r200_fence_q)) {
+        return;
+    }
+    fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
+    off = (uint32_t)lo & ~3u;
+    if ((uint64_t)off + 4 > s->vram_size || off < 5 * 4) {
+        return;
+    }
+    cpt.armed = true;
+    cpt.outer_lo = lo;
+    cpt.outer_hi = hi;
+    cpt.outer_tag = tag;
+    cpt.saved_addr = s->regs.scratch_addr;
+    cpt.saved_umsk = s->regs.scratch_umsk;
+    s->regs.scratch_addr = fb_base + off - 5 * 4;
+    s->regs.scratch_umsk |= 1u << 5;
+    memmove(s->regs.r200_fence_q + 1, s->regs.r200_fence_q,
+            s->regs.r200_fence_n * sizeof(s->regs.r200_fence_q[0]));
+    s->regs.r200_fence_q[0].seq = s->regs.r200_fence_n ? s->regs.r200_fence_q[1].seq
+                                                       : s->regs.r200_fence_last_seq;
+    s->regs.r200_fence_q[0].reg = 5;
+    s->regs.r200_fence_q[0].val = CPT_MAGIC;
+    if (!s->regs.r200_fence_n) {
+        s->regs.r200_fence_last_seq = s->regs.r200_fence_q[0].seq;
+    }
+    s->regs.r200_fence_n++;
+    fprintf(stderr, "cp-test: armed a VRAM fence write-back at 0x%x in front of the outer "
+            "access tag %u [0x%llx, 0x%llx) (draw %llu, %u fences queued)\n", off, tag,
+            (unsigned long long)lo, (unsigned long long)hi,
+            (unsigned long long)s->r3->draws, s->regs.r200_fence_n);
 }
 
 /* The CP thread finished the segment (process_ring_buffer). */
@@ -798,8 +854,19 @@ static bool cp_cancelled(void);
  */
 static void r300_zmask_apply(PPCMacGPUState *s);
 
+static bool r200_vram_access_1(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
+                               bool write_access, uint32_t tag);
 static bool r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
                              bool write_access, uint32_t tag)
+{
+    bool ok = r200_vram_access_1(s, lo, hi, write_access, tag);
+    if (ok) {
+        cp_test_effect(CPT_ACCESS_OK);
+    }
+    return ok;
+}
+static bool r200_vram_access_1(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
+                               bool write_access, uint32_t tag)
 {
     if (unlikely(cp_cancelled())) {
         return false;
@@ -848,6 +915,7 @@ static bool r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
          * belong to the old stream (and the reset cleared the fences). */
         return false;
     }
+    cp_test_arm_nested(s, lo, hi, tag, flushed || busy);
     if (flushed) {
         r200_flush_done(s, R200_WHY_TAG(R200_WHY_2D + tag), did, t0);
     } else if (busy) {
@@ -2680,8 +2748,23 @@ static void ppc_mac_gpu_scratch_writeback_val_1(PPCMacGPUState *s, int reg_idx,
 static void ppc_mac_gpu_scratch_writeback_val(PPCMacGPUState *s, int reg_idx,
                                               uint32_t wb_val)
 {
+    bool mine = cpt.armed && reg_idx == 5 && wb_val == CPT_MAGIC && !cpt.in_nested;
+
     cp_test_effect(CPT_SCRATCH);
+    if (mine) {
+        cpt.in_nested = true;
+    }
     ppc_mac_gpu_scratch_writeback_val_1(s, reg_idx, wb_val);
+    if (mine) {
+        cpt.in_nested = false;
+        if (!cpt.done) {
+            s->regs.scratch_addr = cpt.saved_addr;
+            s->regs.scratch_umsk = cpt.saved_umsk;
+            fprintf(stderr, "cp-test: the nested write-back did not wait: no injection; "
+                    "re-arming\n");
+            cpt.armed = false;
+        }
+    }
 }
 static void ppc_mac_gpu_scratch_writeback_val_1(PPCMacGPUState *s, int reg_idx,
                                              uint32_t wb_val)
