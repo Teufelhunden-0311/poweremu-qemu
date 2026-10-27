@@ -429,6 +429,104 @@ static struct {
     uint16_t sync_reg[0x10000 / 4];
 } cp;
 
+/*
+ * Debug (not for merging): PPCGPU_TEST_RESET=park|wait[:draws] resets the
+ * device from the CP thread at the first mid-segment relock of that kind
+ * (ppc_mac_gpu_cp_park / cp_wait_relock) once the R300 has drawn <draws>
+ * (default 200000): just after the BQL is taken back, as if a system reset
+ * had run while it was let go.  It then counts what the rest of that segment
+ * still does on the CP thread and reports at the segment's end.  With
+ * PPCGPU_TEST_RESET_REBOOT=1 it then asks for a system reset, so the guest
+ * boots again.  AI-generated (Claude).
+ */
+enum { CP_TEST_PARK = 1, CP_TEST_WAIT = 2 };
+enum { CPT_PACKET, CPT_TYPE0, CPT_DRAW, CPT_VRAM, CPT_SCRATCH, CPT_RPTR, CPT_N };
+static const char *const cpt_name[CPT_N] = {
+    "packets", "type0_writes", "draws", "vram_writes", "scratch_wb", "rptr_publish" };
+static struct {
+    int kind;                   /* 0: off */
+    uint64_t draws;
+    bool init, done, stale, reboot, released;
+    unsigned waiters_at;
+    int nest_at;
+    int64_t t;
+    uint64_t n[CPT_N];
+} cpt;
+
+static bool ppc_mac_gpu_cp_on_thread(void);
+static void ppc_mac_gpu_reset(DeviceState *dev);
+
+static void cp_test_init(void)
+{
+    const char *e = getenv("PPCGPU_TEST_RESET");
+
+    cpt.init = true;
+    if (!e) {
+        return;
+    }
+    cpt.kind = !strncmp(e, "park", 4) ? CP_TEST_PARK :
+               !strncmp(e, "wait", 4) ? CP_TEST_WAIT : 0;
+    cpt.draws = strchr(e, ':') ? strtoull(strchr(e, ':') + 1, NULL, 0) : 200000;
+    cpt.reboot = getenv("PPCGPU_TEST_RESET_REBOOT") &&
+                 getenv("PPCGPU_TEST_RESET_REBOOT")[0] == '1';
+}
+
+/* An effect of the CP thread; counted while the reset-overtaken segment runs on. */
+static inline void cp_test_effect(int k)
+{
+    if (unlikely(cpt.stale) && ppc_mac_gpu_cp_on_thread()) {
+        cpt.n[k]++;
+    }
+}
+
+/* Just after a mid-segment bql_lock() on the CP thread. */
+static void cp_test_inject(int kind)
+{
+    PPCMacGPUState *s = cp.s;
+
+    if (unlikely(!cpt.init)) {
+        cp_test_init();
+    }
+    if (likely(!cpt.kind) || cpt.done || cpt.kind != kind || !s || !s->r3 ||
+        s->r3->draws < cpt.draws) {
+        return;
+    }
+    cpt.done = cpt.stale = true;
+    cpt.waiters_at = cp.waiters;
+    cpt.nest_at = g_in_pm4;
+    cpt.t = g_get_monotonic_time();
+    fprintf(stderr, "cp-test: device reset injected at the %s relock (draw %llu, "
+            "cp_sync waiters %u, IB nesting %d)\n",
+            kind == CP_TEST_PARK ? "park" : "renderer-wait",
+            (unsigned long long)s->r3->draws, cpt.waiters_at, cpt.nest_at);
+    ppc_mac_gpu_reset(DEVICE(s));
+}
+
+/* The CP thread finished the segment (process_ring_buffer). */
+static void cp_test_end(void)
+{
+    GString *g;
+
+    if (likely(!cpt.stale)) {
+        return;
+    }
+    cpt.stale = false;
+    g = g_string_new("cp-test: rest of the overtaken segment:");
+    for (int k = 0; k < CPT_N; k++) {
+        g_string_append_printf(g, " %s=%llu", cpt_name[k],
+                               (unsigned long long)cpt.n[k]);
+    }
+    g_string_append_printf(g, " (%.3f ms; cp_sync waiters now %u, parked %d)",
+                           (g_get_monotonic_time() - cpt.t) / 1000.0, cp.waiters,
+                           cp.parked);
+    fprintf(stderr, "%s\n", g->str);
+    g_string_free(g, TRUE);
+    if (cpt.reboot) {
+        fprintf(stderr, "cp-test: requesting a system reset\n");
+        qemu_system_reset_request(SHUTDOWN_CAUSE_HOST_QMP_SYSTEM_RESET);
+    }
+}
+
 static bool r200_async_enabled(void)
 {
     static int on = -1;
@@ -2550,13 +2648,22 @@ static bool ppc_mac_gpu_agp_translate(PPCMacGPUState *s, uint32_t gpu_addr,
  */
 static void vram_mark(PPCMacGPUState *s, uint64_t off, uint64_t len)
 {
+    cp_test_effect(CPT_VRAM);
     memory_region_set_dirty(&s->vram, off, len);
     if (s->r300) {
         r300_rt_forget(off, off + len);
     }
 }
 
+static void ppc_mac_gpu_scratch_writeback_val_1(PPCMacGPUState *s, int reg_idx,
+                                               uint32_t wb_val);
 static void ppc_mac_gpu_scratch_writeback_val(PPCMacGPUState *s, int reg_idx,
+                                              uint32_t wb_val)
+{
+    cp_test_effect(CPT_SCRATCH);
+    ppc_mac_gpu_scratch_writeback_val_1(s, reg_idx, wb_val);
+}
+static void ppc_mac_gpu_scratch_writeback_val_1(PPCMacGPUState *s, int reg_idx,
                                              uint32_t wb_val)
 {
     if (reg_idx < 0 || reg_idx > 5) {
@@ -4438,6 +4545,9 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
          * into it, copy it out -- all while this packet is processed, so
          * before any later fence the guest waits on. */
         bool sys_ok = !sys.len || r300_xfer_begin(s, &sys, vram);
+        if (sys_ok) {
+            cp_test_effect(CPT_DRAW);
+        }
         int rr = sys_ok ? s->renderer->draw_r300(s->renderer_opaque, vram,
                                                  s->vram_size + (sys.len ? s->stage_size : 0),
                                                  &pkt) : 0;
@@ -5053,6 +5163,7 @@ static void ppc_mac_gpu_pm4_process_type0(PPCMacGPUState *s,
         }
         uint32_t val = data[i];
 
+        cp_test_effect(CPT_TYPE0);
         gpu_debug_log("PM4_EXEC type0 reg=0x%04x val=0x%x%s",
                       reg_addr, val, one_reg_wr ? " [ONE_REG]" : "");
 
@@ -9078,6 +9189,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
             ppc_mac_gpu_cp_park(s)) {
             break;
         }
+        cp_test_effect(CPT_PACKET);
         uint32_t hdr = pm4_data[i];
         uint32_t type = (hdr >> 30) & 3;
         FILE *rd = r300_ringdump();
@@ -10690,6 +10802,7 @@ static bool cp_wait_relock(int saved)
         return true;
     }
     bql_lock();
+    cp_test_inject(CP_TEST_WAIT);
     g_in_pm4 = saved - 1;
     if (!cp_relock_valid(cp.unlock_epoch)) {
         return false;
@@ -10727,6 +10840,7 @@ static bool ppc_mac_gpu_cp_park(PPCMacGPUState *s)
     bql_unlock();
     g_usleep(1);
     bql_lock();
+    cp_test_inject(CP_TEST_PARK);
     g_in_pm4 = nest;
     if (!cp_relock_valid(epoch)) {
         return true;
@@ -10863,6 +10977,7 @@ static bool ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
          * unless it was taken over or cancelled (cp.aborted).  Either way
          * it is over, unwound: the waiters may go, and a cancellation
          * ends with it. */
+        cp_test_end();
         ppc_mac_gpu_cp_unpark();
         cp.replay = cp.cancel = 0;
     }
@@ -10904,6 +11019,7 @@ static void ppc_mac_gpu_cp_run(PPCMacGPUState *s)
         /* Everything up to wptr is carried out: the ring is empty again --
          * in the card's own register and in the copy the driver may be
          * reading from memory instead. */
+        cp_test_effect(CPT_RPTR);
         s->regs.cp_rb_rptr = wptr;
         ppc_mac_gpu_rptr_writeback(s);
         /* Bump CSQ stat counter so the kext's "wait for CSQ change" poll
@@ -10927,6 +11043,11 @@ static void ppc_mac_gpu_cp_sync(PPCMacGPUState *s, hwaddr why)
         cp.waiters++;
         qemu_cond_wait_bql(&cp.park_cond);
         cp.waiters--;
+    }
+    if (unlikely(cpt.done) && !cpt.released) {
+        cpt.released = true;
+        fprintf(stderr, "cp-test: first cp_sync caller after the injection went on, "
+                "%.3f ms after it\n", (g_get_monotonic_time() - cpt.t) / 1000.0);
     }
     if (!ppc_mac_gpu_cp_pending(s)) {
         return;
