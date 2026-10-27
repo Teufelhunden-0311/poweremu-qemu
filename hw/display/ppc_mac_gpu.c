@@ -270,7 +270,8 @@ static int g_in_pm4;            /* > 0 while executing PM4 packets */
 static bool r200_direct_enabled(void);
 
 /* Finish batched direct-R200 rendering before VRAM is read on the CPU side. */
-static void r200_fence_drain(PPCMacGPUState *s, uint32_t done);
+static bool r200_fence_drain(PPCMacGPUState *s, uint32_t done);
+static bool cp_cancelled(void);
 /* Why batches get flushed: histogram logged with the renderer stats. */
 static uint64_t r200_flush_why[0x10000 / 4 + 8];
 static uint64_t r200_flush_total;
@@ -608,8 +609,13 @@ static bool r200_async_submit(PPCMacGPUState *s, const uint32_t *d,
     return true;
 }
 
-/* The BQL-side half of a flush: statistics and the fences it completed. */
-static void r200_flush_done(PPCMacGPUState *s, uint32_t why, bool did,
+/*
+ * The BQL-side half of a flush: statistics and the fences it completed.
+ * Returns false if the CP thread's replay was cancelled meanwhile: a fence
+ * written back into VRAM goes through r200_vram_access, whose wait can let
+ * go of the BQL (see cp_cancelled).  The caller must then stop too.
+ */
+static bool r200_flush_done(PPCMacGPUState *s, uint32_t why, bool did,
                             int64_t t0)
 {
     if (did) {
@@ -640,11 +646,13 @@ static void r200_flush_done(PPCMacGPUState *s, uint32_t why, bool did,
         }
     }
     if (s->regs.r200_fence_n) {
-        r200_fence_drain(s, s->regs.r200_fence_last_seq);
+        return r200_fence_drain(s, s->regs.r200_fence_last_seq);
     }
+    return true;
 }
 
-static void r200_flush_at(PPCMacGPUState *s, uint32_t why)
+/* Returns false if the CP thread's replay was cancelled (r200_flush_done). */
+static bool r200_flush_at(PPCMacGPUState *s, uint32_t why)
 {
     /*
      * Everything that must see finished drawing comes through here, so this
@@ -655,8 +663,9 @@ static void r200_flush_at(PPCMacGPUState *s, uint32_t why)
     if (s->renderer && s->renderer->flush_r200) {
         int64_t t0 = g_get_monotonic_time();
         bool did = s->renderer->flush_r200(s->renderer_opaque);
-        r200_flush_done(s, why, did, t0);
+        return r200_flush_done(s, why, did, t0);
     }
+    return true;
 }
 /* Register-access flushes are tagged by register; others by a tag below. */
 #define R200_WHY_REG(a)   ((uint32_t)(a) / 4)
@@ -730,10 +739,11 @@ static bool r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
          * belong to the old stream (and the reset cleared the fences). */
         return false;
     }
+    /* Its fence write-backs can cancel too (r200_flush_done). */
     if (flushed) {
-        r200_flush_done(s, R200_WHY_TAG(R200_WHY_2D + tag), did, t0);
+        return r200_flush_done(s, R200_WHY_TAG(R200_WHY_2D + tag), did, t0);
     } else if (busy) {
-        r200_flush_at(s, R200_WHY_TAG(R200_WHY_2D + tag));
+        return r200_flush_at(s, R200_WHY_TAG(R200_WHY_2D + tag));
     }
     return true;
 }
@@ -2683,8 +2693,12 @@ static void r200_fill_notify(PPCMacGPUState *s, uint32_t offset, uint32_t pitch,
 
 static QEMUBH *r200_fence_bh;
 
-/* Perform queued scratch writebacks whose GPU batch has completed. */
-static void r200_fence_drain(PPCMacGPUState *s, uint32_t done)
+/*
+ * Perform queued scratch writebacks whose GPU batch has completed.  Returns
+ * false if one cancelled the CP thread's replay (cp_cancelled): the rest
+ * belong to the old stream, and the caller must stop.
+ */
+static bool r200_fence_drain(PPCMacGPUState *s, uint32_t done)
 {
     /*
      * Take each fence off the queue before writing it back: the write-back
@@ -2701,7 +2715,11 @@ static void r200_fence_drain(PPCMacGPUState *s, uint32_t done)
         memmove(s->regs.r200_fence_q, s->regs.r200_fence_q + 1,
                 s->regs.r200_fence_n * sizeof(s->regs.r200_fence_q[0]));
         ppc_mac_gpu_scratch_writeback_val(s, reg, val);
+        if (unlikely(cp_cancelled())) {
+            return false;
+        }
     }
+    return true;
 }
 
 static void r200_fence_bh_cb(void *opaque)
@@ -2784,8 +2802,9 @@ static void r200_scratch_write(PPCMacGPUState *s, int idx, uint32_t val)
     }
     bool sync_fences = fence_mode == 0;
     if (sync_fences) {
-        r200_flush_at(s, R200_WHY_TAG(R200_WHY_FENCE));
-        ppc_mac_gpu_scratch_writeback_val(s, idx, val);
+        if (r200_flush_at(s, R200_WHY_TAG(R200_WHY_FENCE))) {
+            ppc_mac_gpu_scratch_writeback_val(s, idx, val);
+        }
         return;
     }
     if (r200_direct_enabled() && s->renderer && s->renderer->submit_r200) {
@@ -2799,8 +2818,9 @@ static void r200_scratch_write(PPCMacGPUState *s, int idx, uint32_t val)
         seq = s->regs.r200_fence_last_seq;      /* keep fences in order */
     }
     if (!seq || s->regs.r200_fence_n == ARRAY_SIZE(s->regs.r200_fence_q)) {
-        r200_flush_at(s, R200_WHY_TAG(R200_WHY_FENCE));
-        ppc_mac_gpu_scratch_writeback_val(s, idx, val);
+        if (r200_flush_at(s, R200_WHY_TAG(R200_WHY_FENCE))) {
+            ppc_mac_gpu_scratch_writeback_val(s, idx, val);
+        }
         return;
     }
     s->regs.r200_fence_q[s->regs.r200_fence_n].seq = seq;
@@ -2874,7 +2894,7 @@ static uint32_t g_r300_arm_rt;      /* debug: drag-frame capture target */
 static void r300_surfwatch_update(PPCMacGPUState *s);
 static void r300_surface_changed(PPCMacGPUState *s);
 static void r300_ap0s_update(PPCMacGPUState *s);
-static void r300_zconv(PPCMacGPUState *s, bool to_card);
+static bool r300_zconv(PPCMacGPUState *s, bool to_card);
 
 static bool ppc_mac_gpu_gart_translate(PPCMacGPUState *s, uint32_t gpu_addr,
                                         hwaddr *phys_addr);
@@ -4365,7 +4385,10 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         }
     }
     if (s->r3_zconv && (pkt.depth.attach || (r300_reg(s->r3, 0x4F00) & 7))) {
-        r300_zconv(s, false);           /* drawing again: back to linear */
+        if (!r300_zconv(s, false)) {    /* drawing again: back to linear */
+            r300_draw_free(&pkt);
+            return;                         /* cancelled (cp_cancelled) */
+        }
         s->r3_zconv = false;
     }
     if (pkt.depth.attach) {
@@ -12451,6 +12474,9 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         r300_state_write(s->r3, addr, val);
         if (addr == 0x4F58 || addr == 0x4F5C) {
             r300_zpass_write(s, addr, val);
+            if (unlikely(cp_cancelled())) {
+                return;
+            }
         }
     }
     if (s->r300 && addr >= 0x0B00 && addr < 0x0B80) {
@@ -12458,6 +12484,9 @@ static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
         r300_surf_log(addr, val, true);
         if (addr == 0x0B0C) {
             r300_surface_changed(s);
+            if (unlikely(cp_cancelled())) {
+                return;
+            }
             r300_surfwatch_update(s);
         }
         r300_ap0s_update(s);
@@ -13607,7 +13636,7 @@ static const MemoryRegionOps r300_watch_ops = {
  * writes) when it is unmapped.  Depth drawn without multisampling is one
  * linear sample, which every sample of the card's layout gets a copy of.
  */
-static void r300_zconv(PPCMacGPUState *s, bool to_card)
+static bool r300_zconv(PPCMacGPUState *s, bool to_card)
 {
     uint8_t *vram = (uint8_t *)memory_region_get_ram_ptr(&s->vram) +
                     s->r3_zconv_off;
@@ -13617,9 +13646,11 @@ static void r300_zconv(PPCMacGPUState *s, bool to_card)
     uint8_t *tmp;
 
     if (!rows || s->r3_zconv_off + card > s->vram_size) {
-        return;
+        return true;
     }
-    r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY));
+    if (!r200_flush_at(s, R200_WHY_TAG(R200_WHY_DISPLAY))) {
+        return false;                       /* cancelled (cp_cancelled) */
+    }
     tmp = g_malloc(card);
     if (s->r3_zconv_rows_ns) {
         for (uint32_t y = 0; y < rows; y++) {
@@ -13666,6 +13697,7 @@ static void r300_zconv(PPCMacGPUState *s, bool to_card)
                  "card's layout for a CPU readback\n", s->r3_zconv_off, pitch,
                  rows, ns, to_card ? "to" : "back from");
     }
+    return true;
 }
 
 static void r300_surface_changed(PPCMacGPUState *s)
@@ -13679,7 +13711,9 @@ static void r300_surface_changed(PPCMacGPUState *s)
         if (lo == s->r3_zconv_off) {
             return;                             /* still mapped */
         }
-        r300_zconv(s, false);
+        if (!r300_zconv(s, false)) {
+            return;                 /* cancelled */
+        }
         s->r3_zconv = false;
     }
     if (!s->r3 || hi <= lo || zo < fb_base || lo != zo - fb_base ||
@@ -13702,8 +13736,9 @@ static void r300_surface_changed(PPCMacGPUState *s)
     s->r3_zconv_pitch = pitch;
     s->r3_zconv_ns = ns;
     s->r3_zconv_rows = MIN(s->r3_zb_height, (hi - lo + 1) / (pitch * 4 * ns));
-    r300_zconv(s, true);
-    s->r3_zconv = true;
+    if (r300_zconv(s, true)) {
+        s->r3_zconv = true;
+    }
 }
 
 static void r300_surfwatch_update(PPCMacGPUState *s)
