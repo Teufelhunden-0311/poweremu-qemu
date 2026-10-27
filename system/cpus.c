@@ -777,6 +777,7 @@ static int wp_site_find(const char *file, int line)
  * 3 do_run_on_cpu.  Counted per window to show whether any ran.
  */
 static uint64_t wp_rawcw[4];
+static uint64_t wp_park_n[2], wp_park_ns[2];   /* see waitprof_park_wait */
 /* Recorded holds overlapping each other (impossible for one lock): ns. */
 static uint64_t wp_overlap;
 
@@ -992,6 +993,9 @@ static void wp_print(void)
             wp_snap.ring_trunc, wp_snap.pair_drop, wp_snap.site_drop,
             wp_snap.overlap / 1e6, wp_snap.rawcw[0], wp_snap.rawcw[1],
             wp_snap.rawcw[2], wp_snap.rawcw[3]);
+    fprintf(stderr, "wp-park cumulative vcpu_n=%" PRIu64 " vcpu_ms=%.2f other_n=%"
+            PRIu64 " other_ms=%.2f\n", wp_park_n[0], wp_park_ns[0] / 1e6,
+            wp_park_n[1], wp_park_ns[1] / 1e6);
     for (int i = 0; i < wp_snap.npairs; i++) {
         WPPair *p = &wp_snap.pair[i];
         if (p->ns < wp_snap.dt / 2000) {
@@ -1062,6 +1066,19 @@ void qemu_cond_wait_bql(QemuCond *cond)
         wp_hold_t0 = wp_seg_t0 = get_clock();     /* same site holds again */
         wp_held = true;
     }
+}
+
+/*
+ * cp_sync's waits for a parked CP segment: not lock-request waits, not idle,
+ * so otherwise invisible.  [0] = vCPU thread, [1] = any other.  Cumulative
+ * (the BQL serialises the callers).
+ */
+void waitprof_park_wait(int64_t ns)
+{
+    int other = current_cpu == NULL;
+
+    wp_park_n[other]++;
+    wp_park_ns[other] += ns;
 }
 
 /* A BQL condition wait that bypassed qemu_cond_wait_bql: same accounting. */

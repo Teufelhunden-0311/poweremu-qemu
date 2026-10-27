@@ -45,6 +45,9 @@ void waitprof_kick(void);
 /* do_run_on_cpu's wait: accounted as a BQL condition wait if mutex is the BQL. */
 void waitprof_cond_wait_mutex(QemuCond *cond, QemuMutex *mutex);
 
+/* ppc_mac_gpu_cp_sync waited @ns for a parked CP segment (BQL held). */
+void waitprof_park_wait(int64_t ns);
+
 /* RR vCPU thread, BQL held. */
 void waitprof_idle_enter(void);
 void waitprof_idle_wait(bool begin);
