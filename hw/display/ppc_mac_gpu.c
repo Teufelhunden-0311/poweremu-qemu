@@ -10845,9 +10845,13 @@ static void ppc_mac_gpu_cp_sync(PPCMacGPUState *s, hwaddr why)
         return;
     }
     while (cp.parked) {                 /* see ppc_mac_gpu_cp_park */
+        int64_t wp_t0 = waitprof_on ? get_clock() : 0;
         cp.waiters++;
         qemu_cond_wait_bql(&cp.park_cond);
         cp.waiters--;
+        if (waitprof_on) {
+            waitprof_park_wait(get_clock() - wp_t0);
+        }
     }
     if (!ppc_mac_gpu_cp_pending(s)) {
         return;
