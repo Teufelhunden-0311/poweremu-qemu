@@ -419,6 +419,11 @@ static struct {
     unsigned waiters;           /* cp_sync callers waiting for it to finish */
     QemuCond park_cond;
     int64_t park_at;
+    /* Cancelling a replay a reset overtook (see cp_cancelled): the segment
+     * the CP thread is replaying (from 1; 0 = none), the one cancelled, and
+     * the epoch when cp_wait_unlock let go. */
+    unsigned replay_seq, replay, cancel;
+    unsigned unlock_epoch;
     /* Statistics (BQL): catch-ups the guest forced, by register. */
     uint32_t syncs, kicks;
     uint16_t sync_reg[0x10000 / 4];
@@ -661,21 +666,32 @@ enum { R200_WHY_T3 = 1, R200_WHY_DISPLAY, R200_WHY_FENCE, R200_WHY_OTHER };
 enum { R200_WHY_2D = 0x40 };
 
 static int cp_wait_unlock(void);
-static void cp_wait_relock(int saved);
+static bool cp_wait_relock(int saved);
+static bool cp_cancelled(void);
 
 /*
  * A CPU-side 2D operation is about to read (write_access=false) or write
  * VRAM rows [lo, hi).  Flush batched 3D work only if it overlaps: work in
  * flight that neither reads nor writes these bytes can keep running.
+ *
+ * Returns false if the CP thread's replay was cancelled -- now, or already
+ * (see cp_cancelled): the caller must then leave VRAM, the renderer and
+ * guest memory alone and return.
  */
 static void r300_zmask_apply(PPCMacGPUState *s);
 
-static void r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
+static bool r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
                              bool write_access, uint32_t tag)
 {
+    if (unlikely(cp_cancelled())) {
+        return false;
+    }
     if (s->r3_zclear_pending && lo < s->r3_zclear_off + s->r3_zclear_len &&
         hi > s->r3_zclear_off) {
         r300_zmask_apply(s);    /* a depth clear this work must see first */
+        if (unlikely(cp_cancelled())) {
+            return false;
+        }
     }
     if (write_access && tag <= 5) {
         r200_rate.ops2d++;
@@ -686,7 +702,7 @@ static void r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
         }
     }
     if (!s->renderer || !s->renderer->range_busy_r200 || hi <= lo) {
-        return;
+        return true;
     }
     /*
      * It may wait for the render queue, and then for the GPU: not with the
@@ -709,12 +725,17 @@ static void r200_vram_access(PPCMacGPUState *s, uint64_t lo, uint64_t hi,
         did = s->renderer->flush_r200(s->renderer_opaque);
         flushed = true;
     }
-    cp_wait_relock(w);
+    if (!cp_wait_relock(w)) {
+        /* Reset meanwhile: the statistics and the fence write-backs below
+         * belong to the old stream (and the reset cleared the fences). */
+        return false;
+    }
     if (flushed) {
         r200_flush_done(s, R200_WHY_TAG(R200_WHY_2D + tag), did, t0);
     } else if (busy) {
         r200_flush_at(s, R200_WHY_TAG(R200_WHY_2D + tag));
     }
+    return true;
 }
 #define R200_ROWS(off, pitch, y, h) \
     (uint64_t)(off) + (uint64_t)(y) * (pitch), \
@@ -2583,7 +2604,9 @@ static void ppc_mac_gpu_scratch_writeback_val(PPCMacGPUState *s, int reg_idx,
                       reg_idx, wb_val, wb_addr, (uint64_t)phys);
     } else if (wb_addr >= fb_base && wb_addr + 4 <= fb_base + s->vram_size) {
         uint32_t off = wb_addr - fb_base;
-        r200_vram_access(s, off, off + 4, true, 6);
+        if (!r200_vram_access(s, off, off + 4, true, 6)) {
+            return;
+        }
         uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
         memcpy(vram + off, &wire_val, 4);
         vram_mark(s, off, 4);
@@ -3028,7 +3051,9 @@ static bool r300_write_raw(PPCMacGPUState *s, uint32_t gpu_addr,
         uint64_t off = gpu_addr - fb_base;
         /* Only batched work that touches these four bytes has to finish
          * first; a write-back next to rendering keeps the GPU running. */
-        r200_vram_access(s, off, off + 4, true, 6);
+        if (!r200_vram_access(s, off, off + 4, true, 6)) {
+            return false;
+        }
         memcpy((uint8_t *)memory_region_get_ram_ptr(&s->vram) + off, bytes, 4);
         vram_mark(s, off, 4);
         return true;
@@ -3095,7 +3120,7 @@ static void r300_zpass_write(PPCMacGPUState *s, uint32_t addr, uint32_t val)
     uint8_t b[4] = { w, w >> 8, w >> 16, w >> 24 };     /* card stores LE */
 
     s->r3_zpass_active = false;
-    if (!r300_write_raw(s, val & ~3u, b)) {
+    if (!r300_write_raw(s, val & ~3u, b) && !cp_cancelled()) {
         qemu_log("ppc-mac-gpu r300: ZPASS_ADDR %08x not mapped\n", val);
     }
 }
@@ -3137,7 +3162,9 @@ static void r300_zmask_apply(PPCMacGPUState *s)
     }
     s->r3_zclear_pending = false;          /* before r200_vram_access */
     v = r300_swap_mode(r300_reg(s->r3, 0x4F28), s->r3_zclear_swap);
-    r200_vram_access(s, off, off + s->r3_zclear_len, true, 7);
+    if (!r200_vram_access(s, off, off + s->r3_zclear_len, true, 7)) {
+        return;
+    }
     r200_pattern_fill(vram + off, s->r3_zclear_len, v, s->r3_zclear_bpp);
     vram_mark(s, off, s->r3_zclear_len);
     static int logged;
@@ -3188,6 +3215,9 @@ static void r300_zmask_clear(PPCMacGPUState *s)
         return;
     }
     r300_zmask_apply(s);                    /* an earlier one, for another buffer */
+    if (unlikely(cp_cancelled())) {
+        return;                             /* not a clear for after a reset */
+    }
     s->r3_zclear_pending = true;
     s->r3_zclear_off = off;
     s->r3_zclear_len = bpr * rows;
@@ -3243,7 +3273,9 @@ static void r300_cmask_clear(PPCMacGPUState *s)
     if (!rows) {
         return;
     }
-    r200_vram_access(s, off, off + bpr * rows, true, 8);
+    if (!r200_vram_access(s, off, off + bpr * rows, true, 8)) {
+        return;
+    }
     if (bpp == 4) {
         r200_pattern_fill(vram + off, bpr * rows, r300_swap_mode(v, endian), 4);
     } else {
@@ -3663,11 +3695,14 @@ static void r300_aa_resolve(PPCMacGPUState *s, const R300DrawPacket *pkt)
         }
         /* Wait only for batched work that races the read of the samples
          * or the write of the resolve buffer. */
-        r200_vram_access(s, pkt->rt_gpu_addr,
-                         pkt->rt_gpu_addr + srow * iy1, false, 9);
-        r200_vram_access(s, dst, dst + (uint64_t)dpitch * iy1, true, 10);
+        bool go = r200_vram_access(s, pkt->rt_gpu_addr,
+                                   pkt->rt_gpu_addr + srow * iy1, false, 9) &&
+                  r200_vram_access(s, dst, dst + (uint64_t)dpitch * iy1, true, 10);
         if (need_bql) {
             bql_unlock();
+        }
+        if (!go) {
+            return;                         /* cancelled (cp_cancelled) */
         }
     }
     /* 8 bits a channel averages; other formats keep sample 0. */
@@ -3817,7 +3852,9 @@ static bool r300_xfer_begin(PPCMacGPUState *s, R300SysXfer *x, uint8_t *vram)
      * packet stale, and it must not be drawn with what the guest sets up
      * afterwards. */
     x->resets = s->reset_count;
-    r200_vram_access(s, x->off, x->off + x->len, true, 9);  /* may let go of the BQL */
+    if (!r200_vram_access(s, x->off, x->off + x->len, true, 9)) { /* may let go of the BQL */
+        return false;                       /* cancelled (cp_cancelled) */
+    }
     if (s->reset_count != x->resets) {
         r300_warn_once("system-memory colour buffer not drawn: device reset", NULL);
         return false;
@@ -3842,7 +3879,9 @@ static bool r300_xfer_begin(PPCMacGPUState *s, R300SysXfer *x, uint8_t *vram)
 /* After the draw: wait for it to reach the staging, then copy it out. */
 static void r300_xfer_end(PPCMacGPUState *s, R300SysXfer *x, uint8_t *vram)
 {
-    r200_vram_access(s, x->off, x->off + x->len, false, 9); /* may let go of the BQL */
+    if (!r200_vram_access(s, x->off, x->off + x->len, false, 9)) { /* may let go of the BQL */
+        return;                             /* cancelled: no copy back */
+    }
     if (s->reset_count != x->resets) {
         r300_warn_once("system-memory colour buffer not copied back: device reset", NULL);
     } else if (r300_gpu_failures(s) != x->failures) {
@@ -3913,8 +3952,10 @@ static int r300_draw_staged(PPCMacGPUState *s, uint8_t *vram, R300DrawPacket *pk
     /* Earlier work on the staging, and earlier drawing into the buffer:
      * both may let go of the BQL, and a reset meanwhile makes the packet
      * stale (see r300_xfer_begin). */
-    r200_vram_access(s, off, off + len, true, 9);
-    r200_vram_access(s, dst, dst + (uint64_t)row * rows, false, 9);
+    if (!r200_vram_access(s, off, off + len, true, 9) ||
+        !r200_vram_access(s, dst, dst + (uint64_t)row * rows, false, 9)) {
+        return -1;                          /* cancelled (cp_cancelled) */
+    }
     if (s->reset_count != resets) {
         r300_warn_once("colour buffer not drawn in the staging: device reset", NULL);
         return -1;
@@ -3945,8 +3986,10 @@ static int r300_draw_staged(PPCMacGPUState *s, uint8_t *vram, R300DrawPacket *pk
      * or draws the buffer's bytes goes first.  Either wait may finish other
      * work, and with it learn of a reset or a failure: the checks come after
      * both. */
-    r200_vram_access(s, off, off + len, false, 9);
-    r200_vram_access(s, dst, dst + (uint64_t)row * rows, true, 9);
+    if (!r200_vram_access(s, off, off + len, false, 9) ||
+        !r200_vram_access(s, dst, dst + (uint64_t)row * rows, true, 9)) {
+        return rr;                          /* cancelled: no copy back */
+    }
     bool back = false;
     if (s->reset_count != resets) {
         r300_warn_once("staged colour buffer not copied back: device reset", NULL);
@@ -3985,6 +4028,9 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
 
     r300_zmask_apply(s);
+    if (unlikely(cp_cancelled())) {
+        return;                             /* reset during its wait */
+    }
     r300_drawlog_draw(s, opcode, d, body_dw);
 
     if (s->r3_dump) {
@@ -4342,7 +4388,9 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     if (r300_reg(s->r3, 0x4E88) & 1) {         /* RB3D_AARESOLVE_CTL */
         r300_aa_resolve(s, &pkt);
         r300_draw_free(&pkt);
-        s->regs.stall_draws++;
+        if (!cp_cancelled()) {
+            s->regs.stall_draws++;
+        }
         return;
     }
     if (ns > 1) {
@@ -4402,6 +4450,15 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             r300_xfer_end(s, &sys, vram);
         }
         g_free(sys.phys);
+        if (unlikely(cp_cancelled())) {
+            /* A wait above let go of the BQL and the device was reset:
+             * none of the bookkeeping below is for the new state. */
+            if (need_bql) {
+                bql_unlock();
+            }
+            r300_draw_free(&pkt);
+            return;
+        }
         if (s->r3_dump && g_r300_arm_rt && pkt.rt_gpu_addr == g_r300_arm_rt) {
             fprintf(s->r3_dump, "   renderer -> %d\n", rr);
         }
@@ -4988,6 +5045,12 @@ static void ppc_mac_gpu_pm4_process_type0(PPCMacGPUState *s,
     for (i = 0; i < count; i++) {
         uint32_t reg_addr = one_reg_wr ? (reg_base * 4)
                                        : ((reg_base + i) * 4);
+
+        /* A write can run an IB or a blit that lets go of the BQL: after a
+         * cancellation, not one more register (see cp_cancelled). */
+        if (unlikely(cp_cancelled())) {
+            break;
+        }
         uint32_t val = data[i];
 
         gpu_debug_log("PM4_EXEC type0 reg=0x%04x val=0x%x%s",
@@ -5809,10 +5872,12 @@ static void ppc_mac_gpu_2d_blit(PPCMacGPUState *s)
         }
     }
 
-    r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y, blit_h), true, 1);
-    if (src_offset < s->vram_size) {
-        r200_vram_access(s, R200_ROWS(src_offset, src_pitch ? src_pitch : dst_pitch,
-                                      src_y, blit_h), false, 1);
+    if (!r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y, blit_h),
+                          true, 1) ||
+        (src_offset < s->vram_size &&
+         !r200_vram_access(s, R200_ROWS(src_offset, src_pitch ? src_pitch : dst_pitch,
+                                        src_y, blit_h), false, 1))) {
+        return;                             /* cancelled (cp_cancelled) */
     }
     seq_log("REG  rop=%02x src=%06x/%u (%u,%u) dst=%06x/%u (%u,%u) %ux%u",
             rop3, src_offset, src_pitch, src_x, src_y,
@@ -6334,10 +6399,12 @@ static void ppc_mac_gpu_2d_blit_sep(PPCMacGPUState *s)
         return;
     }
 
-    r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y, blit_h), true, 2);
-    if (src_offset < s->vram_size) {
-        r200_vram_access(s, R200_ROWS(src_offset, src_pitch ? src_pitch : dst_pitch,
-                                      src_y, blit_h), false, 2);
+    if (!r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y, blit_h),
+                          true, 2) ||
+        (src_offset < s->vram_size &&
+         !r200_vram_access(s, R200_ROWS(src_offset, src_pitch ? src_pitch : dst_pitch,
+                                        src_y, blit_h), false, 2))) {
+        return;                             /* cancelled (cp_cancelled) */
     }
     seq_log("SEP  rop=%02x srctype=%u src=%06x/%u (%u,%u) "
             "dst=%06x/%u (%u,%u) %ux%u",
@@ -7477,7 +7544,9 @@ static void r200_clear_depth_buffer(PPCMacGPUState *s)
     if (off + pitch * h > s->vram_size) {
         h = (s->vram_size - off) / pitch;
     }
-    r200_vram_access(s, R200_ROWS(off, pitch, 0, h), true, 5);
+    if (!r200_vram_access(s, R200_ROWS(off, pitch, 0, h), true, 5)) {
+        return;                             /* cancelled (cp_cancelled) */
+    }
     for (uint32_t y = 0; y < h; y++) {
         uint8_t *row = vram + off + y * pitch;
         for (uint32_t x = 0; x < pitch_px; x++) {
@@ -8984,7 +9053,7 @@ static FILE *r300_ringdump(void)
 }
 
 static bool ppc_mac_gpu_cp_yield(PPCMacGPUState *s, uint32_t pos_dw);
-static void ppc_mac_gpu_cp_park(PPCMacGPUState *s);
+static bool ppc_mac_gpu_cp_park(PPCMacGPUState *s);
 static bool cp_in_ring;             /* the CP thread is replaying the ring */
 
 static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
@@ -8994,14 +9063,20 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
     g_in_pm4++;
     uint32_t i = 0;
     while (i < size_dw) {
+        /* Nothing more of a cancelled replay, at this IB level or any
+         * (a packet that let go of the BQL may have been the last). */
+        if (unlikely(cp_cancelled())) {
+            break;
+        }
         /* Between two ring packets the CP thread may let others in. */
         if (unlikely(cp_in_ring) && g_in_pm4 == 1 &&
             ppc_mac_gpu_cp_yield(s, i)) {
             break;
         }
         /* Inside an IB it may let go too, without giving the ring away. */
-        if (unlikely(cp_in_ring) && g_in_pm4 > 1) {
-            ppc_mac_gpu_cp_park(s);
+        if (unlikely(cp_in_ring) && g_in_pm4 > 1 &&
+            ppc_mac_gpu_cp_park(s)) {
+            break;
         }
         uint32_t hdr = pm4_data[i];
         uint32_t type = (hdr >> 30) & 3;
@@ -9412,10 +9487,12 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                         }
                     }
 
-                    r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y,
-                                                  blit_h), true, 3);
-                    r200_vram_access(s, R200_ROWS(src_offset, src_pitch, src_y,
-                                                  blit_h), false, 3);
+                    if (!r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, dst_y,
+                                                       blit_h), true, 3) ||
+                        !r200_vram_access(s, R200_ROWS(src_offset, src_pitch, src_y,
+                                                       blit_h), false, 3)) {
+                        goto cancelled;
+                    }
                     seq_log("BBM  rop=%02x src=%06x/%u (%u,%u) "
                             "dst=%06x/%u (%u,%u) %ux%u",
                             rop3, src_offset, src_pitch, src_x, src_y,
@@ -9839,8 +9916,10 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                         continue;
                     }
 
-                    r200_vram_access(s, R200_ROWS(offset, pitch, dst_y, blit_h),
-                                     true, 4);
+                    if (!r200_vram_access(s, R200_ROWS(offset, pitch, dst_y, blit_h),
+                                          true, 4)) {
+                        goto cancelled;
+                    }
                     seq_log("FILL rop=%02x dst=%06x/%u (%u,%u) %ux%u "
                             "color=%08x",
                             rop3, offset, pitch, dst_x, dst_y,
@@ -9936,7 +10015,9 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                     if (xa < x1 && ya < y1 && hi <= s->vram_size) {
                         uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
 
-                        r200_vram_access(s, lo, hi, true, 5);
+                        if (!r200_vram_access(s, lo, hi, true, 5)) {
+                            goto cancelled;
+                        }
                         for (int32_t y = ya; y < y1; y++) {
                             const uint32_t *src = &d[9 + (uint64_t)(y - y0) * w];
                             uint8_t *row = vram + dst_off + (uint64_t)y * dst_pitch;
@@ -9977,8 +10058,10 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
                 {   /* geometry order is ambiguous here: cover both */
                     uint32_t ymax = MAX(dst_yx & 0xFFFF, (dst_yx >> 16) & 0xFFFF);
                     uint32_t hmax = MAX(dwh & 0x3FFF, (dwh >> 16) & 0x3FFF);
-                    r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, 0,
-                                                  ymax + hmax), true, 5);
+                    if (!r200_vram_access(s, R200_ROWS(dst_offset, dst_pitch, 0,
+                                                       ymax + hmax), true, 5)) {
+                        goto cancelled;
+                    }
                 }
                 seq_log("HOST dst=%06x/%u raw_yx=%08x raw_wh=%08x "
                         "asYX_HW=(%u,%u) %ux%u  asXY_WH=(%u,%u) %ux%u "
@@ -10390,6 +10473,7 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
             i += pkt_count;
         }
     }
+cancelled:      /* (packets that find their replay cancelled come here) */
     g_in_pm4--;
 }
 
@@ -10502,6 +10586,42 @@ static bool ppc_mac_gpu_cp_on_thread(void)
 }
 
 /*
+ * Cancelling a replay.  The CP thread lets go of the BQL part-way through a
+ * segment: ppc_mac_gpu_cp_park between IB packets, cp_wait_unlock while the
+ * renderer finishes.  Nobody can take the segment over meanwhile -- cp_sync
+ * waits while it is parked -- but a system reset can run: ppc_mac_gpu_reset
+ * (also part of a snapshot load) bumps cp.epoch and clears the registers.
+ * The rest of the CP thread's copy of the ring is then stale and none of it
+ * may take effect: no further packet, register write, VRAM write, draw,
+ * scratch or fence write-back, and no published rptr.
+ *
+ * cp.replay names the segment the CP thread is replaying; cp_relock_valid
+ * sets cp.cancel to it when the epoch moved.  cp_cancelled() is then true on
+ * the CP thread until ppc_mac_gpu_process_ring_buffer, at the end of that
+ * segment, clears both: it cannot hold over into later work, nor apply to
+ * another thread's replay or to PIO packets.  Code that let go of the BQL
+ * returns early when it is, and ppc_mac_gpu_process_pm4 checks it before
+ * every packet at every IB level, the Type 0 loop before every register.
+ */
+static bool cp_cancelled(void)
+{
+    return unlikely(cp.cancel) && cp.cancel == cp.replay &&
+           ppc_mac_gpu_cp_on_thread();
+}
+
+/* The CP thread took the BQL back part-way through a segment: false, with
+ * the segment cancelled, if the device was reset meanwhile. */
+static bool cp_relock_valid(unsigned epoch)
+{
+    if (likely(cp.epoch == epoch)) {
+        return true;
+    }
+    cp.cancel = cp.replay;
+    cp.aborted = true;          /* and cp_run publishes no rptr for it */
+    return false;
+}
+
+/*
  * Letting go inside an IB.  The yield below only happens between ring
  * packets, but a game's frame is one IB of tens of thousands of dwords:
  * Doom 3's held the BQL for milliseconds at a time, and the vCPU, which
@@ -10553,37 +10673,54 @@ static int cp_wait_unlock(void)
     cp.parked = true;
     g_in_pm4 = 0;
     cp_in_ring = false;
+    cp.unlock_epoch = cp.epoch;
     bql_unlock();
     return nest + 1;
 }
 
-static void cp_wait_relock(int saved)
+/*
+ * Returns false if the segment was cancelled while the lock was let go
+ * (cp_cancelled): the caller must not go on with what it was doing.  The
+ * IB nesting comes back either way, for the frames that unwind; ring
+ * replay (cp_in_ring) does not, so a cancelled segment never lets go again.
+ */
+static bool cp_wait_relock(int saved)
 {
     if (!saved) {
-        return;
+        return true;
     }
     bql_lock();
     g_in_pm4 = saved - 1;
+    if (!cp_relock_valid(cp.unlock_epoch)) {
+        return false;
+    }
     cp_in_ring = true;
+    return true;
 }
 
-/* Called by the CP thread between two packets of an IB, BQL held. */
-static void ppc_mac_gpu_cp_park(PPCMacGPUState *s)
+/*
+ * Called by the CP thread between two packets of an IB, BQL held.  Returns
+ * true if the segment was cancelled while the lock was let go (see
+ * cp_cancelled): the next packet must not run.
+ */
+static bool ppc_mac_gpu_cp_park(PPCMacGPUState *s)
 {
     int64_t now;
+    unsigned epoch;
     int nest;
 
     if (++cp.pkts & 15) {
-        return;
+        return false;
     }
     if (!cp_park_us() || cp.waiters) {
-        return;                 /* someone wants the ring done: finish it */
+        return false;           /* someone wants the ring done: finish it */
     }
     now = g_get_monotonic_time();
     if (now < cp.park_at) {
-        return;
+        return false;
     }
     cp.parked = true;
+    epoch = cp.epoch;
     nest = g_in_pm4;
     g_in_pm4 = 0;
     cp_in_ring = false;
@@ -10591,8 +10728,12 @@ static void ppc_mac_gpu_cp_park(PPCMacGPUState *s)
     g_usleep(1);
     bql_lock();
     g_in_pm4 = nest;
+    if (!cp_relock_valid(epoch)) {
+        return true;
+    }
     cp_in_ring = true;
     cp.park_at = g_get_monotonic_time() + cp_park_us();
+    return false;
 }
 
 /*
@@ -10711,13 +10852,19 @@ static bool ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
         cp.seg_rptr = old_rptr;
         cp.ring_mask = ring_mask;
         cp.aborted = false;
+        cp.replay = ++cp.replay_seq ? cp.replay_seq : ++cp.replay_seq;
+        cp.cancel = 0;
         cp_in_ring = true;
     }
     ppc_mac_gpu_process_pm4(s, rb_data, count);
     cp_in_ring = false;
     if (on_thread) {
-        /* cp_run publishes the segment before the BQL is next released. */
+        /* cp_run publishes the segment before the BQL is next released --
+         * unless it was taken over or cancelled (cp.aborted).  Either way
+         * it is over, unwound: the waiters may go, and a cancellation
+         * ends with it. */
         ppc_mac_gpu_cp_unpark();
+        cp.replay = cp.cancel = 0;
     }
     g_free(rb_data);
     return !(on_thread && cp.aborted);
