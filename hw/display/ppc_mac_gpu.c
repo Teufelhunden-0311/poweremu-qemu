@@ -448,6 +448,8 @@ static struct {
     int kind;                   /* 0: off */
     uint64_t draws;
     bool init, done, stale, reboot, released, want_waiter, stall_logged;
+    int waiter_ms;
+    int64_t hold_us;
     unsigned waiters_at;
     int nest_at;
     int64_t t;
@@ -468,8 +470,12 @@ static void cp_test_init(void)
     cpt.kind = !strncmp(e, "park", 4) ? CP_TEST_PARK :
                !strncmp(e, "wait", 4) ? CP_TEST_WAIT : 0;
     cpt.draws = strchr(e, ':') ? strtoull(strchr(e, ':') + 1, NULL, 0) : 200000;
-    cpt.want_waiter = getenv("PPCGPU_TEST_RESET_WAITER") &&
-                      getenv("PPCGPU_TEST_RESET_WAITER")[0] == '1';
+    cpt.waiter_ms = getenv("PPCGPU_TEST_RESET_WAITER") ?
+                    atoi(getenv("PPCGPU_TEST_RESET_WAITER")) : 0;
+    if (cpt.waiter_ms == 1) {
+        cpt.waiter_ms = 500;
+    }
+    cpt.want_waiter = cpt.waiter_ms > 0;
     cpt.reboot = getenv("PPCGPU_TEST_RESET_REBOOT") &&
                  getenv("PPCGPU_TEST_RESET_REBOOT")[0] == '1';
 }
@@ -496,11 +502,15 @@ static void cp_test_inject(int kind)
     }
     if (cpt.want_waiter) {
         /* Still parked: let go again until a cp_sync caller waits for it. */
-        for (int i = 0; i < 500 && !cp.waiters; i++) {
+        int64_t h0 = g_get_monotonic_time();
+        for (int i = 0; i < cpt.waiter_ms && !cp.waiters; i++) {
             bql_unlock();
             g_usleep(1000);
             bql_lock();
         }
+        cpt.hold_us = g_get_monotonic_time() - h0;
+        fprintf(stderr, "cp-test: held the park %.1f ms for a cp_sync caller: %u waiting\n",
+                cpt.hold_us / 1000.0, cp.waiters);
     }
     cpt.done = cpt.stale = true;
     cpt.waiters_at = cp.waiters;
@@ -11100,7 +11110,8 @@ static void ppc_mac_gpu_cp_sync(PPCMacGPUState *s, hwaddr why)
     if (unlikely(cpt.done) && !cpt.released) {
         cpt.released = true;
         fprintf(stderr, "cp-test: first cp_sync caller after the injection went on, "
-                "%.3f ms after it\n", (g_get_monotonic_time() - cpt.t) / 1000.0);
+                "%.3f ms after it (%s thread)\n", (g_get_monotonic_time() - cpt.t) / 1000.0,
+                current_cpu ? "vCPU" : "non-vCPU");
     }
     if (!ppc_mac_gpu_cp_pending(s)) {
         return;
