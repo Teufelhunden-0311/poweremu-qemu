@@ -21,6 +21,7 @@
 #include "exec/perf-counters.h"
 #include "qemu/units.h"
 #include "cpu.h"
+#include "exec/flush-diag.h"
 #include "system/kvm.h"
 #include "kvm_ppc.h"
 #include "mmu-hash64.h"
@@ -167,6 +168,9 @@ static inline void do_invalidate_BAT(CPUPPCState *env, target_ulong BATu,
         skip_invalid = !(e && e[0] == '0');
     }
     if (skip_invalid && !(BATu & (BATU32_VS | BATU32_VP))) {
+        if (unlikely(fdiag_on)) {
+            fdiag_bat(data, true, 0, false);
+        }
         return;
     }
     base = BATu & ~0x0001FFFF;
@@ -174,6 +178,10 @@ static inline void do_invalidate_BAT(CPUPPCState *env, target_ulong BATu,
     if (((end - base) >> TARGET_PAGE_BITS) > 1024) {
         /* Flushing 1024 4K pages is slower than a complete flush */
         qemu_log_mask(CPU_LOG_MMU, "Flush all BATs\n");
+        if (unlikely(fdiag_on)) {
+            fdiag_bat(data, false, 0, true);
+            fdiag_inflight(data ? FD_DBAT : FD_IBAT);
+        }
         tlb_flush(cs);
         qemu_log_mask(CPU_LOG_MMU, "Flush done\n");
         return;
@@ -195,6 +203,9 @@ static inline void do_invalidate_BAT(CPUPPCState *env, target_ulong BATu,
     if (fast < 0) {
         const char *e = getenv("PPC_DBAT_FAST");
         fast = !(e && e[0] == '0');
+    }
+    if (unlikely(fdiag_on)) {
+        fdiag_bat(data, false, (end - base) >> TARGET_PAGE_BITS, false);
     }
     if (data && fast && env->mmu_model == POWERPC_MMU_32B) {
         tlb_flush_data_pages_by_mmuidx(cs, base, (end - base) >> TARGET_PAGE_BITS,
@@ -356,6 +367,9 @@ void ppc_mmu_slot_sync(CPUPPCState *env)
         }
     }
     QEMU_PERF_INC(slot_sync);
+    if (unlikely(fdiag_on)) {
+        fdiag_slot(i != PPC_MMU_SLOTS);
+    }
     if (i == PPC_MMU_SLOTS) {
         i = victim;
         memcpy(env->mmu_slot_sr[i], env->sr, sizeof(env->mmu_slot_sr[i]));
@@ -464,6 +478,9 @@ void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
          * leans on congruence-class behaviour (rather than naming every
          * page it changes, as Darwin and Linux do) needs the default.
          */
+        if (unlikely(fdiag_on)) {
+            fdiag_pending(FD_TLBIE);
+        }
         if (ppc_tlbie_flushes_all()) {
             env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
         } else if (env->tlb_flush_npages < PPC_TLB_PENDING_PAGES) {
@@ -517,6 +534,9 @@ target_ulong helper_load_sr(CPUPPCState *env, target_ulong sr_num)
 
 void helper_store_sr(CPUPPCState *env, target_ulong srnum, target_ulong value)
 {
+    if (unlikely(fdiag_on)) {
+        fdiag_mtsr(env->sr[srnum] != value);
+    }
     qemu_log_mask(CPU_LOG_MMU,
             "%s: reg=%d " TARGET_FMT_lx " " TARGET_FMT_lx "\n", __func__,
             (int)srnum, value, env->sr[srnum]);
@@ -563,6 +583,9 @@ void helper_store_sr(CPUPPCState *env, target_ulong srnum, target_ulong value)
 /* TLB management */
 void helper_tlbia(CPUPPCState *env)
 {
+    if (unlikely(fdiag_on)) {
+        fdiag_inflight(FD_TLBIA);
+    }
     ppc_tlb_invalidate_all(env);
 }
 

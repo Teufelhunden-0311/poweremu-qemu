@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/flush-diag.h"
 
 #include "trace.h"
 #include "disas/disas.h"
@@ -674,6 +675,9 @@ void tcg_flush_jmp_cache(CPUState *cpu)
     /* During early initialization, the cache may not yet be allocated. */
     if (unlikely(jc == NULL)) {
         return;
+    }
+    if (unlikely(fdiag_on)) {
+        fdiag_jc_bump(false);
     }
 
     /*
