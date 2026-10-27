@@ -441,7 +441,7 @@ static const char *const cpt_name[CPT_N] = {
 static struct {
     int kind;                   /* 0: off */
     uint64_t draws;
-    bool init, done, stale, reboot, released;
+    bool init, done, stale, reboot, released, want_waiter, stall_logged;
     unsigned waiters_at;
     int nest_at;
     int64_t t;
@@ -462,6 +462,8 @@ static void cp_test_init(void)
     cpt.kind = !strncmp(e, "park", 4) ? CP_TEST_PARK :
                !strncmp(e, "wait", 4) ? CP_TEST_WAIT : 0;
     cpt.draws = strchr(e, ':') ? strtoull(strchr(e, ':') + 1, NULL, 0) : 200000;
+    cpt.want_waiter = getenv("PPCGPU_TEST_RESET_WAITER") &&
+                      getenv("PPCGPU_TEST_RESET_WAITER")[0] == '1';
     cpt.reboot = getenv("PPCGPU_TEST_RESET_REBOOT") &&
                  getenv("PPCGPU_TEST_RESET_REBOOT")[0] == '1';
 }
@@ -485,6 +487,14 @@ static void cp_test_inject(int kind)
     if (likely(!cpt.kind) || cpt.done || cpt.kind != kind || !s || !s->r3 ||
         s->r3->draws < cpt.draws) {
         return;
+    }
+    if (cpt.want_waiter) {
+        /* Still parked: let go again until a cp_sync caller waits for it. */
+        for (int i = 0; i < 500 && !cp.waiters; i++) {
+            bql_unlock();
+            g_usleep(1000);
+            bql_lock();
+        }
     }
     cpt.done = cpt.stale = true;
     cpt.waiters_at = cp.waiters;
@@ -10886,6 +10896,26 @@ static bool ppc_mac_gpu_cp_pending(PPCMacGPUState *s)
     return qatomic_read(&s->regs.cp_rb_wptr) != s->regs.cp_rb_rptr;
 }
 
+/* Debug (cptest): a cp_sync wait that logs once if it lasts 2 s. */
+static void cp_test_cond_wait(void)
+{
+    int64_t t0;
+
+    if (likely(!cpt.kind)) {
+        qemu_cond_wait_bql(&cp.park_cond);
+        return;
+    }
+    t0 = g_get_monotonic_time();
+    qemu_cond_timedwait_bql(&cp.park_cond, 2000);
+    if (cp.parked && g_get_monotonic_time() - t0 >= 1900000 && !cpt.stall_logged) {
+        cpt.stall_logged = true;
+        fprintf(stderr, "cp-test: STALL a cp_sync caller waited 2 s: parked %d "
+                "waiters %u epoch %u cp_in_ring %d g_in_pm4 %d injected %d "
+                "stale %d\n", cp.parked, cp.waiters, cp.epoch, cp_in_ring,
+                g_in_pm4, cpt.done, cpt.stale);
+    }
+}
+
 /* Bring the ring up to date before the guest sees the card (BQL held). */
 static void ppc_mac_gpu_cp_sync(PPCMacGPUState *s, hwaddr why)
 {
@@ -10894,7 +10924,7 @@ static void ppc_mac_gpu_cp_sync(PPCMacGPUState *s, hwaddr why)
     }
     while (cp.parked) {                 /* see ppc_mac_gpu_cp_park */
         cp.waiters++;
-        qemu_cond_wait_bql(&cp.park_cond);
+        cp_test_cond_wait();
         cp.waiters--;
     }
     if (unlikely(cpt.done) && !cpt.released) {
