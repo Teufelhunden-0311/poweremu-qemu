@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/flush-diag.h"
 #include "qemu/qemu-print.h"
 #include "qapi/error.h"
 #include "qapi/type-helpers.h"
@@ -1035,6 +1036,17 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 CPUJumpCache *jc;
                 uint32_t h;
 
+                if (unlikely(fdiag_on)) {
+                    /* the same code already translated under another tag (SR slot)? */
+                    int other = -1;
+                    for (uint64_t cb = 0; cb < 4 && other < 0; cb++) {
+                        if (cb != cs_base &&
+                            tb_htable_lookup(cpu, pc, cb, flags, cflags)) {
+                            other = cb;
+                        }
+                    }
+                    fdiag_tb_miss(other >= 0);
+                }
                 mmap_lock();
                 tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
                 mmap_unlock();

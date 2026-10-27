@@ -60,6 +60,9 @@ void fdiag_request(int outcome, int causes, unsigned pages);
 void fdiag_slot(bool hit, bool unused, int slot);
 /* a TB was translated */
 void fdiag_tb_gen(void);
+/* cpu_exec_loop is about to translate: @dup if the same pc/flags exist
+ * under another cs_base (another SR slot's tag) */
+void fdiag_tb_miss(bool dup);
 /* cputlb: one whole-flush execution */
 void fdiag_flush_exec(uint16_t asked, uint16_t cleaned);
 /* tcg_flush_jmp_cache: every generation bump (!@from_tlb), and again
