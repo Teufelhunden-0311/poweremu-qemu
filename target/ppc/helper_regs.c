@@ -378,6 +378,19 @@ void check_tlb_flush(CPUPPCState *env, bool global)
 {
     CPUState *cs = env_cpu(env);
 
+    /*
+     * With PPC_TLBIE=class (ppc_tlbie_class), on qemu-system-ppc the GLOBAL
+     * flag comes only from a translated tlbie, whose class was invalidated
+     * when it ran, on the only CPU: nothing is left to do for it.  Whatever
+     * else is pending (a LOCAL or PAGE flush) still takes the whole flush
+     * below, and an SR switch is still made further down.
+     */
+    if (global && (env->tlb_need_flush & TLB_NEED_GLOBAL_FLUSH) &&
+        !(env->tlb_need_flush & (TLB_NEED_LOCAL_FLUSH | TLB_NEED_PAGE_FLUSH)) &&
+        ppc_tlbie_class(env)) {
+        env->tlb_need_flush &= ~TLB_NEED_GLOBAL_FLUSH;
+    }
+
     /* Handle global flushes first */
     if (global && (env->tlb_need_flush & TLB_NEED_GLOBAL_FLUSH)) {
         env->tlb_need_flush &= ~TLB_NEED_GLOBAL_FLUSH;

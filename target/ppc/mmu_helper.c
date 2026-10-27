@@ -395,6 +395,40 @@ static bool ppc_tlbie_flushes_all(void)
     return mode;
 }
 
+/*
+ * PPC_TLBIE=class (opt-in; default off): a tlbie invalidates its congruence
+ * class at once, in every SR set's TLB, instead of the whole TLB at the
+ * next context synchronization.  The 7400 invalidates the set that
+ * EA[14:19] (address bits 12-17) selects, both ways of both the instruction
+ * and the data TLB, whatever the VSID (MPC7400 User's Manual, Table 2-57
+ * and 5.4.3.2.1).  Only that verified geometry: the 7400 family's CPUs, the
+ * 32-bit hash MMU, a single vCPU.  Anything else keeps the whole flush.
+ * check_tlb_flush asks the same question before it lets the GLOBAL flag go.
+ */
+#define PPC_TLBIE_CLASS_MASK 0x3F000    /* 64 classes: address bits 12-17 */
+QEMU_BUILD_BUG_ON(TARGET_PAGE_BITS != 12);
+
+bool ppc_tlbie_class(CPUPPCState *env)
+{
+    static int mode = -1, ok = -1;
+
+    if (mode < 0) {
+        const char *s = getenv("PPC_TLBIE");
+        mode = s && !strcmp(s, "class");
+    }
+    if (!mode) {
+        return false;
+    }
+    if (ok < 0) {
+        ok = env->mmu_model == POWERPC_MMU_32B && !CPU_NEXT(first_cpu) &&
+             object_dynamic_cast(OBJECT(env_cpu(env)),
+                                 "7400-family-" TYPE_POWERPC_CPU) != NULL;
+        qemu_log("ppc: PPC_TLBIE=class %s\n", ok ? "on (7400, one vCPU)" :
+                 "not for this CPU or configuration: whole flushes");
+    }
+    return ok;
+}
+
 void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
 {
 #if !defined(FLUSH_ALL_TLBS)
@@ -416,6 +450,12 @@ void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
         ppc6xx_tlb_invalidate_virt(env, addr, 1);
         break;
     case POWERPC_MMU_32B:
+        if (ppc_tlbie_class(env)) {
+            /* translated user/supervisor indexes of every SR set (as below) */
+            tlb_flush_page_class_by_mmuidx(env_cpu(env), addr,
+                                           PPC_TLBIE_CLASS_MASK, 0x3333);
+            break;
+        }
         /*
          * Actual CPUs invalidate entire congruence classes based on
          * the geometry of their TLBs and some OSes take that into
