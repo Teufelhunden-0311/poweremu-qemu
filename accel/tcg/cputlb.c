@@ -630,11 +630,80 @@ void tlb_flush_data_pages_by_mmuidx(CPUState *cpu, vaddr addr, vaddr npages,
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 }
 
+/*
+ * Debug (not for merging): TLB_CLASS_CHECK=1 checks every class flush
+ * against a full scan of the indexes it was asked for -- every primary
+ * entry, not only the class's, and the victims: none of the class may be
+ * left, and every entry outside it must have survived.  Counts what the
+ * flush itself visited.  Totals every 10 s and at exit.  AI-generated
+ * (Claude).
+ */
+static struct {
+    int on;
+    uint64_t flushes, violations, lost, visited, idx_scanned, entries_seen;
+    int64_t next;
+} tcc;
+
+static void tcc_report(const char *tag)
+{
+    fprintf(stderr, "tlb-class-check%s: flushes %" PRIu64 " violations %" PRIu64
+            " lost-outside %" PRIu64 " visited/flush %.1f dirty-idx/flush %.2f"
+            " entries-in-maps/flush %.1f\n", tag, tcc.flushes, tcc.violations,
+            tcc.lost, tcc.flushes ? (double)tcc.visited / tcc.flushes : 0,
+            tcc.flushes ? (double)tcc.idx_scanned / tcc.flushes : 0,
+            tcc.flushes ? (double)tcc.entries_seen / tcc.flushes : 0);
+}
+
+static void tcc_final(void)
+{
+    tcc_report("-final");
+}
+
+/* Valid entries of the indexes in @idxmap: in the class (@in) and outside. */
+static void tcc_count(CPUState *cpu, vaddr addr, vaddr mask, uint16_t idxmap,
+                      uint64_t *in, uint64_t *out)
+{
+    *in = *out = 0;
+    for (int midx = 0; midx < NB_MMU_MODES; midx++) {
+        CPUTLBDescFast *f = &cpu->neg.tlb.f[midx];
+        CPUTLBDesc *d = &cpu->neg.tlb.d[midx];
+        size_t n = tlb_n_entries(f);
+
+        if (!((idxmap >> midx) & 1)) {
+            continue;
+        }
+        for (size_t i = 0; i < n + CPU_VTLB_SIZE; i++) {
+            CPUTLBEntry *te = i < n ? &f->table[i] : &d->vtable[i - n];
+            if (tlb_entry_is_empty(te)) {
+                continue;
+            }
+            if (tlb_hit_page_mask_anyprot(te, addr, mask | TLB_INVALID_MASK)) {
+                (*in)++;
+            } else {
+                (*out)++;
+            }
+        }
+    }
+}
+
 void tlb_flush_page_class_by_mmuidx(CPUState *cpu, vaddr addr, vaddr mask,
                                     uint16_t idxmap)
 {
     vaddr classes = (mask >> TARGET_PAGE_BITS) + 1;
     vaddr cls;
+    uint64_t tcc_in0 = 0, tcc_out0 = 0;
+
+    if (unlikely(tcc.on == 0)) {
+        const char *e = getenv("TLB_CLASS_CHECK");
+        tcc.on = e && e[0] == '1' ? 1 : -1;
+        if (tcc.on > 0) {
+            atexit(tcc_final);
+        }
+    }
+    if (tcc.on > 0) {
+        tcc_count(cpu, addr & mask, mask, idxmap, &tcc_in0, &tcc_out0);
+        tcc.entries_seen += tcc_in0 + tcc_out0;
+    }
 
     assert_cpu_is_self(cpu);
     g_assert(is_power_of_2(classes) &&
@@ -663,9 +732,33 @@ void tlb_flush_page_class_by_mmuidx(CPUState *cpu, vaddr addr, vaddr mask,
                 tlb_n_used_entries_dec(cpu, midx);
             }
         }
+        if (tcc.on > 0) {
+            tcc.visited += n / classes + CPU_VTLB_SIZE;
+            tcc.idx_scanned++;
+        }
         tlb_flush_vtlb_page_mask_locked(cpu, midx, addr, mask | TLB_INVALID_MASK);
     }
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+
+    if (tcc.on > 0) {
+        uint64_t in1, out1;
+        int64_t now = get_clock_realtime();
+
+        tcc_count(cpu, addr, mask, idxmap, &in1, &out1);
+        tcc.flushes++;
+        tcc.violations += in1;
+        tcc.lost += tcc_out0 - out1;
+        if (in1 || out1 != tcc_out0) {
+            fprintf(stderr, "tlb-class-check: VIOLATION addr %" VADDR_PRIx
+                    " idxmap %#x: %" PRIu64 " of the class left, outside %"
+                    PRIu64 " -> %" PRIu64 "\n", addr, idxmap, in1, tcc_out0,
+                    out1);
+        }
+        if (now >= tcc.next) {
+            tcc.next = now + 10 * NANOSECONDS_PER_SECOND;
+            tcc_report("");
+        }
+    }
 
     /*
      * Whole, even when nothing above was cached: what the TLB holds says
