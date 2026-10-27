@@ -58,5 +58,37 @@ int main(void)
            p.uniforms.out_sel[0], p.uniforms.out_sel[1], p.uniforms.out_sel[2],
            p.uniforms.out_sel[3], p.uniforms.rt_swap32);
     r300_draw_free(&p);
-    return 0;
+
+    /* Early depth/stencil rejection through both packet paths (GPU and CPU
+     * vertex shading): only single-sampled Z16 / Z24S8 draws get the
+     * preview.  AI-generated (Claude). */
+    static const struct { uint32_t aa, zf; bool keep; } ex[] = {
+        { 0, 0, true }, { 0, 2, true }, { 0, 1, false }, { 0, 3, false },
+        { 1, 2, false }, { 3, 0, false }, { 5, 2, false }, { 7, 2, false },
+    };
+    int bad = 0;
+    for (int gpu = 0; gpu < 2; gpu++) {
+        for (unsigned i = 0; i < sizeof(ex) / sizeof(ex[0]); i++) {
+            r300_state_write(&st, 0x4020, ex[i].aa);        /* GB_AA_CONFIG */
+            r300_state_write(&st, 0x4F10, ex[i].zf);        /* ZB_FORMAT */
+            st.glsl_flags = R300_GLSL_EARLY_Z | (gpu ? R300_GLSL_GPU_VS : 0);
+            memset(&arr, 0, sizeof(arr));
+            if (!r300_draw_build(&st, &arr, 0x35, pkt3, 49, no_read, NULL, &p, &err)) {
+                printf("FAIL early-Z build (%s, aa %x zf %x): %s\n", gpu ? "GPU VS" : "CPU VS",
+                       ex[i].aa, ex[i].zf, err);
+                bad++;
+                continue;
+            }
+            bool pre = p.glsl && strstr(p.glsl, "r300_zpreview(zb") != NULL;
+            if (pre != ex[i].keep || (p.vs_glsl != NULL) != gpu) {
+                printf("FAIL early-Z %s path aa %x zf %x: preview %d vs_glsl %d\n",
+                       gpu ? "GPU VS" : "CPU VS", ex[i].aa, ex[i].zf, pre, p.vs_glsl != NULL);
+                bad++;
+            }
+            r300_draw_free(&p);
+        }
+    }
+    st.glsl_flags = 0;
+    printf("early-Z packet exclusions: %s\n", bad ? "FAIL" : "ok (GPU and CPU vertex paths)");
+    return bad != 0;
 }

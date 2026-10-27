@@ -2026,7 +2026,8 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
                          &failed, err)) {
             pkt->warn |= f.warn;
             free(order);
-            pkt->glsl = r300_us_glsl_cached(st, &desc, st->glsl_flags,
+            pkt->glsl = r300_us_glsl_cached(st, &desc,
+                                            r300_glsl_flags_for_draw(st, st->glsl_flags),
                                             &pkt->glsl_id, err);
             if (!pkt->glsl) {
                 r300_draw_free(pkt);
@@ -2242,7 +2243,8 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
     free(xv);
     free(order);
 
-    pkt->glsl = r300_us_glsl_cached(st, &desc, st->glsl_flags, &pkt->glsl_id, err);
+    pkt->glsl = r300_us_glsl_cached(st, &desc, r300_glsl_flags_for_draw(st, st->glsl_flags),
+                                    &pkt->glsl_id, err);
     if (!pkt->glsl) {
         r300_draw_free(pkt);
         return false;
@@ -2284,6 +2286,21 @@ bool r300_draw_build(const R300State *st, const R300Arrays *arr,
     }
     return draw_core(st, arr, vf, order, n, opcode == 0x35 ? payload : NULL,
                      opcode == 0x35 ? payload_dw : 0, read, opaque, pkt, err);
+}
+
+/* The fragment-program flags for this draw: early depth/stencil rejection
+ * (R300_GLSL_EARLY_Z) only single-sampled and for Z16 / Z24S8 (ZB_FORMAT 0, 2;
+ * 13E3 is approximated).  Applied before the program memo, so it is part of
+ * the text's identity.  AI-generated (Claude). */
+uint32_t r300_glsl_flags_for_draw(const R300State *st, uint32_t flags)
+{
+    uint32_t zf = r300_reg(st, ZB_FORMAT) & 0xF;
+
+    if ((flags & R300_GLSL_EARLY_Z) &&
+        (r300_aa_samples(st) != 1 || (zf != 0 && zf != 2))) {
+        flags &= ~R300_GLSL_EARLY_Z;
+    }
+    return flags;
 }
 
 uint32_t r300_aa_samples(const R300State *st)
