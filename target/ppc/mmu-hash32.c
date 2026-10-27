@@ -25,6 +25,7 @@
 #include "system/kvm.h"
 #include "kvm_ppc.h"
 #include "internal.h"
+#include "exec/vcpu-diag.h"
 #include "mmu-hash32.h"
 #include "mmu-books.h"
 #include "exec/log.h"
@@ -251,6 +252,8 @@ static void ppc_hash32_set_c(PowerPCCPU *cpu, hwaddr pte_offset, uint64_t pte1)
     stb_phys(CPU(cpu)->as, base + offset, (pte1 & 0xff) | 0x80);
 }
 
+static int vdiag_pteg;     /* PPC_VCPU_DIAG: which PTEG the last lookup found */
+
 static hwaddr ppc_hash32_htab_lookup(PowerPCCPU *cpu,
                                      target_ulong sr, target_ulong eaddr,
                                      ppc_hash_pte32_t *pte)
@@ -278,7 +281,9 @@ static hwaddr ppc_hash32_htab_lookup(PowerPCCPU *cpu,
             vsid, ptem, hash);
     pteg_off = get_pteg_offset32(cpu, hash);
     pte_offset = ppc_hash32_pteg_search(cpu, pteg_off, 0, ptem, pte);
+    vdiag_pteg = VDIAG_X_PTEG1;
     if (pte_offset == -1) {
+        vdiag_pteg = VDIAG_X_PTEG2;
         /* Secondary PTEG lookup */
         qemu_log_mask(CPU_LOG_MMU, "1 htab=" HWADDR_FMT_plx "/" HWADDR_FMT_plx
                 " vsid=%" PRIx32 " api=%" PRIx32
@@ -309,6 +314,9 @@ bool ppc_hash32_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
     /* 1. Handle real mode accesses */
     if (mmuidx_real(mmu_idx)) {
         /* Translation is off */
+        if (unlikely(vdiag_on)) {
+            vdiag_xlate(VDIAG_X_REAL);
+        }
         *raddrp = eaddr;
         *protp = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
         return true;
@@ -318,6 +326,9 @@ bool ppc_hash32_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
     if (env->nb_BATs != 0) {
         raddr = ppc_hash32_bat_lookup(cpu, eaddr, access_type, protp, mmu_idx);
         if (raddr != -1) {
+            if (unlikely(vdiag_on)) {
+                vdiag_xlate(VDIAG_X_BAT);
+            }
             if (!check_prot_access_type(*protp, access_type)) {
                 if (guest_visible) {
                     if (access_type == MMU_INST_FETCH) {
@@ -346,6 +357,9 @@ bool ppc_hash32_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
 
     /* 4. Handle direct store segments */
     if (sr & SR32_T) {
+        if (unlikely(vdiag_on)) {
+            vdiag_xlate(VDIAG_X_OTHER);
+        }
         return ppc_hash32_direct_store(cpu, sr, eaddr, access_type,
                                        raddrp, protp, mmu_idx, guest_visible);
     }
@@ -361,6 +375,9 @@ bool ppc_hash32_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
 
     /* 6. Locate the PTE in the hash table */
     pte_offset = ppc_hash32_htab_lookup(cpu, sr, eaddr, &pte);
+    if (unlikely(vdiag_on)) {
+        vdiag_xlate(pte_offset == -1 ? VDIAG_X_FAULT : vdiag_pteg);
+    }
     if (pte_offset == -1) {
         if (guest_visible) {
             if (access_type == MMU_INST_FETCH) {

@@ -46,6 +46,7 @@
 #include "internal-common.h"
 #include "internal-target.h"
 #include "exec/perf-counters.h"
+#include "exec/vcpu-diag.h"
 #include "qemu/log.h"
 
 QemuPerfCounters qemu_perf;
@@ -299,10 +300,23 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
                tb->flags == flags &&
                tb_cflags(tb) == cflags)) {
         QEMU_PERF_INC(jc_hit);
+        if (unlikely(vdiag_on)) {
+            vdiag_lookup(false, VDIAG_JC_HIT, -1);
+        }
         goto hit;
     }
 
-    tb = tb_htable_lookup(cpu, pc, cs_base, flags, cflags);
+    if (unlikely(vdiag_on)) {
+        int why = !tb ? VDIAG_JC_EMPTY : jc->array[hash].gen != jc->gen ? VDIAG_JC_GEN :
+                  jc->array[hash].pc != pc ? VDIAG_JC_PC : VDIAG_JC_STATE;
+        vdiag_lookup_table(true);
+        tb = tb_htable_lookup(cpu, pc, cs_base, flags, cflags);
+        vdiag_lookup_table(false);
+        vdiag_lookup(false, why, tb != NULL);
+        vdiag_maybe_report();
+    } else {
+        tb = tb_htable_lookup(cpu, pc, cs_base, flags, cflags);
+    }
     if (tb == NULL) {
         QEMU_PERF_INC(ht_miss);
         return NULL;
@@ -457,7 +471,13 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
         cpu_loop_exit(cpu);
     }
 
-    tb = tb_lookup(cpu, pc, cs_base, flags, cflags);
+    if (unlikely(vdiag_on)) {
+        vdiag_helper_enter();
+        tb = tb_lookup(cpu, pc, cs_base, flags, cflags);
+        vdiag_helper_exit();
+    } else {
+        tb = tb_lookup(cpu, pc, cs_base, flags, cflags);
+    }
     if (tb == NULL) {
         return tcg_code_gen_epilogue;
     }
@@ -1030,6 +1050,9 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 break;
             }
 
+            if (unlikely(vdiag_on)) {
+                vdiag_helper_exit();    /* in case a lookup in the helper longjmp'd */
+            }
             tb = tb_lookup(cpu, pc, cs_base, flags, cflags);
             if (tb == NULL) {
                 CPUJumpCache *jc;

@@ -37,6 +37,8 @@
 #include "qemu/thread.h"
 #include "qemu/main-loop.h"
 #include "qemu/plugin.h"
+#include "exec/vcpu-diag.h"
+#include "qemu/timer.h"
 #include "system/cpus.h"
 #include "qemu/guest-random.h"
 #include "hw/nmi.h"
@@ -554,6 +556,18 @@ void bql_lock_impl(const char *file, int line)
     QemuMutexLockFunc bql_lock_fn = qatomic_read(&bql_mutex_lock_func);
 
     g_assert(!bql_locked());
+    if (unlikely(vdiag_on)) {
+        /* PPC_VCPU_DIAG: time contended acquisitions, by waiter and owner */
+        if (qemu_mutex_trylock(&bql)) {
+            int64_t t0 = get_clock();
+            vdiag_bql_wait_begin();
+            bql_lock_fn(&bql, file, line);
+            vdiag_bql_wait(file, line, get_clock() - t0);
+        }
+        vdiag_bql_acquired(file, line);
+        set_bql_locked(true);
+        return;
+    }
     bql_lock_fn(&bql, file, line);
     set_bql_locked(true);
 }

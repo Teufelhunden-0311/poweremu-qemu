@@ -36,6 +36,7 @@
 #include <sys/sysctl.h>
 #include <uuid/uuid.h>
 
+#include "exec/vcpu-diag.h"
 #include "ppc_mac_gpu_renderer.h"
 #include "r300/r300_draw.h"
 #include "r300/r300_spirv.h"
@@ -10535,6 +10536,9 @@ static int metal_draw_r300(void *opaque, uint8_t *vram_ptr, uint64_t vram_size,
     PPCMacGPUMetalState *st = opaque;
     int r;
 
+    if (unlikely(vdiag_on)) {
+        qatomic_inc(&vdiag_r300_draws);         /* PPC_VCPU_DIAG window marker */
+    }
     if (!rqueue_enabled()) {
         pthread_mutex_lock(&g_render_lock);
         r = r300_draw_encode(st, vram_ptr, vram_size, pkt, NULL);   /* sync: today's path */

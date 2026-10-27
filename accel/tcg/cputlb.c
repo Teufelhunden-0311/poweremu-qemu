@@ -39,6 +39,7 @@
 #include "qemu/atomic128.h"
 #include "tb-internal.h"
 #include "exec/perf-counters.h"
+#include "exec/vcpu-diag.h"
 #include "trace.h"
 #include "tb-hash.h"
 #include "tb-internal.h"
@@ -295,6 +296,9 @@ static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
     CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
     CPUTLBDescFast *fast = &cpu->neg.tlb.f[mmu_idx];
 
+    if (unlikely(vdiag_on)) {
+        vdiag_flush_all();
+    }
     tlb_mmu_resize_locked(desc, fast, now);
     tlb_mmu_flush_locked(desc, fast);
 }
@@ -507,6 +511,10 @@ static void tlb_flush_page_locked(CPUState *cpu, int midx, vaddr page)
     vaddr lp_addr = cpu->neg.tlb.d[midx].large_page_addr;
     vaddr lp_mask = cpu->neg.tlb.d[midx].large_page_mask;
 
+    if (unlikely(vdiag_on)) {
+        vdiag_flush_page(midx, page);
+    }
+
     /* Check if we need to flush due to large pages.  */
     if ((page & lp_mask) == lp_addr) {
         tlb_debug("forcing full flush midx %d (%016"
@@ -687,6 +695,10 @@ static void tlb_flush_range_locked(CPUState *cpu, int midx,
 {
     CPUTLBDesc *d = &cpu->neg.tlb.d[midx];
     CPUTLBDescFast *f = &cpu->neg.tlb.f[midx];
+
+    if (unlikely(vdiag_on)) {
+        vdiag_flush_all();          /* conservative: a range clears every shadow */
+    }
     vaddr mask = MAKE_64BIT_MASK(0, bits);
 
     /*
@@ -1261,6 +1273,9 @@ static bool tlb_fill_align(CPUState *cpu, vaddr addr, MMUAccessType type,
     const TCGCPUOps *ops = cpu->cc->tcg_ops;
     CPUTLBEntryFull full;
 
+    if (unlikely(vdiag_on)) {
+        vdiag_fill(mmu_idx, addr & TARGET_PAGE_MASK, type);
+    }
     if (ops->tlb_fill_align) {
         if (ops->tlb_fill_align(cpu, &full, addr, type, mmu_idx,
                                 memop, size, probe, ra)) {
@@ -1318,6 +1333,34 @@ static void io_failed(CPUState *cpu, CPUTLBEntryFull *full, vaddr addr,
                                                 access_type, mmu_idx,
                                                 full->attrs, response, retaddr);
     }
+}
+
+/* PPC_VCPU_DIAG: what the primary slot held on a miss for @page. */
+static int vdiag_miss_class(CPUTLBEntry *entry, vaddr page, uint64_t *occ)
+{
+    *occ = (uint64_t)-1;
+    for (int t = 0; t < 3; t++) {
+        uint64_t tag = tlb_read_idx(entry, t);
+        if (tag != (uint64_t)-1 && !(tag & TLB_INVALID_MASK) &&
+            (tag & TARGET_PAGE_MASK) == page) {
+            return VDIAG_MISS_PERM;
+        }
+    }
+    for (int t = 0; t < 3; t++) {
+        uint64_t tag = tlb_read_idx(entry, t);
+        if (tag != (uint64_t)-1 && !(tag & TLB_INVALID_MASK)) {
+            *occ = tag & TARGET_PAGE_MASK;
+            return VDIAG_MISS_CONFLICT;
+        }
+    }
+    return VDIAG_MISS_EMPTY;
+}
+
+static int vdiag_flag_bits(int flags)
+{
+    return (flags & TLB_MMIO ? 1 : 0) | (flags & TLB_NOTDIRTY ? 2 : 0) |
+           (flags & TLB_WATCHPOINT ? 4 : 0) | (flags & TLB_DISCARD_WRITE ? 8 : 0) |
+           (flags & ~(TLB_MMIO | TLB_NOTDIRTY | TLB_WATCHPOINT | TLB_DISCARD_WRITE) ? 16 : 0);
 }
 
 /* Return true if ADDR is present in the victim tlb, and has been copied
@@ -1391,7 +1434,21 @@ static int probe_access_internal(CPUState *cpu, vaddr addr,
     CPUTLBEntryFull *full;
 
     if (!tlb_hit_page(tlb_addr, page_addr)) {
-        if (!victim_tlb_hit(cpu, mmu_idx, index, access_type, page_addr)) {
+        bool vh;
+        int mc = VDIAG_MISS_NONE;
+        uint64_t occ = (uint64_t)-1;
+
+        if (unlikely(vdiag_on)) {
+            mc = vdiag_miss_class(entry, page_addr, &occ);
+        }
+        vh = victim_tlb_hit(cpu, mmu_idx, index, access_type, page_addr);
+        if (unlikely(vdiag_on)) {
+            vdiag_slow(access_type, vh ? VDIAG_SLOW_VICTIM : VDIAG_SLOW_FILL, mc, 0);
+            if (mc != VDIAG_MISS_PERM) {
+                vdiag_primary_miss(mmu_idx, page_addr, occ, vh);
+            }
+        }
+        if (!vh) {
             if (!tlb_fill_align(cpu, addr, access_type, mmu_idx,
                                 0, fault_size, nonfault, retaddr)) {
                 /* Non-faulting page table read failed.  */
@@ -1669,10 +1726,24 @@ static bool mmu_lookup1(CPUState *cpu, MMULookupPageData *data, MemOp memop,
     CPUTLBEntryFull *full;
     int flags;
 
+    int vd_out = VDIAG_SLOW_HIT, vd_mc = VDIAG_MISS_NONE;
+
     /* If the TLB entry is for a different page, reload and try again.  */
     if (!tlb_hit(tlb_addr, addr)) {
-        if (!victim_tlb_hit(cpu, mmu_idx, index, access_type,
-                            addr & TARGET_PAGE_MASK)) {
+        uint64_t occ = (uint64_t)-1;
+        bool vh;
+
+        if (unlikely(vdiag_on)) {
+            vd_mc = vdiag_miss_class(entry, addr & TARGET_PAGE_MASK, &occ);
+        }
+        vh = victim_tlb_hit(cpu, mmu_idx, index, access_type, addr & TARGET_PAGE_MASK);
+        if (unlikely(vdiag_on)) {
+            vd_out = vh ? VDIAG_SLOW_VICTIM : VDIAG_SLOW_FILL;
+            if (vd_mc != VDIAG_MISS_PERM) {
+                vdiag_primary_miss(mmu_idx, addr & TARGET_PAGE_MASK, occ, vh);
+            }
+        }
+        if (!vh) {
             tlb_fill_align(cpu, addr, access_type, mmu_idx,
                            memop, data->size, false, ra);
             maybe_resized = true;
@@ -1685,6 +1756,9 @@ static bool mmu_lookup1(CPUState *cpu, MMULookupPageData *data, MemOp memop,
     full = &cpu->neg.tlb.d[mmu_idx].fulltlb[index];
     flags = tlb_addr & (TLB_FLAGS_MASK & ~TLB_FORCE_SLOW);
     flags |= full->slow_flags[access_type];
+    if (unlikely(vdiag_on)) {
+        vdiag_slow(access_type, vd_out, vd_mc, vdiag_flag_bits(flags));
+    }
 
     if (likely(!maybe_resized)) {
         /* Alignment has not been checked by tlb_fill_align. */
@@ -2011,6 +2085,9 @@ static uint64_t do_ld_mmio_beN(CPUState *cpu, CPUTLBEntryFull *full,
     attrs = full->attrs;
     section = io_prepare(&mr_offset, cpu, full->xlat_section, attrs, addr, ra);
     mr = section->mr;
+    if (unlikely(vdiag_on)) {
+        vdiag_mmio(mr, false);
+    }
 
     MMIO_BQL_GUARD(mr);
     return int_ld_mmio_beN(cpu, full, ret_be, addr, size, mmu_idx,
@@ -2552,6 +2629,9 @@ static uint64_t do_st_mmio_leN(CPUState *cpu, CPUTLBEntryFull *full,
     attrs = full->attrs;
     section = io_prepare(&mr_offset, cpu, full->xlat_section, attrs, addr, ra);
     mr = section->mr;
+    if (unlikely(vdiag_on)) {
+        vdiag_mmio(mr, true);
+    }
 
     MMIO_BQL_GUARD(mr);
     return int_st_mmio_leN(cpu, full, val_le, addr, size, mmu_idx,

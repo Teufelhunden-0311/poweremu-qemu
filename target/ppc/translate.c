@@ -29,6 +29,7 @@
 #include "exec/helper-proto.h"
 #include "exec/helper-gen.h"
 
+#include "exec/vcpu-diag.h"
 #include "exec/translator.h"
 #include "exec/translation-block.h"
 #include "exec/log.h"
@@ -3718,6 +3719,7 @@ static void gen_branch_lookup_and_goto_ptr(DisasContext *ctx)
 {
     if (unlikely(ctx->singlestep_enabled) ||
         (tb_cflags(ctx->base.tb) & CF_NO_GOTO_PTR)) {
+        vdiag_ij_kind_next = VDIAG_IJ_OTHER;
         gen_lookup_and_goto_ptr(ctx);
     } else {
         TCGv_i64 pc = tcg_temp_new_i64();
@@ -3740,6 +3742,7 @@ static void gen_goto_tb(DisasContext *ctx, int n, target_ulong dest)
         tcg_gen_exit_tb(ctx->base.tb, n);
     } else {
         tcg_gen_movi_tl(cpu_nip, dest & ~3);
+        vdiag_ij_kind_next = VDIAG_IJ_DIRECT;   /* PPC_VCPU_DIAG */
         gen_branch_lookup_and_goto_ptr(ctx);
     }
 }
@@ -3889,6 +3892,7 @@ static void gen_bcond(DisasContext *ctx, int type)
         } else {
             tcg_gen_andi_tl(cpu_nip, target, ~3);
         }
+        vdiag_ij_kind_next = type == BCOND_LR ? VDIAG_IJ_LR : VDIAG_IJ_CTR;
         gen_branch_lookup_and_goto_ptr(ctx);
     }
     if ((bo & 0x14) != 0x14) {

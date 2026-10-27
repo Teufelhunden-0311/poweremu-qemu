@@ -11,6 +11,7 @@
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "exec/exec-all.h"
+#include "exec/vcpu-diag.h"
 #include "exec/translator.h"
 #include "exec/cpu_ldst.h"
 #include "exec/plugin-gen.h"
@@ -147,10 +148,32 @@ static bool tb_inline_lookup_on(void)
     return on;
 }
 
+/* PPC_VCPU_DIAG: count this exit's executions by kind; tag a helper call. */
+static void vdiag_gen_exec(int kind)
+{
+    TCGv_ptr p = tcg_constant_ptr(&vdiag_ij_exec[kind]);
+    TCGv_i64 c = tcg_temp_new_i64();
+
+    tcg_gen_ld_i64(c, p, 0);
+    tcg_gen_addi_i64(c, c, 1);
+    tcg_gen_st_i64(c, p, 0);
+}
+
+static void vdiag_gen_pending(int kind)
+{
+    tcg_gen_st_i32(tcg_constant_i32(kind), tcg_constant_ptr(&vdiag_ij_pending), 0);
+}
+
 void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc)
 {
     TranslationBlock *tb = db->tb;
     uint32_t cf = tb_cflags(tb);
+    int vd_kind = vdiag_ij_kind_next;
+
+    vdiag_ij_kind_next = VDIAG_IJ_OTHER;
+    if (unlikely(vdiag_on)) {
+        vdiag_gen_exec(vd_kind);
+    }
     const size_t esz = sizeof(((CPUJumpCache *)0)->array[0]);
     TCGLabel *miss;
     TCGv_i64 h, t;
@@ -162,6 +185,9 @@ void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc)
                CF_BP_PAGE)) ||
         db->plugin_enabled || qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC) ||
         !tb_inline_lookup_on()) {
+        if (unlikely(vdiag_on)) {
+            vdiag_gen_pending(vd_kind);
+        }
         tcg_gen_lookup_and_goto_ptr();
         return;
     }
@@ -206,6 +232,9 @@ void translator_lookup_and_goto_ptr(DisasContextBase *db, TCGv_i64 pc)
     tcg_gen_goto_ptr(next);
 
     gen_set_label(miss);
+    if (unlikely(vdiag_on)) {
+        vdiag_gen_pending(vd_kind);
+    }
     tcg_gen_lookup_and_goto_ptr();
 }
 
