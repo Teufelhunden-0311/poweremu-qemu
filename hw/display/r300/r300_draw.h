@@ -259,6 +259,13 @@ void r300_load_vbpntr(R300Arrays *arr, const uint32_t *d, uint32_t ndw);
  */
 enum { R300_PH_STATE, R300_PH_FETCH, R300_PH_VSPACK, R300_PH_FSMEMO, R300_PH_CPU };
 extern void (*r300_phase_hook)(int phase);
+/*
+ * Debug hook (waitprof): after the GPU-VS distinct-vertex loop, the draw's
+ * arrays, positions n, distinct vertices nu and the index range; for sizing
+ * a bulk capture of vertex bytes.  NULL = nothing.
+ */
+extern void (*r300_capture_hook)(const R300Arrays *arr, bool immd, uint32_t n,
+                                 uint32_t nu, uint32_t vmin, uint32_t vmax);
 
 /*
  * Build a draw from a 3D_DRAW_VBUF_2 (0x34), 3D_DRAW_IMMD_2 (0x35) or

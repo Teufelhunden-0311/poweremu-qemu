@@ -360,6 +360,8 @@ static bool fetch_vertex_planned(Fetch *f, uint32_t vtx,
 }
 
 void (*r300_phase_hook)(int phase);
+void (*r300_capture_hook)(const R300Arrays *arr, bool immd, uint32_t n,
+                          uint32_t nu, uint32_t vmin, uint32_t vmax);
 
 static inline void r300_phase(int phase)
 {
@@ -1862,6 +1864,14 @@ static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *pr
             hval[h] = nu++;
         }
         pos[i] = hval[h];
+    }
+    if (r300_capture_hook && n) {
+        uint32_t vmin = UINT32_MAX, vmax = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            vmin = order[i] < vmin ? order[i] : vmin;
+            vmax = order[i] > vmax ? order[i] : vmax;
+        }
+        r300_capture_hook(f->arr, f->immd != NULL, n, nu, vmin, vmax);
     }
     r300_phase(R300_PH_VSPACK);
     for (uint32_t k = 0; k < nidx; k++) {

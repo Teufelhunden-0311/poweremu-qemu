@@ -4020,6 +4020,67 @@ static int r300_draw_staged(PPCMacGPUState *s, uint8_t *vram, R300DrawPacket *pk
     return rr;
 }
 
+/*
+ * waitprof debug: size a bulk capture of each GPU-VS draw's vertex bytes.
+ * Per array: span = bytes from the lowest to the highest index used, fetched
+ * = distinct vertices x element size; [0] VRAM, [1] system memory (AGP or
+ * PCI GART).  rb = span bytes by span/fetched ratio (<=1.5, <=4, <=16, more);
+ * dsz = draws by total span (<=16K, <=256K, <=4M, more).  Cumulative,
+ * printed at most every 10 s.
+ */
+static PPCMacGPUState *wp_cap_s;
+static struct {
+    uint64_t draws, immd, n, nu, arrays[2], span[2], fetched[2], rb[2][4], dsz[4];
+    int64_t next;
+} wp_cap;
+
+static void wp_r300_capture(const R300Arrays *arr, bool immd, uint32_t n,
+                            uint32_t nu, uint32_t vmin, uint32_t vmax)
+{
+    PPCMacGPUState *s = wp_cap_s;
+    int64_t now = g_get_real_time();
+    uint64_t total = 0;
+
+    wp_cap.draws++;
+    wp_cap.n += n;
+    wp_cap.nu += nu;
+    if (immd) {
+        wp_cap.immd++;
+    } else {
+        for (unsigned k = 0; k < arr->count; k++) {
+            uint64_t lo = arr->a[k].addr + (uint64_t)vmin * arr->a[k].stride_dw * 4;
+            uint64_t span = (uint64_t)(vmax - vmin) * arr->a[k].stride_dw * 4 +
+                            arr->a[k].size_dw * 4;
+            uint64_t fetched = (uint64_t)nu * arr->a[k].size_dw * 4;
+            int sys = !(lo + span <= 0x100000000ull && r300_in_fb(s, lo, span));
+            double r = fetched ? (double)span / fetched : 99;
+
+            wp_cap.arrays[sys]++;
+            wp_cap.span[sys] += span;
+            wp_cap.fetched[sys] += fetched;
+            wp_cap.rb[sys][r <= 1.5 ? 0 : r <= 4 ? 1 : r <= 16 ? 2 : 3] += span;
+            total += span;
+        }
+        wp_cap.dsz[total <= 16384 ? 0 : total <= 262144 ? 1 : total <= 4194304 ? 2 : 3]++;
+    }
+    if (now >= wp_cap.next) {
+        wp_cap.next = now + 10000000;
+        fprintf(stderr, "wp-cap T=%.3f draws=%" PRIu64 " immd=%" PRIu64 " n=%" PRIu64
+                " nu=%" PRIu64, now / 1e6, wp_cap.draws, wp_cap.immd, wp_cap.n,
+                wp_cap.nu);
+        for (int m = 0; m < 2; m++) {
+            fprintf(stderr, " %s_arrays=%" PRIu64 " %s_span=%" PRIu64 " %s_fetched=%"
+                    PRIu64 " %s_rb=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64,
+                    m ? "sys" : "vram", wp_cap.arrays[m], m ? "sys" : "vram",
+                    wp_cap.span[m], m ? "sys" : "vram", wp_cap.fetched[m],
+                    m ? "sys" : "vram", wp_cap.rb[m][0], wp_cap.rb[m][1],
+                    wp_cap.rb[m][2], wp_cap.rb[m][3]);
+        }
+        fprintf(stderr, " dsz=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n",
+                wp_cap.dsz[0], wp_cap.dsz[1], wp_cap.dsz[2], wp_cap.dsz[3]);
+    }
+}
+
 static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                         uint32_t body_dw, const R300Indices *idx)
 {
@@ -4140,6 +4201,8 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     }
     if (waitprof_on && !r300_phase_hook) {
         r300_phase_hook = wp_r300_phase;
+        wp_cap_s = s;
+        r300_capture_hook = wp_r300_capture;
     }
     int wp_b = WAITPROF_ACT(WAITPROF_ACT_BUILD);
     bool build_ok = idx ?
