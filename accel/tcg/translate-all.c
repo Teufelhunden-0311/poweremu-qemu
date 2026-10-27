@@ -434,6 +434,9 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     }
     tb->tc.size = gen_code_size;
     QEMU_PERF_INC(tb_gen);
+    if (unlikely(fdiag_on)) {
+        fdiag_tb_gen();
+    }
     QEMU_PERF_ADD(tb_bytes, gen_code_size);
 
     /*

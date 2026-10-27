@@ -367,9 +367,8 @@ void ppc_mmu_slot_sync(CPUPPCState *env)
         }
     }
     QEMU_PERF_INC(slot_sync);
-    if (unlikely(fdiag_on)) {
-        fdiag_slot(i != PPC_MMU_SLOTS);
-    }
+    bool fd_hit = i != PPC_MMU_SLOTS;
+    bool fd_unused = !fd_hit && !env->mmu_slot_used[victim];
     if (i == PPC_MMU_SLOTS) {
         i = victim;
         memcpy(env->mmu_slot_sr[i], env->sr, sizeof(env->mmu_slot_sr[i]));
@@ -380,6 +379,9 @@ void ppc_mmu_slot_sync(CPUPPCState *env)
     }
     env->mmu_slot_used[i] = ++env->mmu_slot_clock;
     env->mmu_slot = i;
+    if (unlikely(fdiag_on)) {
+        fdiag_slot(fd_hit, fd_unused, i);
+    }
 }
 
 /* After the whole QEMU TLB was flushed: only the current set is cached. */

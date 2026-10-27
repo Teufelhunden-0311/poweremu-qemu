@@ -52,8 +52,11 @@ void fdiag_bat(bool data, bool skipped, unsigned pages, bool whole);
 int fdiag_sync(unsigned need, bool global, const uint32_t *sr);
 /* what check_tlb_flush did with the pending causes */
 void fdiag_request(int outcome, int causes, unsigned pages);
-/* SR-slot sync: @hit or eviction */
-void fdiag_slot(bool hit);
+/* SR-slot sync for the current SR set: @hit, or a miss that filled an
+ * @unused slot or replaced another set; @slot = where the set now is */
+void fdiag_slot(bool hit, bool unused, int slot);
+/* a TB was translated */
+void fdiag_tb_gen(void);
 /* cputlb: one whole-flush execution */
 void fdiag_flush_exec(uint16_t asked, uint16_t cleaned);
 /* tcg_flush_jmp_cache: every generation bump (!@from_tlb), and again
