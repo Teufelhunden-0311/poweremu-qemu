@@ -19,6 +19,7 @@
 
 #include "qemu/osdep.h"
 #include "cpu.h"
+#include "exec/flush-diag.h"
 #include "qemu/main-loop.h"
 #include "exec/cputlb.h"
 #include "system/kvm.h"
@@ -377,9 +378,22 @@ void store_40x_sler(CPUPPCState *env, uint32_t val)
 void check_tlb_flush(CPUPPCState *env, bool global)
 {
     CPUState *cs = env_cpu(env);
+    int fdc = 0;
+    bool fd_did = false;
+
+    if (unlikely(fdiag_on)) {
+        uint32_t sr32[16];
+        for (int i = 0; i < 16; i++) {
+            sr32[i] = env->sr[i];
+        }
+        fdc = fdiag_sync(env->tlb_need_flush, global, sr32);
+    }
 
     /* Handle global flushes first */
     if (global && (env->tlb_need_flush & TLB_NEED_GLOBAL_FLUSH)) {
+        if (unlikely(fdiag_on)) {
+            fdiag_request(FD_REQ_GLOBAL, fdc, 0);
+        }
         env->tlb_need_flush &= ~TLB_NEED_GLOBAL_FLUSH;
         env->tlb_need_flush &= ~TLB_NEED_LOCAL_FLUSH;
         env->tlb_need_flush &= ~TLB_NEED_PAGE_FLUSH;
@@ -392,6 +406,9 @@ void check_tlb_flush(CPUPPCState *env, bool global)
 
     /* Then handle local ones */
     if (env->tlb_need_flush & TLB_NEED_LOCAL_FLUSH) {
+        if (unlikely(fdiag_on)) {
+            fdiag_request(FD_REQ_LOCAL, fdc, 0);
+        }
         env->tlb_need_flush &= ~TLB_NEED_LOCAL_FLUSH;
         env->tlb_need_flush &= ~TLB_NEED_PAGE_FLUSH;
         env->tlb_flush_npages = 0;
@@ -409,6 +426,10 @@ void check_tlb_flush(CPUPPCState *env, bool global)
      * translations don't depend on the page table.
      */
     if (env->tlb_need_flush & TLB_NEED_PAGE_FLUSH) {
+        if (unlikely(fdiag_on)) {
+            fdiag_request(FD_REQ_PAGE, fdc, env->tlb_flush_npages * 16);
+            fd_did = true;
+        }
         env->tlb_need_flush &= ~TLB_NEED_PAGE_FLUSH;
         for (int i = 0; i < env->tlb_flush_npages; i++) {
             for (uint32_t seg = 0; seg < 16; seg++) {
@@ -421,8 +442,15 @@ void check_tlb_flush(CPUPPCState *env, bool global)
     }
 
     if (env->tlb_need_flush & TLB_NEED_SR_SWITCH) {
+        if (unlikely(fdiag_on)) {
+            fdiag_request(FD_REQ_SRSW, fdc, 0);
+            fd_did = true;
+        }
         env->tlb_need_flush &= ~TLB_NEED_SR_SWITCH;
         ppc_mmu_slot_sync(env);
+    }
+    if (unlikely(fdiag_on) && !fd_did) {
+        fdiag_request(FD_REQ_NONE, fdc, 0);
     }
 }
 #endif /* !CONFIG_USER_ONLY */

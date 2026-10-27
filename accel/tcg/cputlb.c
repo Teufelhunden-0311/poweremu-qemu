@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/flush-diag.h"
 #include "qemu/main-loop.h"
 #include "accel/tcg/cpu-ops.h"
 #include "exec/exec-all.h"
@@ -153,6 +154,9 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
         return;
     }
 
+    if (unlikely(fdiag_on)) {
+        fdiag_jc_page();
+    }
     i0 = tb_jmp_cache_hash_page(page_addr);
     for (i = 0; i < TB_JMP_PAGE_SIZE; i++) {
         qatomic_set(&jc->array[i0 + i].tb, NULL);
@@ -393,6 +397,10 @@ static void tlb_flush_by_mmuidx_async_work(CPUState *cpu, run_on_cpu_data data)
 
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 
+    if (unlikely(fdiag_on)) {
+        fdiag_flush_exec(asked, to_clean);
+        fdiag_jc_bump(true);
+    }
     tcg_flush_jmp_cache(cpu);
 
     if (to_clean == ALL_MMUIDX_BITS) {
@@ -512,6 +520,9 @@ static void tlb_flush_page_locked(CPUState *cpu, int midx, vaddr page)
         tlb_debug("forcing full flush midx %d (%016"
                   VADDR_PRIx "/%016" VADDR_PRIx ")\n",
                   midx, lp_addr, lp_mask);
+        if (unlikely(fdiag_on)) {
+            fdiag_lp_escalate();
+        }
         tlb_flush_one_mmuidx_locked(cpu, midx, get_clock_realtime());
     } else {
         if (tlb_flush_entry_locked(tlb_entry(cpu, midx, page), page)) {

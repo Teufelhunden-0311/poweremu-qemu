@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "cpu.h"
+#include "exec/flush-diag.h"
 #include "exec/exec-all.h"
 #include "exec/cputlb.h"
 #include "exec/helper-proto.h"
@@ -165,6 +166,9 @@ void helper_store_sdr1(CPUPPCState *env, target_ulong val)
 {
     if (env->spr[SPR_SDR1] != val) {
         ppc_store_sdr1(env, val);
+        if (unlikely(fdiag_on)) {
+            fdiag_inflight(FD_SDR1);
+        }
         tlb_flush(env_cpu(env));
     }
 }
