@@ -167,6 +167,22 @@ void tlb_flush_data_pages_by_mmuidx(CPUState *cpu, vaddr addr, vaddr npages,
                                     uint16_t idxmap);
 
 /**
+ * tlb_flush_page_class_by_mmuidx:
+ * @cpu: CPU whose TLB should be flushed; must be the calling CPU
+ * @addr: virtual address naming the class
+ * @mask: the page-address bits that form a class: (classes - 1) <<
+ *        TARGET_PAGE_BITS, at most 1 << CPU_TLB_DYN_MIN_BITS classes
+ * @idxmap: bitmap of MMU indexes to flush
+ *
+ * The congruence-class invalidation of a set-associative hardware TLB:
+ * drop every entry of these MMU indexes, primary or victim, whose page
+ * agrees with @addr in the bits of @mask, whatever its other address bits.
+ * The TB jump cache is retired whole.
+ */
+void tlb_flush_page_class_by_mmuidx(CPUState *cpu, vaddr addr, vaddr mask,
+                                    uint16_t idxmap);
+
+/**
  * tlb_flush_page_by_mmuidx_all_cpus_synced:
  * @cpu: Originating CPU of the flush
  * @addr: virtual address of page to be flushed
@@ -262,6 +278,10 @@ static inline void tlb_flush_page_by_mmuidx(CPUState *cpu,
 }
 static inline void tlb_flush_data_pages_by_mmuidx(CPUState *cpu, vaddr addr,
                                                   vaddr npages, uint16_t idxmap)
+{
+}
+static inline void tlb_flush_page_class_by_mmuidx(CPUState *cpu, vaddr addr,
+                                                  vaddr mask, uint16_t idxmap)
 {
 }
 
