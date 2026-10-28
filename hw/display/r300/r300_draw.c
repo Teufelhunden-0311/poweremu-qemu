@@ -1893,6 +1893,10 @@ static bool gpu_vs_build(const R300State *st, Fetch *f, const R300PVSProgram *pr
     return true;
 }
 
+/* A captured build on this thread (r300_draw_parked_begin), and whether it
+ * found it needs the usual one. */
+static __thread bool build_parked, build_needs_protected;
+
 /*
  * Everything after vertex ordering.  order[] (n entries, malloc'd) is
  * taken over; immd is the DRAW_IMMD_2 vertex data or NULL.
@@ -2039,6 +2043,14 @@ static bool draw_core(const R300State *st, const R300Arrays *arr,
             free(order);
             return false;
         }
+    }
+    if (build_parked) {
+        /* A captured build (r300_draw_parked_begin) does not take the CPU
+         * vertex path: it reads more than the capture covers. */
+        build_needs_protected = true;
+        *err = "needs the protected build";
+        free(order);
+        return false;
     }
 
     /* Transform every vertex in draw order (cheap next to the GPU work). */
@@ -2381,6 +2393,171 @@ bool r300_draw_build_indexed(const R300State *st, const R300Arrays *arr,
     }
     free(sw);
     return draw_core(st, arr, vf, order, n, NULL, 0, read, opaque, pkt, err);
+}
+
+/* ---- builds from captured bytes (PPCGPU_BUILD_UNLOCK) ----------------- */
+
+bool r300_draw_fetch_plan(const R300State *st, const R300Arrays *arr,
+                          uint32_t opcode, const uint32_t *d, uint32_t ndw,
+                          const R300Indices *idx, uint64_t max_bytes,
+                          R300FetchPlan *plan)
+{
+    uint64_t lo[R300_MAX_ARRAYS], hi[R300_MAX_ARRAYS];  /* dwords in a vertex */
+    uint32_t vf, n, vmin = UINT32_MAX, vmax = 0;
+    unsigned swap = r300_reg(st, VAP_CNTL_STATUS) & 3, cursor = 0;
+    bool i32;
+
+    memset(plan, 0, sizeof(*plan));
+    if (ndw < 1 || (opcode != 0x34 && opcode != 0x36) || (idx && opcode != 0x36)) {
+        return false;                   /* no body; immediate data; others */
+    }
+    vf = d[0];
+    n = vf >> 16;
+    i32 = (vf >> 11) & 1;
+    if (!n || (vf & 0xF) == 8 ||                        /* rect lists */
+        ((r300_reg(st, VAP_CNTL_STATUS) >> 8) & 1) ||    /* PVS bypass */
+        !(st->glsl_flags & R300_GLSL_GPU_VS) || arr->count > R300_MAX_ARRAYS) {
+        return false;
+    }
+    if (idx && (uint64_t)(i32 ? n : (n + 1) / 2) > idx->ndw) {
+        return false;                   /* "index buffer shorter than the draw" */
+    }
+
+    /* The vertex indices, decoded as the two builders do. */
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t v;
+        if (idx) {                      /* VC_SWAP, then r300_index_at */
+            uint32_t w = i32 ? i : i / 2;
+            uint32_t dv = w < idx->ndw ? vc_swap(idx->dw[w], swap) : 0;
+            v = w >= idx->ndw ? 0 : i32 ? dv : (dv >> (16 * (i & 1))) & 0xFFFF;
+        } else if (opcode == 0x36) {    /* inline, in CP order */
+            v = r300_index_at(d + 1, ndw - 1, i32, i);
+        } else {
+            v = i;
+        }
+        vmin = v < vmin ? v : vmin;
+        vmax = v > vmax ? v : vmax;
+    }
+
+    /* The dwords of a vertex each array's PSC elements read (fetch_vertex). */
+    for (unsigned a = 0; a < R300_MAX_ARRAYS; a++) {
+        lo[a] = UINT64_MAX;
+        hi[a] = 0;
+    }
+    for (unsigned k = 0; k < 16; k++) {
+        uint32_t reg = r300_reg(st, VAP_PROG_STREAM_CNTL_0 + 4 * (k / 2));
+        unsigned e = (reg >> (16 * (k % 2))) & 0xFFFF;
+        unsigned w = psc_dwords(e & 0xF), a;
+
+        if (k < arr->count) {
+            cursor = 0;                 /* each array starts afresh */
+        }
+        cursor += (e >> 4) & 0xF;       /* skip, read or not */
+        if (w) {
+            if (!arr->count) {
+                return false;           /* "no 3D_LOAD_VBPNTR array" */
+            }
+            a = k < arr->count ? k : arr->count - 1;
+            if (cursor < lo[a]) {
+                lo[a] = cursor;
+            }
+            if ((uint64_t)cursor + w > hi[a]) {
+                hi[a] = (uint64_t)cursor + w;
+            }
+        }
+        cursor += w;
+        if (e & (1u << 13)) {           /* LAST_VEC */
+            break;
+        }
+    }
+
+    /* Per array: [addr + (vmin*stride + lo)*4, addr + (vmax*stride + hi)*4),
+     * all of it below 2^32 so the fetcher's 32-bit arithmetic matches. */
+    for (unsigned a = 0; a < arr->count; a++) {
+        uint64_t stride = arr->a[a].stride_dw, base = arr->a[a].addr;
+        uint64_t start, end;
+
+        if (lo[a] >= hi[a]) {
+            continue;                   /* no element reads this array */
+        }
+        start = base + ((uint64_t)vmin * stride + lo[a]) * 4;
+        end = base + ((uint64_t)vmax * stride + hi[a]) * 4;
+        if (end > 0x100000000ull || end <= start) {
+            return false;               /* would wrap in fetch_dwords */
+        }
+        if (end - start > max_bytes) {
+            return false;               /* (and merged lengths stay 32-bit) */
+        }
+        plan->r[plan->n].gpu = (uint32_t)start;
+        plan->r[plan->n].len = (uint32_t)(end - start);
+        plan->n++;
+    }
+    if (!plan->n) {
+        return true;                    /* no element reads: nothing to capture */
+    }
+
+    /* Sort by address, merge overlapping or touching ranges. */
+    for (unsigned i = 1; i < plan->n; i++) {
+        R300FetchRange t = plan->r[i];
+        unsigned j = i;
+        while (j && plan->r[j - 1].gpu > t.gpu) {
+            plan->r[j] = plan->r[j - 1];
+            j--;
+        }
+        plan->r[j] = t;
+    }
+    unsigned m = 0;
+    for (unsigned i = 1; i < plan->n; i++) {
+        uint64_t end = (uint64_t)plan->r[m].gpu + plan->r[m].len;
+        if (plan->r[i].gpu <= end) {
+            uint64_t e2 = (uint64_t)plan->r[i].gpu + plan->r[i].len;
+            plan->r[m].len = (uint32_t)((e2 > end ? e2 : end) - plan->r[m].gpu);
+        } else {
+            plan->r[++m] = plan->r[i];
+        }
+    }
+    plan->n = m + 1;
+    for (unsigned i = 0; i < plan->n; i++) {
+        plan->total += plan->r[i].len;
+    }
+    return plan->total <= max_bytes;
+}
+
+bool r300_capture_read(void *opaque, uint32_t gpu_addr, void *dst,
+                       uint32_t len)
+{
+    const R300Capture *c = opaque;
+    uint64_t at = 0;
+
+    for (unsigned i = 0; i < c->plan.n; i++) {
+        const R300FetchRange *r = &c->plan.r[i];
+        if (gpu_addr >= r->gpu &&
+            (uint64_t)gpu_addr + len <= (uint64_t)r->gpu + r->len) {
+            memcpy(dst, c->buf + at + (gpu_addr - r->gpu), len);
+            return true;
+        }
+        at += r->len;
+    }
+    build_needs_protected = true;       /* never a live read instead */
+    return false;
+}
+
+void r300_draw_parked_begin(void)
+{
+    build_parked = true;
+    build_needs_protected = false;
+}
+
+bool r300_draw_parked_end(void)
+{
+    build_parked = false;
+    return build_needs_protected;
+}
+
+void r300_draw_init_options(void)
+{
+    r300_endian_model();
+    rt_le_on();
 }
 
 void r300_draw_free(R300DrawPacket *pkt)

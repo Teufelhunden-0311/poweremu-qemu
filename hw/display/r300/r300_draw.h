@@ -279,6 +279,57 @@ bool r300_draw_build_indexed(const R300State *st, const R300Arrays *arr,
  * packed two per dword, the first in the low half. */
 uint32_t r300_index_at(const uint32_t *dw, uint32_t ndw, bool i32, uint32_t i);
 
+/*
+ * Building a draw from captured bytes (PPCGPU_BUILD_UNLOCK, AI-generated).
+ *
+ * r300_draw_fetch_plan: the guest GPU address ranges that r300_draw_build
+ * (opcode, d, ndw; idx NULL) or r300_draw_build_indexed (vf = d[0], idx) can
+ * read vertex data from, for a draw that takes the GPU vertex-shader path:
+ * per array, the vertex index range [min, max] the draw names times the
+ * array's stride, plus the dword extent its PSC elements read.  A covering
+ * range, not the exact bytes (sparse indices, stride gaps).  Overlapping
+ * ranges are merged.  Returns false -- the draw is not for a captured build
+ * -- for immediate data, rect lists, PVS bypass, the CPU vertex path,
+ * empty or short draws, an element with no array, a range whose 32-bit address arithmetic
+ * would wrap in the fetcher, or more than max_bytes in all.
+ *
+ * Between r300_draw_parked_begin() and r300_draw_parked_end() (one thread)
+ * a build that would leave the GPU vertex-shader path, or a read through
+ * r300_capture_read that the capture does not cover, stops with an error
+ * instead and r300_draw_parked_end() returns true: the draw has to be built
+ * again the usual way.  r300_draw_init_options() reads the build's
+ * environment switches once, before any such build.
+ */
+typedef struct R300FetchRange {
+    uint32_t gpu;               /* first byte */
+    uint32_t len;               /* bytes, > 0; gpu + len <= 2^32 */
+} R300FetchRange;
+
+typedef struct R300FetchPlan {
+    unsigned n;
+    R300FetchRange r[R300_MAX_ARRAYS];
+    uint64_t total;             /* bytes in all ranges */
+} R300FetchPlan;
+
+bool r300_draw_fetch_plan(const R300State *st, const R300Arrays *arr,
+                          uint32_t opcode, const uint32_t *d, uint32_t ndw,
+                          const R300Indices *idx, uint64_t max_bytes,
+                          R300FetchPlan *plan);
+
+/* The planned ranges' bytes, back to back in plan order (buf: plan.total). */
+typedef struct R300Capture {
+    R300FetchPlan plan;
+    uint8_t *buf;
+} R300Capture;
+
+/* An R300ReadFn over an R300Capture (opaque): never reads anything else. */
+bool r300_capture_read(void *opaque, uint32_t gpu_addr, void *dst,
+                       uint32_t len);
+
+void r300_draw_parked_begin(void);
+bool r300_draw_parked_end(void);
+void r300_draw_init_options(void);
+
 /* GB_AA_CONFIG's sample count (1 without antialiasing), and GB_MSPOS's
  * sample positions as offsets from the pixel centre, in pixels. */
 uint32_t r300_aa_samples(const R300State *st);

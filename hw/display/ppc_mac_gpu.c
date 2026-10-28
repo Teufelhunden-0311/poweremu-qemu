@@ -675,6 +675,7 @@ enum { R200_WHY_T3 = 1, R200_WHY_DISPLAY, R200_WHY_FENCE, R200_WHY_OTHER };
 enum { R200_WHY_2D = 0x40 };
 
 static int cp_wait_unlock(void);
+static bool cp_can_unlock(void);
 static bool cp_wait_relock(int saved);
 static bool cp_cancelled(void);
 
@@ -4040,6 +4041,91 @@ static int r300_draw_staged(PPCMacGPUState *s, uint8_t *vram, R300DrawPacket *pk
     return rr;
 }
 
+/*
+ * PPCGPU_BUILD_UNLOCK=1 (default off; AI-generated): build a draw with the
+ * BQL let go.  Vertex fetch, the vertex shader's input packing and the
+ * shader memos are most of the time the CP thread holds the lock for, and
+ * the vCPU needs the lock for every mtmsr and interrupt.  Only a draw whose
+ * vertex arrays lie in VRAM and that takes the GPU vertex-shader path (see
+ * r300_draw_fetch_plan) is built this way:
+ *  - with the BQL: every byte the build can fetch is copied out of VRAM
+ *    (the range the draw's indices and PSC elements span, at most
+ *    R300_BUILD_CAPTURE_MAX in all);
+ *  - parked (cp_wait_unlock: the ring is not given away, cp_sync waits): the
+ *    build reads the copy and nothing else -- not s->regs, the GART or the
+ *    address space.  It also reads the R300 state, which nothing changes
+ *    meanwhile: guest register writes wait in cp_sync, a device reset
+ *    leaves s->r3 alone, and a load comes after a stop that cp_syncs.  The
+ *    shader memos have no other user then: PIO draws come through
+ *    cp_sync too;
+ *  - with the BQL again: a reset meanwhile cancels the segment; a build
+ *    that needed more than the copy is thrown away and done the usual way.
+ * Returns 1 with *pkt, *err and *ok as the build left them, 0 if the draw is
+ * to be built the usual way (nothing allocated), -1 if the segment was
+ * cancelled (nothing allocated).
+ */
+#define R300_BUILD_CAPTURE_MAX (4 * MiB)
+static bool r300_build_unlock;      /* PPCGPU_BUILD_UNLOCK, read at realize */
+static bool r300_build_debug;       /* a debug capture is on: never */
+
+static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
+                             const uint32_t *d, uint32_t ndw,
+                             const R300Indices *idx, R300DrawPacket *pkt,
+                             const char **err, bool *ok)
+{
+    uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
+    R300Capture cap;
+    uint64_t at = 0;
+    uint8_t *vram;
+    bool redo;
+    int w;
+
+    if (!r300_build_unlock || r300_build_debug || s->r3_dump ||
+        !cp_can_unlock() || !r300_endian_model() ||
+        !r300_draw_fetch_plan(s->r3, &s->r3_arrays, opcode, d, ndw, idx,
+                              R300_BUILD_CAPTURE_MAX, &cap.plan)) {
+        return 0;
+    }
+    for (unsigned i = 0; i < cap.plan.n; i++) {
+        const R300FetchRange *r = &cap.plan.r[i];
+        if (!r300_in_fb(s, r->gpu, r->len) || r->gpu < fb_base ||
+            (uint64_t)(r->gpu - fb_base) + r->len > s->vram_size) {
+            return 0;                   /* VRAM only (r300_read_raw's first case) */
+        }
+    }
+    cap.buf = cap.plan.total ? g_try_malloc(cap.plan.total) : NULL;
+    if (cap.plan.total && !cap.buf) {
+        return 0;
+    }
+    vram = r300_vfetch && s->vram_host ? s->vram_host :
+           memory_region_get_ram_ptr(&s->vram);
+    for (unsigned i = 0; i < cap.plan.n; i++) {
+        const R300FetchRange *r = &cap.plan.r[i];
+        memcpy(cap.buf + at, vram + (r->gpu - fb_base), r->len);
+        at += r->len;
+    }
+
+    w = cp_wait_unlock();
+    r300_draw_parked_begin();
+    *ok = idx ?
+        r300_draw_build_indexed(s->r3, &s->r3_arrays, d[0], idx,
+                                r300_capture_read, &cap, pkt, err) :
+        r300_draw_build(s->r3, &s->r3_arrays, opcode, d, ndw,
+                        r300_capture_read, &cap, pkt, err);
+    redo = r300_draw_parked_end();
+    if (!cp_wait_relock(w)) {
+        r300_draw_free(pkt);            /* (a failed build holds nothing) */
+        g_free(cap.buf);
+        return -1;
+    }
+    g_free(cap.buf);
+    if (redo) {
+        r300_draw_free(pkt);
+        return 0;
+    }
+    return 1;
+}
+
 static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                         uint32_t body_dw, const R300Indices *idx)
 {
@@ -4161,11 +4247,19 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             s->r3->glsl_flags &= ~R300_GLSL_GPU_VS;
         }
     }
-    bool build_ok = idx ?
-        r300_draw_build_indexed(s->r3, &s->r3_arrays, d[0], idx, r300_read_raw,
-                                s, &pkt, &err) :
-        r300_draw_build(s->r3, &s->r3_arrays, opcode, d, body_dw,
-                        r300_read_raw, s, &pkt, &err);
+    bool build_ok;
+    int parked = r300_build_parked(s, opcode, d, body_dw, idx, &pkt, &err,
+                                   &build_ok);
+    if (parked < 0) {
+        return;                             /* cancelled (cp_cancelled) */
+    }
+    if (!parked) {
+        build_ok = idx ?
+            r300_draw_build_indexed(s->r3, &s->r3_arrays, d[0], idx,
+                                    r300_read_raw, s, &pkt, &err) :
+            r300_draw_build(s->r3, &s->r3_arrays, opcode, d, body_dw,
+                            r300_read_raw, s, &pkt, &err);
+    }
     if (s->r3_dump && g_r300_arm_rt &&
         (r300_reg(s->r3, 0x4E28) & ~0x1Fu) == g_r300_arm_rt) {
         fprintf(s->r3_dump, "TRY op %02x vf %08x ok %d err %s tex0 en %u off %06x "
@@ -10677,6 +10771,12 @@ static void ppc_mac_gpu_cp_unpark(void)
     }
 }
 
+/* Would cp_wait_unlock let go here?  (PPCGPU_CP_PARK_US=0: never.) */
+static bool cp_can_unlock(void)
+{
+    return cp_in_ring && cp_park_us() && ppc_mac_gpu_cp_on_thread();
+}
+
 /*
  * The CP thread is about to wait for the renderer (the render queue or the
  * GPU): park for the length of the wait instead of holding the BQL through
@@ -10689,7 +10789,7 @@ static int cp_wait_unlock(void)
 {
     int nest;
 
-    if (!cp_in_ring || !cp_park_us() || !ppc_mac_gpu_cp_on_thread()) {
+    if (!cp_can_unlock()) {
         return 0;
     }
     nest = g_in_pm4;
@@ -14431,6 +14531,16 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         r300_vfetch = e && e[0] == '1';
         e = getenv("PPCGPU_GLSL_SHARE");
         r300_glsl_share = e && e[0] == '1';
+        e = getenv("PPCGPU_BUILD_UNLOCK");
+        r300_build_unlock = e && e[0] == '1';
+        r300_build_debug = getenv("R300_CAP") || getenv("R300_GLSLDUMP") ||
+                           getenv("R300_DXTDUMP") || getenv("R300_DUMP");
+        r300_draw_init_options();       /* before any build without the BQL */
+        if (r300_build_unlock) {
+            qemu_log("ppc-mac-gpu r300: PPCGPU_BUILD_UNLOCK on: GPU vertex-"
+                     "shader draws with VRAM arrays built with the BQL let go%s\n",
+                     r300_build_debug ? " (not now: a debug capture is on)" : "");
+        }
     }
     if (s->r300) {
         /* Two apertures onto VRAM, as on a real Radeon (see r300_ap1_ops). */

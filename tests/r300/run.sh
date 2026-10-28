@@ -14,7 +14,7 @@ SPV="$R/r300_spirv.c -DR300_HAVE_SPIRV_CROSS $(pkg-config --cflags --libs shader
 SPV="$SPV -lspirv-cross-msl -lspirv-cross-hlsl -lspirv-cross-cpp -lspirv-cross-reflect"
 SPV="$SPV -lspirv-cross-glsl -lspirv-cross-util -lspirv-cross-core -lc++"
 
-for t in test_pvs test_us test_draw test_features test_vfetch; do
+for t in test_pvs test_us test_draw test_features test_vfetch test_buildcap; do
     cc -O1 -Wall -Wno-unused-function -o "$B/$t" $t.c $SRC -lm
 done
 # Shared shader texts: under AddressSanitizer and ThreadSanitizer.
@@ -37,6 +37,7 @@ done
 "$B/test_pvs"
 "$B/test_draw"
 "$B/test_vfetch"
+"$B/test_buildcap"
 "$B/test_glslshare_address"
 "$B/test_glslshare_thread"
 "$B/test_aperture"
