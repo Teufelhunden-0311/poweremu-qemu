@@ -4195,6 +4195,164 @@ static int r300_draw_staged(PPCMacGPUState *s, uint8_t *vram, R300DrawPacket *pk
 static bool r300_build_unlock;      /* PPCGPU_BUILD_UNLOCK, read at realize */
 static bool r300_build_debug;       /* a debug capture is on: never */
 
+/*
+ * Debug (not for merging): PPCGPU_BUILD_STATS=1 counts what the parked
+ * builds do (a line every 10 s and at exit).  PPCGPU_BUILD_TEST=<mode> acts
+ * INSIDE one parked build -- at its first read of the capture -- once the
+ * R300 has drawn PPCGPU_BUILD_TEST_AT draws (default 200000):
+ *  dev-reset  a BH resets the device from the main loop (BQL), and the build
+ *             waits (at most 2 s) until cp.epoch moves; retried on later
+ *             builds (5 at most) if it did not move in time;
+ *  sys-reset  qemu_system_reset_request, the same bounded wait (no retry);
+ *  overwrite  XOR the first 4 KiB of the first captured range in VRAM; after
+ *             relock: the capture unchanged?  the packet = a rebuild from the
+ *             capture?  a rebuild from live VRAM different?  VRAM restored;
+ *  stall:<ms> sleep in the build; cp_sync waiters, CP_RB_WPTR kicks and
+ *             cp_run calls off the CP thread meanwhile, cp.parked kept.
+ * After a cancelled build the reproducer's counters report what the rest of
+ * the segment still did (cp_test_end); PPCGPU_BUILD_TEST_REBOOT=1 then asks
+ * for a system reset.  AI-generated (Claude).
+ */
+enum { BT_DEV = 1, BT_SYS, BT_OVERWRITE, BT_STALL };
+static struct {
+    bool init, stats, fired;
+    int mode, stall_ms, tries;
+    uint64_t at;
+    /* in the build under test */
+    bool armed, acted, moved;
+    unsigned epoch_in;
+    int64_t t_in, t_moved;
+    uint8_t *ow_host;
+    uint32_t ow_len, crc_before;
+    unsigned waiters_max;
+    uint32_t kicks_before;
+    uint64_t runs_before;
+    bool parked_kept;
+    /* counters */
+    uint64_t attempts, planned, not_vram, alloc_fail, unlocked, ok, failed,
+             redo_miss, redo_cpu, cancelled, bytes, ns_cap, ns_build;
+    int64_t next;
+} bt;
+static uint64_t bt_other_runs;      /* ppc_mac_gpu_cp_run off the CP thread */
+static __thread bool bt_miss;
+
+static void bt_report(const char *tag)
+{
+    fprintf(stderr, "build-stats%s attempts=%" PRIu64 " planned=%" PRIu64
+            " not_vram=%" PRIu64 " alloc_fail=%" PRIu64 " unlocked=%" PRIu64
+            " ok=%" PRIu64 " failed=%" PRIu64 " redo_miss=%" PRIu64
+            " redo_cpu=%" PRIu64 " cancelled=%" PRIu64 " bytes=%" PRIu64
+            " cap_ms=%.1f build_ms=%.1f\n", tag, bt.attempts, bt.planned,
+            bt.not_vram, bt.alloc_fail, bt.unlocked, bt.ok, bt.failed,
+            bt.redo_miss, bt.redo_cpu, bt.cancelled, bt.bytes, bt.ns_cap / 1e6,
+            bt.ns_build / 1e6);
+}
+
+static void bt_final(void)
+{
+    bt_report("-final");
+}
+
+static void bt_init(void)
+{
+    const char *e = getenv("PPCGPU_BUILD_TEST");
+
+    bt.init = true;
+    bt.stats = getenv("PPCGPU_BUILD_STATS") && getenv("PPCGPU_BUILD_STATS")[0] == '1';
+    if (bt.stats) {
+        atexit(bt_final);
+    }
+    if (e) {
+        bt.mode = !strcmp(e, "dev-reset") ? BT_DEV : !strcmp(e, "sys-reset") ? BT_SYS :
+                  !strcmp(e, "overwrite") ? BT_OVERWRITE :
+                  !strncmp(e, "stall:", 6) ? BT_STALL : 0;
+        bt.stall_ms = bt.mode == BT_STALL ? atoi(e + 6) : 0;
+    }
+    bt.at = getenv("PPCGPU_BUILD_TEST_AT") ? strtoull(getenv("PPCGPU_BUILD_TEST_AT"), NULL, 0)
+                                           : 200000;
+    cpt.reboot |= getenv("PPCGPU_BUILD_TEST_REBOOT") &&
+                  getenv("PPCGPU_BUILD_TEST_REBOOT")[0] == '1';
+}
+
+static uint32_t bt_crc(const uint8_t *p, uint64_t n)
+{
+    uint32_t h = 2166136261u;
+    for (uint64_t i = 0; i < n; i++) {
+        h = (h ^ p[i]) * 16777619u;
+    }
+    return h;
+}
+
+static void bt_reset_bh(void *opaque)
+{
+    PPCMacGPUState *s = opaque;
+    fprintf(stderr, "build-test: device reset (main-loop BH) runs %.3f ms after the "
+            "parked build began\n", (g_get_monotonic_time() - bt.t_in) / 1000.0);
+    ppc_mac_gpu_reset(DEVICE(s));
+}
+
+/* Wait (bounded) for cp.epoch to move away from the build's. */
+static void bt_wait_epoch(void)
+{
+    for (int i = 0; i < 2000; i++) {
+        if (qatomic_read(&cp.epoch) != bt.epoch_in) {
+            bt.moved = true;
+            bt.t_moved = g_get_monotonic_time();
+            return;
+        }
+        g_usleep(1000);
+    }
+}
+
+typedef struct { R300Capture *cap; PPCMacGPUState *s; } BtRead;
+
+static bool bt_read(void *opaque, uint32_t gpu_addr, void *dst, uint32_t len)
+{
+    BtRead *b = opaque;
+    if (bt.armed && !bt.acted) {
+        bt.acted = true;
+        switch (bt.mode) {
+        case BT_DEV:
+            aio_bh_schedule_oneshot(qemu_get_aio_context(), bt_reset_bh, b->s);
+            bt_wait_epoch();
+            break;
+        case BT_SYS:
+            qemu_system_reset_request(SHUTDOWN_CAUSE_HOST_QMP_SYSTEM_RESET);
+            bt_wait_epoch();
+            break;
+        case BT_OVERWRITE:
+            for (uint32_t i = 0; i < bt.ow_len; i++) {
+                bt.ow_host[i] ^= 0x5A;
+            }
+            break;
+        case BT_STALL:
+            fprintf(stderr, "build-test: stall begins (%d ms, draw %llu)\n", bt.stall_ms,
+                    (unsigned long long)b->s->r3->draws);
+            bt.kicks_before = qatomic_read(&cp.kicks);
+            bt.runs_before = qatomic_read(&bt_other_runs);
+            for (int i = 0; i < bt.stall_ms; i++) {
+                bt.waiters_max = MAX(bt.waiters_max, qatomic_read(&cp.waiters));
+                g_usleep(1000);
+            }
+            bt.parked_kept = qatomic_read(&cp.parked);
+            break;
+        }
+    }
+    if (!r300_capture_read(b->cap, gpu_addr, dst, len)) {
+        bt_miss = true;
+        return false;
+    }
+    return true;
+}
+
+static bool bt_same_vs(const R300DrawPacket *a, const R300DrawPacket *b)
+{
+    return a->vs_in_vecs == b->vs_in_vecs && a->num_verts == b->num_verts &&
+           !a->vs_in == !b->vs_in &&
+           (!a->vs_in || !memcmp(a->vs_in, b->vs_in, sizeof(float) * 4 * a->vs_in_vecs)) &&
+           (!a->vs_idx || !memcmp(a->vs_idx, b->vs_idx, sizeof(uint32_t) * a->num_verts));
+}
+
 static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
                              const uint32_t *d, uint32_t ndw,
                              const R300Indices *idx, R300DrawPacket *pkt,
@@ -4206,22 +4364,38 @@ static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
     uint8_t *vram;
     bool redo;
     int w;
+    int64_t t0, t1, t2;
+    BtRead br = { &cap, s };
 
+    if (unlikely(!bt.init)) {
+        bt_init();
+    }
     if (!r300_build_unlock || r300_build_debug || s->r3_dump ||
-        !cp_can_unlock() || !r300_endian_model() ||
-        !r300_draw_fetch_plan(s->r3, &s->r3_arrays, opcode, d, ndw, idx,
+        !cp_can_unlock() || !r300_endian_model()) {
+        return 0;
+    }
+    bt.attempts++;
+    if (bt.stats && g_get_monotonic_time() >= bt.next) {
+        bt.next = g_get_monotonic_time() + 10 * 1000000;
+        bt_report("");
+    }
+    t0 = get_clock();
+    if (!r300_draw_fetch_plan(s->r3, &s->r3_arrays, opcode, d, ndw, idx,
                               R300_BUILD_CAPTURE_MAX, &cap.plan)) {
         return 0;
     }
+    bt.planned++;
     for (unsigned i = 0; i < cap.plan.n; i++) {
         const R300FetchRange *r = &cap.plan.r[i];
         if (!r300_in_fb(s, r->gpu, r->len) || r->gpu < fb_base ||
             (uint64_t)(r->gpu - fb_base) + r->len > s->vram_size) {
+            bt.not_vram++;
             return 0;                   /* VRAM only (r300_read_raw's first case) */
         }
     }
     cap.buf = cap.plan.total ? g_try_malloc(cap.plan.total) : NULL;
     if (cap.plan.total && !cap.buf) {
+        bt.alloc_fail++;
         return 0;
     }
     vram = r300_vfetch && s->vram_host ? s->vram_host :
@@ -4231,24 +4405,121 @@ static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
         memcpy(cap.buf + at, vram + (r->gpu - fb_base), r->len);
         at += r->len;
     }
+    bt.bytes += cap.plan.total;
 
+    bt.armed = bt.mode && !bt.fired && s->r3->draws >= bt.at &&
+               (bt.mode != BT_OVERWRITE || cap.plan.n);
+    bt.acted = bt.moved = false;
+    if (bt.armed) {
+        bt.fired = true;
+        bt.tries++;
+        bt.epoch_in = cp.epoch;
+        bt.t_in = g_get_monotonic_time();
+        bt.waiters_max = 0;
+        if (bt.mode == BT_OVERWRITE) {
+            bt.ow_host = vram + (cap.plan.r[0].gpu - fb_base);
+            bt.ow_len = MIN(cap.plan.r[0].len, 4096u);
+            bt.crc_before = bt_crc(cap.buf, cap.plan.total);
+        }
+    }
+    bt_miss = false;
+    t1 = get_clock();
     w = cp_wait_unlock();
     r300_draw_parked_begin();
     *ok = idx ?
         r300_draw_build_indexed(s->r3, &s->r3_arrays, d[0], idx,
-                                r300_capture_read, &cap, pkt, err) :
+                                bt_read, &br, pkt, err) :
         r300_draw_build(s->r3, &s->r3_arrays, opcode, d, ndw,
-                        r300_capture_read, &cap, pkt, err);
+                        bt_read, &br, pkt, err);
     redo = r300_draw_parked_end();
-    if (!cp_wait_relock(w)) {
+    bool cap_same = !bt.armed || bt.mode != BT_OVERWRITE ||
+                    bt_crc(cap.buf, cap.plan.total) == bt.crc_before;
+    bool valid = cp_wait_relock(w);
+    t2 = get_clock();
+    bt.unlocked += w != 0;
+    bt.ns_cap += t1 - t0;
+    bt.ns_build += t2 - t1;
+
+    if (bt.armed && (bt.mode == BT_DEV || bt.mode == BT_SYS)) {
+        fprintf(stderr, "build-test: %s INSIDE the parked build: cp.epoch moved %s "
+                "(%.3f ms after it began; the build ran %.3f ms); unlocked %d; "
+                "outcome %s (draw %llu, try %d)\n",
+                bt.mode == BT_DEV ? "device reset" : "system reset",
+                bt.moved ? "yes" : "NO", bt.moved ? (bt.t_moved - bt.t_in) / 1000.0 : 0.0,
+                (g_get_monotonic_time() - bt.t_in) / 1000.0, w != 0,
+                !valid ? "cancelled" : redo ? "redo" : *ok ? "built" : "failed",
+                (unsigned long long)s->r3->draws, bt.tries);
+        if (!bt.moved && bt.mode == BT_DEV && bt.tries < 5) {
+            bt.fired = false;           /* try again on a later build */
+        }
+    }
+    if (!valid) {
+        bt.cancelled++;
+        if (bt.armed) {
+            cpt.done = cpt.stale = true;    /* count the rest of the segment */
+            cpt.t = g_get_monotonic_time();
+        }
         r300_draw_free(pkt);            /* (a failed build holds nothing) */
         g_free(cap.buf);
+        bt.armed = false;
         return -1;
     }
+    if (bt.armed && bt.mode == BT_OVERWRITE) {
+        R300DrawPacket p2, p3;
+        const char *e2, *e3;
+        bool ok2, ok3, r2;
+        r300_draw_parked_begin();
+        ok2 = idx ? r300_draw_build_indexed(s->r3, &s->r3_arrays, d[0], idx,
+                                            r300_capture_read, &cap, &p2, &e2) :
+                    r300_draw_build(s->r3, &s->r3_arrays, opcode, d, ndw,
+                                    r300_capture_read, &cap, &p2, &e2);
+        r2 = r300_draw_parked_end();
+        ok3 = idx ? r300_draw_build_indexed(s->r3, &s->r3_arrays, d[0], idx,
+                                            r300_read_raw, s, &p3, &e3) :
+                    r300_draw_build(s->r3, &s->r3_arrays, opcode, d, ndw,
+                                    r300_read_raw, s, &p3, &e3);
+        fprintf(stderr, "build-test: VRAM overwrite INSIDE the parked build (%u bytes at "
+                "%08x, draw %llu): capture unchanged %d; parked packet ok %d redo %d "
+                "vs_in_vecs %u; same as a rebuild from the capture %d; different from a "
+                "rebuild from live (overwritten) VRAM %d\n", bt.ow_len,
+                cap.plan.r[0].gpu, (unsigned long long)s->r3->draws, cap_same, *ok,
+                redo, *ok ? pkt->vs_in_vecs : 0,
+                *ok && ok2 && !r2 && bt_same_vs(pkt, &p2),
+                *ok && (!ok3 || !bt_same_vs(pkt, &p3)));
+        if (ok2) {
+            r300_draw_free(&p2);
+        }
+        if (ok3) {
+            r300_draw_free(&p3);
+        }
+        for (uint32_t i = 0; i < bt.ow_len; i++) {
+            bt.ow_host[i] ^= 0x5A;      /* restore */
+        }
+    }
+    if (bt.armed && bt.mode == BT_STALL) {
+        fprintf(stderr, "build-test: stall of %d ms INSIDE the parked build (draw %llu): "
+                "cp_sync waiters max %u; CP_RB_WPTR kicks %u; cp_run off the CP thread "
+                "%llu; cp.parked kept %d; relock valid %d\n", bt.stall_ms,
+                (unsigned long long)s->r3->draws, bt.waiters_max,
+                qatomic_read(&cp.kicks) - bt.kicks_before,
+                (unsigned long long)(qatomic_read(&bt_other_runs) - bt.runs_before),
+                bt.parked_kept, valid);
+    }
+    bt.armed = false;
     g_free(cap.buf);
     if (redo) {
+        if (bt_miss) {
+            bt.redo_miss++;
+        } else {
+            bt.redo_cpu++;
+        }
         r300_draw_free(pkt);
         return 0;
+    }
+    if (*ok) {
+        bt.ok++;
+    } else {
+        bt.failed++;
     }
     return 1;
 }
@@ -11134,6 +11405,9 @@ static bool ppc_mac_gpu_process_ring_buffer(PPCMacGPUState *s,
  */
 static void ppc_mac_gpu_cp_run(PPCMacGPUState *s)
 {
+    if (!ppc_mac_gpu_cp_on_thread()) {
+        qatomic_inc(&bt_other_runs);
+    }
     unsigned epoch = ++cp.epoch;    /* a yielded CP thread gives up its copy */
 
     for (;;) {
