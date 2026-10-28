@@ -822,6 +822,7 @@ void tcg_region_init(size_t tb_size, int splitwx, unsigned max_cpus)
     size_t region_size;
     int have_prot, need_prot;
     G_GNUC_UNUSED bool auto_size = tb_size == 0;
+    size_t requested = tb_size;     /* 0 = automatic */
 
     /* Size the buffer.  */
     if (tb_size == 0) {
@@ -839,6 +840,9 @@ void tcg_region_init(size_t tb_size, int splitwx, unsigned max_cpus)
     if (tb_size > MAX_CODE_GEN_BUFFER_SIZE) {
         tb_size = MAX_CODE_GEN_BUFFER_SIZE;
     }
+    if (auto_size) {
+        requested = tb_size;
+    }
 
 #if defined(CONFIG_DARWIN) && defined(__aarch64__) && \
     !defined(CONFIG_TCG_INTERPRETER) && \
@@ -851,10 +855,24 @@ void tcg_region_init(size_t tb_size, int splitwx, unsigned max_cpus)
         have_prot = alloc_code_gen_buffer(tb_size, splitwx, &error_fatal);
     }
     assert(have_prot >= 0);
-    if (qemu_perf_on) {
-        qemu_log("tcg: code buffer %p, %zu MiB; QEMU code at %p\n",
-                 region.start_aligned, (size_t)(tb_size / MiB),
-                 (void *)&tcg_region_init);
+    /*
+     * debug (local, not for merging): one startup record of the code
+     * buffer's size and placement, for launch acceptance in timing runs.
+     * same_block: the whole buffer lies in the 4 GiB-aligned block of
+     * QEMU's code (the predicate alloc_code_gen_buffer_near uses).
+     */
+    {
+        uintptr_t code = (uintptr_t)&tcg_region_init;
+        uintptr_t start = (uintptr_t)region.start_aligned;
+        uintptr_t last = start + region.total_size - 1;
+
+        qemu_log("tcg-placement: requested=%zu MiB (%s) actual=%zu MiB "
+                 "start=%p end=%p qemu_code=%p same_block=%s\n",
+                 (size_t)(requested / MiB), auto_size ? "auto" : "explicit",
+                 (size_t)(tb_size / MiB), (void *)start, (void *)(last + 1),
+                 (void *)code,
+                 (start >> 32) == (code >> 32) && (last >> 32) == (code >> 32)
+                 ? "yes" : "no");
     }
 
     /* Request large pages for the buffer and the splitwx.  */
@@ -940,6 +958,8 @@ void tcg_region_init(size_t tb_size, int splitwx, unsigned max_cpus)
      * It is also the only context for CONFIG_USER_ONLY.
      */
     tcg_region_initial_alloc__locked(&tcg_init_ctx);
+    qemu_log("tcg-placement: capacity=%zu KiB regions=%zu\n",
+             (size_t)(tcg_code_capacity() / KiB), (size_t)region.n);
 }
 
 void tcg_region_prologue_set(TCGContext *s)
