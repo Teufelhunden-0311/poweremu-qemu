@@ -34,7 +34,6 @@
 #include "exec/translation-block.h"
 #include "tcg-internal.h"
 #include "host/cpuinfo.h"
-#include "exec/perf-counters.h"
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 
@@ -753,7 +752,8 @@ static int alloc_code_gen_buffer(size_t size, int splitwx, Error **errp)
  * the image, stacks and the shared cache, and the next free space is above
  * the GPU carveout, at 0x70_0000_0000.  So when the size is ours to
  * choose, take the largest that lands in the same 4 GiB block as QEMU's
- * code.  A size the user asked for is left as it is.
+ * code.  A size the user asked for is left as it is; tcg_region_init warns
+ * when it lands outside.
  */
 static bool code_gen_buffer_far(void)
 {
@@ -821,7 +821,10 @@ void tcg_region_init(size_t tb_size, int splitwx, unsigned max_cpus)
     const size_t page_size = qemu_real_host_page_size();
     size_t region_size;
     int have_prot, need_prot;
-    G_GNUC_UNUSED bool auto_size = tb_size == 0;
+    bool auto_size = tb_size == 0;
+    size_t requested = tb_size;     /* as asked, before any clamping */
+    size_t allocated;
+    G_GNUC_UNUSED bool far = false;
 
     /* Size the buffer.  */
     if (tb_size == 0) {
@@ -839,23 +842,35 @@ void tcg_region_init(size_t tb_size, int splitwx, unsigned max_cpus)
     if (tb_size > MAX_CODE_GEN_BUFFER_SIZE) {
         tb_size = MAX_CODE_GEN_BUFFER_SIZE;
     }
+    if (auto_size) {
+        requested = tb_size;        /* the automatic size first tried */
+    }
 
 #if defined(CONFIG_DARWIN) && defined(__aarch64__) && \
     !defined(CONFIG_TCG_INTERPRETER) && \
     !defined(CONFIG_TCG_THREADED_INTERPRETER)
     if (auto_size) {
         have_prot = alloc_code_gen_buffer_near(&tb_size, splitwx);
-    } else
-#endif
-    {
+    } else {
         have_prot = alloc_code_gen_buffer(tb_size, splitwx, &error_fatal);
     }
-    assert(have_prot >= 0);
-    if (qemu_perf_on) {
-        qemu_log("tcg: code buffer %p, %zu MiB; QEMU code at %p\n",
-                 region.start_aligned, (size_t)(tb_size / MiB),
-                 (void *)&tcg_region_init);
+    /* Over the whole extent, before the guard page comes off total_size;
+     * the startup record below reports this same result. */
+    far = code_gen_buffer_far();
+    if (!auto_size && far) {
+        warn_report("TCG code buffer of the requested %zu MiB at %p is "
+                    "outside the 4 GiB block of QEMU's code; on the Apple "
+                    "Silicon host where this was measured, helper calls "
+                    "from generated code then often mispredict "
+                    "(automatic sizing attempts smaller allocations "
+                    "where supported)",
+                    (size_t)(requested / MiB), region.start_aligned);
     }
+#else
+    have_prot = alloc_code_gen_buffer(tb_size, splitwx, &error_fatal);
+#endif
+    assert(have_prot >= 0);
+    allocated = region.total_size;  /* the static buffer may differ */
 
     /* Request large pages for the buffer and the splitwx.  */
     qemu_madvise(region.start_aligned, region.total_size, QEMU_MADV_HUGEPAGE);
@@ -940,6 +955,24 @@ void tcg_region_init(size_t tb_size, int splitwx, unsigned max_cpus)
      * It is also the only context for CONFIG_USER_ONLY.
      */
     tcg_region_initial_alloc__locked(&tcg_init_ctx);
+
+    /*
+     * One record of the code buffer's size and place, so that reports and
+     * timing runs can say which buffer they had: an automatic size can come
+     * out smaller than asked for (alloc_code_gen_buffer_near).
+     */
+    qemu_log("tcg: code buffer %zu KiB allocated (%s %zu KiB) at %p..%p, "
+             "capacity %zu KiB in %zu region(s)\n", (size_t)(allocated / KiB),
+             auto_size ? "automatic, first tried" : "requested",
+             (size_t)(requested / KiB), region.start_aligned,
+             (void *)((uintptr_t)region.start_aligned + allocated),
+             (size_t)(tcg_code_capacity() / KiB), (size_t)region.n);
+#if defined(CONFIG_DARWIN) && defined(__aarch64__) && \
+    !defined(CONFIG_TCG_INTERPRETER) && \
+    !defined(CONFIG_TCG_THREADED_INTERPRETER)
+    qemu_log("tcg: QEMU code at %p; code buffer in its 4 GiB block: %s\n",
+             (void *)&tcg_region_init, far ? "no" : "yes");
+#endif
 }
 
 void tcg_region_prologue_set(TCGContext *s)
