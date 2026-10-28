@@ -1679,6 +1679,7 @@ void ppc_tlb_invalidate_all(CPUPPCState *env);
 void ppc_mmu_slot_sync(CPUPPCState *env);
 void ppc_mmu_slots_reset(CPUPPCState *env);
 void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr);
+bool ppc_tlbie_class(CPUPPCState *env);
 void cpu_ppc_set_vhyp(PowerPCCPU *cpu, PPCVirtualHypervisor *vhyp);
 void cpu_ppc_set_1lpar(PowerPCCPU *cpu);
 #endif

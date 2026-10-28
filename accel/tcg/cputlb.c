@@ -630,6 +630,51 @@ void tlb_flush_data_pages_by_mmuidx(CPUState *cpu, vaddr addr, vaddr npages,
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 }
 
+void tlb_flush_page_class_by_mmuidx(CPUState *cpu, vaddr addr, vaddr mask,
+                                    uint16_t idxmap)
+{
+    vaddr classes = (mask >> TARGET_PAGE_BITS) + 1;
+    vaddr cls;
+
+    assert_cpu_is_self(cpu);
+    g_assert(is_power_of_2(classes) &&
+             mask == (classes - 1) << TARGET_PAGE_BITS &&
+             classes <= (1u << CPU_TLB_DYN_MIN_BITS));
+    addr &= mask;
+    cls = addr >> TARGET_PAGE_BITS;
+
+    qemu_spin_lock(&cpu->neg.tlb.c.lock);
+    /* an index without entries since its last full flush has none to drop */
+    for (uint16_t work = idxmap & cpu->neg.tlb.c.dirty; work; work &= work - 1) {
+        int midx = ctz32(work);
+        CPUTLBDescFast *f = &cpu->neg.tlb.f[midx];
+        size_t n = tlb_n_entries(f);
+
+        /*
+         * tlb_index: a page's entry sits at its page number modulo n, and
+         * n (a power of two, at least 1 << CPU_TLB_DYN_MIN_BITS) is a
+         * multiple of classes, so the class's entries are every
+         * classes'th from cls.  TLB_INVALID_MASK keeps empty entries
+         * (all ones) from matching class classes - 1.
+         */
+        for (size_t i = cls; i < n; i += classes) {
+            if (tlb_flush_entry_mask_locked(&f->table[i], addr,
+                                            mask | TLB_INVALID_MASK)) {
+                tlb_n_used_entries_dec(cpu, midx);
+            }
+        }
+        tlb_flush_vtlb_page_mask_locked(cpu, midx, addr, mask | TLB_INVALID_MASK);
+    }
+    qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+
+    /*
+     * Whole, even when nothing above was cached: what the TLB holds says
+     * nothing about which TBs the jump cache maps, and an instruction
+     * mapping in the class may have changed.
+     */
+    tcg_flush_jmp_cache(cpu);
+}
+
 void tlb_flush_page(CPUState *cpu, vaddr addr)
 {
     tlb_flush_page_by_mmuidx(cpu, addr, ALL_MMUIDX_BITS);
