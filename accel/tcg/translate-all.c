@@ -67,6 +67,7 @@
 #include "internal-target.h"
 #include "tcg/perf.h"
 #include "exec/perf-counters.h"
+#include "exec/tb-diag.h"
 #include "tcg/insn-start-words.h"
 
 TBContext tb_ctx;
@@ -322,6 +323,9 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     tb = tcg_tb_alloc(tcg_ctx);
     if (unlikely(!tb)) {
         /* flush must be done */
+        if (unlikely(tbdiag_on)) {
+            tbdiag_flush_full();
+        }
         tb_flush(cpu);
         mmap_unlock();
         /* Make the execution loop process the flush as soon as possible.  */
@@ -434,6 +438,9 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     tb->tc.size = gen_code_size;
     QEMU_PERF_INC(tb_gen);
     QEMU_PERF_ADD(tb_bytes, gen_code_size);
+    if (unlikely(tbdiag_on)) {
+        tbdiag_gen(pc, cs_base, flags, cflags, phys_pc);
+    }
 
     /*
      * For CF_PCREL, attribute all executions of the generated code

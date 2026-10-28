@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/tb-diag.h"
 #include "exec/page-vary.h"
 #include "qapi/error.h"
 
@@ -2829,7 +2830,13 @@ static void invalidate_and_set_dirty(MemoryRegion *mr, hwaddr addr,
     }
     if (dirty_log_mask & (1 << DIRTY_MEMORY_CODE)) {
         assert(tcg_enabled());
+#ifdef CONFIG_TCG
+        tbdiag_cause = TBD_DMA;
+#endif
         tb_invalidate_phys_range(addr, addr + length - 1);
+#ifdef CONFIG_TCG
+        tbdiag_cause = TBD_OTHER;
+#endif
         dirty_log_mask &= ~(1 << DIRTY_MEMORY_CODE);
     }
     cpu_physical_memory_set_dirty_range(addr, length, dirty_log_mask);

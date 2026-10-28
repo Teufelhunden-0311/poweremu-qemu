@@ -35,6 +35,7 @@
 #include "internal-common.h"
 #include "internal-target.h"
 #include "exec/perf-counters.h"
+#include "exec/tb-diag.h"
 #ifdef CONFIG_USER_ONLY
 #include "user/page-protection.h"
 #endif
@@ -773,6 +774,9 @@ static void do_tb_flush(CPUState *cpu, run_on_cpu_data tb_flush_count)
     }
     did_flush = true;
     QEMU_PERF_INC(code_flush);
+    if (unlikely(tbdiag_on)) {
+        tbdiag_flush();
+    }
 
     CPU_FOREACH(cpu) {
         tcg_flush_jmp_cache(cpu);
@@ -930,6 +934,9 @@ static void do_tb_phys_invalidate(TranslationBlock *tb, bool rm_from_page_list)
                      tb->flags, tb->cs_base, orig_cflags);
     if (!qht_remove(&tb_ctx.htable, tb, h)) {
         return;
+    }
+    if (unlikely(tbdiag_on)) {
+        tbdiag_inval(tb->pc, tb->cs_base, tb->flags, orig_cflags);
     }
 
     /* remove the TB from the page list */
@@ -1119,6 +1126,9 @@ tb_invalidate_phys_page_range__locked(struct page_collection *pages,
     /* Range may not cross a page. */
     tcg_debug_assert(((start ^ last) & TARGET_PAGE_MASK) == 0);
 
+    if (unlikely(tbdiag_on)) {
+        tbdiag_ev_begin(start, retaddr);
+    }
     /*
      * We remove all the TBs in the range [start, last].
      * XXX: see if in some cases it could be faster to invalidate all the code
@@ -1152,6 +1162,10 @@ tb_invalidate_phys_page_range__locked(struct page_collection *pages,
 #endif /* TARGET_HAS_PRECISE_SMC */
             tb_phys_invalidate__locked(tb);
         }
+    }
+
+    if (unlikely(tbdiag_on)) {
+        tbdiag_ev_end();
     }
 
     /* if no code remaining, no need to continue to use slow writes */
@@ -1232,7 +1246,9 @@ void tb_invalidate_phys_range_fast(ram_addr_t ram_addr,
     struct page_collection *pages;
 
     pages = page_collection_lock(ram_addr, ram_addr + size - 1);
+    tbdiag_cause = TBD_STORE;
     tb_invalidate_phys_page_fast__locked(pages, ram_addr, size, retaddr);
+    tbdiag_cause = TBD_OTHER;
     page_collection_unlock(pages);
 }
 
