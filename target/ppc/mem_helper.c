@@ -303,8 +303,31 @@ static void dcbz_common(CPUPPCState *env, target_ulong addr,
     clear_helper_retaddr();
 }
 
+/*
+ * DEBUG (local dcbzstats, not for merging; AI-generated): PPC_DCBZ_STATS=1
+ * prints the cumulative dcbz count with a CLOCK_UPTIME_RAW timestamp every
+ * 2^20 calls (vCPU thread only, so a plain counter).
+ */
+static int dcbz_stats = -1;
+static uint64_t dcbz_n;
+
 void helper_dcbz(CPUPPCState *env, target_ulong addr, int mmu_idx)
 {
+    if (unlikely(dcbz_stats)) {
+        if (dcbz_stats < 0) {
+            const char *e = getenv("PPC_DCBZ_STATS");
+            dcbz_stats = e && !strcmp(e, "1");
+        }
+        if (dcbz_stats && !(++dcbz_n & ((1u << 20) - 1))) {
+#ifdef __APPLE__
+            uint64_t t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+#else
+            uint64_t t = get_clock();
+#endif
+            fprintf(stderr, "dcbz-stats n=%" PRIu64 " t=%.3f\n", dcbz_n,
+                    t / 1e9);
+        }
+    }
     dcbz_common(env, addr, mmu_idx, env->dcache_line_size, GETPC());
 }
 
