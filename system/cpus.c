@@ -48,6 +48,7 @@
 #include "hw/hw.h"
 #include "trace.h"
 #include "qemu/processor.h"
+#include "system/tcg.h"
 #include "qemu/cutils.h"
 
 #ifdef CONFIG_LINUX
@@ -552,15 +553,46 @@ void rust_bql_mock_lock(void)
 
 /*
  * PPC_BQL_SPIN_NS (experiment, default off; AI-generated): before the
- * blocking BQL acquire, the vCPU thread retries a try-lock for at most
- * this many nanoseconds (1..5000).  Unset, empty or 0 keeps the old path
- * with no clock reads.  Only on Darwin/aarch64 for now, only on a vCPU
- * thread (current_cpu set), and only when the BQL lock function is the
- * plain qemu_mutex_lock_impl (not under sync-profile).  Condition-variable
- * reacquisition and every other thread are unchanged.
+ * blocking BQL acquire, the vCPU thread retries a try-lock with an N-ns
+ * elapsed-time budget (1..5000) checked after failed attempts; preemption
+ * and an in-flight attempt can exceed it.  Unset, empty or 0 keeps the old
+ * path with no clock reads.
+ * Eligible only on Darwin/aarch64, with TCG and exactly one configured vCPU
+ * (decided in qemu_init_vcpu, before the vCPU thread starts), on that
+ * vCPU's own execution thread, and while neither the BQL lock function
+ * nor the try-lock function is substituted (sync-profile).  Everything
+ * else -- other threads, condition-variable reacquisition -- keeps the
+ * old path.
  */
 #define BQL_SPIN_MAX_NS 5000
-static int64_t bql_spin_ns;
+static int64_t bql_spin_ns;         /* parsed request */
+static int64_t bql_spin_active_ns;  /* nonzero only once eligible */
+
+static void bql_spin_configure(CPUState *cpu)
+{
+    MachineState *ms = MACHINE(qdev_get_machine());
+    const char *why = NULL;
+
+    if (!bql_spin_ns) {
+        return;
+    }
+    if (!tcg_enabled()) {
+        why = "not TCG";
+    } else if (ms->smp.cpus != 1 || ms->smp.max_cpus != 1) {
+        why = "more than one vCPU configured";
+    } else if (cpu->cpu_index != 0) {
+        why = "second vCPU";
+    }
+    if (why) {
+        qatomic_set(&bql_spin_active_ns, 0);
+        fprintf(stderr, "bql-spin: PPC_BQL_SPIN_NS=%" PRId64 " not used: %s\n",
+                bql_spin_ns, why);
+        return;
+    }
+    qatomic_set(&bql_spin_active_ns, bql_spin_ns);
+    fprintf(stderr, "bql-spin: vCPU try-lock budget %" PRId64
+            " ns (TCG, one vCPU)\n", bql_spin_ns);
+}
 
 static void bql_spin_init(void)
 {
@@ -576,10 +608,7 @@ static void bql_spin_init(void)
         return;
     }
 #if defined(__APPLE__) && defined(__aarch64__)
-    bql_spin_ns = ns;
-    if (ns) {
-        fprintf(stderr, "bql-spin: vCPU try-lock budget %" PRIu64 " ns\n", ns);
-    }
+    bql_spin_ns = ns;   /* used once qemu_init_vcpu finds it eligible */
 #else
     if (ns) {
         fprintf(stderr, "bql-spin: PPC_BQL_SPIN_NS ignored: Darwin/aarch64 "
@@ -603,7 +632,7 @@ static bool bql_spin_acquire(const char *file, int line)
     if (qemu_mutex_trylock_impl(&bql, file, line) == 0) {
         return true;
     }
-    deadline = bql_spin_clock() + bql_spin_ns;
+    deadline = bql_spin_clock() + qatomic_read(&bql_spin_active_ns);
     do {
         cpu_relax();
         if (qemu_mutex_trylock_impl(&bql, file, line) == 0) {
@@ -628,8 +657,10 @@ void bql_lock_impl(const char *file, int line)
     QemuMutexLockFunc bql_lock_fn = qatomic_read(&bql_mutex_lock_func);
 
     g_assert(!bql_locked());
-    if (unlikely(bql_spin_ns) && current_cpu &&
+    if (unlikely(qatomic_read(&bql_spin_active_ns)) && current_cpu &&
+        qemu_cpu_is_self(current_cpu) &&
         bql_lock_fn == qemu_mutex_lock_impl &&
+        qatomic_read(&qemu_mutex_trylock_func) == qemu_mutex_trylock_impl &&
         bql_spin_acquire(file, line)) {
         set_bql_locked(true);
         return;
@@ -779,6 +810,9 @@ void qemu_init_vcpu(CPUState *cpu)
         cpu->num_ases = 1;
         cpu_address_space_init(cpu, 0, "cpu-memory", cpu->memory);
     }
+
+    /* before the vCPU thread exists, so it sees the decision */
+    bql_spin_configure(cpu);
 
     /* accelerators all implement the AccelOpsClass */
     g_assert(cpus_accel != NULL && cpus_accel->create_vcpu_thread != NULL);
