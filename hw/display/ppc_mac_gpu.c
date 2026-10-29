@@ -4115,10 +4115,26 @@ static int r300_draw_staged(PPCMacGPUState *s, uint8_t *vram, R300DrawPacket *pk
 static bool r300_build_unlock;      /* PPCGPU_BUILD_UNLOCK, read at realize */
 static bool r300_build_debug;       /* a debug capture is on: never */
 
+static int r300_build_parked_1(PPCMacGPUState *s, uint32_t opcode,
+                               const uint32_t *d, uint32_t ndw,
+                               const R300Indices *idx, R300DrawPacket *pkt,
+                               const char **err, bool *ok);
+/* waitprof debug: label the protected parts (P1 capture, P3 bookkeeping) */
 static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
                              const uint32_t *d, uint32_t ndw,
                              const R300Indices *idx, R300DrawPacket *pkt,
                              const char **err, bool *ok)
+{
+    int wp = WAITPROF_ACT(WAITPROF_ACT_B_CAPTURE);
+    int r = r300_build_parked_1(s, opcode, d, ndw, idx, pkt, err, ok);
+    WAITPROF_ACT_END(wp);
+    return r;
+}
+
+static int r300_build_parked_1(PPCMacGPUState *s, uint32_t opcode,
+                               const uint32_t *d, uint32_t ndw,
+                               const R300Indices *idx, R300DrawPacket *pkt,
+                               const char **err, bool *ok)
 {
     uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
     R300Capture cap;
@@ -4173,8 +4189,19 @@ static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
     return 1;
 }
 
+static void r300_render_1(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
+                          uint32_t body_dw, const R300Indices *idx);
+/* waitprof debug: r300_render's own work, r_setup then r_final */
 static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                         uint32_t body_dw, const R300Indices *idx)
+{
+    int wp = WAITPROF_ACT(WAITPROF_ACT_R_SETUP);
+    r300_render_1(s, opcode, d, body_dw, idx);
+    WAITPROF_ACT_END(wp);
+}
+
+static void r300_render_1(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
+                          uint32_t body_dw, const R300Indices *idx)
 {
     R300DrawPacket pkt;
     const char *err;
@@ -4311,6 +4338,9 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             r300_draw_build(s->r3, &s->r3_arrays, opcode, d, body_dw,
                             r300_read_raw, s, &pkt, &err);
         WAITPROF_ACT_END(wp_b);
+    }
+    if (waitprof_on) {
+        waitprof_act(WAITPROF_ACT_R_FINAL);  /* restored by r300_render */
     }
     if (s->r3_dump && g_r300_arm_rt &&
         (r300_reg(s->r3, 0x4E28) & ~0x1Fu) == g_r300_arm_rt) {

@@ -29,11 +29,20 @@ enum {
     WAITPROF_ACT_B_VSPACK,  /* GPU-VS path: the rest (VS memo, index list, uniforms) */
     WAITPROF_ACT_B_FSMEMO,  /* fragment shader memo (r300_us_glsl_cached) */
     WAITPROF_ACT_B_CPU,     /* CPU-VS path: transform loop incl. its fetches */
+    /* BUILD_UNLOCK (bqlattr3): r300_build_parked's protected parts -- plan,
+     * VRAM check, allocation and copy (P1), and the bookkeeping after the
+     * relock (P3); the parked build itself holds nothing.  r300_render's own
+     * work before its build (r_setup) and after it (r_final: texture and
+     * colour-buffer resolution, GART texture copies, bookkeeping), outside the
+     * nested submit / fence / vramacc labels. */
+    WAITPROF_ACT_B_CAPTURE,
+    WAITPROF_ACT_R_SETUP,
+    WAITPROF_ACT_R_FINAL,
     WAITPROF_NACT
 };
 static const char *const waitprof_act_name[WAITPROF_NACT] __attribute__((unused)) = {
     "none", "build", "submit", "fence", "vramacc", "2d", "display",
-    "b_fetch", "b_vspack", "b_fsmemo", "b_cpu" };
+    "b_fetch", "b_vspack", "b_fsmemo", "b_cpu", "b_capture", "r_setup", "r_final" };
 int waitprof_act(int act);
 #define WAITPROF_ACT(a) (waitprof_on ? waitprof_act(a) : 0)
 #define WAITPROF_ACT_END(prev) do { if (waitprof_on) { waitprof_act(prev); } } while (0)
