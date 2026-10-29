@@ -4195,9 +4195,24 @@ static int r300_draw_staged(PPCMacGPUState *s, uint8_t *vram, R300DrawPacket *pk
  * Returns 1 with *pkt, *err and *ok as the build left them, 0 if the draw is
  * to be built the usual way (nothing allocated), -1 if the segment was
  * cancelled (nothing allocated).
+ *
+ * PPCGPU_BUILD_UNLOCK_AGP=1 (default off; only with PPCGPU_BUILD_UNLOCK=1;
+ * AI-generated): arrays in AGP memory too, but only pages r200_agp_page's
+ * cache already holds.  Every 4 KiB piece of such a range (split as
+ * r300_read_raw splits it) must be system memory entirely inside the AGP
+ * aperture with no part in an enabled PCI GART aperture, and its page must
+ * already be cached under the current configuration (r200_agp_cached: a
+ * look that never flushes, walks a page table or fills an entry).  The
+ * copy then reads exactly what r300_read_raw would read through the cache
+ * right now: every read is a hit, so no read can evict another (two of the
+ * draw's pages can't both hit one bucket) and the order of reads doesn't
+ * matter.  Anything else -- a miss, a changed configuration, the PCI GART --
+ * builds the usual way, with the cache untouched.
  */
 #define R300_BUILD_CAPTURE_MAX (4 * MiB)
 static bool r300_build_unlock;      /* PPCGPU_BUILD_UNLOCK, read at realize */
+static bool r300_build_unlock_agp;  /* PPCGPU_BUILD_UNLOCK_AGP, read at realize */
+static uint8_t *r200_agp_cached(PPCMacGPUState *s, uint32_t page);
 static bool r300_build_debug;       /* a debug capture is on: never */
 
 /*
@@ -4231,8 +4246,9 @@ static bool r300_build_debug;       /* a debug capture is on: never */
  */
 enum { BT_DEV = 1, BT_SYS, BT_OVERWRITE, BT_STALL, BT_REDO_MISS, BT_REDO_CPU, BT_BH };
 static struct {
-    bool init, stats, fired;
+    bool init, stats, fired, agp_only;
     int mode, stall_ms, tries;
+    uint64_t agp_draws;             /* captures with an AGP range */
     uint64_t at;
     /* in the build under test */
     bool armed, acted, moved;
@@ -4273,10 +4289,10 @@ static void bt_report(const char *tag)
             " not_vram=%" PRIu64 " alloc_fail=%" PRIu64 " unlocked=%" PRIu64
             " ok=%" PRIu64 " failed=%" PRIu64 " redo_miss=%" PRIu64
             " redo_cpu=%" PRIu64 " cancelled=%" PRIu64 " bytes=%" PRIu64
-            " cap_ms=%.1f build_ms=%.1f\n", tag, bt.attempts, bt.planned,
-            bt.not_vram, bt.alloc_fail, bt.unlocked, bt.ok, bt.failed,
+            " cap_ms=%.1f build_ms=%.1f agp_draws=%" PRIu64 "\n", tag, bt.attempts,
+            bt.planned, bt.not_vram, bt.alloc_fail, bt.unlocked, bt.ok, bt.failed,
             bt.redo_miss, bt.redo_cpu, bt.cancelled, bt.bytes, bt.ns_cap / 1e6,
-            bt.ns_build / 1e6);
+            bt.ns_build / 1e6, bt.agp_draws);
     if (bt.mode == BT_REDO_MISS || bt.mode == BT_REDO_CPU) {
         fprintf(stderr, "build-redo%s forced=%" PRIu64 " not_redone=%" PRIu64
                 " rebuilt=%" PRIu64 " rebuilt_under_bql=%" PRIu64 " rebuilt_ok=%" PRIu64
@@ -4444,6 +4460,9 @@ static void bt_init(void)
                                            : 200000;
     bt.every = getenv("PPCGPU_BUILD_TEST_EVERY") ?
                strtoull(getenv("PPCGPU_BUILD_TEST_EVERY"), NULL, 0) : 0;
+    /* PPCGPU_BUILD_TEST_AGP=1: act only in builds with an AGP-captured range */
+    bt.agp_only = getenv("PPCGPU_BUILD_TEST_AGP") &&
+                  getenv("PPCGPU_BUILD_TEST_AGP")[0] == '1';
     cpt.reboot |= getenv("PPCGPU_BUILD_TEST_REBOOT") &&
                   getenv("PPCGPU_BUILD_TEST_REBOOT")[0] == '1';
     if (bt.mode == BT_BH) {
@@ -4587,6 +4606,53 @@ static bool bt_same_vs(const R300DrawPacket *a, const R300DrawPacket *b)
            (!a->vs_idx || !memcmp(a->vs_idx, b->vs_idx, sizeof(uint32_t) * a->num_verts));
 }
 
+/* A planned range r300_read_raw would read from VRAM (its first case). */
+static bool r300_build_vram_range(PPCMacGPUState *s, const R300FetchRange *r)
+{
+    uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
+
+    return r300_in_fb(s, r->gpu, r->len) && r->gpu >= fb_base &&
+           (uint64_t)(r->gpu - fb_base) + r->len <= s->vram_size;
+}
+
+/*
+ * PPCGPU_BUILD_UNLOCK_AGP: is every piece of r AGP memory already in
+ * r200_agp_page's cache (see above)?  With dst, also copy it there.  Under
+ * the BQL; no side effects on the cache or the device.
+ */
+static bool r300_build_agp_range(PPCMacGPUState *s, const R300FetchRange *r,
+                                 uint8_t *dst)
+{
+    uint32_t a = r->gpu, len = r->len;
+
+    if (!r300_build_unlock_agp || !len ||
+        (uint64_t)a + len > 0x100000000ull) {
+        return false;
+    }
+    RCU_READ_LOCK_GUARD();
+    while (len) {
+        uint32_t n = MIN(len, 0x1000 - (a & 0xFFF));
+        uint8_t *page;
+
+        if (!r300_sys_span(s, a, n) || !r300_in_agp(s, a, n) ||
+            ((s->regs.aic_ctrl & 1) && a <= s->regs.aic_hi_addr &&
+             (uint64_t)a + n - 1 >= s->regs.aic_lo_addr)) {
+            return false;               /* not AGP alone */
+        }
+        page = r200_agp_cached(s, a >> 12);
+        if (!page) {
+            return false;
+        }
+        if (dst) {
+            memcpy(dst, page + (a & 0xFFF), n);
+            dst += n;
+        }
+        a += n;
+        len -= n;
+    }
+    return true;
+}
+
 static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
                              const uint32_t *d, uint32_t ndw,
                              const R300Indices *idx, R300DrawPacket *pkt,
@@ -4628,14 +4694,13 @@ static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
     bt.planned++;
     for (unsigned i = 0; i < cap.plan.n; i++) {
         const R300FetchRange *r = &cap.plan.r[i];
-        if (!r300_in_fb(s, r->gpu, r->len) || r->gpu < fb_base ||
-            (uint64_t)(r->gpu - fb_base) + r->len > s->vram_size) {
+        if (!r300_build_vram_range(s, r) && !r300_build_agp_range(s, r, NULL)) {
             bt.not_vram++;
             if (bt.stats) {
                 bt_nv_classify(s, &cap.plan);
                 bt.pend = 1;
             }
-            return 0;                   /* VRAM only (r300_read_raw's first case) */
+            return 0;                   /* VRAM, or AGP pages already cached */
         }
     }
     cap.buf = cap.plan.total ? g_try_malloc(cap.plan.total) : NULL;
@@ -4645,19 +4710,31 @@ static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
     }
     vram = r300_vfetch && s->vram_host ? s->vram_host :
            memory_region_get_ram_ptr(&s->vram);
+    int agp_i = -1;                 /* first AGP-captured range */
     for (unsigned i = 0; i < cap.plan.n; i++) {
         const R300FetchRange *r = &cap.plan.r[i];
-        memcpy(cap.buf + at, vram + (r->gpu - fb_base), r->len);
+        if (r300_build_vram_range(s, r)) {
+            memcpy(cap.buf + at, vram + (r->gpu - fb_base), r->len);
+        } else if (!r300_build_agp_range(s, r, cap.buf + at)) {
+            g_free(cap.buf);            /* (can't change under the BQL) */
+            return 0;
+        } else if (agp_i < 0) {
+            agp_i = i;
+        }
         at += r->len;
     }
+    bt.agp_draws += agp_i >= 0;
+    bool agp_ok = !bt.agp_only || agp_i >= 0;
+    unsigned ow_i = bt.agp_only && agp_i >= 0 ? agp_i : 0;
     bt.bytes += cap.plan.total;
 
     bool redo_mode = bt.mode == BT_REDO_MISS || bt.mode == BT_REDO_CPU;
     if (redo_mode) {
-        bt.armed = s->r3->draws >= bt.at && (bt.mode != BT_REDO_MISS || cap.plan.n) &&
+        bt.armed = agp_ok && s->r3->draws >= bt.at &&
+                   (bt.mode != BT_REDO_MISS || cap.plan.n) &&
                    (bt.every ? ++bt.cand % bt.every == 0 : !bt.fired);
     } else {
-        bt.armed = bt.mode && !bt.fired && s->r3->draws >= bt.at &&
+        bt.armed = agp_ok && bt.mode && !bt.fired && s->r3->draws >= bt.at &&
                    (bt.mode != BT_OVERWRITE || cap.plan.n);
     }
     bt.acted = bt.moved = false;
@@ -4668,8 +4745,14 @@ static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
         bt.t_in = g_get_monotonic_time();
         bt.waiters_max = 0;
         if (bt.mode == BT_OVERWRITE) {
-            bt.ow_host = vram + (cap.plan.r[0].gpu - fb_base);
-            bt.ow_len = MIN(cap.plan.r[0].len, 4096u);
+            const R300FetchRange *o = &cap.plan.r[ow_i];
+            if (r300_build_vram_range(s, o)) {
+                bt.ow_host = vram + (o->gpu - fb_base);
+                bt.ow_len = MIN(o->len, 4096u);
+            } else {                    /* AGP: the cached host page, this page only */
+                bt.ow_host = r200_agp_cached(s, o->gpu >> 12) + (o->gpu & 0xFFF);
+                bt.ow_len = MIN(o->len, 0x1000 - (o->gpu & 0xFFF));
+            }
             bt.crc_before = bt_crc(cap.buf, cap.plan.total);
         }
     }
@@ -4735,11 +4818,12 @@ static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
                                             r300_read_raw, s, &p3, &e3) :
                     r300_draw_build(s->r3, &s->r3_arrays, opcode, d, ndw,
                                     r300_read_raw, s, &p3, &e3);
-        fprintf(stderr, "build-test: VRAM overwrite INSIDE the parked build (%u bytes at "
+        fprintf(stderr, "build-test: %s overwrite INSIDE the parked build (%u bytes at "
                 "%08x, draw %llu): capture unchanged %d; parked packet ok %d redo %d "
                 "vs_in_vecs %u; same as a rebuild from the capture %d; different from a "
-                "rebuild from live (overwritten) VRAM %d\n", bt.ow_len,
-                cap.plan.r[0].gpu, (unsigned long long)s->r3->draws, cap_same, *ok,
+                "rebuild from live (overwritten) memory %d\n",
+                r300_build_vram_range(s, &cap.plan.r[ow_i]) ? "VRAM" : "AGP", bt.ow_len,
+                cap.plan.r[ow_i].gpu, (unsigned long long)s->r3->draws, cap_same, *ok,
                 redo, *ok ? pkt->vs_in_vecs : 0,
                 *ok && ok2 && !r2 && bt_same_vs(pkt, &p2),
                 *ok && (!ok3 || !bt_same_vs(pkt, &p3)));
@@ -7857,6 +7941,27 @@ typedef struct R200AgpCfg {
     uint32_t agp_loc, aic_ctrl, aic_lo, aic_hi, aic_pt, r300_pt, bridge_gen;
 } R200AgpCfg;
 static R200AgpCfg r200_agp_tc_cfg;
+
+/*
+ * The host page r200_agp_page would return for GPU page `page` from its
+ * cache right now, or NULL if it would have to flush (configuration
+ * changed), walk or fill.  Never changes the cache.
+ */
+static uint8_t *r200_agp_cached(PPCMacGPUState *s, uint32_t page)
+{
+    R200AgpCfg cfg = {
+        s->regs.mc_agp_location, s->regs.aic_ctrl, s->regs.aic_lo_addr,
+        s->regs.aic_hi_addr, s->regs.aic_pt_base, s->r300_aic_pt_base,
+        uninorth_get_agp_gart_gen(),
+    };
+    uint32_t i = page & (ARRAY_SIZE(r200_agp_tc) - 1);
+
+    if (memcmp(&cfg, &r200_agp_tc_cfg, sizeof(cfg)) ||
+        r200_agp_tc[i].tag != page + 1) {
+        return NULL;
+    }
+    return r200_agp_tc[i].host;
+}
 
 static uint8_t *r200_agp_page(PPCMacGPUState *s, uint32_t gpu_addr)
 {
@@ -15267,12 +15372,15 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         r300_glsl_share = e && e[0] == '1';
         e = getenv("PPCGPU_BUILD_UNLOCK");
         r300_build_unlock = e && e[0] == '1';
+        e = getenv("PPCGPU_BUILD_UNLOCK_AGP");
+        r300_build_unlock_agp = r300_build_unlock && e && e[0] == '1';
         r300_build_debug = getenv("R300_CAP") || getenv("R300_GLSLDUMP") ||
                            getenv("R300_DXTDUMP") || getenv("R300_DUMP");
         r300_draw_init_options();       /* before any build without the BQL */
         if (r300_build_unlock) {
             qemu_log("ppc-mac-gpu r300: PPCGPU_BUILD_UNLOCK on: GPU vertex-"
-                     "shader draws with VRAM arrays built with the BQL let go%s\n",
+                     "shader draws with VRAM%s arrays built with the BQL let go%s\n",
+                     r300_build_unlock_agp ? " or cached AGP" : "",
                      r300_build_debug ? " (not now: a debug capture is on)" : "");
         }
     }
