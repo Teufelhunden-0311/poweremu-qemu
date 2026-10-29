@@ -4253,6 +4253,11 @@ static struct {
              f_sub0, f_sub1, f_subn, r_sub0, w_sub0, w_draw;
     bool w_pending, w_active, w_bql, w_ok, w_cpu;
     int f_logged;
+    /* not-VRAM attribution */
+    int pend;                       /* 1: not VRAM, 2: plan refused (r300_render's build) */
+    uint64_t nv, nv_ram, nv_unmapped, nv_nonram, nv_mixed, nv_agp, nv_gart,
+             nv_pages, nv_pages_fast, nv_pages_slow, nv_bytes, nv_bucket[8],
+             ns_nv_build, ns_nv_class, nv_built, np_built, ns_np_build, nv_ok;
     /* bh-reset */
     bool in_p2, bh_reboot;
     int64_t t_sched;
@@ -4331,10 +4336,89 @@ static void bt_render_built(const R300DrawPacket *pkt, bool ok)
     bt.w_sub0 = bt.r_sub0;
 }
 
+static void bt_nv_report(const char *tag)
+{
+    fprintf(stderr, "build-nv%s draws=%" PRIu64 " all_ram=%" PRIu64 " unmapped=%" PRIu64
+            " not_ram=%" PRIu64 " with_vram_ranges=%" PRIu64 " agp=%" PRIu64 " pci_gart=%" PRIu64
+            " pages=%" PRIu64 " (fast %" PRIu64 ", slow %" PRIu64 ") bytes=%" PRIu64
+            " size<=1K/4K/16K/64K/256K/1M/4M=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+            "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 " built=%" PRIu64 " ok=%" PRIu64
+            " build_ms=%.1f classify_ms=%.1f | refused_built=%" PRIu64 " refused_build_ms=%.1f\n",
+            tag, bt.nv, bt.nv_ram, bt.nv_unmapped, bt.nv_nonram, bt.nv_mixed, bt.nv_agp,
+            bt.nv_gart, bt.nv_pages, bt.nv_pages_fast, bt.nv_pages_slow, bt.nv_bytes,
+            bt.nv_bucket[0], bt.nv_bucket[1], bt.nv_bucket[2], bt.nv_bucket[3],
+            bt.nv_bucket[4], bt.nv_bucket[5], bt.nv_bucket[6], bt.nv_built, bt.nv_ok,
+            bt.ns_nv_build / 1e6, bt.ns_nv_class / 1e6, bt.np_built, bt.ns_np_build / 1e6);
+}
+
+/* A planned draw with a range outside VRAM: where its bytes are, page by page. */
+static void bt_nv_classify(PPCMacGPUState *s, const R300FetchPlan *plan)
+{
+    int64_t t = get_clock();
+    bool unmapped = false, nonram = false, vram_r = false, agp = false, gart = false;
+    uint64_t total = 0;
+
+    for (unsigned i = 0; i < plan->n; i++) {
+        uint32_t a = plan->r[i].gpu, len = plan->r[i].len;
+        total += len;
+        if (r300_in_fb(s, a, len)) {
+            vram_r = true;
+            continue;
+        }
+        while (len) {
+            uint32_t n = MIN(len, 0x1000 - (a & 0xFFF));
+            hwaddr phys;
+            bt.nv_pages++;
+            if (!r300_sys_span(s, a, n)) {
+                unmapped = true;
+                break;
+            }
+            agp |= r300_in_agp(s, a, 1);
+            gart |= !r300_in_agp(s, a, 1);
+            uint8_t *pg = r300_in_agp(s, a, 1) && r300_in_aic(s, a, 1)
+                          ? NULL : r200_agp_page(s, a);
+            if (pg) {
+                bt.nv_pages_fast++;
+            } else if (!r300_sys_chunk(s, a, n, &phys)) {
+                unmapped = true;
+                break;
+            } else {
+                RCU_READ_LOCK_GUARD();
+                hwaddr xlat, plen = n;
+                MemoryRegion *mr = address_space_translate(&address_space_memory, phys,
+                                                           &xlat, &plen, false,
+                                                           MEMTXATTRS_UNSPECIFIED);
+                if (!memory_region_is_ram(mr) || plen < n) {
+                    nonram = true;
+                } else {
+                    bt.nv_pages_slow++;
+                }
+            }
+            a += n;
+            len -= n;
+        }
+    }
+    bt.nv++;
+    bt.nv_unmapped += unmapped;
+    bt.nv_nonram += !unmapped && nonram;
+    bt.nv_ram += !unmapped && !nonram;
+    bt.nv_mixed += vram_r;
+    bt.nv_agp += agp;
+    bt.nv_gart += gart;
+    bt.nv_bytes += total;
+    int b = total <= 1024 ? 0 : total <= 4096 ? 1 : total <= 16384 ? 2 : total <= 65536 ? 3 :
+            total <= 262144 ? 4 : total <= 1048576 ? 5 : 6;
+    bt.nv_bucket[b]++;
+    bt.ns_nv_class += get_clock() - t;
+}
+
 static void bt_final(void)
 {
     bt_watch_end();
     bt_report("-final");
+    if (bt.stats) {
+        bt_nv_report("-final");
+    }
 }
 
 static void bt_init(void)
@@ -4533,10 +4617,12 @@ static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
     if (bt.stats && g_get_monotonic_time() >= bt.next) {
         bt.next = g_get_monotonic_time() + 10 * 1000000;
         bt_report("");
+        bt_nv_report("");
     }
     t0 = get_clock();
     if (!r300_draw_fetch_plan(s->r3, &s->r3_arrays, opcode, d, ndw, idx,
                               R300_BUILD_CAPTURE_MAX, &cap.plan)) {
+        bt.pend = 2;
         return 0;
     }
     bt.planned++;
@@ -4545,6 +4631,10 @@ static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
         if (!r300_in_fb(s, r->gpu, r->len) || r->gpu < fb_base ||
             (uint64_t)(r->gpu - fb_base) + r->len > s->vram_size) {
             bt.not_vram++;
+            if (bt.stats) {
+                bt_nv_classify(s, &cap.plan);
+                bt.pend = 1;
+            }
             return 0;                   /* VRAM only (r300_read_raw's first case) */
         }
     }
@@ -4825,11 +4915,14 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         }
     }
     bool build_ok;
+    bt.pend = 0;
     int parked = r300_build_parked(s, opcode, d, body_dw, idx, &pkt, &err,
                                    &build_ok);
     if (parked < 0) {
         return;                             /* cancelled (cp_cancelled) */
     }
+    int bt_pend = bt.stats ? bt.pend : 0;
+    int64_t bt_t0 = bt_pend ? get_clock() : 0;
     if (!parked) {
         build_ok = idx ?
             r300_draw_build_indexed(s->r3, &s->r3_arrays, d[0], idx,
@@ -4838,6 +4931,14 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
                             r300_read_raw, s, &pkt, &err);
     }
     bt_render_built(&pkt, build_ok);
+    if (bt_pend == 1) {
+        bt.nv_built++;
+        bt.nv_ok += build_ok;
+        bt.ns_nv_build += get_clock() - bt_t0;
+    } else if (bt_pend == 2) {
+        bt.np_built++;
+        bt.ns_np_build += get_clock() - bt_t0;
+    }
     if (s->r3_dump && g_r300_arm_rt &&
         (r300_reg(s->r3, 0x4E28) & ~0x1Fu) == g_r300_arm_rt) {
         fprintf(s->r3_dump, "TRY op %02x vf %08x ok %d err %s tex0 en %u off %06x "
