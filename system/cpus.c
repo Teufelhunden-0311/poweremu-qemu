@@ -747,6 +747,9 @@ static const int64_t wp_r2a_lim[WP_NR2A - 1] = {
 static struct {
     uint64_t w1p, ownedp, residp, rel_instr, rel_n, snap, snap_n, acq_instr, acq_n;
     uint64_t v_w1p, v_residp, v_r2a, v_r2a_h[WP_NR2A], v_rels[5], v_norel;
+    /* vCPU waits >= 1 us with no release inside: was a recorded hold covering
+     * t_req?  Their length (same buckets as r2a). */
+    uint64_t v_nr_ns, v_nr_held, v_nr_h[WP_NR2A];
 } wp_rs, wp_rs_snap;
 static __thread bool wp_held;
 static uint64_t wp_occ[256][WAITPROF_NACT];
@@ -813,6 +816,7 @@ static void wp_resid(int64_t t_req, int64_t t_ret)
 {
     int64_t wait = t_ret - t_req, owned = 0, last_rel = 0;
     unsigned rels = 0;
+    bool held_at_req = false;
     bool vcpu = current_cpu != NULL;
 
     if (wait < 1000) {
@@ -831,6 +835,7 @@ static void wp_resid(int64_t t_req, int64_t t_ret)
             rels++;
             last_rel = MAX(last_rel, h->t1p);
         }
+        held_at_req |= h->t0p <= t_req && h->t1p > t_req;
     }
     wp_rs.w1p += wait;
     wp_rs.ownedp += MIN(owned, wait);
@@ -841,12 +846,18 @@ static void wp_resid(int64_t t_req, int64_t t_ret)
     wp_rs.v_w1p += wait;
     wp_rs.v_residp += wait > owned ? wait - owned : 0;
     wp_rs.v_rels[MIN(rels, 4u)]++;
+    int b = 0;
     if (!rels) {
         wp_rs.v_norel++;            /* no release recorded inside the wait */
+        wp_rs.v_nr_ns += wait;
+        wp_rs.v_nr_held += held_at_req;
+        while (b < WP_NR2A - 1 && wait >= wp_r2a_lim[b]) {
+            b++;
+        }
+        wp_rs.v_nr_h[b]++;
         return;
     }
     int64_t r2a = t_ret - last_rel;
-    int b = 0;
     while (b < WP_NR2A - 1 && r2a >= wp_r2a_lim[b]) {
         b++;
     }
@@ -1080,7 +1091,8 @@ static void wp_print(void)
             " snap_ms=%.3f snap_n=%" PRIu64 " acq_instr_ms=%.2f acq_n=%" PRIu64 " | vcpu w1p_ms=%.2f"
             " residp_ms=%.2f r2a_ms=%.2f r2a_h=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
             "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 " rels=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
-            "/%" PRIu64 " norel=%" PRIu64 "\n",
+            "/%" PRIu64 " norel=%" PRIu64 " nr_ms=%.2f nr_held=%" PRIu64 " nr_h=%" PRIu64 "/%" PRIu64
+            "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n",
             wp_rs_snap.w1p / 1e6, wp_rs_snap.ownedp / 1e6, wp_rs_snap.residp / 1e6,
             wp_rs_snap.rel_instr / 1e6, wp_rs_snap.rel_n, wp_rs_snap.snap / 1e6, wp_rs_snap.snap_n,
             wp_rs_snap.acq_instr / 1e6, wp_rs_snap.acq_n, wp_rs_snap.v_w1p / 1e6,
@@ -1088,7 +1100,9 @@ static void wp_print(void)
             wp_rs_snap.v_r2a_h[1], wp_rs_snap.v_r2a_h[2], wp_rs_snap.v_r2a_h[3], wp_rs_snap.v_r2a_h[4],
             wp_rs_snap.v_r2a_h[5], wp_rs_snap.v_r2a_h[6], wp_rs_snap.v_r2a_h[7], wp_rs_snap.v_rels[0],
             wp_rs_snap.v_rels[1], wp_rs_snap.v_rels[2], wp_rs_snap.v_rels[3], wp_rs_snap.v_rels[4],
-            wp_rs_snap.v_norel);
+            wp_rs_snap.v_norel, wp_rs_snap.v_nr_ns / 1e6, wp_rs_snap.v_nr_held,
+            wp_rs_snap.v_nr_h[0], wp_rs_snap.v_nr_h[1], wp_rs_snap.v_nr_h[2], wp_rs_snap.v_nr_h[3],
+            wp_rs_snap.v_nr_h[4], wp_rs_snap.v_nr_h[5], wp_rs_snap.v_nr_h[6], wp_rs_snap.v_nr_h[7]);
     fprintf(stderr, "wp-park cumulative vcpu_n=%" PRIu64 " vcpu_ms=%.2f other_n=%"
             PRIu64 " other_ms=%.2f\n", wp_park_n[0], wp_park_ns[0] / 1e6,
             wp_park_n[1], wp_park_ns[1] / 1e6);
