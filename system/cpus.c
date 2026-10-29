@@ -52,7 +52,6 @@
 #include "trace.h"
 #include "qemu/processor.h"
 #include "qemu/cutils.h"
-#include "qemu/error-report.h"
 
 #ifdef CONFIG_LINUX
 
@@ -423,6 +422,155 @@ static QemuCond qemu_cpu_cond;
 static QemuCond qemu_pause_cond;
 
 static void bql_spin_init(void);
+
+/*
+ * PPC_BQL_SPIN_NS (experiment, default off; AI-generated): before the
+ * blocking BQL acquire, the vCPU thread retries a try-lock for at most
+ * this many nanoseconds (1..5000).  Unset, empty or 0 keeps the old path
+ * with no clock reads.  Only on Darwin/aarch64 for now, only on a vCPU
+ * thread (current_cpu set), and only when the BQL lock function is the
+ * plain qemu_mutex_lock_impl (not under sync-profile).  Condition-variable
+ * reacquisition and every other thread are unchanged.
+ */
+#define BQL_SPIN_MAX_NS 5000
+static int64_t bql_spin_ns;
+
+static void bql_spin_init(void)
+{
+    const char *v = getenv("PPC_BQL_SPIN_NS");
+    uint64_t ns;
+
+    if (!v || !*v) {
+        return;
+    }
+    if (qemu_strtou64(v, NULL, 10, &ns) < 0 || ns > BQL_SPIN_MAX_NS) {
+        fprintf(stderr, "bql-spin: PPC_BQL_SPIN_NS=%s ignored: want 0..%d\n",
+                v, BQL_SPIN_MAX_NS);
+        return;
+    }
+#if defined(__APPLE__) && defined(__aarch64__)
+    bql_spin_ns = ns;
+    if (ns) {
+        fprintf(stderr, "bql-spin: vCPU try-lock budget %" PRIu64 " ns\n", ns);
+    }
+#else
+    if (ns) {
+        fprintf(stderr, "bql-spin: PPC_BQL_SPIN_NS ignored: Darwin/aarch64 "
+                "only for now\n");
+    }
+#endif
+}
+
+#if defined(__APPLE__) && defined(__aarch64__)
+static inline int64_t bql_spin_clock(void)
+{
+    /* get_clock() (CLOCK_MONOTONIC) steps in 1 us here; this is 42 ns. */
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+/*
+ * DIAG (bqlspin-diag): the same loop as the production prototype, but it
+ * reports what happened.  BS_IMM / BS_SPIN: the BQL was taken; BS_EXP:
+ * the budget ran out, fall back to the blocking lock.  The extra clock
+ * read on a spin success is diag-only.
+ */
+enum { BS_NONE, BS_IMM, BS_SPIN, BS_EXP };
+typedef struct {
+    int res;
+    uint32_t tries;     /* try-locks after the first */
+    int64_t t0, t1;     /* first failed try-lock .. success or expiry */
+} BQLSpinOut;
+
+static void bql_spin_acquire(const char *file, int line, BQLSpinOut *o)
+{
+    int64_t deadline, now;
+
+    if (qemu_mutex_trylock_impl(&bql, file, line) == 0) {
+        o->res = BS_IMM;
+        return;
+    }
+    o->t0 = bql_spin_clock();
+    deadline = o->t0 + bql_spin_ns;
+    do {
+        cpu_relax();
+        o->tries++;
+        if (qemu_mutex_trylock_impl(&bql, file, line) == 0) {
+            o->t1 = bql_spin_clock();
+            o->res = BS_SPIN;
+            return;
+        }
+    } while ((now = bql_spin_clock()) < deadline);
+    o->t1 = now;
+    o->res = BS_EXP;
+}
+#else
+enum { BS_NONE, BS_IMM, BS_SPIN, BS_EXP };
+typedef struct {
+    int res;
+    uint32_t tries;
+    int64_t t0, t1;
+} BQLSpinOut;
+static void bql_spin_acquire(const char *file, int line, BQLSpinOut *o)
+{
+}
+#endif
+
+/* DIAG: spin counters, written only under the BQL (after the acquire). */
+typedef struct {
+    uint64_t other;                 /* bql_lock off a vCPU thread */
+    uint64_t imm, spin, exp;
+    uint64_t spin_tries, spin_ns;
+    uint64_t spin_th[7];            /* tries 1,2,3-4,5-8,9-16,17-64,65+ */
+    uint64_t spin_h[7];             /* ns <250,<500,<1k,<2k,<3k,<5k,>=5k */
+    uint64_t exp_tries, exp_ns, exp_max;
+    uint64_t blk_ns, blk_max;       /* expiry -> blocking lock returned */
+    uint64_t blk_h[8];              /* us <1,<2,<5,<10,<20,<50,<100,>=100 */
+} BQLSpinStats;
+static BQLSpinStats bs, bs_snap;
+
+static void bql_spin_count(const BQLSpinOut *o, int64_t t_ret, bool vcpu)
+{
+    static const int64_t sh[6] = { 250, 500, 1000, 2000, 3000, 5000 };
+    static const int64_t bh[7] = { 1000, 2000, 5000, 10000, 20000, 50000,
+                                   100000 };
+    int64_t d;
+    int i;
+
+    if (!vcpu) {
+        bs.other++;
+        return;
+    }
+    switch (o->res) {
+    case BS_IMM:
+        bs.imm++;
+        break;
+    case BS_SPIN:
+        d = o->t1 - o->t0;
+        bs.spin++;
+        bs.spin_tries += o->tries;
+        bs.spin_ns += d;
+        i = o->tries <= 1 ? 0 : o->tries <= 2 ? 1 : o->tries <= 4 ? 2 :
+            o->tries <= 8 ? 3 : o->tries <= 16 ? 4 : o->tries <= 64 ? 5 : 6;
+        bs.spin_th[i]++;
+        for (i = 0; i < 6 && d >= sh[i]; i++) {
+        }
+        bs.spin_h[i]++;
+        break;
+    case BS_EXP:
+        d = o->t1 - o->t0;
+        bs.exp++;
+        bs.exp_tries += o->tries;
+        bs.exp_ns += d;
+        bs.exp_max = MAX(bs.exp_max, (uint64_t)d);
+        d = t_ret - o->t1;
+        bs.blk_ns += d;
+        bs.blk_max = MAX(bs.blk_max, (uint64_t)d);
+        for (i = 0; i < 7 && d >= bh[i]; i++) {
+        }
+        bs.blk_h[i]++;
+        break;
+    }
+}
 
 void qemu_init_cpu_loop(void)
 {
@@ -1043,6 +1191,8 @@ static void wp_snapshot(void)
     wp_execlat = wp_execlat_n = 0;
     wp_rs_snap = wp_rs;
     memset(&wp_rs, 0, sizeof(wp_rs));
+    bs_snap = bs;
+    memset(&bs, 0, sizeof(bs));
     wp_last_dump = now;
 }
 
@@ -1125,6 +1275,22 @@ static void wp_print(void)
             wp_rs_snap.v_norel, wp_rs_snap.v_nr_ns / 1e6, wp_rs_snap.v_nr_held,
             wp_rs_snap.v_nr_h[0], wp_rs_snap.v_nr_h[1], wp_rs_snap.v_nr_h[2], wp_rs_snap.v_nr_h[3],
             wp_rs_snap.v_nr_h[4], wp_rs_snap.v_nr_h[5], wp_rs_snap.v_nr_h[6], wp_rs_snap.v_nr_h[7]);
+    fprintf(stderr, "wp-spin budget_ns=%" PRId64 " imm=%" PRIu64 " spin=%" PRIu64
+            " exp=%" PRIu64 " other=%" PRIu64 " spin_tries=%" PRIu64 " spin_ms=%.3f"
+            " spin_th=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+            "/%" PRIu64 " spin_h=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+            "/%" PRIu64 "/%" PRIu64 " exp_tries=%" PRIu64 " exp_ms=%.3f exp_max_ns=%" PRIu64
+            " blk_ms=%.3f blk_max_us=%.1f blk_h=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+            "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n",
+            bql_spin_ns, bs_snap.imm, bs_snap.spin, bs_snap.exp, bs_snap.other,
+            bs_snap.spin_tries, bs_snap.spin_ns / 1e6, bs_snap.spin_th[0],
+            bs_snap.spin_th[1], bs_snap.spin_th[2], bs_snap.spin_th[3], bs_snap.spin_th[4],
+            bs_snap.spin_th[5], bs_snap.spin_th[6], bs_snap.spin_h[0], bs_snap.spin_h[1],
+            bs_snap.spin_h[2], bs_snap.spin_h[3], bs_snap.spin_h[4], bs_snap.spin_h[5],
+            bs_snap.spin_h[6], bs_snap.exp_tries, bs_snap.exp_ns / 1e6, bs_snap.exp_max,
+            bs_snap.blk_ns / 1e6, bs_snap.blk_max / 1e3, bs_snap.blk_h[0], bs_snap.blk_h[1],
+            bs_snap.blk_h[2], bs_snap.blk_h[3], bs_snap.blk_h[4], bs_snap.blk_h[5],
+            bs_snap.blk_h[6], bs_snap.blk_h[7]);
     fprintf(stderr, "wp-park cumulative vcpu_n=%" PRIu64 " vcpu_ms=%.2f other_n=%"
             PRIu64 " other_ms=%.2f\n", wp_park_n[0], wp_park_ns[0] / 1e6,
             wp_park_n[1], wp_park_ns[1] / 1e6);
@@ -1152,74 +1318,6 @@ static void wp_print(void)
 }
 
 /*
- * PPC_BQL_SPIN_NS (experiment, default off; AI-generated): before the
- * blocking BQL acquire, the vCPU thread retries a try-lock for at most
- * this many nanoseconds (1..5000).  Unset, empty or 0 keeps the old path
- * with no clock reads.  Only on Darwin/aarch64 for now, only on a vCPU
- * thread (current_cpu set), and only when the BQL lock function is the
- * plain qemu_mutex_lock_impl (not under sync-profile).  Condition-variable
- * reacquisition and every other thread are unchanged.
- */
-#define BQL_SPIN_MAX_NS 5000
-static int64_t bql_spin_ns;
-
-static void bql_spin_init(void)
-{
-    const char *v = getenv("PPC_BQL_SPIN_NS");
-    uint64_t ns;
-
-    if (!v || !*v) {
-        return;
-    }
-    if (qemu_strtou64(v, NULL, 10, &ns) < 0 || ns > BQL_SPIN_MAX_NS) {
-        warn_report("PPC_BQL_SPIN_NS=%s ignored: want 0..%d", v,
-                    BQL_SPIN_MAX_NS);
-        return;
-    }
-#if defined(__APPLE__) && defined(__aarch64__)
-    bql_spin_ns = ns;
-    if (ns) {
-        info_report("bql-spin: vCPU try-lock budget %" PRIu64 " ns", ns);
-    }
-#else
-    if (ns) {
-        warn_report("PPC_BQL_SPIN_NS ignored: Darwin/aarch64 only for now");
-    }
-#endif
-}
-
-#if defined(__APPLE__) && defined(__aarch64__)
-static inline int64_t bql_spin_clock(void)
-{
-    /* get_clock() (CLOCK_MONOTONIC) steps in 1 us here; this is 42 ns. */
-    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-}
-
-/* True if the BQL was taken; false means fall back to the blocking lock. */
-static bool bql_spin_acquire(const char *file, int line)
-{
-    int64_t deadline;
-
-    if (qemu_mutex_trylock_impl(&bql, file, line) == 0) {
-        return true;
-    }
-    deadline = bql_spin_clock() + bql_spin_ns;
-    do {
-        cpu_relax();
-        if (qemu_mutex_trylock_impl(&bql, file, line) == 0) {
-            return true;
-        }
-    } while (bql_spin_clock() < deadline);
-    return false;
-}
-#else
-static bool bql_spin_acquire(const char *file, int line)
-{
-    return false;
-}
-#endif
-
-/*
  * The BQL is taken from so many places that it is worth profiling the
  * callers directly, instead of funneling them all through a single function.
  */
@@ -1227,17 +1325,21 @@ void bql_lock_impl(const char *file, int line)
 {
     QemuMutexLockFunc bql_lock_fn = qatomic_read(&bql_mutex_lock_func);
     int64_t t_req = waitprof_on ? wp_clock() : 0;
+    BQLSpinOut so = { .res = BS_NONE };
 
     g_assert(!bql_locked());
     if (unlikely(bql_spin_ns) && current_cpu &&
-        bql_lock_fn == qemu_mutex_lock_impl &&
-        bql_spin_acquire(file, line)) {
-        set_bql_locked(true);
-        return;
+        bql_lock_fn == qemu_mutex_lock_impl) {
+        bql_spin_acquire(file, line, &so);
     }
-    bql_lock_fn(&bql, file, line);
-    int64_t t_ret = t_req ? wp_clock() : 0;
+    if (so.res != BS_IMM && so.res != BS_SPIN) {
+        bql_lock_fn(&bql, file, line);
+    }
+    int64_t t_ret = (t_req || so.res == BS_EXP) ? wp_clock() : 0;
     set_bql_locked(true);
+    if (unlikely(bql_spin_ns)) {
+        bql_spin_count(&so, t_ret, current_cpu != NULL);
+    }
     if (t_req) {
         if (!wp_last_dump) {
             wp_last_dump = wp_clock();
