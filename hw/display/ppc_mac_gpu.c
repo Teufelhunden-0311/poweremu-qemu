@@ -459,6 +459,9 @@ static struct {
 static bool ppc_mac_gpu_cp_on_thread(void);
 static void ppc_mac_gpu_reset(DeviceState *dev);
 static uint64_t bt_submits;         /* draw_r300 calls that drew (not REMAP) */
+static uint64_t bt_mmio;            /* register MMIO accesses (racy count) */
+static bool bt_watch_on;            /* a PPCGPU_BUILD_TEST mode: log long cp_sync waits */
+static bool cp_in_ring;             /* (defined below) */
 
 static void cp_test_init(void)
 {
@@ -4217,12 +4220,16 @@ static bool r300_build_debug;       /* a debug capture is on: never */
  *  redo-cpu   the draw takes the CPU vertex path (R300_GLSL_GPU_VS cleared
  *             for this draw after planning): the same.
  *             PPCGPU_BUILD_TEST_EVERY=N forces every Nth planned build after
- *             _AT instead of one; the first 5 are logged, all counted.
+ *             _AT instead of one; the first 5 are logged, all counted;
+ *  bh-reset   (unlock on OR off) a main-loop BH resets the device once, where
+ *             the CP happens to be; _REBOOT=1: a system reset 20 ms later.
+ *             Then cp-watch lines every 5 s (420 s): the guest's register
+ *             accesses, cp_sync catch-ups and waiters, ring pointers.
  * After a cancelled build the reproducer's counters report what the rest of
  * the segment still did (cp_test_end); PPCGPU_BUILD_TEST_REBOOT=1 then asks
  * for a system reset.  AI-generated (Claude).
  */
-enum { BT_DEV = 1, BT_SYS, BT_OVERWRITE, BT_STALL, BT_REDO_MISS, BT_REDO_CPU };
+enum { BT_DEV = 1, BT_SYS, BT_OVERWRITE, BT_STALL, BT_REDO_MISS, BT_REDO_CPU, BT_BH };
 static struct {
     bool init, stats, fired;
     int mode, stall_ms, tries;
@@ -4246,6 +4253,11 @@ static struct {
              f_sub0, f_sub1, f_subn, r_sub0, w_sub0, w_draw;
     bool w_pending, w_active, w_bql, w_ok, w_cpu;
     int f_logged;
+    /* bh-reset */
+    bool in_p2, bh_reboot;
+    int64_t t_sched;
+    QEMUTimer *reboot_timer;
+    QemuThread watch;
 } bt;
 static uint64_t bt_other_runs;      /* ppc_mac_gpu_cp_run off the CP thread */
 static __thread bool bt_miss;
@@ -4339,7 +4351,9 @@ static void bt_init(void)
                   !strcmp(e, "overwrite") ? BT_OVERWRITE :
                   !strncmp(e, "stall:", 6) ? BT_STALL :
                   !strcmp(e, "redo-miss") ? BT_REDO_MISS :
-                  !strcmp(e, "redo-cpu") ? BT_REDO_CPU : 0;
+                  !strcmp(e, "redo-cpu") ? BT_REDO_CPU :
+                  !strcmp(e, "bh-reset") ? BT_BH : 0;
+        bt_watch_on = bt.mode != 0;
         bt.stall_ms = bt.mode == BT_STALL ? atoi(e + 6) : 0;
     }
     bt.at = getenv("PPCGPU_BUILD_TEST_AT") ? strtoull(getenv("PPCGPU_BUILD_TEST_AT"), NULL, 0)
@@ -4348,6 +4362,60 @@ static void bt_init(void)
                strtoull(getenv("PPCGPU_BUILD_TEST_EVERY"), NULL, 0) : 0;
     cpt.reboot |= getenv("PPCGPU_BUILD_TEST_REBOOT") &&
                   getenv("PPCGPU_BUILD_TEST_REBOOT")[0] == '1';
+    if (bt.mode == BT_BH) {
+        bt.bh_reboot = cpt.reboot;  /* from the BH's timer, not the segment's end */
+        cpt.reboot = false;
+    }
+}
+
+static void bt_reboot_cb(void *opaque)
+{
+    fprintf(stderr, "build-test: bh-reset: requesting a system reset (%.3f ms after "
+            "the device reset)\n", (g_get_monotonic_time() - cpt.t) / 1000.0);
+    qemu_system_reset_request(SHUTDOWN_CAUSE_HOST_QMP_SYSTEM_RESET);
+}
+
+static void *bt_watch_thread(void *opaque)
+{
+    PPCMacGPUState *s = opaque;
+
+    for (int i = 0; i < 84; i++) {
+        g_usleep(5 * 1000 * 1000);
+        fprintf(stderr, "cp-watch t=%.0f s: mmio %" PRIu64 " cp_sync catch-ups %u "
+                "waiters %u parked %d epoch %u in_ring %d rptr %x wptr %x resets %u "
+                "draws %" PRIu64 " submits %" PRIu64 "\n",
+                (g_get_monotonic_time() - cpt.t) / 1e6, qatomic_read(&bt_mmio),
+                qatomic_read(&cp.syncs), qatomic_read(&cp.waiters),
+                qatomic_read(&cp.parked), qatomic_read(&cp.epoch),
+                qatomic_read(&cp_in_ring), qatomic_read(&s->regs.cp_rb_rptr),
+                qatomic_read(&s->regs.cp_rb_wptr), qatomic_read(&s->reset_count),
+                s->r3 ? qatomic_read(&s->r3->draws) : 0, qatomic_read(&bt_submits));
+    }
+    return NULL;
+}
+
+/* Main loop, BQL: the device reset, wherever the CP is. */
+static void bt_bh_reset_bh(void *opaque)
+{
+    PPCMacGPUState *s = opaque;
+    bool p2 = qatomic_read(&bt.in_p2);
+
+    fprintf(stderr, "build-test: bh device reset runs %.3f ms after it was scheduled: "
+            "CP %s (parked %d, in_ring %d, g_in_pm4 %d), cp_sync waiters %u, epoch %u, "
+            "draw %" PRIu64 ", unlock %d\n",
+            (g_get_monotonic_time() - bt.t_sched) / 1000.0,
+            p2 ? "in a parked build" : cp.parked ? "parked (not in a build)" :
+            cp_in_ring ? "replaying (BQL let go elsewhere)" : "between segments",
+            cp.parked, cp_in_ring, g_in_pm4, cp.waiters, cp.epoch, s->r3->draws,
+            r300_build_unlock);
+    cpt.t = g_get_monotonic_time();
+    ppc_mac_gpu_reset(DEVICE(s));
+    cpt.done = cpt.stale = true;        /* count what the CP thread still does */
+    if (bt.bh_reboot) {
+        bt.reboot_timer = timer_new_ms(QEMU_CLOCK_REALTIME, bt_reboot_cb, s);
+        timer_mod(bt.reboot_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 20);
+    }
+    qemu_thread_create(&bt.watch, "bt-watch", bt_watch_thread, s, QEMU_THREAD_DETACHED);
 }
 
 static uint32_t bt_crc(const uint8_t *p, uint64_t n)
@@ -4452,6 +4520,11 @@ static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
     if (unlikely(!bt.init)) {
         bt_init();
     }
+    if (bt.mode == BT_BH && !bt.fired && s->r3->draws >= bt.at) {
+        bt.fired = true;
+        bt.t_sched = g_get_monotonic_time();
+        aio_bh_schedule_oneshot(qemu_get_aio_context(), bt_bh_reset_bh, s);
+    }
     if (!r300_build_unlock || r300_build_debug || s->r3_dump ||
         !cp_can_unlock() || !r300_endian_model()) {
         return 0;
@@ -4516,6 +4589,7 @@ static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
     bool forced = bt.armed && redo_mode;
     bt_miss = false;
     t1 = get_clock();
+    qatomic_set(&bt.in_p2, true);
     w = cp_wait_unlock();
     r300_draw_parked_begin();
     *ok = idx ?
@@ -4527,6 +4601,7 @@ static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
     bool cap_same = !bt.armed || bt.mode != BT_OVERWRITE ||
                     bt_crc(cap.buf, cap.plan.total) == bt.crc_before;
     bool valid = cp_wait_relock(w);
+    qatomic_set(&bt.in_p2, false);
     t2 = get_clock();
     bt.unlocked += w != 0;
     bt.ns_cap += t1 - t0;
@@ -11561,7 +11636,7 @@ static void cp_test_cond_wait(void)
 {
     int64_t t0;
 
-    if (likely(!cpt.kind)) {
+    if (likely(!cpt.kind && !bt_watch_on)) {
         qemu_cond_wait_bql(&cp.park_cond);
         return;
     }
@@ -11982,7 +12057,15 @@ static void r300_surf_log(hwaddr addr, uint64_t val, bool wr)
     }
 }
 
+static uint64_t ppc_mac_gpu_mmio_read_1(void *opaque, hwaddr addr,
+                                        unsigned size);
 static uint64_t ppc_mac_gpu_mmio_read(void *opaque, hwaddr addr,
+                                      unsigned size)
+{
+    bt_mmio++;
+    return ppc_mac_gpu_mmio_read_1(opaque, addr, size);
+}
+static uint64_t ppc_mac_gpu_mmio_read_1(void *opaque, hwaddr addr,
                                        unsigned int size)
 {
     PPCMacGPUState *s = opaque;
@@ -13074,7 +13157,15 @@ static void ppc_mac_gpu_tcl_port_write(PPCMacGPUState *s, hwaddr addr,
 }
 
 
+static void ppc_mac_gpu_mmio_write_1(void *opaque, hwaddr addr,
+                                    uint64_t val, unsigned int size);
 static void ppc_mac_gpu_mmio_write(void *opaque, hwaddr addr,
+                                    uint64_t val, unsigned int size)
+{
+    bt_mmio++;
+    ppc_mac_gpu_mmio_write_1(opaque, addr, val, size);
+}
+static void ppc_mac_gpu_mmio_write_1(void *opaque, hwaddr addr,
                                     uint64_t val, unsigned int size)
 {
     PPCMacGPUState *s = opaque;
