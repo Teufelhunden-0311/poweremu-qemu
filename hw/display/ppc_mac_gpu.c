@@ -458,6 +458,7 @@ static struct {
 
 static bool ppc_mac_gpu_cp_on_thread(void);
 static void ppc_mac_gpu_reset(DeviceState *dev);
+static uint64_t bt_submits;         /* draw_r300 calls that drew (not REMAP) */
 
 static void cp_test_init(void)
 {
@@ -4125,6 +4126,7 @@ static int r300_draw_staged(PPCMacGPUState *s, uint8_t *vram, R300DrawPacket *pk
     pkt->rt_pitch = srow / pkt->rt_bpp;     /* rt_width stays the buffer's */
     rr = s->renderer->draw_r300(s->renderer_opaque, vram,
                                 s->vram_size + s->stage_size, pkt);
+    bt_submits += rr != PPC_MAC_GPU_DRAW_REMAP;
     pkt->rt_gpu_addr = dst;
     pkt->rt_pitch = pitch;
     if (rr < 0) {
@@ -4208,12 +4210,19 @@ static bool r300_build_debug;       /* a debug capture is on: never */
  *             relock: the capture unchanged?  the packet = a rebuild from the
  *             capture?  a rebuild from live VRAM different?  VRAM restored;
  *  stall:<ms> sleep in the build; cp_sync waiters, CP_RB_WPTR kicks and
- *             cp_run calls off the CP thread meanwhile, cp.parked kept.
+ *             cp_run calls off the CP thread meanwhile, cp.parked kept;
+ *  redo-miss  the build's first capture read misses (as a read outside the
+ *             capture would): the draw must be built again under the BQL
+ *             (r300_render's usual build) and submitted once;
+ *  redo-cpu   the draw takes the CPU vertex path (R300_GLSL_GPU_VS cleared
+ *             for this draw after planning): the same.
+ *             PPCGPU_BUILD_TEST_EVERY=N forces every Nth planned build after
+ *             _AT instead of one; the first 5 are logged, all counted.
  * After a cancelled build the reproducer's counters report what the rest of
  * the segment still did (cp_test_end); PPCGPU_BUILD_TEST_REBOOT=1 then asks
  * for a system reset.  AI-generated (Claude).
  */
-enum { BT_DEV = 1, BT_SYS, BT_OVERWRITE, BT_STALL };
+enum { BT_DEV = 1, BT_SYS, BT_OVERWRITE, BT_STALL, BT_REDO_MISS, BT_REDO_CPU };
 static struct {
     bool init, stats, fired;
     int mode, stall_ms, tries;
@@ -4232,6 +4241,11 @@ static struct {
     uint64_t attempts, planned, not_vram, alloc_fail, unlocked, ok, failed,
              redo_miss, redo_cpu, cancelled, bytes, ns_cap, ns_build;
     int64_t next;
+    /* forced redo */
+    uint64_t every, cand, f_forced, f_noredo, f_rebuilt, f_bql, f_ok, f_cpu,
+             f_sub0, f_sub1, f_subn, r_sub0, w_sub0, w_draw;
+    bool w_pending, w_active, w_bql, w_ok, w_cpu;
+    int f_logged;
 } bt;
 static uint64_t bt_other_runs;      /* ppc_mac_gpu_cp_run off the CP thread */
 static __thread bool bt_miss;
@@ -4246,10 +4260,68 @@ static void bt_report(const char *tag)
             bt.not_vram, bt.alloc_fail, bt.unlocked, bt.ok, bt.failed,
             bt.redo_miss, bt.redo_cpu, bt.cancelled, bt.bytes, bt.ns_cap / 1e6,
             bt.ns_build / 1e6);
+    if (bt.mode == BT_REDO_MISS || bt.mode == BT_REDO_CPU) {
+        fprintf(stderr, "build-redo%s forced=%" PRIu64 " not_redone=%" PRIu64
+                " rebuilt=%" PRIu64 " rebuilt_under_bql=%" PRIu64 " rebuilt_ok=%" PRIu64
+                " cpu_vertices=%" PRIu64 " submitted_once=%" PRIu64
+                " submitted_never=%" PRIu64 " submitted_more=%" PRIu64 "\n", tag,
+                bt.f_forced, bt.f_noredo, bt.f_rebuilt, bt.f_bql, bt.f_ok, bt.f_cpu,
+                bt.f_sub1, bt.f_sub0, bt.f_subn);
+    }
+}
+
+/* The previous r300_render's forced-redo draw: how often it was submitted. */
+static void bt_watch_end(void)
+{
+    uint64_t n;
+
+    if (!bt.w_active) {
+        return;
+    }
+    bt.w_active = false;
+    n = bt_submits - bt.w_sub0;
+    bt.f_rebuilt++;
+    bt.f_bql += bt.w_bql;
+    bt.f_ok += bt.w_ok;
+    bt.f_cpu += bt.w_cpu;
+    if (n == 0) {
+        bt.f_sub0++;
+    } else if (n == 1) {
+        bt.f_sub1++;
+    } else {
+        bt.f_subn++;
+    }
+    if (bt.f_logged++ < 5) {
+        fprintf(stderr, "build-test: forced redo (%s) of draw %" PRIu64 ": built again "
+                "under the BQL %d (ok %d, CPU vertices %d); submitted %" PRIu64
+                " time(s)\n", bt.mode == BT_REDO_MISS ? "capture miss" : "CPU vertex path",
+                bt.w_draw, bt.w_bql, bt.w_ok, bt.w_cpu, n);
+    }
+}
+
+/* r300_render: entry, and after its build (the usual build after a redo). */
+static void bt_render_enter(void)
+{
+    bt_watch_end();
+    bt.r_sub0 = bt_submits;
+}
+
+static void bt_render_built(const R300DrawPacket *pkt, bool ok)
+{
+    if (!bt.w_pending) {
+        return;
+    }
+    bt.w_pending = false;
+    bt.w_active = true;
+    bt.w_bql = bql_locked();
+    bt.w_ok = ok;
+    bt.w_cpu = ok && pkt->verts && !pkt->vs_glsl;
+    bt.w_sub0 = bt.r_sub0;
 }
 
 static void bt_final(void)
 {
+    bt_watch_end();
     bt_report("-final");
 }
 
@@ -4265,11 +4337,15 @@ static void bt_init(void)
     if (e) {
         bt.mode = !strcmp(e, "dev-reset") ? BT_DEV : !strcmp(e, "sys-reset") ? BT_SYS :
                   !strcmp(e, "overwrite") ? BT_OVERWRITE :
-                  !strncmp(e, "stall:", 6) ? BT_STALL : 0;
+                  !strncmp(e, "stall:", 6) ? BT_STALL :
+                  !strcmp(e, "redo-miss") ? BT_REDO_MISS :
+                  !strcmp(e, "redo-cpu") ? BT_REDO_CPU : 0;
         bt.stall_ms = bt.mode == BT_STALL ? atoi(e + 6) : 0;
     }
     bt.at = getenv("PPCGPU_BUILD_TEST_AT") ? strtoull(getenv("PPCGPU_BUILD_TEST_AT"), NULL, 0)
                                            : 200000;
+    bt.every = getenv("PPCGPU_BUILD_TEST_EVERY") ?
+               strtoull(getenv("PPCGPU_BUILD_TEST_EVERY"), NULL, 0) : 0;
     cpt.reboot |= getenv("PPCGPU_BUILD_TEST_REBOOT") &&
                   getenv("PPCGPU_BUILD_TEST_REBOOT")[0] == '1';
 }
@@ -4336,6 +4412,12 @@ static bool bt_read(void *opaque, uint32_t gpu_addr, void *dst, uint32_t len)
             }
             bt.parked_kept = qatomic_read(&cp.parked);
             break;
+        case BT_REDO_MISS: {
+            /* as a read outside the capture: no data, the sticky redo flag */
+            R300Capture none = { 0 };
+            bt_miss = true;
+            return r300_capture_read(&none, gpu_addr, dst, len);
+        }
         }
     }
     if (!r300_capture_read(b->cap, gpu_addr, dst, len)) {
@@ -4407,8 +4489,14 @@ static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
     }
     bt.bytes += cap.plan.total;
 
-    bt.armed = bt.mode && !bt.fired && s->r3->draws >= bt.at &&
-               (bt.mode != BT_OVERWRITE || cap.plan.n);
+    bool redo_mode = bt.mode == BT_REDO_MISS || bt.mode == BT_REDO_CPU;
+    if (redo_mode) {
+        bt.armed = s->r3->draws >= bt.at && (bt.mode != BT_REDO_MISS || cap.plan.n) &&
+                   (bt.every ? ++bt.cand % bt.every == 0 : !bt.fired);
+    } else {
+        bt.armed = bt.mode && !bt.fired && s->r3->draws >= bt.at &&
+                   (bt.mode != BT_OVERWRITE || cap.plan.n);
+    }
     bt.acted = bt.moved = false;
     if (bt.armed) {
         bt.fired = true;
@@ -4422,6 +4510,10 @@ static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
             bt.crc_before = bt_crc(cap.buf, cap.plan.total);
         }
     }
+    if (bt.armed && bt.mode == BT_REDO_CPU) {
+        s->r3->glsl_flags &= ~R300_GLSL_GPU_VS;  /* this draw only (r300_render) */
+    }
+    bool forced = bt.armed && redo_mode;
     bt_miss = false;
     t1 = get_clock();
     w = cp_wait_unlock();
@@ -4507,6 +4599,17 @@ static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
     }
     bt.armed = false;
     g_free(cap.buf);
+    if (forced) {
+        bt.f_forced++;
+        if (redo) {
+            bt.w_pending = true;
+            bt.w_draw = s->r3->draws;
+        } else {
+            bt.f_noredo++;
+            fprintf(stderr, "build-test: forced redo NOT handed back (draw %" PRIu64
+                    ", ok %d)\n", s->r3->draws, *ok);
+        }
+    }
     if (redo) {
         if (bt_miss) {
             bt.redo_miss++;
@@ -4531,6 +4634,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     const char *err;
     uint8_t *vram = memory_region_get_ram_ptr(&s->vram);
 
+    bt_render_enter();
     r300_zmask_apply(s);
     if (unlikely(cp_cancelled())) {
         return;                             /* reset during its wait */
@@ -4658,6 +4762,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
             r300_draw_build(s->r3, &s->r3_arrays, opcode, d, body_dw,
                             r300_read_raw, s, &pkt, &err);
     }
+    bt_render_built(&pkt, build_ok);
     if (s->r3_dump && g_r300_arm_rt &&
         (r300_reg(s->r3, 0x4E28) & ~0x1Fu) == g_r300_arm_rt) {
         fprintf(s->r3_dump, "TRY op %02x vf %08x ok %d err %s tex0 en %u off %06x "
@@ -4959,6 +5064,7 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
         int rr = sys_ok ? s->renderer->draw_r300(s->renderer_opaque, vram,
                                                  s->vram_size + (sys.len ? s->stage_size : 0),
                                                  &pkt) : 0;
+        bt_submits += sys_ok && rr != PPC_MAC_GPU_DRAW_REMAP;
         if (rr == PPC_MAC_GPU_DRAW_REMAP) {
             /* (a system-memory buffer is in the staging already, rows as
              * the guest's: not moved again) */
