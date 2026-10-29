@@ -576,6 +576,22 @@ void rust_bql_mock_lock(void)
  * BQL and prints the copy after unlocking.
  */
 bool waitprof_on;
+/*
+ * The profiler's clock.  get_clock() is CLOCK_MONOTONIC, which macOS steps in
+ * 1 us: waits and holds under a microsecond were quantized to 0 or 1 us (a
+ * sub-us wait that crossed a tick counted as a 1 us wait; a final segment could
+ * close at 0 ns and lose its release mark).  CLOCK_UPTIME_RAW is ns (42 ns on
+ * M1).  Elsewhere: QEMU's own clock.
+ */
+static inline int64_t wp_clock(void)
+{
+#ifdef __APPLE__
+    return (int64_t)clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+#else
+    return get_clock();
+#endif
+}
+
 const char *(*waitprof_pending)(CPUState *cpu);
 
 static void __attribute__((constructor)) waitprof_init(void)
@@ -614,7 +630,7 @@ void waitprof_irq(int src, int level)
 void waitprof_kick(void)
 {
     qatomic_inc(&wp_kicks);
-    qatomic_set(&wp_last_kick, get_clock());
+    qatomic_set(&wp_last_kick, wp_clock());
 }
 
 /* --- idle episodes (vCPU thread, BQL held) --- */
@@ -634,7 +650,7 @@ void waitprof_idle_enter(void)
     for (int i = 0; i < 4; i++) {
         qatomic_set(&wp_raised[i], 0);
     }
-    wp_t0 = get_clock();
+    wp_t0 = wp_clock();
     wp_nwaits = 0;
     wp_last_ret = 0;
 }
@@ -642,16 +658,16 @@ void waitprof_idle_enter(void)
 void waitprof_idle_wait(bool begin)
 {
     if (begin) {
-        wp_wait_t0 = get_clock();
+        wp_wait_t0 = wp_clock();
     } else {
-        wp_last_ret = get_clock();
+        wp_last_ret = wp_clock();
         wp_nwaits++;
     }
 }
 
 void waitprof_idle_exit(CPUState *cpu)
 {
-    int64_t now = get_clock(), lk = qatomic_read(&wp_last_kick);
+    int64_t now = wp_clock(), lk = qatomic_read(&wp_last_kick);
     char key[48];
     int n = 0, k = 0;
 
@@ -702,7 +718,7 @@ void waitprof_idle_exit(CPUState *cpu)
 void waitprof_exec(void)
 {
     if (wp_resume) {
-        wp_execlat += get_clock() - wp_resume;
+        wp_execlat += wp_clock() - wp_resume;
         wp_execlat_n++;
         wp_resume = 0;
     }
@@ -867,7 +883,7 @@ static void wp_resid(int64_t t_req, int64_t t_ret)
 
 static void wp_acquired(const char *file, int line, int64_t t_req, int64_t t_ret)
 {
-    int64_t now = get_clock(), wait = now - t_req;
+    int64_t now = wp_clock(), wait = now - t_req;
     int w = wp_site_find(file, line);
 
     wp_cur = w;
@@ -876,7 +892,7 @@ static void wp_acquired(const char *file, int line, int64_t t_req, int64_t t_ret
     wp_seg_t0p = t_ret;
     wp_held = true;
     wp_resid(t_req, t_ret);
-    wp_rs.acq_instr += get_clock() - t_ret;
+    wp_rs.acq_instr += wp_clock() - t_ret;
     wp_rs.acq_n++;
     if (w < 0) {
         return;
@@ -941,7 +957,7 @@ int waitprof_act(int act)
     int prev = wp_act_cur;
 
     if (act != prev && wp_held && bql_locked()) {
-        wp_seg_close(get_clock());
+        wp_seg_close(wp_clock());
     }
     wp_act_cur = act;
     return prev;
@@ -950,7 +966,7 @@ int waitprof_act(int act)
 /* About to release (still held): record the hold. */
 static bool wp_release(void)
 {
-    int64_t now = get_clock();
+    int64_t now = wp_clock();
     if (wp_cur >= 0) {
         wp_site[wp_cur].hold += now - wp_hold_t0;
         wp_site[wp_cur].hhist[wp_bucket(now - wp_hold_t0)]++;
@@ -985,7 +1001,7 @@ static struct {
 /* Under the BQL: copy and reset. */
 static void wp_snapshot(void)
 {
-    int64_t now = get_clock();
+    int64_t now = wp_clock();
     wp_snap.now = now;
     wp_snap.dt = now - wp_last_dump;
     memcpy(wp_snap.site, wp_site, sizeof(wp_site));
@@ -1136,15 +1152,15 @@ static void wp_print(void)
 void bql_lock_impl(const char *file, int line)
 {
     QemuMutexLockFunc bql_lock_fn = qatomic_read(&bql_mutex_lock_func);
-    int64_t t_req = waitprof_on ? get_clock() : 0;
+    int64_t t_req = waitprof_on ? wp_clock() : 0;
 
     g_assert(!bql_locked());
     bql_lock_fn(&bql, file, line);
-    int64_t t_ret = t_req ? get_clock() : 0;
+    int64_t t_ret = t_req ? wp_clock() : 0;
     set_bql_locked(true);
     if (t_req) {
         if (!wp_last_dump) {
-            wp_last_dump = get_clock();
+            wp_last_dump = wp_clock();
         }
         wp_acquired(file, line, t_req, t_ret);
     }
@@ -1157,14 +1173,14 @@ void bql_unlock(void)
     g_assert(bql_locked());
     g_assert(!bql_unlock_blocked);
     if (waitprof_on && wp_release()) {
-        int64_t s0 = get_clock();
+        int64_t s0 = wp_clock();
         wp_snapshot();
-        wp_rs.snap += get_clock() - s0;     /* counted in the next window */
+        wp_rs.snap += wp_clock() - s0;     /* counted in the next window */
         wp_rs.snap_n++;
         dump = true;
     }
     if (waitprof_on) {
-        wp_phys_release(get_clock());
+        wp_phys_release(wp_clock());
     }
     set_bql_locked(false);
     qemu_mutex_unlock(&bql);
@@ -1177,11 +1193,11 @@ void qemu_cond_wait_bql(QemuCond *cond)
 {
     if (waitprof_on) {
         wp_release();
-        wp_phys_release(get_clock());
+        wp_phys_release(wp_clock());
     }
     qemu_cond_wait(cond, &bql);
     if (waitprof_on) {
-        wp_hold_t0 = wp_seg_t0 = wp_seg_t0p = get_clock();     /* same site holds again */
+        wp_hold_t0 = wp_seg_t0 = wp_seg_t0p = wp_clock();     /* same site holds again */
         wp_held = true;
     }
 }
@@ -1223,11 +1239,11 @@ void qemu_cond_timedwait_bql(QemuCond *cond, int ms)
 {
     if (waitprof_on) {
         wp_release();
-        wp_phys_release(get_clock());
+        wp_phys_release(wp_clock());
     }
     qemu_cond_timedwait(cond, &bql, ms);
     if (waitprof_on) {
-        wp_hold_t0 = wp_seg_t0 = wp_seg_t0p = get_clock();
+        wp_hold_t0 = wp_seg_t0 = wp_seg_t0p = wp_clock();
         wp_held = true;
     }
 }
