@@ -47,6 +47,8 @@
 #include "hw/boards.h"
 #include "hw/hw.h"
 #include "trace.h"
+#include "qemu/processor.h"
+#include "qemu/cutils.h"
 
 #ifdef CONFIG_LINUX
 
@@ -416,12 +418,15 @@ static QemuCond qemu_cpu_cond;
 /* system init */
 static QemuCond qemu_pause_cond;
 
+static void bql_spin_init(void);
+
 void qemu_init_cpu_loop(void)
 {
     qemu_init_sigbus();
     qemu_cond_init(&qemu_cpu_cond);
     qemu_cond_init(&qemu_pause_cond);
     qemu_mutex_init(&bql);
+    bql_spin_init();
 
     qemu_thread_get_self(&io_thread);
 }
@@ -546,6 +551,75 @@ void rust_bql_mock_lock(void)
 }
 
 /*
+ * PPC_BQL_SPIN_NS (experiment, default off; AI-generated): before the
+ * blocking BQL acquire, the vCPU thread retries a try-lock for at most
+ * this many nanoseconds (1..5000).  Unset, empty or 0 keeps the old path
+ * with no clock reads.  Only on Darwin/aarch64 for now, only on a vCPU
+ * thread (current_cpu set), and only when the BQL lock function is the
+ * plain qemu_mutex_lock_impl (not under sync-profile).  Condition-variable
+ * reacquisition and every other thread are unchanged.
+ */
+#define BQL_SPIN_MAX_NS 5000
+static int64_t bql_spin_ns;
+
+static void bql_spin_init(void)
+{
+    const char *v = getenv("PPC_BQL_SPIN_NS");
+    uint64_t ns;
+
+    if (!v || !*v) {
+        return;
+    }
+    if (qemu_strtou64(v, NULL, 10, &ns) < 0 || ns > BQL_SPIN_MAX_NS) {
+        fprintf(stderr, "bql-spin: PPC_BQL_SPIN_NS=%s ignored: want 0..%d\n",
+                v, BQL_SPIN_MAX_NS);
+        return;
+    }
+#if defined(__APPLE__) && defined(__aarch64__)
+    bql_spin_ns = ns;
+    if (ns) {
+        fprintf(stderr, "bql-spin: vCPU try-lock budget %" PRIu64 " ns\n", ns);
+    }
+#else
+    if (ns) {
+        fprintf(stderr, "bql-spin: PPC_BQL_SPIN_NS ignored: Darwin/aarch64 "
+                "only for now\n");
+    }
+#endif
+}
+
+#if defined(__APPLE__) && defined(__aarch64__)
+static inline int64_t bql_spin_clock(void)
+{
+    /* get_clock() (CLOCK_MONOTONIC) steps in 1 us here; this is 42 ns. */
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+/* True if the BQL was taken; false means fall back to the blocking lock. */
+static bool bql_spin_acquire(const char *file, int line)
+{
+    int64_t deadline;
+
+    if (qemu_mutex_trylock_impl(&bql, file, line) == 0) {
+        return true;
+    }
+    deadline = bql_spin_clock() + bql_spin_ns;
+    do {
+        cpu_relax();
+        if (qemu_mutex_trylock_impl(&bql, file, line) == 0) {
+            return true;
+        }
+    } while (bql_spin_clock() < deadline);
+    return false;
+}
+#else
+static bool bql_spin_acquire(const char *file, int line)
+{
+    return false;
+}
+#endif
+
+/*
  * The BQL is taken from so many places that it is worth profiling the
  * callers directly, instead of funneling them all through a single function.
  */
@@ -554,6 +628,12 @@ void bql_lock_impl(const char *file, int line)
     QemuMutexLockFunc bql_lock_fn = qatomic_read(&bql_mutex_lock_func);
 
     g_assert(!bql_locked());
+    if (unlikely(bql_spin_ns) && current_cpu &&
+        bql_lock_fn == qemu_mutex_lock_impl &&
+        bql_spin_acquire(file, line)) {
+        set_bql_locked(true);
+        return;
+    }
     bql_lock_fn(&bql, file, line);
     set_bql_locked(true);
 }
