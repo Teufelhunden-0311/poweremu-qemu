@@ -3022,6 +3022,7 @@ static void r200_scratch_write(PPCMacGPUState *s, int idx, uint32_t val)
  * (and every 1000th) is written out for reverse engineering.
  */
 static uint8_t *r200_agp_page(PPCMacGPUState *s, uint32_t gpu_addr);
+static int r200_agp_peek(PPCMacGPUState *s, uint32_t page, uint32_t *other);
 static uint32_t g_r300_arm_rt;      /* debug: drag-frame capture target */
 static void r300_surfwatch_update(PPCMacGPUState *s);
 static void r300_surface_changed(PPCMacGPUState *s);
@@ -4259,6 +4260,11 @@ static struct {
              nv_pages, nv_pages_fast, nv_pages_slow, nv_bytes, nv_bucket[8],
              ns_nv_build, ns_nv_class, nv_built, np_built, ns_np_build, nv_ok;
     /* bh-reset */
+    /* agpcount (PPCGPU_BUILD_AGPCOUNT=1): all-hit v1 predicate, peek only */
+    bool agpcount;
+    uint64_t ac_draws, ac_elig, ac_elig_mixed, ac_why[7], ac_pages, ac_hit, ac_miss,
+             ac_coll, ac_cfg, ac_agp_bytes, ac_vram_bytes, ac_elig_agp_bytes,
+             ac_elig_vram_bytes, ac_el_built, ns_el_build, ac_ne_built, ns_ne_build;
     bool in_p2, bh_reboot;
     int64_t t_sched;
     QEMUTimer *reboot_timer;
@@ -4351,6 +4357,112 @@ static void bt_nv_report(const char *tag)
             bt.ns_nv_build / 1e6, bt.ns_nv_class / 1e6, bt.np_built, bt.ns_np_build / 1e6);
 }
 
+static const char *const ac_why_name[7] = {
+    "span", "pci_gart", "aic_overlap", "config", "collision", "miss", "vram_bound",
+};
+
+static void bt_ac_report(const char *tag)
+{
+    fprintf(stderr, "build-agp%s draws=%" PRIu64 " eligible=%" PRIu64 " (with_vram %" PRIu64
+            ") pages=%" PRIu64 " hit=%" PRIu64 " miss=%" PRIu64 " collision=%" PRIu64
+            " config=%" PRIu64 " agp_bytes=%" PRIu64 " vram_bytes=%" PRIu64
+            " elig_agp_bytes=%" PRIu64 " elig_vram_bytes=%" PRIu64, tag, bt.ac_draws,
+            bt.ac_elig, bt.ac_elig_mixed, bt.ac_pages, bt.ac_hit, bt.ac_miss, bt.ac_coll,
+            bt.ac_cfg, bt.ac_agp_bytes, bt.ac_vram_bytes, bt.ac_elig_agp_bytes,
+            bt.ac_elig_vram_bytes);
+    fprintf(stderr, " | first_reason");
+    for (int i = 0; i < 7; i++) {
+        fprintf(stderr, " %s=%" PRIu64, ac_why_name[i], bt.ac_why[i]);
+    }
+    fprintf(stderr, " | protected build: eligible %" PRIu64 " draws %.1f ms, other %" PRIu64
+            " draws %.1f ms\n", bt.ac_el_built, bt.ns_el_build / 1e6, bt.ac_ne_built,
+            bt.ns_ne_build / 1e6);
+}
+
+/*
+ * agpcount: would this planned not-VRAM draw pass the all-hit v1 predicate?
+ * Per range: VRAM by the same whole-range and host-bound test as the capture;
+ * else every 4 KiB chunk (split as r300_read_raw splits) must be system span,
+ * entirely AGP, with no enabled-AIC overlap, and its page must already be in
+ * the cache under the current configuration.  Peek only.  Returns eligible.
+ */
+static bool bt_agp_count(PPCMacGPUState *s, const R300FetchPlan *plan)
+{
+    static uint32_t req_page[1024], req_gen[1024], gen;
+    uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
+    uint64_t agp_b = 0, vram_b = 0;
+    int why = -1;
+    bool vram_r = false;
+
+    if (++gen == 0) {
+        memset(req_gen, 0, sizeof(req_gen));
+        gen = 1;
+    }
+    int64_t t = get_clock();
+    for (unsigned i = 0; i < plan->n; i++) {
+        uint32_t a = plan->r[i].gpu, len = plan->r[i].len;
+        if (r300_in_fb(s, a, len)) {
+            if (a < fb_base || (uint64_t)(a - fb_base) + len > s->vram_size) {
+                if (why < 0) why = 6;
+            } else {
+                vram_b += len;
+                vram_r = true;
+            }
+            continue;
+        }
+        while (len) {
+            uint32_t n = MIN(len, 0x1000 - (a & 0xFFF)), other;
+            uint32_t page = a >> 12, b = page & 1023;
+            bt.ac_pages++;
+            if (!r300_sys_span(s, a, n)) {
+                if (why < 0) why = 0;
+            } else if (!r300_in_agp(s, a, n)) {
+                if (why < 0) why = 1;
+            } else if ((s->regs.aic_ctrl & 1) && !(s->regs.aic_lo_addr & 0xFFF) &&
+                       a <= s->regs.aic_hi_addr &&
+                       (uint64_t)a + n - 1 >= s->regs.aic_lo_addr) {
+                if (why < 0) why = 2;
+            } else {
+                int h = r200_agp_peek(s, page, &other);
+                if (h < 0) {
+                    bt.ac_cfg++;
+                    if (why < 0) why = 3;
+                } else if (h) {
+                    bt.ac_hit++;
+                    agp_b += n;
+                } else {
+                    bt.ac_miss++;
+                    bool coll = other != 0xFFFFFFFFu && req_gen[b] == gen &&
+                                req_page[b] == other;
+                    bt.ac_coll += coll;
+                    if (why < 0) why = coll ? 4 : 5;
+                }
+                if (req_gen[b] == gen && req_page[b] != page) {
+                    bt.ac_coll++;               /* two required pages, one bucket */
+                    if (why < 0) why = 4;
+                }
+                req_gen[b] = gen;
+                req_page[b] = page;
+            }
+            a += n;
+            len -= n;
+        }
+    }
+    bt.ac_draws++;
+    bt.ac_agp_bytes += agp_b;
+    bt.ac_vram_bytes += vram_b;
+    if (why < 0) {
+        bt.ac_elig++;
+        bt.ac_elig_mixed += vram_r;
+        bt.ac_elig_agp_bytes += agp_b;
+        bt.ac_elig_vram_bytes += vram_b;
+    } else {
+        bt.ac_why[why]++;
+    }
+    bt.ns_nv_class += get_clock() - t;
+    return why < 0;
+}
+
 /* A planned draw with a range outside VRAM: where its bytes are, page by page. */
 static void bt_nv_classify(PPCMacGPUState *s, const R300FetchPlan *plan)
 {
@@ -4416,6 +4528,9 @@ static void bt_final(void)
 {
     bt_watch_end();
     bt_report("-final");
+    if (bt.agpcount) {
+        bt_ac_report("-final");
+    }
     if (bt.stats) {
         bt_nv_report("-final");
     }
@@ -4427,6 +4542,8 @@ static void bt_init(void)
 
     bt.init = true;
     bt.stats = getenv("PPCGPU_BUILD_STATS") && getenv("PPCGPU_BUILD_STATS")[0] == '1';
+    bt.agpcount = bt.stats && getenv("PPCGPU_BUILD_AGPCOUNT") &&
+                  !strcmp(getenv("PPCGPU_BUILD_AGPCOUNT"), "1");
     if (bt.stats) {
         atexit(bt_final);
     }
@@ -4618,6 +4735,9 @@ static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
         bt.next = g_get_monotonic_time() + 10 * 1000000;
         bt_report("");
         bt_nv_report("");
+        if (bt.agpcount) {
+            bt_ac_report("");
+        }
     }
     t0 = get_clock();
     if (!r300_draw_fetch_plan(s->r3, &s->r3_arrays, opcode, d, ndw, idx,
@@ -4631,7 +4751,9 @@ static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
         if (!r300_in_fb(s, r->gpu, r->len) || r->gpu < fb_base ||
             (uint64_t)(r->gpu - fb_base) + r->len > s->vram_size) {
             bt.not_vram++;
-            if (bt.stats) {
+            if (bt.agpcount) {
+                bt.pend = bt_agp_count(s, &cap.plan) ? 3 : 4;
+            } else if (bt.stats) {
                 bt_nv_classify(s, &cap.plan);
                 bt.pend = 1;
             }
@@ -4938,6 +5060,12 @@ static void r300_render(PPCMacGPUState *s, uint32_t opcode, const uint32_t *d,
     } else if (bt_pend == 2) {
         bt.np_built++;
         bt.ns_np_build += get_clock() - bt_t0;
+    } else if (bt_pend == 3) {
+        bt.ac_el_built++;
+        bt.ns_el_build += get_clock() - bt_t0;
+    } else if (bt_pend == 4) {
+        bt.ac_ne_built++;
+        bt.ns_ne_build += get_clock() - bt_t0;
     }
     if (s->r3_dump && g_r300_arm_rt &&
         (r300_reg(s->r3, 0x4E28) & ~0x1Fu) == g_r300_arm_rt) {
@@ -7857,6 +7985,30 @@ typedef struct R200AgpCfg {
     uint32_t agp_loc, aic_ctrl, aic_lo, aic_hi, aic_pt, r300_pt, bridge_gen;
 } R200AgpCfg;
 static R200AgpCfg r200_agp_tc_cfg;
+
+/*
+ * DEBUG (agpcount): side-effect-free look at the cache for one GPU page, under
+ * the BQL.  1 = exact tag and non-null host pointer under the CURRENT
+ * configuration; 0 = miss (bucket empty or another page); -1 = configuration
+ * differs from the cached one (the next r200_agp_page would flush).  *other =
+ * the page holding the bucket (0xFFFFFFFF if empty).  Never flushes, walks or
+ * fills.
+ */
+static int r200_agp_peek(PPCMacGPUState *s, uint32_t page, uint32_t *other)
+{
+    R200AgpCfg cfg = {
+        s->regs.mc_agp_location, s->regs.aic_ctrl, s->regs.aic_lo_addr,
+        s->regs.aic_hi_addr, s->regs.aic_pt_base, s->r300_aic_pt_base,
+        uninorth_get_agp_gart_gen(),
+    };
+    uint32_t i = page & (ARRAY_SIZE(r200_agp_tc) - 1);
+
+    *other = r200_agp_tc[i].tag ? r200_agp_tc[i].tag - 1 : 0xFFFFFFFFu;
+    if (memcmp(&cfg, &r200_agp_tc_cfg, sizeof(cfg))) {
+        return -1;
+    }
+    return r200_agp_tc[i].tag == page + 1 && r200_agp_tc[i].host ? 1 : 0;
+}
 
 static uint8_t *r200_agp_page(PPCMacGPUState *s, uint32_t gpu_addr)
 {
