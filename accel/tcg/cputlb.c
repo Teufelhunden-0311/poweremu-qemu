@@ -95,6 +95,157 @@ static inline size_t tlb_n_entries(CPUTLBDescFast *fast)
     return (fast->mask >> CPU_TLB_ENTRY_BITS) + 1;
 }
 
+
+/* PPC_TLBDIAG=1: temporary, AI-generated single-vCPU diagnostics.
+ * Cumulative counters; no logging or clocks while the TLB lock is held.
+ * Event-driven reports: check time every 1024 refill/sync events, at most
+ * once per two seconds. An idle CPU has no heartbeat or final dump.
+ */
+typedef struct TLBDiagIndex {
+    uint64_t whole, page, class_flush, grow, shrink;
+    uint64_t victim[3], refill[3], probe;
+} TLBDiagIndex;
+
+static struct {
+    TLBDiagIndex idx[NB_MMU_MODES];
+    uint64_t sync, checks, compares, hit, miss, switches, seq, events;
+    uint64_t to[4], miss_to[4];
+    int slot, d_idx, i_idx;
+    int64_t last_ns;
+    bool started;
+} tlbdiag;
+
+static bool tlbdiag_on(CPUState *cpu)
+{
+    static gsize option;
+
+    if (g_once_init_enter(&option)) {
+        const char *e = getenv("PPC_TLBDIAG");
+        g_once_init_leave(&option, e && !strcmp(e, "1") ? 2 : 1);
+    }
+    return option == 2 && cpu == first_cpu && !CPU_NEXT(cpu) &&
+           current_cpu == cpu && qemu_cpu_is_self(cpu);
+}
+
+static int64_t tlbdiag_clock_ns(void)
+{
+    struct timespec ts;
+#ifdef __APPLE__
+    clock_gettime(CLOCK_UPTIME_RAW, &ts);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+/* Called only outside tlb.c.lock, on its owning vCPU thread. */
+static void tlbdiag_poll(CPUState *cpu)
+{
+    int64_t now;
+    size_t sizes[NB_MMU_MODES], used[NB_MMU_MODES];
+    struct timespec wall;
+    uint64_t seq;
+    int i;
+
+    if (tlbdiag.started && (++tlbdiag.events & 1023)) {
+        return;
+    }
+    now = tlbdiag_clock_ns();
+    if (tlbdiag.started && now - tlbdiag.last_ns < 2000000000LL) {
+        return;
+    }
+    tlbdiag.started = true;
+    tlbdiag.last_ns = now;
+    seq = ++tlbdiag.seq;
+    clock_gettime(CLOCK_REALTIME, &wall);
+    qemu_spin_lock(&cpu->neg.tlb.c.lock);
+    for (i = 0; i < NB_MMU_MODES; i++) {
+        sizes[i] = tlb_n_entries(&cpu->neg.tlb.f[i]);
+        used[i] = cpu->neg.tlb.d[i].n_used_entries;
+    }
+    qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+
+    fprintf(stderr, "tlbdiag seq=%" PRIu64 " ns=%" PRId64
+            " wall_ns=%" PRId64 " kind=slots slot=%d d_idx=%d i_idx=%d"
+            " sync=%" PRIu64 " checks=%" PRIu64 " compares=%" PRIu64
+            " hit=%" PRIu64 " miss=%" PRIu64 " switches=%" PRIu64 "\n",
+            seq, now, (int64_t)wall.tv_sec * 1000000000 + wall.tv_nsec,
+            tlbdiag.slot, tlbdiag.d_idx, tlbdiag.i_idx,
+            tlbdiag.sync, tlbdiag.checks, tlbdiag.compares,
+            tlbdiag.hit, tlbdiag.miss, tlbdiag.switches);
+    for (i = 0; i < 4; i++) {
+        fprintf(stderr, "tlbdiag seq=%" PRIu64 " ns=%" PRId64
+                " kind=slot_to slot=%d to=%" PRIu64 " miss_to=%" PRIu64 "\n",
+                seq, now, i, tlbdiag.to[i], tlbdiag.miss_to[i]);
+    }
+    for (i = 0; i < NB_MMU_MODES; i++) {
+        TLBDiagIndex *d = &tlbdiag.idx[i];
+        /* Print every index: an empty index's learned size matters too. */
+        fprintf(stderr, "tlbdiag seq=%" PRIu64 " ns=%" PRId64
+                " kind=idx idx=%d entries=%zu used_approx=%zu"
+                " whole=%" PRIu64 " page=%" PRIu64 " class=%" PRIu64
+                " grow=%" PRIu64 " shrink=%" PRIu64
+                " victim_ld=%" PRIu64 " victim_st=%" PRIu64
+                " victim_if=%" PRIu64 " refill_ld=%" PRIu64
+                " refill_st=%" PRIu64 " refill_if=%" PRIu64
+                " probe=%" PRIu64 "\n",
+                seq, now, i, sizes[i], used[i], d->whole, d->page,
+                d->class_flush, d->grow, d->shrink,
+                d->victim[MMU_DATA_LOAD], d->victim[MMU_DATA_STORE],
+                d->victim[MMU_INST_FETCH], d->refill[MMU_DATA_LOAD],
+                d->refill[MMU_DATA_STORE], d->refill[MMU_INST_FETCH], d->probe);
+    }
+}
+
+/* Optional class-mode hook: call once per index actually scanned, inside
+ * or outside the TLB lock. This hook only counts; it never prints/polls.
+ */
+void tlbdiag_class_flush(CPUState *cpu, int mmu_idx)
+{
+    if (tlbdiag_on(cpu) && (unsigned)mmu_idx < NB_MMU_MODES) {
+        tlbdiag.idx[mmu_idx].class_flush++;
+    }
+}
+
+void tlbdiag_ppc_refill(CPUState *cpu, int mmu_idx, int access_type,
+                        bool probe, int slot, int d_idx, int i_idx)
+{
+    if (!tlbdiag_on(cpu)) {
+        return;
+    }
+    tlbdiag.slot = slot;
+    tlbdiag.d_idx = d_idx;
+    tlbdiag.i_idx = i_idx;
+    if ((unsigned)mmu_idx < NB_MMU_MODES && (unsigned)access_type < 3) {
+        tlbdiag.idx[mmu_idx].refill[access_type]++;
+        tlbdiag.idx[mmu_idx].probe += probe;
+    }
+    tlbdiag_poll(cpu);
+}
+
+void tlbdiag_ppc_sync(CPUState *cpu, int old_slot, int slot,
+                      int checks, int compares, bool hit,
+                      int d_idx, int i_idx)
+{
+    if (!tlbdiag_on(cpu)) {
+        return;
+    }
+    tlbdiag.slot = slot;
+    tlbdiag.d_idx = d_idx;
+    tlbdiag.i_idx = i_idx;
+    tlbdiag.sync++;
+    tlbdiag.checks += checks;
+    tlbdiag.compares += compares;
+    tlbdiag.hit += hit;
+    tlbdiag.miss += !hit;
+    tlbdiag.switches += old_slot != slot;
+    if ((unsigned)slot < 4) {
+        tlbdiag.to[slot]++;
+        tlbdiag.miss_to[slot] += !hit;
+    }
+    tlbdiag_poll(cpu);
+}
+
 static inline size_t sizeof_tlb(CPUTLBDescFast *fast)
 {
     return fast->mask + (1 << CPU_TLB_ENTRY_BITS);
@@ -295,7 +446,17 @@ static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
     CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
     CPUTLBDescFast *fast = &cpu->neg.tlb.f[mmu_idx];
 
+    size_t old_size = tlb_n_entries(fast);
+
     tlb_mmu_resize_locked(desc, fast, now);
+    if (tlbdiag_on(cpu)) {
+        TLBDiagIndex *d = &tlbdiag.idx[mmu_idx];
+        size_t new_size = tlb_n_entries(fast);
+
+        d->whole++;
+        d->grow += new_size > old_size;
+        d->shrink += new_size < old_size;
+    }
     tlb_mmu_flush_locked(desc, fast);
 }
 
@@ -506,6 +667,10 @@ static void tlb_flush_page_locked(CPUState *cpu, int midx, vaddr page)
 {
     vaddr lp_addr = cpu->neg.tlb.d[midx].large_page_addr;
     vaddr lp_mask = cpu->neg.tlb.d[midx].large_page_mask;
+
+    if (tlbdiag_on(cpu)) {
+        tlbdiag.idx[midx].page++;
+    }
 
     /* Check if we need to flush due to large pages.  */
     if ((page & lp_mask) == lp_addr) {
@@ -1391,6 +1556,9 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
             CPUTLBEntryFull *f2 = &cpu->neg.tlb.d[mmu_idx].vfulltlb[vidx];
             CPUTLBEntryFull tmpf;
             tmpf = *f1; *f1 = *f2; *f2 = tmpf;
+            if (tlbdiag_on(cpu)) {
+                tlbdiag.idx[mmu_idx].victim[access_type]++;
+            }
             return true;
         }
     }

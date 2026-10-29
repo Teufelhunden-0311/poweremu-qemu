@@ -345,8 +345,11 @@ void ppc_tlb_invalidate_all(CPUPPCState *env)
 void ppc_mmu_slot_sync(CPUPPCState *env)
 {
     int i, victim = 0;
+    int old_slot = env->mmu_slot, checks, compares = 0;
+    bool hit;
 
     for (i = 0; i < PPC_MMU_SLOTS; i++) {
+        compares += env->mmu_slot_used[i] != 0;
         if (env->mmu_slot_used[i] &&
             !memcmp(env->mmu_slot_sr[i], env->sr, sizeof(env->mmu_slot_sr[i]))) {
             break;
@@ -355,6 +358,8 @@ void ppc_mmu_slot_sync(CPUPPCState *env)
             victim = i;
         }
     }
+    hit = i < PPC_MMU_SLOTS;
+    checks = hit ? i + 1 : PPC_MMU_SLOTS;
     QEMU_PERF_INC(slot_sync);
     if (i == PPC_MMU_SLOTS) {
         i = victim;
@@ -366,6 +371,9 @@ void ppc_mmu_slot_sync(CPUPPCState *env)
     }
     env->mmu_slot_used[i] = ++env->mmu_slot_clock;
     env->mmu_slot = i;
+    tlbdiag_ppc_sync(env_cpu(env), old_slot, i, checks, compares, hit,
+                     ppc_env_mmu_index(env, false),
+                     ppc_env_mmu_index(env, true));
 }
 
 /* After the whole QEMU TLB was flushed: only the current set is cached. */
@@ -1544,6 +1552,9 @@ bool ppc_cpu_tlb_fill(CPUState *cs, vaddr eaddr, int size,
     hwaddr raddr;
     int page_size, prot;
 
+    tlbdiag_ppc_refill(cs, mmu_idx, access_type, probe, cpu->env.mmu_slot,
+                       ppc_env_mmu_index(&cpu->env, false),
+                       ppc_env_mmu_index(&cpu->env, true));
     QEMU_PERF_INC(tlb_fill);
     qemu_perf_maybe_report(cs);
 

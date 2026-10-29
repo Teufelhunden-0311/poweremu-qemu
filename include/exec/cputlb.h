@@ -26,6 +26,16 @@
 #include "exec/vaddr.h"
 
 #if defined(CONFIG_TCG) && !defined(CONFIG_USER_ONLY)
+/* Temporary PPC_TLBDIAG diagnostics, disabled unless explicitly requested.
+ * Refill/sync hooks must run outside the TLB lock. Class hook only counts.
+ */
+void tlbdiag_class_flush(CPUState *cpu, int mmu_idx);
+void tlbdiag_ppc_refill(CPUState *cpu, int mmu_idx, int access_type,
+                        bool probe, int slot, int d_idx, int i_idx);
+void tlbdiag_ppc_sync(CPUState *cpu, int old_slot, int slot,
+                      int checks, int compares, bool hit,
+                      int d_idx, int i_idx);
+
 void tlb_protect_code(ram_addr_t ram_addr);
 void tlb_unprotect_code(ram_addr_t ram_addr);
 #endif
@@ -260,6 +270,18 @@ void tlb_flush_range_by_mmuidx_all_cpus_synced(CPUState *cpu,
                                                uint16_t idxmap,
                                                unsigned bits);
 #else
+static inline void tlbdiag_class_flush(CPUState *cpu, int mmu_idx)
+{
+}
+static inline void tlbdiag_ppc_refill(CPUState *cpu, int mmu_idx, int access_type,
+                                    bool probe, int slot, int d_idx, int i_idx)
+{
+}
+static inline void tlbdiag_ppc_sync(CPUState *cpu, int old_slot, int slot,
+                                  int checks, int compares, bool hit,
+                                  int d_idx, int i_idx)
+{
+}
 static inline void tlb_flush_page(CPUState *cpu, vaddr addr)
 {
 }
