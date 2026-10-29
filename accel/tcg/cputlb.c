@@ -813,6 +813,8 @@ void tlb_flush_page_class_by_mmuidx(CPUState *cpu, vaddr addr, vaddr mask,
     for (uint16_t work = idxmap & cpu->neg.tlb.c.dirty; work; work &= work - 1) {
         int midx = ctz32(work);
         CPUTLBDescFast *f = &cpu->neg.tlb.f[midx];
+
+        tlbdiag_class_flush(cpu, midx);
         size_t n = tlb_n_entries(f);
 
         /*
