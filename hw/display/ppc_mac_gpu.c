@@ -4130,6 +4130,64 @@ static bool r300_build_agp_range(PPCMacGPUState *s, const R300FetchRange *r,
     return true;
 }
 
+/* DEBUG agp-diff */
+uint64_t agp_fills;                 /* r200_agp_page cache fills (ever) */
+static struct {
+    int on;                         /* -1 unread */
+    uint64_t draws, same, differ, ord_fail, cap_fail, fills, bytes_agp, cap_err_only;
+    int logged;
+    int64_t next;
+} ad = { .on = -1 };
+
+static bool ad_same_packet(const R300DrawPacket *a, const R300DrawPacket *b)
+{
+    R300DrawPacket x = *a, y = *b;
+
+    x.glsl = y.glsl = NULL;
+    x.verts = y.verts = NULL;
+    x.vs_glsl = y.vs_glsl = NULL;
+    x.vs_in = y.vs_in = NULL;
+    x.vs_idx = y.vs_idx = NULL;
+    x.vs_u = y.vs_u = NULL;
+    for (int t = 0; t < R300_NUM_TEX_UNITS; t++) {
+        x.tex[t].host_data = y.tex[t].host_data = NULL;
+    }
+    if (memcmp(&x, &y, sizeof(x))) {
+        return false;
+    }
+    if (!a->glsl != !b->glsl || (a->glsl && strcmp(a->glsl, b->glsl)) ||
+        !a->vs_glsl != !b->vs_glsl || (a->vs_glsl && strcmp(a->vs_glsl, b->vs_glsl)) ||
+        !a->verts != !b->verts || !a->vs_u != !b->vs_u) {
+        return false;
+    }
+    if (a->verts && memcmp(a->verts, b->verts, sizeof(R300Vertex) *
+                           (a->num_verts + a->num_line_verts))) {
+        return false;
+    }
+    if (a->vs_glsl &&
+        (memcmp(a->vs_in, b->vs_in, sizeof(float) * 4 * a->vs_in_vecs) ||
+         memcmp(a->vs_idx, b->vs_idx, sizeof(uint32_t) * a->num_verts))) {
+        return false;
+    }
+    if (a->vs_u && memcmp(a->vs_u, b->vs_u, sizeof(*a->vs_u))) {
+        return false;
+    }
+    return true;
+}
+
+static void ad_report(const char *tag)
+{
+    fprintf(stderr, "agp-diff%s draws=%" PRIu64 " same=%" PRIu64 " differ=%" PRIu64
+            " usual_build_failed=%" PRIu64 " capture_build_failed=%" PRIu64
+            " fills_during_usual_build=%" PRIu64 " agp_bytes=%" PRIu64 "\n", tag, ad.draws,
+            ad.same, ad.differ, ad.ord_fail, ad.cap_fail, ad.fills, ad.bytes_agp);
+}
+
+static void ad_final(void)
+{
+    ad_report("-final");
+}
+
 static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
                              const uint32_t *d, uint32_t ndw,
                              const R300Indices *idx, R300DrawPacket *pkt,
@@ -4171,6 +4229,63 @@ static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
         at += r->len;
     }
 
+    if (unlikely(ad.on)) {
+        if (ad.on < 0) {
+            const char *e = getenv("PPCGPU_BUILD_TEST");
+            ad.on = e && !strcmp(e, "agp-diff");
+            if (ad.on) {
+                atexit(ad_final);
+                fprintf(stderr, "agp-diff: on\n");
+            }
+        }
+        uint64_t agp_b = 0;
+        for (unsigned i = 0; i < cap.plan.n; i++) {
+            if (!r300_build_vram_range(s, &cap.plan.r[i])) {
+                agp_b += cap.plan.r[i].len;
+            }
+        }
+        if (ad.on && agp_b) {
+            R300DrawPacket pa = { 0 }, pb = { 0 };
+            const char *ea = NULL, *eb = NULL;
+            uint64_t f0 = agp_fills;
+            bool oka = idx ?
+                r300_draw_build_indexed(s->r3, &s->r3_arrays, d[0], idx,
+                                        r300_read_raw, s, &pa, &ea) :
+                r300_draw_build(s->r3, &s->r3_arrays, opcode, d, ndw,
+                                r300_read_raw, s, &pa, &ea);
+            ad.fills += agp_fills - f0;
+            bool okb = idx ?
+                r300_draw_build_indexed(s->r3, &s->r3_arrays, d[0], idx,
+                                        r300_capture_read, &cap, &pb, &eb) :
+                r300_draw_build(s->r3, &s->r3_arrays, opcode, d, ndw,
+                                r300_capture_read, &cap, &pb, &eb);
+            ad.draws++;
+            ad.bytes_agp += agp_b;
+            if (!oka) {
+                ad.ord_fail++;
+            }
+            if (!okb) {
+                ad.cap_fail++;
+            }
+            if (oka && okb) {
+                if (ad_same_packet(&pa, &pb)) {
+                    ad.same++;
+                } else {
+                    ad.differ++;
+                    if (ad.logged++ < 5) {
+                        fprintf(stderr, "agp-diff: draw %" PRIu64 " differs (verts %u, vs_in_vecs %u)\n",
+                                ad.draws, pa.num_verts, pa.vs_in_vecs);
+                    }
+                }
+            }
+            r300_draw_free(&pa);
+            r300_draw_free(&pb);
+            if (g_get_monotonic_time() >= ad.next) {
+                ad.next = g_get_monotonic_time() + 10 * 1000000;
+                ad_report("");
+            }
+        }
+    }
     w = cp_wait_unlock();
     r300_draw_parked_begin();
     *ok = idx ?
@@ -7292,6 +7407,7 @@ static uint8_t *r200_agp_page(PPCMacGPUState *s, uint32_t gpu_addr)
         return NULL;
     }
     uint8_t *h = (uint8_t *)memory_region_get_ram_ptr(mr) + xlat;
+    agp_fills++;
     r200_agp_tc[i].tag = page + 1;
     r200_agp_tc[i].host = h;
     return h;
