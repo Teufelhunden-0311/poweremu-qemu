@@ -51,6 +51,7 @@
 #include "hw/hw.h"
 #include "trace.h"
 #include "qemu/processor.h"
+#include "system/tcg.h"
 #include "qemu/cutils.h"
 
 #ifdef CONFIG_LINUX
@@ -425,15 +426,46 @@ static void bql_spin_init(void);
 
 /*
  * PPC_BQL_SPIN_NS (experiment, default off; AI-generated): before the
- * blocking BQL acquire, the vCPU thread retries a try-lock for at most
- * this many nanoseconds (1..5000).  Unset, empty or 0 keeps the old path
- * with no clock reads.  Only on Darwin/aarch64 for now, only on a vCPU
- * thread (current_cpu set), and only when the BQL lock function is the
- * plain qemu_mutex_lock_impl (not under sync-profile).  Condition-variable
- * reacquisition and every other thread are unchanged.
+ * blocking BQL acquire, the vCPU thread retries a try-lock with an N-ns
+ * elapsed-time budget (1..5000) checked after failed attempts; preemption
+ * and an in-flight attempt can exceed it.  Unset, empty or 0 keeps the old
+ * path with no clock reads.
+ * Eligible only on Darwin/aarch64, with TCG and exactly one configured vCPU
+ * (decided in qemu_init_vcpu, before the vCPU thread starts), on that
+ * vCPU's own execution thread, and while neither the BQL lock function
+ * nor the try-lock function is substituted (sync-profile).  Everything
+ * else -- other threads, condition-variable reacquisition -- keeps the
+ * old path.
  */
 #define BQL_SPIN_MAX_NS 5000
-static int64_t bql_spin_ns;
+static int64_t bql_spin_ns;         /* parsed request */
+static int64_t bql_spin_active_ns;  /* nonzero only once eligible */
+
+static void bql_spin_configure(CPUState *cpu)
+{
+    MachineState *ms = MACHINE(qdev_get_machine());
+    const char *why = NULL;
+
+    if (!bql_spin_ns) {
+        return;
+    }
+    if (!tcg_enabled()) {
+        why = "not TCG";
+    } else if (ms->smp.cpus != 1 || ms->smp.max_cpus != 1) {
+        why = "more than one vCPU configured";
+    } else if (cpu->cpu_index != 0) {
+        why = "second vCPU";
+    }
+    if (why) {
+        qatomic_set(&bql_spin_active_ns, 0);
+        fprintf(stderr, "bql-spin: PPC_BQL_SPIN_NS=%" PRId64 " not used: %s\n",
+                bql_spin_ns, why);
+        return;
+    }
+    qatomic_set(&bql_spin_active_ns, bql_spin_ns);
+    fprintf(stderr, "bql-spin: vCPU try-lock budget %" PRId64
+            " ns (TCG, one vCPU)\n", bql_spin_ns);
+}
 
 static void bql_spin_init(void)
 {
@@ -449,10 +481,7 @@ static void bql_spin_init(void)
         return;
     }
 #if defined(__APPLE__) && defined(__aarch64__)
-    bql_spin_ns = ns;
-    if (ns) {
-        fprintf(stderr, "bql-spin: vCPU try-lock budget %" PRIu64 " ns\n", ns);
-    }
+    bql_spin_ns = ns;   /* used once qemu_init_vcpu finds it eligible */
 #else
     if (ns) {
         fprintf(stderr, "bql-spin: PPC_BQL_SPIN_NS ignored: Darwin/aarch64 "
@@ -490,7 +519,7 @@ static void bql_spin_acquire(const char *file, int line, BQLSpinOut *o)
         return;
     }
     o->t0 = bql_spin_clock();
-    deadline = o->t0 + bql_spin_ns;
+    deadline = o->t0 + qatomic_read(&bql_spin_active_ns);
     do {
         cpu_relax();
         o->tries++;
@@ -518,6 +547,8 @@ static void bql_spin_acquire(const char *file, int line, BQLSpinOut *o)
 /* DIAG: spin counters, written only under the BQL (after the acquire). */
 typedef struct {
     uint64_t other;                 /* bql_lock off a vCPU thread */
+    uint64_t notself;               /* current_cpu set, not its thread */
+    uint64_t wrap;                  /* lock or try-lock substituted */
     uint64_t imm, spin, exp;
     uint64_t spin_tries, spin_ns;
     uint64_t spin_th[7];            /* tries 1,2,3-4,5-8,9-16,17-64,65+ */
@@ -528,7 +559,7 @@ typedef struct {
 } BQLSpinStats;
 static BQLSpinStats bs, bs_snap;
 
-static void bql_spin_count(const BQLSpinOut *o, int64_t t_ret, bool vcpu)
+static void bql_spin_count(const BQLSpinOut *o, int64_t t_ret, int vcpu)
 {
     static const int64_t sh[6] = { 250, 500, 1000, 2000, 3000, 5000 };
     static const int64_t bh[7] = { 1000, 2000, 5000, 10000, 20000, 50000,
@@ -536,8 +567,10 @@ static void bql_spin_count(const BQLSpinOut *o, int64_t t_ret, bool vcpu)
     int64_t d;
     int i;
 
-    if (!vcpu) {
-        bs.other++;
+    if (vcpu <= 0) {
+        if (vcpu == 0) bs.other++;
+        else if (vcpu == -1) bs.notself++;
+        else bs.wrap++;
         return;
     }
     switch (o->res) {
@@ -1276,13 +1309,13 @@ static void wp_print(void)
             wp_rs_snap.v_nr_h[0], wp_rs_snap.v_nr_h[1], wp_rs_snap.v_nr_h[2], wp_rs_snap.v_nr_h[3],
             wp_rs_snap.v_nr_h[4], wp_rs_snap.v_nr_h[5], wp_rs_snap.v_nr_h[6], wp_rs_snap.v_nr_h[7]);
     fprintf(stderr, "wp-spin budget_ns=%" PRId64 " imm=%" PRIu64 " spin=%" PRIu64
-            " exp=%" PRIu64 " other=%" PRIu64 " spin_tries=%" PRIu64 " spin_ms=%.3f"
+            " exp=%" PRIu64 " other=%" PRIu64 " notself=%" PRIu64 " wrap=%" PRIu64 " spin_tries=%" PRIu64 " spin_ms=%.3f"
             " spin_th=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
             "/%" PRIu64 " spin_h=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
             "/%" PRIu64 "/%" PRIu64 " exp_tries=%" PRIu64 " exp_ms=%.3f exp_max_ns=%" PRIu64
             " blk_ms=%.3f blk_max_us=%.1f blk_h=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
             "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "\n",
-            bql_spin_ns, bs_snap.imm, bs_snap.spin, bs_snap.exp, bs_snap.other,
+            qatomic_read(&bql_spin_active_ns), bs_snap.imm, bs_snap.spin, bs_snap.exp, bs_snap.other, bs_snap.notself, bs_snap.wrap,
             bs_snap.spin_tries, bs_snap.spin_ns / 1e6, bs_snap.spin_th[0],
             bs_snap.spin_th[1], bs_snap.spin_th[2], bs_snap.spin_th[3], bs_snap.spin_th[4],
             bs_snap.spin_th[5], bs_snap.spin_th[6], bs_snap.spin_h[0], bs_snap.spin_h[1],
@@ -1328,17 +1361,26 @@ void bql_lock_impl(const char *file, int line)
     BQLSpinOut so = { .res = BS_NONE };
 
     g_assert(!bql_locked());
-    if (unlikely(bql_spin_ns) && current_cpu &&
-        bql_lock_fn == qemu_mutex_lock_impl) {
-        bql_spin_acquire(file, line, &so);
+    int elig = 0;   /* DIAG: 1 spin path, 0 not a vCPU, -1 not self, -2 substituted */
+    if (unlikely(qatomic_read(&bql_spin_active_ns)) && current_cpu) {
+        if (!qemu_cpu_is_self(current_cpu)) {
+            elig = -1;
+        } else if (bql_lock_fn != qemu_mutex_lock_impl ||
+                   qatomic_read(&qemu_mutex_trylock_func) !=
+                   qemu_mutex_trylock_impl) {
+            elig = -2;
+        } else {
+            elig = 1;
+            bql_spin_acquire(file, line, &so);
+        }
     }
     if (so.res != BS_IMM && so.res != BS_SPIN) {
         bql_lock_fn(&bql, file, line);
     }
     int64_t t_ret = (t_req || so.res == BS_EXP) ? wp_clock() : 0;
     set_bql_locked(true);
-    if (unlikely(bql_spin_ns)) {
-        bql_spin_count(&so, t_ret, current_cpu != NULL);
+    if (unlikely(qatomic_read(&bql_spin_active_ns))) {
+        bql_spin_count(&so, t_ret, elig);
     }
     if (t_req) {
         if (!wp_last_dump) {
@@ -1553,6 +1595,9 @@ void qemu_init_vcpu(CPUState *cpu)
         cpu->num_ases = 1;
         cpu_address_space_init(cpu, 0, "cpu-memory", cpu->memory);
     }
+
+    /* before the vCPU thread exists, so it sees the decision */
+    bql_spin_configure(cpu);
 
     /* accelerators all implement the AccelOpsClass */
     g_assert(cpus_accel != NULL && cpus_accel->create_vcpu_thread != NULL);
