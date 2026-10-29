@@ -4063,10 +4063,72 @@ static int r300_draw_staged(PPCMacGPUState *s, uint8_t *vram, R300DrawPacket *pk
  * Returns 1 with *pkt, *err and *ok as the build left them, 0 if the draw is
  * to be built the usual way (nothing allocated), -1 if the segment was
  * cancelled (nothing allocated).
+ *
+ * PPCGPU_BUILD_UNLOCK_AGP=1 (default off; only with PPCGPU_BUILD_UNLOCK=1;
+ * AI-generated): arrays in AGP memory too, but only pages r200_agp_page's
+ * cache already holds.  Every 4 KiB piece of such a range (split as
+ * r300_read_raw splits it) must be system memory entirely inside the AGP
+ * aperture with no part in an enabled PCI GART aperture, and its page must
+ * already be cached under the current configuration (r200_agp_cached: a
+ * look that never flushes, walks a page table or fills an entry).  The
+ * copy then reads exactly what r300_read_raw would read through the cache
+ * right now: every read is a hit, so no read can evict another (two of the
+ * draw's pages can't both hit one bucket) and the order of reads doesn't
+ * matter.  Anything else -- a miss, a changed configuration, the PCI GART --
+ * builds the usual way, with the cache untouched.
  */
 #define R300_BUILD_CAPTURE_MAX (4 * MiB)
 static bool r300_build_unlock;      /* PPCGPU_BUILD_UNLOCK, read at realize */
+static bool r300_build_unlock_agp;  /* PPCGPU_BUILD_UNLOCK_AGP, read at realize */
+static uint8_t *r200_agp_cached(PPCMacGPUState *s, uint32_t page);
 static bool r300_build_debug;       /* a debug capture is on: never */
+
+/* A planned range r300_read_raw would read from VRAM (its first case). */
+static bool r300_build_vram_range(PPCMacGPUState *s, const R300FetchRange *r)
+{
+    uint32_t fb_base = (s->regs.mc_fb_location & 0xFFFF) << 16;
+
+    return r300_in_fb(s, r->gpu, r->len) && r->gpu >= fb_base &&
+           (uint64_t)(r->gpu - fb_base) + r->len <= s->vram_size;
+}
+
+/*
+ * PPCGPU_BUILD_UNLOCK_AGP: is every piece of r AGP memory already in
+ * r200_agp_page's cache (see above)?  With dst, also copy it there.  Under
+ * the BQL; no side effects on the cache or the device.
+ */
+static bool r300_build_agp_range(PPCMacGPUState *s, const R300FetchRange *r,
+                                 uint8_t *dst)
+{
+    uint32_t a = r->gpu, len = r->len;
+
+    if (!r300_build_unlock_agp || !len ||
+        (uint64_t)a + len > 0x100000000ull) {
+        return false;
+    }
+    RCU_READ_LOCK_GUARD();
+    while (len) {
+        uint32_t n = MIN(len, 0x1000 - (a & 0xFFF));
+        uint8_t *page;
+
+        if (!r300_sys_span(s, a, n) || !r300_in_agp(s, a, n) ||
+            ((s->regs.aic_ctrl & 1) && a <= s->regs.aic_hi_addr &&
+             (uint64_t)a + n - 1 >= s->regs.aic_lo_addr)) {
+            return false;               /* not AGP alone */
+        }
+        page = r200_agp_cached(s, a >> 12);
+        if (!page) {
+            return false;
+        }
+        if (dst) {
+            memcpy(dst, page + (a & 0xFFF), n);
+            dst += n;
+        }
+        a += n;
+        len -= n;
+    }
+    return true;
+}
 
 static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
                              const uint32_t *d, uint32_t ndw,
@@ -4088,9 +4150,8 @@ static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
     }
     for (unsigned i = 0; i < cap.plan.n; i++) {
         const R300FetchRange *r = &cap.plan.r[i];
-        if (!r300_in_fb(s, r->gpu, r->len) || r->gpu < fb_base ||
-            (uint64_t)(r->gpu - fb_base) + r->len > s->vram_size) {
-            return 0;                   /* VRAM only (r300_read_raw's first case) */
+        if (!r300_build_vram_range(s, r) && !r300_build_agp_range(s, r, NULL)) {
+            return 0;                   /* VRAM, or AGP pages already cached */
         }
     }
     cap.buf = cap.plan.total ? g_try_malloc(cap.plan.total) : NULL;
@@ -4101,7 +4162,12 @@ static int r300_build_parked(PPCMacGPUState *s, uint32_t opcode,
            memory_region_get_ram_ptr(&s->vram);
     for (unsigned i = 0; i < cap.plan.n; i++) {
         const R300FetchRange *r = &cap.plan.r[i];
-        memcpy(cap.buf + at, vram + (r->gpu - fb_base), r->len);
+        if (r300_build_vram_range(s, r)) {
+            memcpy(cap.buf + at, vram + (r->gpu - fb_base), r->len);
+        } else if (!r300_build_agp_range(s, r, cap.buf + at)) {
+            g_free(cap.buf);            /* (can't change under the BQL) */
+            return 0;
+        }
         at += r->len;
     }
 
@@ -7173,6 +7239,27 @@ typedef struct R200AgpCfg {
     uint32_t agp_loc, aic_ctrl, aic_lo, aic_hi, aic_pt, r300_pt, bridge_gen;
 } R200AgpCfg;
 static R200AgpCfg r200_agp_tc_cfg;
+
+/*
+ * The host page r200_agp_page would return for GPU page `page` from its
+ * cache right now, or NULL if it would have to flush (configuration
+ * changed), walk or fill.  Never changes the cache.
+ */
+static uint8_t *r200_agp_cached(PPCMacGPUState *s, uint32_t page)
+{
+    R200AgpCfg cfg = {
+        s->regs.mc_agp_location, s->regs.aic_ctrl, s->regs.aic_lo_addr,
+        s->regs.aic_hi_addr, s->regs.aic_pt_base, s->r300_aic_pt_base,
+        uninorth_get_agp_gart_gen(),
+    };
+    uint32_t i = page & (ARRAY_SIZE(r200_agp_tc) - 1);
+
+    if (memcmp(&cfg, &r200_agp_tc_cfg, sizeof(cfg)) ||
+        r200_agp_tc[i].tag != page + 1) {
+        return NULL;
+    }
+    return r200_agp_tc[i].host;
+}
 
 static uint8_t *r200_agp_page(PPCMacGPUState *s, uint32_t gpu_addr)
 {
@@ -14533,12 +14620,15 @@ static void ppc_mac_gpu_realize(PCIDevice *dev, Error **errp)
         r300_glsl_share = e && e[0] == '1';
         e = getenv("PPCGPU_BUILD_UNLOCK");
         r300_build_unlock = e && e[0] == '1';
+        e = getenv("PPCGPU_BUILD_UNLOCK_AGP");
+        r300_build_unlock_agp = r300_build_unlock && e && e[0] == '1';
         r300_build_debug = getenv("R300_CAP") || getenv("R300_GLSLDUMP") ||
                            getenv("R300_DXTDUMP") || getenv("R300_DUMP");
         r300_draw_init_options();       /* before any build without the BQL */
         if (r300_build_unlock) {
             qemu_log("ppc-mac-gpu r300: PPCGPU_BUILD_UNLOCK on: GPU vertex-"
-                     "shader draws with VRAM arrays built with the BQL let go%s\n",
+                     "shader draws with VRAM%s arrays built with the BQL let go%s\n",
+                     r300_build_unlock_agp ? " or cached AGP" : "",
                      r300_build_debug ? " (not now: a debug capture is on)" : "");
         }
     }
