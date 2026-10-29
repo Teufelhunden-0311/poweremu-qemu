@@ -38,11 +38,14 @@ enum {
     WAITPROF_ACT_B_CAPTURE,
     WAITPROF_ACT_R_SETUP,
     WAITPROF_ACT_R_FINAL,
+    /* the CP's PM4 dispatch: type-0 register writes, R300 type-3 packets */
+    WAITPROF_ACT_PM4_T0,
+    WAITPROF_ACT_PM4_R3,
     WAITPROF_NACT
 };
 static const char *const waitprof_act_name[WAITPROF_NACT] __attribute__((unused)) = {
     "none", "build", "submit", "fence", "vramacc", "2d", "display",
-    "b_fetch", "b_vspack", "b_fsmemo", "b_cpu", "b_capture", "r_setup", "r_final" };
+    "b_fetch", "b_vspack", "b_fsmemo", "b_cpu", "b_capture", "r_setup", "r_final", "pm4_t0", "pm4_r3" };
 int waitprof_act(int act);
 #define WAITPROF_ACT(a) (waitprof_on ? waitprof_act(a) : 0)
 #define WAITPROF_ACT_END(prev) do { if (waitprof_on) { waitprof_act(prev); } } while (0)

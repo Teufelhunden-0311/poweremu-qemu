@@ -5221,7 +5221,20 @@ static void r200_traffic_tick(void)
     }
 }
 
-static void ppc_mac_gpu_pm4_process_type0(PPCMacGPUState *s,
+static void ppc_mac_gpu_pm4_process_type0_1(PPCMacGPUState *s, uint32_t reg_base,
+                                            bool one_reg_wr, uint32_t count,
+                                            uint32_t *data);
+/* waitprof debug: label type-0 register writes */
+static void ppc_mac_gpu_pm4_process_type0(PPCMacGPUState *s, uint32_t reg_base,
+                                          bool one_reg_wr, uint32_t count,
+                                          uint32_t *data)
+{
+    int wp = WAITPROF_ACT(WAITPROF_ACT_PM4_T0);
+    ppc_mac_gpu_pm4_process_type0_1(s, reg_base, one_reg_wr, count, data);
+    WAITPROF_ACT_END(wp);
+}
+
+static void ppc_mac_gpu_pm4_process_type0_1(PPCMacGPUState *s,
                                            uint32_t reg_base,
                                            bool one_reg_wr,
                                            uint32_t count,
@@ -9357,7 +9370,10 @@ static void ppc_mac_gpu_process_pm4(PPCMacGPUState *s,
             uint32_t body_dw = pkt_count - 1;
             uint32_t body_adv = body_dw;   /* 0x1B may widen body_dw */
             uint32_t *d = &pm4_data[i];
-            if (s->r3 && ppc_mac_gpu_r300_packet3(s, opcode, d, body_dw)) {
+            int wp_r3 = WAITPROF_ACT(WAITPROF_ACT_PM4_R3);
+            bool r3_used = s->r3 && ppc_mac_gpu_r300_packet3(s, opcode, d, body_dw);
+            WAITPROF_ACT_END(wp_r3);
+            if (r3_used) {
                 opcode = 0x10;      /* consumed: let the common path see a NOP */
             }
             if (opcode == 0x29) {

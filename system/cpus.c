@@ -723,8 +723,8 @@ typedef struct { uint16_t w, o; uint8_t a; uint64_t ns, n; } WPPair;
 #define WP_NPAIRS 1024
 static WPPair wp_pair[WP_NPAIRS];
 static int wp_npairs;
-typedef struct { uint16_t site; uint8_t act; int64_t t0, t1; } WPHold;
-#define WP_RING 16384
+typedef struct { uint16_t site; uint8_t act, rel; int64_t t0, t1, t0p, t1p; } WPHold;
+#define WP_RING 65536
 static WPHold wp_ring[WP_RING];
 static uint64_t wp_ring_head;
 static __thread int wp_cur = -1;
@@ -737,6 +737,17 @@ static __thread int64_t wp_hold_t0, wp_last_rel;
  */
 static __thread int wp_act_cur;
 static __thread int64_t wp_seg_t0;
+/* Residual pass: this segment's physical start (t_ret for a hold's first
+ * segment), and this thread's last release record (index + 1). */
+static __thread int64_t wp_seg_t0p;
+static __thread uint64_t wp_last_rec;
+#define WP_NR2A 8
+static const int64_t wp_r2a_lim[WP_NR2A - 1] = {
+    1000, 2000, 5000, 10000, 20000, 50000, 100000 };
+static struct {
+    uint64_t w1p, ownedp, residp, rel_instr, rel_n, snap, snap_n, acq_instr, acq_n;
+    uint64_t v_w1p, v_residp, v_r2a, v_r2a_h[WP_NR2A], v_rels[5], v_norel;
+} wp_rs, wp_rs_snap;
 static __thread bool wp_held;
 static uint64_t wp_occ[256][WAITPROF_NACT];
 /* Accounting checks: waits >= 1 us (total, attributed to holds, free), lost records. */
@@ -797,7 +808,53 @@ static void wp_pair_add(int w, int o, int a, int64_t ns)
     }
 }
 
-static void wp_acquired(const char *file, int line, int64_t t_req)
+/* Residual pass: the wait [t_req, t_ret] against physical hold boundaries. */
+static void wp_resid(int64_t t_req, int64_t t_ret)
+{
+    int64_t wait = t_ret - t_req, owned = 0, last_rel = 0;
+    unsigned rels = 0;
+    bool vcpu = current_cpu != NULL;
+
+    if (wait < 1000) {
+        return;
+    }
+    for (uint64_t k = 0; k < WP_RING && k < wp_ring_head; k++) {
+        WPHold *h = &wp_ring[(wp_ring_head - 1 - k) % WP_RING];
+        if (h->t1p <= t_req) {
+            break;
+        }
+        int64_t ov = MIN(h->t1p, t_ret) - MAX(h->t0p, t_req);
+        if (ov > 0) {
+            owned += ov;
+        }
+        if (h->rel && h->t1p <= t_ret) {
+            rels++;
+            last_rel = MAX(last_rel, h->t1p);
+        }
+    }
+    wp_rs.w1p += wait;
+    wp_rs.ownedp += MIN(owned, wait);
+    wp_rs.residp += wait > owned ? wait - owned : 0;
+    if (!vcpu) {
+        return;
+    }
+    wp_rs.v_w1p += wait;
+    wp_rs.v_residp += wait > owned ? wait - owned : 0;
+    wp_rs.v_rels[MIN(rels, 4u)]++;
+    if (!rels) {
+        wp_rs.v_norel++;            /* no release recorded inside the wait */
+        return;
+    }
+    int64_t r2a = t_ret - last_rel;
+    int b = 0;
+    while (b < WP_NR2A - 1 && r2a >= wp_r2a_lim[b]) {
+        b++;
+    }
+    wp_rs.v_r2a += r2a;
+    wp_rs.v_r2a_h[b]++;
+}
+
+static void wp_acquired(const char *file, int line, int64_t t_req, int64_t t_ret)
 {
     int64_t now = get_clock(), wait = now - t_req;
     int w = wp_site_find(file, line);
@@ -805,7 +862,11 @@ static void wp_acquired(const char *file, int line, int64_t t_req)
     wp_cur = w;
     wp_hold_t0 = now;
     wp_seg_t0 = now;
+    wp_seg_t0p = t_ret;
     wp_held = true;
+    wp_resid(t_req, t_ret);
+    wp_rs.acq_instr += get_clock() - t_ret;
+    wp_rs.acq_n++;
     if (w < 0) {
         return;
     }
@@ -857,10 +918,11 @@ static void wp_seg_close(int64_t now)
             }
         }
         wp_ring[wp_ring_head++ % WP_RING] =
-            (WPHold){ wp_cur, wp_act_cur, wp_seg_t0, now };
+            (WPHold){ wp_cur, wp_act_cur, 0, wp_seg_t0, now, wp_seg_t0p && wp_seg_t0p < wp_seg_t0 ? wp_seg_t0p : wp_seg_t0, now };
         wp_occ[wp_cur][wp_act_cur] += now - wp_seg_t0;
     }
     wp_seg_t0 = now;
+    wp_seg_t0p = now;
 }
 
 int waitprof_act(int act)
@@ -882,7 +944,14 @@ static bool wp_release(void)
         wp_site[wp_cur].hold += now - wp_hold_t0;
         wp_site[wp_cur].hhist[wp_bucket(now - wp_hold_t0)]++;
     }
+    uint64_t head0 = wp_ring_head;
     wp_seg_close(now);
+    if (wp_ring_head != head0) {
+        wp_ring[(wp_ring_head - 1) % WP_RING].rel = 1;
+        wp_last_rec = wp_ring_head;
+    } else {
+        wp_last_rec = 0;
+    }
     wp_held = false;
     wp_last_rel = now;
     return wp_last_dump && now - wp_last_dump >= 10 * NANOSECONDS_PER_SECOND;
@@ -939,7 +1008,21 @@ static void wp_snapshot(void)
     wp_npairs = 0;
     wp_nidle = 0;
     wp_execlat = wp_execlat_n = 0;
+    wp_rs_snap = wp_rs;
+    memset(&wp_rs, 0, sizeof(wp_rs));
     wp_last_dump = now;
+}
+
+/* Still holding: this thread's last release record ends physically at t. */
+static void wp_phys_release(int64_t t)
+{
+    if (wp_last_rec) {
+        WPHold *h = &wp_ring[(wp_last_rec - 1) % WP_RING];
+        wp_rs.rel_instr += t - h->t1;
+        wp_rs.rel_n++;
+        h->t1p = t;
+        wp_last_rec = 0;
+    }
 }
 
 static const char *wp_sname(WPSite *s, char *buf, size_t n)
@@ -993,6 +1076,19 @@ static void wp_print(void)
             wp_snap.ring_trunc, wp_snap.pair_drop, wp_snap.site_drop,
             wp_snap.overlap / 1e6, wp_snap.rawcw[0], wp_snap.rawcw[1],
             wp_snap.rawcw[2], wp_snap.rawcw[3]);
+    fprintf(stderr, "wp-resid w1p_ms=%.2f ownedp_ms=%.2f residp_ms=%.2f rel_instr_ms=%.2f rel_n=%" PRIu64
+            " snap_ms=%.3f snap_n=%" PRIu64 " acq_instr_ms=%.2f acq_n=%" PRIu64 " | vcpu w1p_ms=%.2f"
+            " residp_ms=%.2f r2a_ms=%.2f r2a_h=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+            "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 " rels=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+            "/%" PRIu64 " norel=%" PRIu64 "\n",
+            wp_rs_snap.w1p / 1e6, wp_rs_snap.ownedp / 1e6, wp_rs_snap.residp / 1e6,
+            wp_rs_snap.rel_instr / 1e6, wp_rs_snap.rel_n, wp_rs_snap.snap / 1e6, wp_rs_snap.snap_n,
+            wp_rs_snap.acq_instr / 1e6, wp_rs_snap.acq_n, wp_rs_snap.v_w1p / 1e6,
+            wp_rs_snap.v_residp / 1e6, wp_rs_snap.v_r2a / 1e6, wp_rs_snap.v_r2a_h[0],
+            wp_rs_snap.v_r2a_h[1], wp_rs_snap.v_r2a_h[2], wp_rs_snap.v_r2a_h[3], wp_rs_snap.v_r2a_h[4],
+            wp_rs_snap.v_r2a_h[5], wp_rs_snap.v_r2a_h[6], wp_rs_snap.v_r2a_h[7], wp_rs_snap.v_rels[0],
+            wp_rs_snap.v_rels[1], wp_rs_snap.v_rels[2], wp_rs_snap.v_rels[3], wp_rs_snap.v_rels[4],
+            wp_rs_snap.v_norel);
     fprintf(stderr, "wp-park cumulative vcpu_n=%" PRIu64 " vcpu_ms=%.2f other_n=%"
             PRIu64 " other_ms=%.2f\n", wp_park_n[0], wp_park_ns[0] / 1e6,
             wp_park_n[1], wp_park_ns[1] / 1e6);
@@ -1030,12 +1126,13 @@ void bql_lock_impl(const char *file, int line)
 
     g_assert(!bql_locked());
     bql_lock_fn(&bql, file, line);
+    int64_t t_ret = t_req ? get_clock() : 0;
     set_bql_locked(true);
     if (t_req) {
         if (!wp_last_dump) {
             wp_last_dump = get_clock();
         }
-        wp_acquired(file, line, t_req);
+        wp_acquired(file, line, t_req, t_ret);
     }
 }
 
@@ -1046,8 +1143,14 @@ void bql_unlock(void)
     g_assert(bql_locked());
     g_assert(!bql_unlock_blocked);
     if (waitprof_on && wp_release()) {
+        int64_t s0 = get_clock();
         wp_snapshot();
+        wp_rs.snap += get_clock() - s0;     /* counted in the next window */
+        wp_rs.snap_n++;
         dump = true;
+    }
+    if (waitprof_on) {
+        wp_phys_release(get_clock());
     }
     set_bql_locked(false);
     qemu_mutex_unlock(&bql);
@@ -1060,10 +1163,11 @@ void qemu_cond_wait_bql(QemuCond *cond)
 {
     if (waitprof_on) {
         wp_release();
+        wp_phys_release(get_clock());
     }
     qemu_cond_wait(cond, &bql);
     if (waitprof_on) {
-        wp_hold_t0 = wp_seg_t0 = get_clock();     /* same site holds again */
+        wp_hold_t0 = wp_seg_t0 = wp_seg_t0p = get_clock();     /* same site holds again */
         wp_held = true;
     }
 }
@@ -1105,10 +1209,11 @@ void qemu_cond_timedwait_bql(QemuCond *cond, int ms)
 {
     if (waitprof_on) {
         wp_release();
+        wp_phys_release(get_clock());
     }
     qemu_cond_timedwait(cond, &bql, ms);
     if (waitprof_on) {
-        wp_hold_t0 = wp_seg_t0 = get_clock();
+        wp_hold_t0 = wp_seg_t0 = wp_seg_t0p = get_clock();
         wp_held = true;
     }
 }
