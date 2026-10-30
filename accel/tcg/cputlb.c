@@ -48,6 +48,11 @@
 #include "qemu/plugin-memory.h"
 #endif
 #include "tcg/tcg-ldst.h"
+#if defined(TARGET_PPC) && !defined(TARGET_PPC64)
+#include "cpu.h"
+#include "hw/boards.h"
+#include "hw/qdev-core.h"
+#endif
 
 /* DEBUG defines, enable DEBUG_TLB_LOG to log to the CPU_LOG_MMU target */
 /* #define DEBUG_TLB */
@@ -93,6 +98,74 @@ QEMU_BUILD_BUG_ON(NB_MMU_MODES > 16);
 static inline size_t tlb_n_entries(CPUTLBDescFast *fast)
 {
     return (fast->mask >> CPU_TLB_ENTRY_BITS) + 1;
+}
+
+/*
+ * Temporary capacity experiment (AI-generated, Codex; not for merging).
+ * PPC_TLB_USER_MIN_BITS=10..15, with PPC_TLBDIAG=1, raises only the
+ * translated user indexes 0/4/8/12 of this fork's 32-bit hash MMU.
+ * Unset, empty or 0 leaves the normal sizing policy in place. A nonzero
+ * request must be honored or fail the run, including under memory pressure.
+ * Configured at tlb_init, before the sole vCPU starts; immutable afterwards.
+ */
+static CPUState *tlbcap_cpu;
+static size_t tlbcap_user_min;
+
+static void tlbcap_configure(CPUState *cpu)
+{
+    const char *s = getenv("PPC_TLB_USER_MIN_BITS");
+    const char *diag;
+    char *end;
+    long bits;
+
+    if (!s || !*s || !strcmp(s, "0")) {
+        return;
+    }
+    errno = 0;
+    bits = strtol(s, &end, 10);
+    if (errno || end == s || *end || bits < CPU_TLB_DYN_MIN_BITS ||
+        bits > 15 || bits > CPU_TLB_DYN_MAX_BITS) {
+        fprintf(stderr, "tlbcap: invalid PPC_TLB_USER_MIN_BITS; "
+                "want 0 or %d..15 (also within the target maximum)\n",
+                CPU_TLB_DYN_MIN_BITS);
+        exit(EXIT_FAILURE);
+    }
+    diag = getenv("PPC_TLBDIAG");
+    if (!diag || strcmp(diag, "1")) {
+        fprintf(stderr, "tlbcap: PPC_TLB_USER_MIN_BITS requires PPC_TLBDIAG=1\n");
+        exit(EXIT_FAILURE);
+    }
+#if defined(TARGET_PPC) && !defined(TARGET_PPC64)
+    {
+        MachineState *ms = MACHINE(qdev_get_machine());
+
+        QEMU_BUILD_BUG_ON(NB_MMU_MODES != 16);
+        QEMU_BUILD_BUG_ON(PPC_MMU_SLOTS != 4);
+        if (POWERPC_CPU(cpu)->env.mmu_model != POWERPC_MMU_32B ||
+            ms->smp.cpus != 1 || ms->smp.max_cpus != 1 || tlbcap_cpu) {
+            fprintf(stderr, "tlbcap: requires 32-bit hash MMU and exactly "
+                    "one configured vCPU, initialized once\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+    tlbcap_user_min = (size_t)1 << bits;
+    tlbcap_cpu = cpu;
+    fprintf(stderr, "tlbcap: diagnostic user_min_bits=%ld entries=%zu "
+            "idxmap=0x1111; allocation below floor is fatal\n",
+            bits, tlbcap_user_min);
+#else
+    fprintf(stderr, "tlbcap: requires the 32-bit PPC system target\n");
+    exit(EXIT_FAILURE);
+#endif
+}
+
+static size_t tlbcap_min_entries(CPUState *cpu, int mmu_idx)
+{
+    if (cpu == tlbcap_cpu && (unsigned)mmu_idx < 16 &&
+        (0x1111u & (1u << mmu_idx))) {
+        return tlbcap_user_min;
+    }
+    return (size_t)1 << CPU_TLB_DYN_MIN_BITS;
 }
 
 
@@ -162,6 +235,7 @@ static void tlbdiag_poll(CPUState *cpu)
     for (i = 0; i < NB_MMU_MODES; i++) {
         sizes[i] = tlb_n_entries(&cpu->neg.tlb.f[i]);
         used[i] = cpu->neg.tlb.d[i].n_used_entries;
+        g_assert(sizes[i] >= tlbcap_min_entries(cpu, i));
     }
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
 
@@ -182,14 +256,15 @@ static void tlbdiag_poll(CPUState *cpu)
         TLBDiagIndex *d = &tlbdiag.idx[i];
         /* Print every index: an empty index's learned size matters too. */
         fprintf(stderr, "tlbdiag seq=%" PRIu64 " ns=%" PRId64
-                " kind=idx idx=%d entries=%zu used_approx=%zu"
+                " kind=idx idx=%d entries=%zu floor_entries=%zu used_approx=%zu"
                 " whole=%" PRIu64 " page=%" PRIu64 " class=%" PRIu64
                 " grow=%" PRIu64 " shrink=%" PRIu64
                 " victim_ld=%" PRIu64 " victim_st=%" PRIu64
                 " victim_if=%" PRIu64 " refill_ld=%" PRIu64
                 " refill_st=%" PRIu64 " refill_if=%" PRIu64
                 " probe=%" PRIu64 "\n",
-                seq, now, i, sizes[i], used[i], d->whole, d->page,
+                seq, now, i, sizes[i], tlbcap_min_entries(cpu, i),
+                used[i], d->whole, d->page,
                 d->class_flush, d->grow, d->shrink,
                 d->victim[MMU_DATA_LOAD], d->victim[MMU_DATA_STORE],
                 d->victim[MMU_INST_FETCH], d->refill[MMU_DATA_LOAD],
@@ -351,7 +426,7 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
  * conflict misses.
  */
 static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
-                                  int64_t now)
+                                  int64_t now, size_t min_entries)
 {
     size_t old_size = tlb_n_entries(fast);
     size_t rate;
@@ -384,9 +459,10 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
         if (expected_rate > 70) {
             ceil *= 2;
         }
-        new_size = MAX(ceil, 1 << CPU_TLB_DYN_MIN_BITS);
+        new_size = MAX(ceil, min_entries);
     }
 
+    new_size = MAX(new_size, min_entries);
     if (new_size == old_size) {
         if (window_expired) {
             tlb_window_reset(desc, now, desc->n_used_entries);
@@ -413,14 +489,20 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
      * memory, so going back to half of new_size has a good chance of working.
      * Increased memory pressure elsewhere in the system might cause the
      * allocations to fail though, so we progressively reduce the allocation
-     * size, aborting if we cannot even allocate the smallest TLB we support.
+     * size, aborting if we cannot allocate this index's minimum. Do not
+     * silently turn a capacity-controlled run into a smaller-table run.
      */
     while (fast->table == NULL || desc->fulltlb == NULL) {
-        if (new_size == (1 << CPU_TLB_DYN_MIN_BITS)) {
+        if (new_size == min_entries) {
+            if (min_entries > ((size_t)1 << CPU_TLB_DYN_MIN_BITS)) {
+                fprintf(stderr, "tlbcap: cannot allocate required %zu-entry "
+                        "TLB floor; stopping diagnostic\n", min_entries);
+                abort();
+            }
             error_report("%s: %s", __func__, strerror(errno));
             abort();
         }
-        new_size = MAX(new_size >> 1, 1 << CPU_TLB_DYN_MIN_BITS);
+        new_size = MAX(new_size >> 1, min_entries);
         fast->mask = (new_size - 1) << CPU_TLB_ENTRY_BITS;
 
         g_free(fast->table);
@@ -448,7 +530,7 @@ static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
 
     size_t old_size = tlb_n_entries(fast);
 
-    tlb_mmu_resize_locked(desc, fast, now);
+    tlb_mmu_resize_locked(desc, fast, now, tlbcap_min_entries(cpu, mmu_idx));
     if (tlbdiag_on(cpu)) {
         TLBDiagIndex *d = &tlbdiag.idx[mmu_idx];
         size_t new_size = tlb_n_entries(fast);
@@ -460,9 +542,10 @@ static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
     tlb_mmu_flush_locked(desc, fast);
 }
 
-static void tlb_mmu_init(CPUTLBDesc *desc, CPUTLBDescFast *fast, int64_t now)
+static void tlb_mmu_init(CPUTLBDesc *desc, CPUTLBDescFast *fast, int64_t now,
+                         size_t min_entries)
 {
-    size_t n_entries = 1 << CPU_TLB_DYN_DEFAULT_BITS;
+    size_t n_entries = MAX((size_t)1 << CPU_TLB_DYN_DEFAULT_BITS, min_entries);
 
     tlb_window_reset(desc, now, 0);
     desc->n_used_entries = 0;
@@ -487,13 +570,15 @@ void tlb_init(CPUState *cpu)
     int64_t now = get_clock_realtime();
     int i;
 
+    tlbcap_configure(cpu);
     qemu_spin_init(&cpu->neg.tlb.c.lock);
 
     /* All tlbs are initialized flushed. */
     cpu->neg.tlb.c.dirty = 0;
 
     for (i = 0; i < NB_MMU_MODES; i++) {
-        tlb_mmu_init(&cpu->neg.tlb.d[i], &cpu->neg.tlb.f[i], now);
+        tlb_mmu_init(&cpu->neg.tlb.d[i], &cpu->neg.tlb.f[i], now,
+                     tlbcap_min_entries(cpu, i));
     }
 }
 
