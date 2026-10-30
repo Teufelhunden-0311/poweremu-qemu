@@ -38,6 +38,7 @@ done
 "$B/test_draw"
 "$B/test_vfetch"
 "$B/test_buildcap"
+python3 test_agpcap.py
 "$B/test_glslshare_address"
 "$B/test_glslshare_thread"
 "$B/test_aperture"
