@@ -38,7 +38,7 @@ with tempfile.TemporaryDirectory(prefix='agpcap-') as tmp:
  cc=shlex.split(os.environ.get('CC','cc'))
  def run(text):
   header.write_text(text)
-  subprocess.run(cc+['-std=gnu11','-O1','-g','-Wall','-Wextra','-Werror','-Wno-unused-function','-Wno-unused-variable','-fsanitize=undefined','-fno-sanitize-recover=all','-I',str(d),str(here/'test_agpcap.c'),'-o',str(exe)],check=True)
+  subprocess.run(cc+['-std=gnu11','-O1','-g','-Wall','-Wextra','-Werror','-Wno-unused-function','-Wno-unused-variable','-Wno-unused-but-set-variable','-fsanitize=undefined','-fno-sanitize-recover=all','-I',str(d),str(here/'test_agpcap.c'),'-o',str(exe)],check=True)
   return subprocess.run([str(exe)],capture_output=True,text=True)
  r=run(code)
  if r.returncode:raise RuntimeError(r.stdout+r.stderr)
