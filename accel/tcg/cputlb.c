@@ -220,6 +220,36 @@ static void tlbrecount_configure(CPUState *cpu)
 #endif
 }
 
+/* AI-generated diagnostic only: retain learned primary-table capacity.
+ * Requires recount so wrapped incremental estimates cannot drive retention.
+ * No eager growth or changed floor. Allocation failure may still shrink.
+ */
+static CPUState *tlbretain_cpu;
+static uint64_t tlbretain_suppressed;
+
+static void tlbretain_configure(CPUState *cpu)
+{
+    const char *s = getenv("PPC_TLB_USER_NOSHRINK");
+
+    if (!s || !*s || !strcmp(s, "0")) {
+        return;
+    }
+    if (strcmp(s, "1") || cpu != tlbrecount_cpu) {
+        fprintf(stderr, "tlbretain: PPC_TLB_USER_NOSHRINK=1 requires the "
+                "validated PPC_TLB_USER_RECOUNT=1 configuration\n");
+        exit(EXIT_FAILURE);
+    }
+    tlbretain_cpu = cpu;
+    fprintf(stderr, "tlbretain: diagnostic user no-policy-shrink idxmap=0x1111; "
+            "growth/floor unchanged; allocation backoff may shrink\n");
+}
+
+static bool tlbretain_on(CPUState *cpu, int mmu_idx)
+{
+    return cpu == tlbretain_cpu && (unsigned)mmu_idx < 16 &&
+           (0x1111u & (1u << mmu_idx));
+}
+
 /* Owner-only, called with tlb.c.lock held; no allocation, clocks or I/O. */
 static bool tlbrecount_apply(CPUState *cpu, int mmu_idx)
 {
@@ -338,6 +368,10 @@ static void tlbres_dump(CPUState *cpu, int64_t report_ns)
         return;
     }
     policy_report_ns = get_clock_realtime();
+    if (cpu == tlbretain_cpu) {
+        fprintf(stderr, "tlbretain kind=summary report_ns=%" PRId64
+                " suppressed=%" PRIu64 "\n", report_ns, tlbretain_suppressed);
+    }
     for (unsigned i = 0; i < tlbres.n; i++) {
         TLBResizeRecord *r = &tlbres.ring[i];
         fprintf(stderr, "tlbres kind=resize report_ns=%" PRId64
@@ -624,7 +658,8 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
  * conflict misses.
  */
 static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
-                                  int64_t now, size_t min_entries, size_t *proposed)
+                                  int64_t now, size_t min_entries, size_t *proposed,
+                                  bool retain_size)
 {
     size_t old_size = tlb_n_entries(fast);
     size_t rate;
@@ -661,6 +696,10 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
     }
 
     new_size = MAX(new_size, min_entries);
+    if (retain_size) {
+        tlbretain_suppressed += new_size < old_size;
+        new_size = MAX(new_size, old_size);
+    }
     if (proposed) {
         *proposed = new_size;
     }
@@ -749,7 +788,8 @@ static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
         record.used = desc->n_used_entries;
     }
     tlb_mmu_resize_locked(desc, fast, now, tlbcap_min_entries(cpu, mmu_idx),
-                          tracing ? &record.proposed : NULL);
+                          tracing ? &record.proposed : NULL,
+                          tlbretain_on(cpu, mmu_idx));
     if (tracing) {
         record.actual = tlb_n_entries(fast);
         tlbres_record(&record);
@@ -795,6 +835,7 @@ void tlb_init(CPUState *cpu)
 
     tlbcap_configure(cpu);
     tlbrecount_configure(cpu);
+    tlbretain_configure(cpu);
     qemu_spin_init(&cpu->neg.tlb.c.lock);
 
     /* All tlbs are initialized flushed. */
