@@ -364,7 +364,8 @@ void ppc_mmu_slot_sync(CPUPPCState *env)
     if (i == PPC_MMU_SLOTS) {
         i = victim;
         memcpy(env->mmu_slot_sr[i], env->sr, sizeof(env->mmu_slot_sr[i]));
-        tlb_flush_by_mmuidx(env_cpu(env), 3 << (4 * i));
+        tlbdiag_slot_flush(env_cpu(env), 3 << (4 * i),
+                            env->mmu_slot_used[i] == 0);
         QEMU_PERF_INC(slot_evict);
     } else {
         QEMU_PERF_INC(slot_hit);
@@ -384,6 +385,7 @@ void ppc_mmu_slots_reset(CPUPPCState *env)
     memcpy(env->mmu_slot_sr[env->mmu_slot], env->sr,
            sizeof(env->mmu_slot_sr[0]));
     env->mmu_slot_used[env->mmu_slot] = ++env->mmu_slot_clock;
+    tlbdiag_slot_reset(env_cpu(env));
 }
 
 /*

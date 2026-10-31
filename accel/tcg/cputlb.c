@@ -200,6 +200,116 @@ static bool tlbdiag_on(CPUState *cpu)
            current_cpu == cpu && qemu_cpu_is_self(cpu);
 }
 
+
+/* AI-generated diagnostic only. One owning vCPU; bounded output, no I/O
+ * or clock reads in record/resize. policy_ns is the resize policy's clock,
+ * not wp_clock/CLOCK_UPTIME_RAW. Reports carry their own raw-clock stamp.
+ */
+#define TLBRES_RING 512
+#define TLBRES_LIMIT 16384
+typedef struct TLBResizeRecord {
+    uint64_t event, resets;
+    int idx, cause;
+    int64_t policy_ns, begin_ns;
+    size_t old, proposed, actual, used, window_max;
+} TLBResizeRecord;
+static struct {
+    TLBResizeRecord ring[TLBRES_RING];
+    unsigned n;
+    int cause;
+    uint64_t event, resets, eligible, kept, emitted, dropped;
+    uint64_t calls[16], unchanged[16], expired[16];
+} tlbres;
+
+static bool tlbres_on(CPUState *cpu)
+{
+    static gsize option;
+    if (g_once_init_enter(&option)) {
+        const char *e = getenv("PPC_TLB_RESIZE_TRACE");
+        g_once_init_leave(&option, e && !strcmp(e, "1") ? 2 : 1);
+    }
+    return option == 2 && tlbdiag_on(cpu);
+}
+
+/* Call only for translated user indexes, on the owning vCPU. */
+static void tlbres_record(TLBResizeRecord *r)
+{
+    r->event = ++tlbres.event;
+    r->resets = tlbres.resets;
+    r->cause = tlbres.cause;
+    tlbres.calls[r->idx]++;
+    tlbres.expired[r->idx] += r->policy_ns > r->begin_ns + 100000000;
+    if (r->proposed == r->old && r->actual == r->old) {
+        tlbres.unchanged[r->idx]++;
+        return;
+    }
+    tlbres.eligible++;
+    if (tlbres.n == TLBRES_RING || tlbres.kept == TLBRES_LIMIT) {
+        tlbres.dropped++;
+        return;
+    }
+    tlbres.ring[tlbres.n++] = *r;
+    tlbres.kept++;
+}
+
+/* Existing refill/sync polling calls this outside tlb.c.lock. No new
+ * heartbeat: the last unpolled batch can remain pending at process exit. */
+static void tlbres_dump(CPUState *cpu, int64_t report_ns)
+{
+    int64_t policy_report_ns;
+    if (!tlbres_on(cpu)) {
+        return;
+    }
+    policy_report_ns = get_clock_realtime();
+    for (unsigned i = 0; i < tlbres.n; i++) {
+        TLBResizeRecord *r = &tlbres.ring[i];
+        fprintf(stderr, "tlbres kind=resize report_ns=%" PRId64
+                " event=%" PRIu64 " resets=%" PRIu64 " idx=%d cause=%d"
+                " policy_ns=%" PRId64 " begin_ns=%" PRId64
+                " old=%zu proposed=%zu actual=%zu used=%zu window_max=%zu\n",
+                report_ns, r->event, r->resets, r->idx, r->cause,
+                r->policy_ns, r->begin_ns, r->old, r->proposed, r->actual,
+                r->used, r->window_max);
+    }
+    tlbres.emitted += tlbres.n;
+    tlbres.n = 0;
+    fprintf(stderr, "tlbres kind=summary report_ns=%" PRId64
+            " policy_report_ns=%" PRId64 " events=%" PRIu64 " resets=%" PRIu64 " eligible=%" PRIu64
+            " kept=%" PRIu64 " emitted=%" PRIu64 " dropped=%" PRIu64 "\n",
+            report_ns, policy_report_ns, tlbres.event, tlbres.resets, tlbres.eligible,
+            tlbres.kept, tlbres.emitted, tlbres.dropped);
+    for (int i = 0; i < 16; i += 4) {
+        fprintf(stderr, "tlbres kind=index report_ns=%" PRId64
+                " idx=%d calls=%" PRIu64 " unchanged=%" PRIu64
+                " expired=%" PRIu64 "\n", report_ns, i,
+                tlbres.calls[i], tlbres.unchanged[i], tlbres.expired[i]);
+    }
+}
+
+/* Source tags describe this synchronous caller, not an inferred guest cause.
+ * 0=other/unknown, 1=unused slot fill, 2=occupied slot replacement. */
+void tlbdiag_slot_flush(CPUState *cpu, uint16_t idxmap, bool unused)
+{
+    int saved;
+    if (!tlbres_on(cpu)) {
+        tlb_flush_by_mmuidx(cpu, idxmap);
+        return;
+    }
+    saved = tlbres.cause;
+    tlbres.cause = unused ? 1 : 2;
+    tlb_flush_by_mmuidx(cpu, idxmap);
+    tlbres.cause = saved;
+}
+
+void tlbdiag_slot_reset(CPUState *cpu)
+{
+    if (tlbres_on(cpu)) {
+        /* Notification AFTER the caller's reset. Does not label the earlier
+         * flush as a reset-caused flush; that direction would be misleading. */
+        tlbres.resets++;
+    }
+}
+
 static int64_t tlbdiag_clock_ns(void)
 {
     struct timespec ts;
@@ -270,6 +380,7 @@ static void tlbdiag_poll(CPUState *cpu)
                 d->victim[MMU_INST_FETCH], d->refill[MMU_DATA_LOAD],
                 d->refill[MMU_DATA_STORE], d->refill[MMU_INST_FETCH], d->probe);
     }
+    tlbres_dump(cpu, now);
 }
 
 /* Optional class-mode hook: call once per index actually scanned, inside
@@ -426,7 +537,7 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
  * conflict misses.
  */
 static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
-                                  int64_t now, size_t min_entries)
+                                  int64_t now, size_t min_entries, size_t *proposed)
 {
     size_t old_size = tlb_n_entries(fast);
     size_t rate;
@@ -463,6 +574,9 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
     }
 
     new_size = MAX(new_size, min_entries);
+    if (proposed) {
+        *proposed = new_size;
+    }
     if (new_size == old_size) {
         if (window_expired) {
             tlb_window_reset(desc, now, desc->n_used_entries);
@@ -530,7 +644,24 @@ static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
 
     size_t old_size = tlb_n_entries(fast);
 
-    tlb_mmu_resize_locked(desc, fast, now, tlbcap_min_entries(cpu, mmu_idx));
+    bool tracing = tlbres_on(cpu) && (unsigned)mmu_idx < 16 &&
+                   (0x1111u & (1u << mmu_idx));
+    TLBResizeRecord record;
+
+    if (tracing) {
+        record = (TLBResizeRecord) {
+            .idx = mmu_idx, .policy_ns = now,
+            .begin_ns = desc->window_begin_ns, .old = old_size,
+            .used = desc->n_used_entries,
+            .window_max = desc->window_max_entries,
+        };
+    }
+    tlb_mmu_resize_locked(desc, fast, now, tlbcap_min_entries(cpu, mmu_idx),
+                          tracing ? &record.proposed : NULL);
+    if (tracing) {
+        record.actual = tlb_n_entries(fast);
+        tlbres_record(&record);
+    }
     if (tlbdiag_on(cpu)) {
         TLBDiagIndex *d = &tlbdiag.idx[mmu_idx];
         size_t new_size = tlb_n_entries(fast);

@@ -30,6 +30,8 @@
  * Refill/sync hooks must run outside the TLB lock. Class hook only counts.
  */
 void tlbdiag_class_flush(CPUState *cpu, int mmu_idx);
+void tlbdiag_slot_flush(CPUState *cpu, uint16_t idxmap, bool unused);
+void tlbdiag_slot_reset(CPUState *cpu);
 void tlbdiag_ppc_refill(CPUState *cpu, int mmu_idx, int access_type,
                         bool probe, int slot, int d_idx, int i_idx);
 void tlbdiag_ppc_sync(CPUState *cpu, int old_slot, int slot,
@@ -270,6 +272,12 @@ void tlb_flush_range_by_mmuidx_all_cpus_synced(CPUState *cpu,
                                                uint16_t idxmap,
                                                unsigned bits);
 #else
+static inline void tlbdiag_slot_flush(CPUState *cpu, uint16_t idxmap, bool unused)
+{
+}
+static inline void tlbdiag_slot_reset(CPUState *cpu)
+{
+}
 static inline void tlbdiag_class_flush(CPUState *cpu, int mmu_idx)
 {
 }
