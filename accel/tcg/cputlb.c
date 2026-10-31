@@ -169,6 +169,82 @@ static size_t tlbcap_min_entries(CPUState *cpu, int mmu_idx)
 }
 
 
+/*
+ * AI-generated diagnostic experiment, not for merging. Recount only occupied
+ * primary entries immediately before translated-user resize decisions. The
+ * incremental estimate can wrap (victim invalidations also decrement it).
+ * This does NOT repair incremental accounting or change invalidation semantics.
+ * O(table size) work under tlb.c.lock makes this unsuitable for timing claims.
+ */
+static CPUState *tlbrecount_cpu;
+static struct {
+    uint64_t calls, mismatch, raw_gt_capacity, scanned;
+} tlbrecount_stats[16];
+
+static inline bool tlb_entry_is_empty(const CPUTLBEntry *te);
+
+static void tlbrecount_configure(CPUState *cpu)
+{
+    const char *s = getenv("PPC_TLB_USER_RECOUNT");
+    const char *diag = getenv("PPC_TLBDIAG");
+    const char *trace = getenv("PPC_TLB_RESIZE_TRACE");
+    const char *slots = getenv("PPC_SR_SLOTS");
+
+    if (!s || !*s || !strcmp(s, "0")) {
+        return;
+    }
+    if (strcmp(s, "1") || !diag || strcmp(diag, "1") ||
+        !trace || strcmp(trace, "1") || !slots || strcmp(slots, "1")) {
+        fprintf(stderr, "tlbrecount: want PPC_TLB_USER_RECOUNT=1 with "
+                "PPC_TLBDIAG=1 PPC_TLB_RESIZE_TRACE=1 PPC_SR_SLOTS=1\n");
+        exit(EXIT_FAILURE);
+    }
+#if defined(TARGET_PPC) && !defined(TARGET_PPC64)
+    {
+        MachineState *ms = MACHINE(qdev_get_machine());
+        QEMU_BUILD_BUG_ON(NB_MMU_MODES != 16);
+        QEMU_BUILD_BUG_ON(PPC_MMU_SLOTS != 4);
+        if (POWERPC_CPU(cpu)->env.mmu_model != POWERPC_MMU_32B ||
+            ms->smp.cpus != 1 || ms->smp.max_cpus != 1 || tlbrecount_cpu) {
+            fprintf(stderr, "tlbrecount: requires 32-bit hash MMU and exactly "
+                    "one configured vCPU, initialized once\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+    tlbrecount_cpu = cpu;
+    fprintf(stderr, "tlbrecount: diagnostic primary recount idxmap=0x1111; "
+            "resize thresholds unchanged; linear scan under TLB lock\n");
+#else
+    fprintf(stderr, "tlbrecount: requires the 32-bit PPC system target\n");
+    exit(EXIT_FAILURE);
+#endif
+}
+
+/* Owner-only, called with tlb.c.lock held; no allocation, clocks or I/O. */
+static bool tlbrecount_apply(CPUState *cpu, int mmu_idx)
+{
+    CPUTLBDesc *d;
+    CPUTLBDescFast *f;
+    size_t n, used = 0;
+
+    if (cpu != tlbrecount_cpu || (unsigned)mmu_idx >= 16 ||
+        !(0x1111u & (1u << mmu_idx))) {
+        return false;
+    }
+    d = &cpu->neg.tlb.d[mmu_idx];
+    f = &cpu->neg.tlb.f[mmu_idx];
+    n = tlb_n_entries(f);
+    for (size_t i = 0; i < n; i++) {
+        used += !tlb_entry_is_empty(&f->table[i]);
+    }
+    tlbrecount_stats[mmu_idx].calls++;
+    tlbrecount_stats[mmu_idx].mismatch += d->n_used_entries != used;
+    tlbrecount_stats[mmu_idx].raw_gt_capacity += d->n_used_entries > n;
+    tlbrecount_stats[mmu_idx].scanned += n;
+    d->n_used_entries = used;
+    return true;
+}
+
 /* PPC_TLBDIAG=1: temporary, AI-generated single-vCPU diagnostics.
  * Cumulative counters; no logging or clocks while the TLB lock is held.
  * Event-driven reports: check time every 1024 refill/sync events, at most
@@ -211,7 +287,8 @@ typedef struct TLBResizeRecord {
     uint64_t event, resets;
     int idx, cause;
     int64_t policy_ns, begin_ns;
-    size_t old, proposed, actual, used, window_max;
+    size_t old, proposed, actual, used, raw_used, window_max;
+    bool recounted;
 } TLBResizeRecord;
 static struct {
     TLBResizeRecord ring[TLBRES_RING];
@@ -266,10 +343,11 @@ static void tlbres_dump(CPUState *cpu, int64_t report_ns)
         fprintf(stderr, "tlbres kind=resize report_ns=%" PRId64
                 " event=%" PRIu64 " resets=%" PRIu64 " idx=%d cause=%d"
                 " policy_ns=%" PRId64 " begin_ns=%" PRId64
-                " old=%zu proposed=%zu actual=%zu used=%zu window_max=%zu\n",
+                " old=%zu proposed=%zu actual=%zu used=%zu window_max=%zu"
+                " raw_used=%zu recounted=%d\n",
                 report_ns, r->event, r->resets, r->idx, r->cause,
                 r->policy_ns, r->begin_ns, r->old, r->proposed, r->actual,
-                r->used, r->window_max);
+                r->used, r->window_max, r->raw_used, r->recounted);
     }
     tlbres.emitted += tlbres.n;
     tlbres.n = 0;
@@ -283,6 +361,15 @@ static void tlbres_dump(CPUState *cpu, int64_t report_ns)
                 " idx=%d calls=%" PRIu64 " unchanged=%" PRIu64
                 " expired=%" PRIu64 "\n", report_ns, i,
                 tlbres.calls[i], tlbres.unchanged[i], tlbres.expired[i]);
+        if (cpu == tlbrecount_cpu) {
+            fprintf(stderr, "tlbrecount kind=index report_ns=%" PRId64
+                    " idx=%d calls=%" PRIu64 " mismatch=%" PRIu64
+                    " raw_gt_capacity=%" PRIu64 " scanned=%" PRIu64 "\n",
+                    report_ns, i, tlbrecount_stats[i].calls,
+                    tlbrecount_stats[i].mismatch,
+                    tlbrecount_stats[i].raw_gt_capacity,
+                    tlbrecount_stats[i].scanned);
+        }
     }
 }
 
@@ -652,9 +739,14 @@ static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
         record = (TLBResizeRecord) {
             .idx = mmu_idx, .policy_ns = now,
             .begin_ns = desc->window_begin_ns, .old = old_size,
-            .used = desc->n_used_entries,
+            .used = desc->n_used_entries, .raw_used = desc->n_used_entries,
             .window_max = desc->window_max_entries,
         };
+    }
+    bool recounted = tlbrecount_apply(cpu, mmu_idx);
+    if (tracing) {
+        record.recounted = recounted;
+        record.used = desc->n_used_entries;
     }
     tlb_mmu_resize_locked(desc, fast, now, tlbcap_min_entries(cpu, mmu_idx),
                           tracing ? &record.proposed : NULL);
@@ -702,6 +794,7 @@ void tlb_init(CPUState *cpu)
     int i;
 
     tlbcap_configure(cpu);
+    tlbrecount_configure(cpu);
     qemu_spin_init(&cpu->neg.tlb.c.lock);
 
     /* All tlbs are initialized flushed. */
