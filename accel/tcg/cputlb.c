@@ -347,6 +347,95 @@ static bool tlbretain_on(CPUState *cpu, int mmu_idx)
            (0x1111u & (1u << mmu_idx));
 }
 
+/* AI-generated, default-off retention experiment. Leave native growth alone;
+ * delay policy shrink until 5 s without an observed >=30% occupancy sample,
+ * then permit at most one halving. Samples are taken at whole-index flushes,
+ * not continuously. History follows host index capacity, not an SR-set ID.
+ * Requires exact accounting; no scan is part of this policy.
+ */
+#define TLBDECAY_DELAY_NS UINT64_C(5000000000)
+typedef struct TLBDecayState {
+    bool initialized;
+    size_t entries;
+    int64_t last_seen_ns, last_pressure_ns;
+    uint64_t calls, renew, blocked, limited, down, up, backoff, clock_reset;
+} TLBDecayState;
+typedef struct TLBDecayDecision {
+    int64_t mono_ns;
+    uint64_t age_ns;
+    size_t bound;
+} TLBDecayDecision;
+static CPUState *tlbdecay_cpu;
+static TLBDecayState tlbdecay[16];
+
+static void tlbdecay_configure(CPUState *cpu)
+{
+    const char *s = getenv("PPC_TLB_USER_DECAY");
+
+    if (!s || !*s || !strcmp(s, "0")) {
+        return;
+    }
+    if (strcmp(s, "1") || cpu != tlbaccount_cpu ||
+        cpu == tlbretain_cpu || tlbdecay_cpu) {
+        fprintf(stderr, "tlbdecay: PPC_TLB_USER_DECAY=1 requires validated "
+                "ACCOUNT=1, NOSHRINK off, and one initialization\n");
+        exit(EXIT_FAILURE);
+    }
+    tlbdecay_cpu = cpu;
+    fprintf(stderr, "tlbdecay: user idxmap=0x1111 delay_ns=%" PRIu64
+            " pressure_pct=30 max_shrink_factor=2; default-off experiment\n",
+            TLBDECAY_DELAY_NS);
+}
+
+static bool tlbdecay_on(CPUState *cpu, int mmu_idx)
+{
+    return cpu == tlbdecay_cpu && tlbaccount_on(cpu, mmu_idx);
+}
+
+/* Called under tlb.c.lock. Use raw monotonic diagnostic time, independent
+ * of the native resize window's realtime clock. No allocation or scan here.
+ */
+static TLBDecayDecision tlbdecay_prepare(TLBDecayState *s, size_t entries,
+                                       size_t observed, int64_t now)
+{
+    TLBDecayDecision d = { .mono_ns = now };
+    bool backwards = s->initialized && now < s->last_seen_ns;
+    /* ceil(3 * entries / 10), without a large multiplication. */
+    size_t pressure = (entries / 10) * 3 + ((entries % 10) * 3 + 9) / 10;
+
+    s->calls++;
+    s->clock_reset += backwards;
+    if (!s->initialized || s->entries != entries || backwards ||
+        observed >= pressure) {
+        s->last_pressure_ns = now;
+        s->renew++;
+    }
+    s->initialized = true;
+    s->entries = entries;
+    s->last_seen_ns = now;
+    d.age_ns = (uint64_t)now - (uint64_t)s->last_pressure_ns;
+    d.bound = d.age_ns < TLBDECAY_DELAY_NS ? entries : entries / 2;
+    return d;
+}
+
+/* Feedback uses ACTUAL allocation size, including memory-pressure backoff.
+ * Every actual capacity change starts a new interval; no catch-up halvings.
+ */
+static void tlbdecay_finish(TLBDecayState *s, const TLBDecayDecision *d,
+                           size_t old, size_t native, size_t proposed,
+                           size_t actual)
+{
+    s->blocked += native < old && proposed == old;
+    s->limited += native < proposed && proposed < old;
+    s->backoff += actual < proposed;
+    s->down += actual < old;
+    s->up += actual > old;
+    if (actual != old) {
+        s->entries = actual;
+        s->last_pressure_ns = d->mono_ns;
+    }
+}
+
 /* Owner-only, called with tlb.c.lock held; no allocation, clocks or I/O. */
 static bool tlbrecount_apply(CPUState *cpu, int mmu_idx)
 {
@@ -416,6 +505,10 @@ typedef struct TLBResizeRecord {
     int64_t policy_ns, begin_ns;
     size_t old, proposed, actual, used, raw_used, window_max;
     bool recounted;
+    bool decay;
+    int64_t mono_ns;
+    uint64_t age_ns;
+    size_t native, bound;
 } TLBResizeRecord;
 static struct {
     TLBResizeRecord ring[TLBRES_RING];
@@ -443,7 +536,8 @@ static void tlbres_record(TLBResizeRecord *r)
     r->cause = tlbres.cause;
     tlbres.calls[r->idx]++;
     tlbres.expired[r->idx] += r->policy_ns > r->begin_ns + 100000000;
-    if (r->proposed == r->old && r->actual == r->old) {
+    if (r->proposed == r->old && r->actual == r->old &&
+        !(r->decay && r->native != r->proposed)) {
         tlbres.unchanged[r->idx]++;
         return;
     }
@@ -490,10 +584,12 @@ static void tlbres_dump(CPUState *cpu, int64_t report_ns)
                 " event=%" PRIu64 " resets=%" PRIu64 " idx=%d cause=%d"
                 " policy_ns=%" PRId64 " begin_ns=%" PRId64
                 " old=%zu proposed=%zu actual=%zu used=%zu window_max=%zu"
-                " raw_used=%zu recounted=%d\n",
+                " raw_used=%zu recounted=%d decay=%d mono_ns=%" PRId64
+                " age_ns=%" PRIu64 " native=%zu bound=%zu\n",
                 report_ns, r->event, r->resets, r->idx, r->cause,
                 r->policy_ns, r->begin_ns, r->old, r->proposed, r->actual,
-                r->used, r->window_max, r->raw_used, r->recounted);
+                r->used, r->window_max, r->raw_used, r->recounted,
+                r->decay, r->mono_ns, r->age_ns, r->native, r->bound);
     }
     tlbres.emitted += tlbres.n;
     tlbres.n = 0;
@@ -515,6 +611,16 @@ static void tlbres_dump(CPUState *cpu, int64_t report_ns)
                     tlbrecount_stats[i].mismatch,
                     tlbrecount_stats[i].raw_gt_capacity,
                     tlbrecount_stats[i].scanned);
+        }
+        if (cpu == tlbdecay_cpu) {
+            TLBDecayState *s = &tlbdecay[i];
+            fprintf(stderr, "tlbdecay kind=index report_ns=%" PRId64
+                    " idx=%d entries=%zu calls=%" PRIu64 " renew=%" PRIu64
+                    " blocked=%" PRIu64 " limited=%" PRIu64
+                    " down=%" PRIu64 " up=%" PRIu64 " backoff=%" PRIu64
+                    " clock_reset=%" PRIu64 "\n", report_ns, i, s->entries,
+                    s->calls, s->renew, s->blocked, s->limited, s->down,
+                    s->up, s->backoff, s->clock_reset);
         }
     }
 }
@@ -771,7 +877,8 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
  */
 static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
                                   int64_t now, size_t min_entries, size_t *proposed,
-                                  bool retain_size)
+                                  bool retain_size, size_t shrink_bound,
+                                  size_t *native)
 {
     size_t old_size = tlb_n_entries(fast);
     size_t rate;
@@ -808,6 +915,12 @@ static void tlb_mmu_resize_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast,
     }
 
     new_size = MAX(new_size, min_entries);
+    if (native) {
+        *native = new_size;
+    }
+    if (new_size < old_size) {
+        new_size = MAX(new_size, shrink_bound);
+    }
     if (retain_size) {
         tlbretain_suppressed += new_size < old_size;
         new_size = MAX(new_size, old_size);
@@ -881,6 +994,9 @@ static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
     CPUTLBDescFast *fast = &cpu->neg.tlb.f[mmu_idx];
 
     size_t old_size = tlb_n_entries(fast);
+    bool decay = tlbdecay_on(cpu, mmu_idx);
+    TLBDecayDecision decision = { 0 };
+    size_t native, proposed;
 
     bool tracing = tlbres_on(cpu) && (unsigned)mmu_idx < 16 &&
                    (0x1111u & (1u << mmu_idx));
@@ -900,11 +1016,27 @@ static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
         record.recounted = recounted;
         record.used = desc->n_used_entries;
     }
+    if (decay) {
+        decision = tlbdecay_prepare(&tlbdecay[mmu_idx], old_size,
+                                   MAX(desc->n_used_entries,
+                                       desc->window_max_entries),
+                                   tlbdiag_clock_ns());
+    }
     tlb_mmu_resize_locked(desc, fast, now, tlbcap_min_entries(cpu, mmu_idx),
-                          tracing ? &record.proposed : NULL,
-                          tlbretain_on(cpu, mmu_idx));
+                          &proposed, tlbretain_on(cpu, mmu_idx),
+                          decision.bound, &native);
+    if (decay) {
+        tlbdecay_finish(&tlbdecay[mmu_idx], &decision, old_size, native,
+                       proposed, tlb_n_entries(fast));
+    }
     if (tracing) {
+        record.proposed = proposed;
         record.actual = tlb_n_entries(fast);
+        record.decay = decay;
+        record.native = native;
+        record.bound = decision.bound;
+        record.mono_ns = decision.mono_ns;
+        record.age_ns = decision.age_ns;
         tlbres_record(&record);
     }
     if (tlbdiag_on(cpu)) {
@@ -957,6 +1089,7 @@ void tlb_init(CPUState *cpu)
     tlbrecount_configure(cpu);
     tlbaccount_configure(cpu);
     tlbretain_configure(cpu);
+    tlbdecay_configure(cpu);
     qemu_spin_init(&cpu->neg.tlb.c.lock);
 
     /* All tlbs are initialized flushed. */
