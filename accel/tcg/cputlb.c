@@ -220,8 +220,104 @@ static void tlbrecount_configure(CPUState *cpu)
 #endif
 }
 
+/* AI-generated, opt-in experiment: exact primary occupancy, user indexes
+ * only. RECOUNT is mutually exclusive; ORACLE observes but never repairs.
+ * Options are immutable once the sole vCPU has been initialized.
+ */
+static CPUState *tlbaccount_cpu;
+static bool tlbaccount_oracle;
+static struct {
+    uint64_t checks, mismatch, out_of_range, scanned;
+    size_t first_count, first_scan, first_capacity;
+} tlbaccount_stats[16];
+
+static bool tlbaccount_option(const char *name)
+{
+    const char *s = getenv(name);
+    if (!s || !*s || !strcmp(s, "0")) {
+        return false;
+    }
+    if (strcmp(s, "1")) {
+        fprintf(stderr, "tlbaccount: %s wants 0 or 1\n", name);
+        exit(EXIT_FAILURE);
+    }
+    return true;
+}
+
+static void tlbaccount_configure(CPUState *cpu)
+{
+    bool enable = tlbaccount_option("PPC_TLB_USER_ACCOUNT");
+    bool oracle = tlbaccount_option("PPC_TLB_USER_ORACLE");
+    const char *diag = getenv("PPC_TLBDIAG");
+    const char *trace = getenv("PPC_TLB_RESIZE_TRACE");
+    const char *slots = getenv("PPC_SR_SLOTS");
+
+    if (!enable && !oracle) {
+        return;
+    }
+    if (!enable || tlbrecount_cpu || !diag || strcmp(diag, "1") ||
+        !trace || strcmp(trace, "1") || !slots || strcmp(slots, "1")) {
+        fprintf(stderr, "tlbaccount: ACCOUNT=1 requires RECOUNT off, "
+                "PPC_TLBDIAG=1 PPC_TLB_RESIZE_TRACE=1 PPC_SR_SLOTS=1; "
+                "ORACLE=1 requires ACCOUNT=1\n");
+        exit(EXIT_FAILURE);
+    }
+#if defined(TARGET_PPC) && !defined(TARGET_PPC64)
+    {
+        MachineState *ms = MACHINE(qdev_get_machine());
+        QEMU_BUILD_BUG_ON(NB_MMU_MODES != 16);
+        QEMU_BUILD_BUG_ON(PPC_MMU_SLOTS != 4);
+        if (POWERPC_CPU(cpu)->env.mmu_model != POWERPC_MMU_32B ||
+            ms->smp.cpus != 1 || ms->smp.max_cpus != 1 || tlbaccount_cpu) {
+            fprintf(stderr, "tlbaccount: requires 32-bit hash MMU and "
+                    "one configured vCPU, initialized once\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+    tlbaccount_cpu = cpu;
+    tlbaccount_oracle = oracle;
+    fprintf(stderr, "tlbaccount: primary accounting idxmap=0x1111 oracle=%d; "
+            "oracle never repairs; default-off experiment\n", oracle);
+#else
+    fprintf(stderr, "tlbaccount: requires the 32-bit PPC system target\n");
+    exit(EXIT_FAILURE);
+#endif
+}
+
+static bool tlbaccount_on(CPUState *cpu, uintptr_t mmu_idx)
+{
+    return cpu == tlbaccount_cpu && mmu_idx < 16 &&
+           (0x1111u & (1u << mmu_idx));
+}
+
+/* Under tlb.c.lock, before resize/whole flush. No I/O or corrections. */
+static void tlbaccount_check(CPUState *cpu, int mmu_idx)
+{
+    size_t n, used = 0, count;
+    CPUTLBDescFast *f;
+    if (!tlbaccount_oracle || !tlbaccount_on(cpu, mmu_idx)) {
+        return;
+    }
+    f = &cpu->neg.tlb.f[mmu_idx];
+    n = tlb_n_entries(f);
+    for (size_t i = 0; i < n; i++) {
+        used += !tlb_entry_is_empty(&f->table[i]);
+    }
+    count = cpu->neg.tlb.d[mmu_idx].n_used_entries;
+    tlbaccount_stats[mmu_idx].checks++;
+    tlbaccount_stats[mmu_idx].scanned += n;
+    tlbaccount_stats[mmu_idx].out_of_range += count > n;
+    if (count != used) {
+        if (!tlbaccount_stats[mmu_idx].mismatch++) {
+            tlbaccount_stats[mmu_idx].first_count = count;
+            tlbaccount_stats[mmu_idx].first_scan = used;
+            tlbaccount_stats[mmu_idx].first_capacity = n;
+        }
+    }
+}
+
 /* AI-generated diagnostic only: retain learned primary-table capacity.
- * Requires recount so wrapped incremental estimates cannot drive retention.
+ * Requires recount or exact accounting as the sizing input.
  * No eager growth or changed floor. Allocation failure may still shrink.
  */
 static CPUState *tlbretain_cpu;
@@ -234,9 +330,10 @@ static void tlbretain_configure(CPUState *cpu)
     if (!s || !*s || !strcmp(s, "0")) {
         return;
     }
-    if (strcmp(s, "1") || cpu != tlbrecount_cpu) {
+    if (strcmp(s, "1") ||
+        (cpu != tlbrecount_cpu && cpu != tlbaccount_cpu)) {
         fprintf(stderr, "tlbretain: PPC_TLB_USER_NOSHRINK=1 requires the "
-                "validated PPC_TLB_USER_RECOUNT=1 configuration\n");
+                "validated RECOUNT=1 or ACCOUNT=1 configuration\n");
         exit(EXIT_FAILURE);
     }
     tlbretain_cpu = cpu;
@@ -368,6 +465,21 @@ static void tlbres_dump(CPUState *cpu, int64_t report_ns)
         return;
     }
     policy_report_ns = get_clock_realtime();
+    if (cpu == tlbaccount_cpu && tlbaccount_oracle) {
+        for (int i = 0; i < 16; i += 4) {
+            fprintf(stderr, "tlbaccount kind=oracle report_ns=%" PRId64
+                    " idx=%d checks=%" PRIu64 " mismatch=%" PRIu64
+                    " out_of_range=%" PRIu64 " scanned=%" PRIu64
+                    " first_count=%zu first_scan=%zu first_capacity=%zu\n",
+                    report_ns, i, tlbaccount_stats[i].checks,
+                    tlbaccount_stats[i].mismatch,
+                    tlbaccount_stats[i].out_of_range,
+                    tlbaccount_stats[i].scanned,
+                    tlbaccount_stats[i].first_count,
+                    tlbaccount_stats[i].first_scan,
+                    tlbaccount_stats[i].first_capacity);
+        }
+    }
     if (cpu == tlbretain_cpu) {
         fprintf(stderr, "tlbretain kind=summary report_ns=%" PRId64
                 " suppressed=%" PRIu64 "\n", report_ns, tlbretain_suppressed);
@@ -782,6 +894,7 @@ static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
             .window_max = desc->window_max_entries,
         };
     }
+    tlbaccount_check(cpu, mmu_idx);
     bool recounted = tlbrecount_apply(cpu, mmu_idx);
     if (tracing) {
         record.recounted = recounted;
@@ -820,11 +933,18 @@ static void tlb_mmu_init(CPUTLBDesc *desc, CPUTLBDescFast *fast, int64_t now,
 
 static inline void tlb_n_used_entries_inc(CPUState *cpu, uintptr_t mmu_idx)
 {
+    if (tlbaccount_on(cpu, mmu_idx)) {
+        g_assert(cpu->neg.tlb.d[mmu_idx].n_used_entries <
+                 tlb_n_entries(&cpu->neg.tlb.f[mmu_idx]));
+    }
     cpu->neg.tlb.d[mmu_idx].n_used_entries++;
 }
 
 static inline void tlb_n_used_entries_dec(CPUState *cpu, uintptr_t mmu_idx)
 {
+    if (tlbaccount_on(cpu, mmu_idx)) {
+        g_assert(cpu->neg.tlb.d[mmu_idx].n_used_entries > 0);
+    }
     cpu->neg.tlb.d[mmu_idx].n_used_entries--;
 }
 
@@ -835,6 +955,7 @@ void tlb_init(CPUState *cpu)
 
     tlbcap_configure(cpu);
     tlbrecount_configure(cpu);
+    tlbaccount_configure(cpu);
     tlbretain_configure(cpu);
     qemu_spin_init(&cpu->neg.tlb.c.lock);
 
@@ -974,6 +1095,20 @@ static inline bool tlb_entry_is_empty(const CPUTLBEntry *te)
     return te->addr_read == -1 && te->addr_write == -1 && te->addr_code == -1;
 }
 
+/* Account only for the primary entry's occupancy transition, before copy.
+ * Victim occupancy is deliberately outside n_used_entries. */
+static void tlbaccount_replace(CPUState *cpu, int mmu_idx,
+                               const CPUTLBEntry *old, const CPUTLBEntry *new)
+{
+    bool old_empty = tlb_entry_is_empty(old);
+    bool new_empty = tlb_entry_is_empty(new);
+    if (old_empty && !new_empty) {
+        tlb_n_used_entries_inc(cpu, mmu_idx);
+    } else if (!old_empty && new_empty) {
+        tlb_n_used_entries_dec(cpu, mmu_idx);
+    }
+}
+
 /* Called with tlb_c.lock held */
 static bool tlb_flush_entry_mask_locked(CPUTLBEntry *tlb_entry,
                                         vaddr page,
@@ -1002,7 +1137,9 @@ static void tlb_flush_vtlb_page_mask_locked(CPUState *cpu, int mmu_idx,
     assert_cpu_is_self(cpu);
     for (k = 0; k < CPU_VTLB_SIZE; k++) {
         if (tlb_flush_entry_mask_locked(&d->vtable[k], page, mask)) {
-            tlb_n_used_entries_dec(cpu, mmu_idx);
+            if (!tlbaccount_on(cpu, mmu_idx)) {
+                tlb_n_used_entries_dec(cpu, mmu_idx);
+            }
         }
     }
 }
@@ -1615,6 +1752,7 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     vaddr addr_page;
     int asidx, wp_flags, prot;
     bool is_ram, is_romd;
+    bool accounting = tlbaccount_on(cpu, mmu_idx);
 
     assert_cpu_is_self(cpu);
 
@@ -1715,7 +1853,9 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
         /* Evict the old entry into the victim tlb.  */
         copy_tlb_helper_locked(tv, te);
         desc->vfulltlb[vidx] = desc->fulltlb[index];
-        tlb_n_used_entries_dec(cpu, mmu_idx);
+        if (!accounting) {
+            tlb_n_used_entries_dec(cpu, mmu_idx);
+        }
     }
 
     /* refill the tlb */
@@ -1759,8 +1899,13 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     tlb_set_compare(full, &tn, addr_page, write_flags,
                     MMU_DATA_STORE, prot & PAGE_WRITE);
 
+    if (accounting) {
+        tlbaccount_replace(cpu, mmu_idx, te, &tn);
+    }
     copy_tlb_helper_locked(te, &tn);
-    tlb_n_used_entries_inc(cpu, mmu_idx);
+    if (!accounting) {
+        tlb_n_used_entries_inc(cpu, mmu_idx);
+    }
     qemu_spin_unlock(&tlb->c.lock);
 }
 
@@ -1899,6 +2044,9 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
             CPUTLBEntry tmptlb, *tlb = &cpu->neg.tlb.f[mmu_idx].table[index];
 
             qemu_spin_lock(&cpu->neg.tlb.c.lock);
+            if (tlbaccount_on(cpu, mmu_idx)) {
+                tlbaccount_replace(cpu, mmu_idx, tlb, vtlb);
+            }
             copy_tlb_helper_locked(&tmptlb, tlb);
             copy_tlb_helper_locked(tlb, vtlb);
             copy_tlb_helper_locked(vtlb, &tmptlb);
