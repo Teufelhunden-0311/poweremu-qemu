@@ -255,11 +255,17 @@ static void tlbaccount_configure(CPUState *cpu)
     if (!enable && !oracle) {
         return;
     }
-    if (!enable || tlbrecount_cpu || !diag || strcmp(diag, "1") ||
-        !trace || strcmp(trace, "1") || !slots || strcmp(slots, "1")) {
-        fprintf(stderr, "tlbaccount: ACCOUNT=1 requires RECOUNT off, "
-                "PPC_TLBDIAG=1 PPC_TLB_RESIZE_TRACE=1 PPC_SR_SLOTS=1; "
-                "ORACLE=1 requires ACCOUNT=1\n");
+    if (!enable || tlbrecount_cpu || !slots || strcmp(slots, "1")) {
+        fprintf(stderr, "tlbaccount: ACCOUNT=1 requires RECOUNT off and "
+                "PPC_SR_SLOTS=1; ORACLE=1 requires ACCOUNT=1\n");
+        exit(EXIT_FAILURE);
+    }
+    /* The optional scan needs a reporting sink, not the accounting policy.
+     * Refuse an unobservable oracle rather than silently doing O(n) work. */
+    if (oracle && (!diag || strcmp(diag, "1") ||
+                   !trace || strcmp(trace, "1"))) {
+        fprintf(stderr, "tlbaccount: ORACLE=1 requires PPC_TLBDIAG=1 "
+                "PPC_TLB_RESIZE_TRACE=1 for reports\n");
         exit(EXIT_FAILURE);
     }
 #if defined(TARGET_PPC) && !defined(TARGET_PPC64)
@@ -326,14 +332,18 @@ static uint64_t tlbretain_suppressed;
 static void tlbretain_configure(CPUState *cpu)
 {
     const char *s = getenv("PPC_TLB_USER_NOSHRINK");
+    const char *diag = getenv("PPC_TLBDIAG");
+    const char *trace = getenv("PPC_TLB_RESIZE_TRACE");
 
     if (!s || !*s || !strcmp(s, "0")) {
         return;
     }
-    if (strcmp(s, "1") ||
+    if (strcmp(s, "1") || !diag || strcmp(diag, "1") ||
+        !trace || strcmp(trace, "1") ||
         (cpu != tlbrecount_cpu && cpu != tlbaccount_cpu)) {
         fprintf(stderr, "tlbretain: PPC_TLB_USER_NOSHRINK=1 requires the "
-                "validated RECOUNT=1 or ACCOUNT=1 configuration\n");
+                "validated RECOUNT=1 or ACCOUNT=1 configuration with "
+                "PPC_TLBDIAG=1 PPC_TLB_RESIZE_TRACE=1\n");
         exit(EXIT_FAILURE);
     }
     tlbretain_cpu = cpu;
@@ -345,6 +355,20 @@ static bool tlbretain_on(CPUState *cpu, int mmu_idx)
 {
     return cpu == tlbretain_cpu && (unsigned)mmu_idx < 16 &&
            (0x1111u & (1u << mmu_idx));
+}
+
+/* Policy time is independent of diagnostic enablement and the native
+ * resize window's realtime clock. Same host clock as the earlier experiment.
+ * AI-generated (Codex). */
+static int64_t tlbpolicy_clock_ns(void)
+{
+    struct timespec ts;
+#ifdef __APPLE__
+    clock_gettime(CLOCK_UPTIME_RAW, &ts);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
 }
 
 /* AI-generated, default-off retention experiment. Leave native growth alone;
@@ -396,7 +420,7 @@ static bool tlbdecay_on(CPUState *cpu, int mmu_idx)
     return cpu == tlbdecay_cpu && tlbaccount_on(cpu, mmu_idx);
 }
 
-/* Called under tlb.c.lock. Use raw monotonic diagnostic time, independent
+/* Called under tlb.c.lock. Use raw monotonic policy time, independent
  * of the native resize window's realtime clock. No allocation or scan here.
  */
 static TLBDecayDecision tlbdecay_prepare(TLBDecayState *s, size_t entries,
@@ -454,7 +478,9 @@ typedef struct TLBGrowState {
     bool pending, clock_seen;
     size_t queued_entries;
     uint64_t queued_fills;
-    uint64_t queued_whole;
+    /* Mechanism-owned generation, never reset by a diagnostic report or
+     * guest reset. Kept until the queued callback consumes its request. */
+    uint64_t generation, queued_generation;
     int64_t last_queue_ns;
     uint64_t fills, samples, queued, completed, stale, applied, backoff;
     uint64_t clock_reset;
@@ -483,6 +509,18 @@ static void tlbgrow_configure(CPUState *cpu)
     tlbgrow_cpu = cpu;
     fprintf(stderr, "tlbgrow: user idxmap=0x1111 sample=1024 interval_ns=10000000 "
             "max_entries=32768 deferred=1; default-off experiment\n");
+}
+
+/* All runtime whole-index clears (including reset and page/range fallback)
+ * pass through tlb_flush_one_mmuidx_locked. Initialization precedes requests.
+ * Do not clear pending here: its already queued callback must consume it;
+ * otherwise a new request could reuse the same queue token prematurely.
+ * Called with tlb.c.lock held, independently of TLBDIAG/RESIZE_TRACE. */
+static void tlbgrow_invalidate_locked(CPUState *cpu, int mmu_idx)
+{
+    if (cpu == tlbgrow_cpu && tlbaccount_on(cpu, mmu_idx)) {
+        tlbgrow[mmu_idx].generation++;
+    }
 }
 
 /* Owner-only, called with tlb.c.lock held; no allocation, clocks or I/O. */
@@ -720,13 +758,7 @@ void tlbdiag_slot_reset(CPUState *cpu)
 
 static int64_t tlbdiag_clock_ns(void)
 {
-    struct timespec ts;
-#ifdef __APPLE__
-    clock_gettime(CLOCK_UPTIME_RAW, &ts);
-#else
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-#endif
-    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+    return tlbpolicy_clock_ns();
 }
 
 /* Called only outside tlb.c.lock, on its owning vCPU thread. */
@@ -1089,7 +1121,7 @@ static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
         decision = tlbdecay_prepare(&tlbdecay[mmu_idx], old_size,
                                    MAX(desc->n_used_entries,
                                        desc->window_max_entries),
-                                   tlbdiag_clock_ns());
+                                   tlbpolicy_clock_ns());
     }
     tlb_mmu_resize_locked(desc, fast, now, tlbcap_min_entries(cpu, mmu_idx),
                           &proposed, tlbretain_on(cpu, mmu_idx),
@@ -1116,6 +1148,7 @@ static void tlb_flush_one_mmuidx_locked(CPUState *cpu, int mmu_idx,
         d->grow += new_size > old_size;
         d->shrink += new_size < old_size;
     }
+    tlbgrow_invalidate_locked(cpu, mmu_idx);
     tlb_mmu_flush_locked(desc, fast);
 }
 
@@ -2168,8 +2201,8 @@ static void tlbgrow_work(CPUState *cpu, run_on_cpu_data data)
     unsigned idx = data.host_int;
     TLBGrowState *s = &tlbgrow[idx];
     size_t old, used;
-    bool valid;
-    unsigned saved_cause;
+    bool valid, tracing;
+    unsigned saved_cause = 0;
 
     assert_cpu_is_self(cpu);
     qemu_spin_lock(&cpu->neg.tlb.c.lock);
@@ -2177,7 +2210,7 @@ static void tlbgrow_work(CPUState *cpu, run_on_cpu_data data)
     used = cpu->neg.tlb.d[idx].n_used_entries;
     valid = cpu == tlbgrow_cpu && s->pending &&
             old == s->queued_entries && old < TLBGROW_MAX_ENTRIES &&
-            tlbdiag.idx[idx].whole == s->queued_whole &&
+            s->generation == s->queued_generation &&
             (cpu->neg.tlb.c.dirty & (1u << idx)) &&
             used <= old && used * 100 / old > 70;
     s->pending = false;
@@ -2191,10 +2224,15 @@ static void tlbgrow_work(CPUState *cpu, run_on_cpu_data data)
      * primary and victims, accounting/large-page reset, dirty map update,
      * and whole jump-cache retirement. No SR-set reset or guest flag edits.
      */
-    saved_cause = tlbres.cause;
-    tlbres.cause = 3; /* growth opportunity, not a guest-requested flush */
+    tracing = tlbres_on(cpu);
+    if (tracing) {
+        saved_cause = tlbres.cause;
+        tlbres.cause = 3; /* observer tag, not a guest-requested flush */
+    }
     tlb_flush_by_mmuidx(cpu, 1u << idx);
-    tlbres.cause = saved_cause;
+    if (tracing) {
+        tlbres.cause = saved_cause;
+    }
     s->last_old = old;
     s->last_new = tlb_n_entries(&cpu->neg.tlb.f[idx]);
     s->applied++;
@@ -2234,7 +2272,7 @@ static void tlbgrow_note(CPUState *cpu, int idx, MMUAccessType type, bool probe)
         qemu_spin_unlock(&cpu->neg.tlb.c.lock);
         return;
     }
-    now = tlbdiag_clock_ns();
+    now = tlbpolicy_clock_ns();
     if (s->clock_seen && now < s->last_queue_ns) {
         s->clock_reset++;
         s->last_queue_ns = now;
@@ -2247,7 +2285,7 @@ static void tlbgrow_note(CPUState *cpu, int idx, MMUAccessType type, bool probe)
     s->last_queue_ns = now;
     s->queued_entries = entries;
     s->queued_fills = s->fills;
-    s->queued_whole = tlbdiag.idx[idx].whole;
+    s->queued_generation = s->generation;
     s->pending = true;
     s->queued++;
     qemu_spin_unlock(&cpu->neg.tlb.c.lock);
