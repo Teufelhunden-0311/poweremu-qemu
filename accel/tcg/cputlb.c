@@ -375,7 +375,11 @@ static void tlbdecay_configure(CPUState *cpu)
     if (!s || !*s || !strcmp(s, "0")) {
         return;
     }
-    if (strcmp(s, "1") || cpu != tlbaccount_cpu ||
+    if (strcmp(s, "1")) {
+        fprintf(stderr, "tlbdecay: PPC_TLB_USER_DECAY wants 0 or 1\n");
+        exit(EXIT_FAILURE);
+    }
+    if (cpu != tlbaccount_cpu ||
         cpu == tlbretain_cpu || tlbdecay_cpu) {
         fprintf(stderr, "tlbdecay: PPC_TLB_USER_DECAY=1 requires validated "
                 "ACCOUNT=1, NOSHRINK off, and one initialization\n");
@@ -434,6 +438,51 @@ static void tlbdecay_finish(TLBDecayState *s, const TLBDecayDecision *d,
         s->entries = actual;
         s->last_pressure_ns = d->mono_ns;
     }
+}
+
+/* AI-generated, default-off growth opportunity experiment. Successful data
+ * refills only REQUEST work; never resize with a memory helper on the stack.
+ * Owner CPU work executes after cpu_exec returns. History follows the host
+ * index, not a guest SR identity. Constants are bounded experiment choices.
+ */
+#define TLBGROW_SAMPLE 1024u
+#define TLBGROW_INTERVAL_NS INT64_C(10000000)
+#define TLBGROW_MAX_ENTRIES 32768u
+static CPUState *tlbgrow_cpu;
+typedef struct TLBGrowState {
+    unsigned ticks;
+    bool pending, clock_seen;
+    size_t queued_entries;
+    uint64_t queued_fills;
+    uint64_t queued_whole;
+    int64_t last_queue_ns;
+    uint64_t fills, samples, queued, completed, stale, applied, backoff;
+    uint64_t clock_reset;
+    size_t last_old, last_new;
+} TLBGrowState;
+static TLBGrowState tlbgrow[16];
+static void tlbgrow_note(CPUState *cpu, int idx, MMUAccessType type, bool probe);
+
+static void tlbgrow_configure(CPUState *cpu)
+{
+    const char *s = getenv("PPC_TLB_USER_GROW");
+
+    if (!s || !*s || !strcmp(s, "0")) {
+        return;
+    }
+    if (strcmp(s, "1")) {
+        fprintf(stderr, "tlbgrow: PPC_TLB_USER_GROW wants 0 or 1\n");
+        exit(EXIT_FAILURE);
+    }
+    if (cpu != tlbdecay_cpu || cpu != tlbaccount_cpu || tlbcap_cpu ||
+        tlbgrow_cpu) {
+        fprintf(stderr, "tlbgrow: requires ACCOUNT=1, DECAY=1, ordinary "
+                "floor and one initialization\n");
+        exit(EXIT_FAILURE);
+    }
+    tlbgrow_cpu = cpu;
+    fprintf(stderr, "tlbgrow: user idxmap=0x1111 sample=1024 interval_ns=10000000 "
+            "max_entries=32768 deferred=1; default-off experiment\n");
 }
 
 /* Owner-only, called with tlb.c.lock held; no allocation, clocks or I/O. */
@@ -509,6 +558,8 @@ typedef struct TLBResizeRecord {
     int64_t mono_ns;
     uint64_t age_ns;
     size_t native, bound;
+    int64_t request_ns;
+    uint64_t request_fills;
 } TLBResizeRecord;
 static struct {
     TLBResizeRecord ring[TLBRES_RING];
@@ -534,6 +585,10 @@ static void tlbres_record(TLBResizeRecord *r)
     r->event = ++tlbres.event;
     r->resets = tlbres.resets;
     r->cause = tlbres.cause;
+    if (r->cause == 3) {
+        r->request_ns = tlbgrow[r->idx].last_queue_ns;
+        r->request_fills = tlbgrow[r->idx].queued_fills;
+    }
     tlbres.calls[r->idx]++;
     tlbres.expired[r->idx] += r->policy_ns > r->begin_ns + 100000000;
     if (r->proposed == r->old && r->actual == r->old &&
@@ -585,11 +640,13 @@ static void tlbres_dump(CPUState *cpu, int64_t report_ns)
                 " policy_ns=%" PRId64 " begin_ns=%" PRId64
                 " old=%zu proposed=%zu actual=%zu used=%zu window_max=%zu"
                 " raw_used=%zu recounted=%d decay=%d mono_ns=%" PRId64
-                " age_ns=%" PRIu64 " native=%zu bound=%zu\n",
+                " age_ns=%" PRIu64 " native=%zu bound=%zu"
+                " request_ns=%" PRId64 " request_fills=%" PRIu64 "\n",
                 report_ns, r->event, r->resets, r->idx, r->cause,
                 r->policy_ns, r->begin_ns, r->old, r->proposed, r->actual,
                 r->used, r->window_max, r->raw_used, r->recounted,
-                r->decay, r->mono_ns, r->age_ns, r->native, r->bound);
+                r->decay, r->mono_ns, r->age_ns, r->native, r->bound,
+                r->request_ns, r->request_fills);
     }
     tlbres.emitted += tlbres.n;
     tlbres.n = 0;
@@ -611,6 +668,18 @@ static void tlbres_dump(CPUState *cpu, int64_t report_ns)
                     tlbrecount_stats[i].mismatch,
                     tlbrecount_stats[i].raw_gt_capacity,
                     tlbrecount_stats[i].scanned);
+        }
+        if (cpu == tlbgrow_cpu) {
+            TLBGrowState *s = &tlbgrow[i];
+            fprintf(stderr, "tlbgrow kind=index report_ns=%" PRId64
+                    " idx=%d fills=%" PRIu64 " samples=%" PRIu64
+                    " queued=%" PRIu64 " completed=%" PRIu64
+                    " pending=%d stale=%" PRIu64 " applied=%" PRIu64
+                    " backoff=%" PRIu64 " clock_reset=%" PRIu64
+                    " last_old=%zu last_new=%zu\n", report_ns, i,
+                    s->fills, s->samples, s->queued, s->completed, s->pending,
+                    s->stale, s->applied, s->backoff, s->clock_reset,
+                    s->last_old, s->last_new);
         }
         if (cpu == tlbdecay_cpu) {
             TLBDecayState *s = &tlbdecay[i];
@@ -1090,6 +1159,7 @@ void tlb_init(CPUState *cpu)
     tlbaccount_configure(cpu);
     tlbretain_configure(cpu);
     tlbdecay_configure(cpu);
+    tlbgrow_configure(cpu);
     qemu_spin_init(&cpu->neg.tlb.c.lock);
 
     /* All tlbs are initialized flushed. */
@@ -2088,6 +2158,102 @@ static inline bool tlb_hit(uint64_t tlb_addr, vaddr addr)
     return tlb_hit_page(tlb_addr, addr & TARGET_PAGE_MASK);
 }
 
+/* This callback is queued even for the current CPU. It must not be replaced
+ * with run_on_cpu(), which executes inline when called by the owner.
+ * Natural flush/reset/slot replacement or capacity changes make a request
+ * stale. Recheck current occupancy, not the old native-window high-water mark.
+ */
+static void tlbgrow_work(CPUState *cpu, run_on_cpu_data data)
+{
+    unsigned idx = data.host_int;
+    TLBGrowState *s = &tlbgrow[idx];
+    size_t old, used;
+    bool valid;
+    unsigned saved_cause;
+
+    assert_cpu_is_self(cpu);
+    qemu_spin_lock(&cpu->neg.tlb.c.lock);
+    old = tlb_n_entries(&cpu->neg.tlb.f[idx]);
+    used = cpu->neg.tlb.d[idx].n_used_entries;
+    valid = cpu == tlbgrow_cpu && s->pending &&
+            old == s->queued_entries && old < TLBGROW_MAX_ENTRIES &&
+            tlbdiag.idx[idx].whole == s->queued_whole &&
+            (cpu->neg.tlb.c.dirty & (1u << idx)) &&
+            used <= old && used * 100 / old > 70;
+    s->pending = false;
+    s->completed++;
+    qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+    if (!valid) {
+        s->stale++;
+        return;
+    }
+    /* Same public flush path as existing invalidations: lock, resize/clear
+     * primary and victims, accounting/large-page reset, dirty map update,
+     * and whole jump-cache retirement. No SR-set reset or guest flag edits.
+     */
+    saved_cause = tlbres.cause;
+    tlbres.cause = 3; /* growth opportunity, not a guest-requested flush */
+    tlb_flush_by_mmuidx(cpu, 1u << idx);
+    tlbres.cause = saved_cause;
+    s->last_old = old;
+    s->last_new = tlb_n_entries(&cpu->neg.tlb.f[idx]);
+    s->applied++;
+    s->backoff += s->last_new < old * 2;
+}
+
+/* Called after a successful target refill, at tlb_fill_align's return boundary.
+ * A request never changes the table or the current access's translation.
+ * No clock/lock on the first 1023 eligible refill completions per sample.
+ */
+static void tlbgrow_note(CPUState *cpu, int idx, MMUAccessType type, bool probe)
+{
+    TLBGrowState *s;
+    size_t entries, used;
+    int64_t now;
+
+    if (cpu != tlbgrow_cpu || probe || type == MMU_INST_FETCH ||
+        !tlbaccount_on(cpu, idx)) {
+        return;
+    }
+    assert_cpu_is_self(cpu);
+    s = &tlbgrow[idx];
+    s->fills++;
+    if (++s->ticks < TLBGROW_SAMPLE) {
+        return;
+    }
+    s->ticks = 0;
+    s->samples++;
+    if (s->pending) {
+        return;
+    }
+    qemu_spin_lock(&cpu->neg.tlb.c.lock);
+    entries = tlb_n_entries(&cpu->neg.tlb.f[idx]);
+    used = cpu->neg.tlb.d[idx].n_used_entries;
+    if (entries >= TLBGROW_MAX_ENTRIES || used > entries ||
+        used * 100 / entries <= 70) {
+        qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+        return;
+    }
+    now = tlbdiag_clock_ns();
+    if (s->clock_seen && now < s->last_queue_ns) {
+        s->clock_reset++;
+        s->last_queue_ns = now;
+    }
+    if (s->clock_seen && now - s->last_queue_ns < TLBGROW_INTERVAL_NS) {
+        qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+        return;
+    }
+    s->clock_seen = true;
+    s->last_queue_ns = now;
+    s->queued_entries = entries;
+    s->queued_fills = s->fills;
+    s->queued_whole = tlbdiag.idx[idx].whole;
+    s->pending = true;
+    s->queued++;
+    qemu_spin_unlock(&cpu->neg.tlb.c.lock);
+    async_run_on_cpu(cpu, tlbgrow_work, RUN_ON_CPU_HOST_INT(idx));
+}
+
 /*
  * Note: tlb_fill_align() can trigger a resize of the TLB.
  * This means that all of the caller's prior references to the TLB table
@@ -2105,6 +2271,7 @@ static bool tlb_fill_align(CPUState *cpu, vaddr addr, MMUAccessType type,
         if (ops->tlb_fill_align(cpu, &full, addr, type, mmu_idx,
                                 memop, size, probe, ra)) {
             tlb_set_page_full(cpu, mmu_idx, addr, &full);
+            tlbgrow_note(cpu, mmu_idx, type, probe);
             return true;
         }
     } else {
@@ -2113,6 +2280,7 @@ static bool tlb_fill_align(CPUState *cpu, vaddr addr, MMUAccessType type,
             ops->do_unaligned_access(cpu, addr, type, mmu_idx, ra);
         }
         if (ops->tlb_fill(cpu, addr, size, type, mmu_idx, probe, ra)) {
+            tlbgrow_note(cpu, mmu_idx, type, probe);
             return true;
         }
     }
